@@ -1,0 +1,31 @@
+# OpenID Foundation conformance suite (prebuilt images) for testing rust-oidc.
+# Based on the suite's docker-compose-prebuilt.yml, with:
+#  - host port 18443 -> nginx 8443 (8443 is taken on titanl); the suite still
+#    believes it lives at https://localhost.emobix.co.uk:8443 inside the network
+#  - gate.wushilin.net pinned to titanl so the suite reaches rust-oidc
+services:
+  mongodb:
+    image: docker.io/library/mongo:6.0.13
+    volumes:
+      - ./mongo-data:/data/db:z
+  nginx:
+    image: registry.gitlab.com/openid/conformance-suite/nginx:latest
+    ports:
+      - "18443:8443"
+    networks:
+      default:
+        aliases:
+          - localhost.emobix.co.uk
+    depends_on:
+      - server
+  server:
+    image: registry.gitlab.com/openid/conformance-suite:latest
+    environment:
+      BASE_URL: https://localhost.emobix.co.uk:8443
+      BASE_MTLS_URL: https://localhost.emobix.co.uk:8444
+      MONGODB_HOST: mongodb
+      SPRING_PROFILES_ACTIVE: dev
+    extra_hosts:
+      - "gate.wushilin.net:${RUST_OIDC_HOST_IP:-192.168.44.113}"
+    depends_on:
+      - mongodb

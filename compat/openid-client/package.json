@@ -1,0 +1,11 @@
+{
+  "name": "rust-oidc-compat-openid-client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test_rp.mjs"
+  },
+  "dependencies": {
+    "openid-client": "^6.8.8"
+  }
+}

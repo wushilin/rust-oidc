@@ -28,7 +28,7 @@ pub struct AadError {
 }
 
 impl AadError {
-    fn new(status: StatusCode, error: &'static str, code: u32, message: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, error: &'static str, code: u32, message: impl Into<String>) -> Self {
         Self {
             status,
             error,
@@ -138,6 +138,23 @@ impl AadError {
             format!(
                 "The resource principal named {resource} was not found in the tenant named {tenant_name}. This can happen if the application has not been installed by the administrator of the tenant or consented to by any user in the tenant. You might have sent your authentication request to the wrong tenant."
             ),
+        )
+    }
+
+    pub fn invalid_grant(code: u32, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_grant", code, message)
+    }
+
+    /// `error_description` for redirects and error pages:
+    /// `AADSTS{code}: {message} Trace ID: ... Correlation ID: ... Timestamp: ...`
+    pub fn description(&self) -> String {
+        let timestamp = time::OffsetDateTime::now_utc().format(TIMESTAMP).unwrap_or_default();
+        let correlation_id = self.correlation_id.clone().unwrap_or_else(new_guid);
+        format!(
+            "AADSTS{}: {} Trace ID: {} Correlation ID: {correlation_id} Timestamp: {timestamp}",
+            self.code,
+            self.message,
+            new_guid()
         )
     }
 

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use argon2::{Argon2, PasswordHasher};
 use sqlx::SqlitePool;
 
@@ -62,4 +62,141 @@ pub async fn create(pool: &SqlitePool, tenant: &Tenant, user: NewUser<'_>) -> an
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct User {
+    pub id: String,
+    pub tenant_id: String,
+    pub upn: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
+    pub display_name: Option<String>,
+    pub given_name: Option<String>,
+    pub family_name: Option<String>,
+    pub enabled: bool,
+}
+
+pub async fn find(pool: &SqlitePool, tenant_id: &str, user_id: &str) -> anyhow::Result<Option<User>> {
+    Ok(sqlx::query_as(
+        "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
+         FROM users WHERE tenant_id = ? AND id = ?",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub enum AuthResult {
+    Ok(User),
+    /// Unknown user or wrong password (indistinguishable to the caller).
+    InvalidCredentials,
+    Locked,
+    Disabled,
+}
+
+/// Entra smart lockout: 10 failures lock the account for 60 seconds, doubling
+/// with each further failure up to an hour.
+const LOCKOUT_THRESHOLD: i64 = 10;
+
+fn lockout_secs(failures: i64) -> i64 {
+    let extra = (failures - LOCKOUT_THRESHOLD).clamp(0, 6) as u32;
+    (60 * 2i64.pow(extra)).min(3600)
+}
+
+/// A fixed hash to verify against when the user does not exist, so unknown
+/// and known accounts take the same time.
+static DUMMY_HASH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| hash_password("not-a-real-password").expect("argon2"));
+
+pub async fn authenticate(pool: &SqlitePool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<AuthResult> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: String,
+        password_hash: Option<String>,
+        enabled: bool,
+        failed_logins: i64,
+        locked_until: Option<i64>,
+    }
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT id, password_hash, enabled, failed_logins, locked_until FROM users WHERE tenant_id = ? AND upn = ?",
+    )
+    .bind(&tenant.id)
+    .bind(upn.trim())
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        let _ = verify_password(password, &DUMMY_HASH);
+        return Ok(AuthResult::InvalidCredentials);
+    };
+    let ts = now();
+    if row.locked_until.is_some_and(|until| until > ts) {
+        return Ok(AuthResult::Locked);
+    }
+    let ok = row
+        .password_hash
+        .as_deref()
+        .is_some_and(|h| verify_password(password, h));
+    if !ok {
+        let failures = row.failed_logins + 1;
+        let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
+        sqlx::query("UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?")
+            .bind(failures)
+            .bind(locked_until)
+            .bind(&row.id)
+            .execute(pool)
+            .await?;
+        return Ok(AuthResult::InvalidCredentials);
+    }
+    if !row.enabled {
+        return Ok(AuthResult::Disabled);
+    }
+    sqlx::query("UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?")
+        .bind(&row.id)
+        .execute(pool)
+        .await?;
+    let user = find(pool, &tenant.id, &row.id).await?.context("user vanished")?;
+    Ok(AuthResult::Ok(user))
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    use argon2::PasswordVerifier;
+    Argon2::default().verify_password(password.as_bytes(), hash).is_ok()
+}
+
+pub async fn set_password(pool: &SqlitePool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<()> {
+    if password.chars().count() < 8 {
+        bail!("password must be at least 8 characters");
+    }
+    let res = sqlx::query(
+        "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
+         WHERE tenant_id = ? AND upn = ?",
+    )
+    .bind(hash_password(password)?)
+    .bind(now())
+    .bind(&tenant.id)
+    .bind(upn)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() == 0 {
+        bail!("user '{upn}' not found");
+    }
+    // As in Entra, a password reset revokes the user's refresh tokens and sessions.
+    let user: (String,) = sqlx::query_as("SELECT id FROM users WHERE tenant_id = ? AND upn = ?")
+        .bind(&tenant.id)
+        .bind(upn)
+        .fetch_one(pool)
+        .await?;
+    sqlx::query("UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+        .bind(now())
+        .bind(&user.0)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(&user.0)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

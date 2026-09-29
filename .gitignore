@@ -3,3 +3,4 @@
 compat/.venv
 compat/msal-node/node_modules
 __pycache__/
+compat/openid-client/node_modules

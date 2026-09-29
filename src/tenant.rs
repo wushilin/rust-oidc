@@ -9,12 +9,18 @@ use crate::util::{is_guid, new_guid, now};
 pub struct TenantSettings {
     /// Access token lifetime. Entra's default is 60-90 minutes; we use 60.
     pub access_token_lifetime_secs: i64,
+    /// Browser sign-in session lifetime.
+    pub session_lifetime_secs: i64,
+    /// Refresh token inactivity lifetime (Entra: 90 days).
+    pub refresh_token_lifetime_secs: i64,
 }
 
 impl Default for TenantSettings {
     fn default() -> Self {
         Self {
             access_token_lifetime_secs: 3599,
+            session_lifetime_secs: 86_400,
+            refresh_token_lifetime_secs: 90 * 86_400,
         }
     }
 }

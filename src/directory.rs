@@ -74,3 +74,21 @@ pub async fn assign(
     .await?;
     Ok(())
 }
+
+/// Directory role template ids held by the user, directly or through groups
+/// (the `wids` claim).
+pub async fn wids_for_user(pool: &SqlitePool, tenant_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT role_template_id FROM directory_role_assignments
+         WHERE tenant_id = ?1
+           AND ((principal_type = 'User' AND principal_id = ?2)
+             OR (principal_type = 'Group' AND principal_id IN
+                   (SELECT group_id FROM group_members WHERE user_id = ?2)))
+         ORDER BY role_template_id",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(r,)| r).collect())
+}

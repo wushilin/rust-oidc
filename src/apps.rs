@@ -20,6 +20,7 @@ pub struct ServicePrincipal {
     pub tenant_id: String,
     pub app_id: String,
     pub enabled: bool,
+    pub app_role_assignment_required: bool,
 }
 
 pub struct CreatedApp {
@@ -106,7 +107,7 @@ pub async fn service_principal(
     app_id: &str,
 ) -> anyhow::Result<Option<ServicePrincipal>> {
     Ok(sqlx::query_as(
-        "SELECT id, tenant_id, app_id, enabled FROM service_principals
+        "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required FROM service_principals
          WHERE tenant_id = ? AND app_id = ? COLLATE NOCASE",
     )
     .bind(tenant_id)
@@ -404,4 +405,178 @@ pub async fn app_roles_for_service_principal(
         .filter(|(_, types)| types.contains(MEMBER_APPLICATION))
         .map(|(value, _)| value)
         .collect())
+}
+
+// ---- redirect URIs ----
+
+pub const PLATFORM_WEB: &str = "web";
+pub const PLATFORM_SPA: &str = "spa";
+pub const PLATFORM_PUBLIC: &str = "publicClient";
+
+fn is_loopback_http(url: &url::Url) -> bool {
+    url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+}
+
+/// Entra's rules: web and SPA URIs must be https (or http on loopback); no
+/// fragments anywhere; public clients may use custom schemes.
+pub fn validate_redirect_uri(platform: &str, uri: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(uri).with_context(|| format!("redirect URI '{uri}' is not an absolute URI"))?;
+    if url.fragment().is_some() {
+        bail!("redirect URI must not contain a fragment");
+    }
+    match platform {
+        PLATFORM_WEB | PLATFORM_SPA => {
+            if url.scheme() != "https" && !is_loopback_http(&url) {
+                bail!("{platform} redirect URIs must use https (http is allowed only for localhost)");
+            }
+        }
+        PLATFORM_PUBLIC => {}
+        _ => bail!("platform must be one of web, spa, publicClient"),
+    }
+    Ok(())
+}
+
+pub async fn add_redirect_uri(pool: &SqlitePool, app: &Application, platform: &str, uri: &str) -> anyhow::Result<()> {
+    validate_redirect_uri(platform, uri)?;
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT platform FROM app_redirect_uris WHERE application_id = ? AND uri = ?")
+            .bind(&app.id)
+            .bind(uri)
+            .fetch_optional(pool)
+            .await?;
+    if let Some((p,)) = existing {
+        bail!("redirect URI '{uri}' is already registered for platform {p}");
+    }
+    sqlx::query("INSERT INTO app_redirect_uris (application_id, platform, uri) VALUES (?, ?, ?)")
+        .bind(&app.id)
+        .bind(platform)
+        .bind(uri)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn redirect_uris(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<(String, String)>> {
+    Ok(
+        sqlx::query_as("SELECT platform, uri FROM app_redirect_uris WHERE application_id = ? ORDER BY platform, uri")
+            .bind(&app.id)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+/// Exact match, except that the port is ignored for http loopback URIs, as in Entra.
+pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
+    if registered == requested {
+        return true;
+    }
+    match (url::Url::parse(registered), url::Url::parse(requested)) {
+        (Ok(mut a), Ok(mut b)) if is_loopback_http(&a) && is_loopback_http(&b) => {
+            let _ = a.set_port(None);
+            let _ = b.set_port(None);
+            a.as_str() == b.as_str()
+        }
+        _ => false,
+    }
+}
+
+/// The platform of the registered redirect URI matching `requested`, if any.
+pub async fn match_redirect_uri(
+    pool: &SqlitePool,
+    app: &Application,
+    requested: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(redirect_uris(pool, app)
+        .await?
+        .into_iter()
+        .find(|(_, uri)| redirect_uri_matches(uri, requested))
+        .map(|(platform, _)| platform))
+}
+
+// ---- delegated permission scopes ----
+
+pub async fn add_scope(
+    pool: &SqlitePool,
+    app: &Application,
+    value: &str,
+    display_name: &str,
+    scope_type: &str,
+) -> anyhow::Result<String> {
+    if value.is_empty() || value.contains(char::is_whitespace) || value.starts_with('.') || value.contains('/') {
+        bail!("invalid scope value '{value}'");
+    }
+    if scope_type != "User" && scope_type != "Admin" {
+        bail!("scope type must be User or Admin");
+    }
+    let id = new_guid();
+    sqlx::query(
+        "INSERT INTO app_scopes (id, application_id, value, display_name, type, enabled) VALUES (?, ?, ?, ?, ?, 1)",
+    )
+    .bind(&id)
+    .bind(&app.id)
+    .bind(value)
+    .bind(display_name)
+    .bind(scope_type)
+    .execute(pool)
+    .await
+    .with_context(|| format!("scope '{value}' already exists"))?;
+    Ok(id)
+}
+
+pub async fn enabled_scopes(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT value FROM app_scopes WHERE application_id = ? AND enabled = 1 ORDER BY value")
+            .bind(&app.id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(v,)| v).collect())
+}
+
+/// Role values of `resource_sp_id` a user holds directly or through group
+/// membership (the `roles` claim of user tokens).
+pub async fn app_roles_for_user(pool: &SqlitePool, resource_sp_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT r.value, r.allowed_member_types FROM app_role_assignments a
+         JOIN app_roles r ON r.id = a.app_role_id
+         WHERE a.resource_id = ?1 AND r.enabled = 1
+           AND ((a.principal_type = 'User' AND a.principal_id = ?2)
+             OR (a.principal_type = 'Group' AND a.principal_id IN
+                   (SELECT group_id FROM group_members WHERE user_id = ?2)))
+         ORDER BY r.value",
+    )
+    .bind(resource_sp_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, types)| types.contains(MEMBER_USER))
+        .map(|(value, _)| value)
+        .collect())
+}
+
+/// Whether the user may sign in to an app that requires assignment
+/// (`appRoleAssignmentRequired`), directly or through a group.
+pub async fn user_is_assigned(pool: &SqlitePool, sp_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM app_role_assignments
+         WHERE resource_id = ?1
+           AND ((principal_type = 'User' AND principal_id = ?2)
+             OR (principal_type = 'Group' AND principal_id IN
+                   (SELECT group_id FROM group_members WHERE user_id = ?2)))",
+    )
+    .bind(sp_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+pub async fn set_assignment_required(pool: &SqlitePool, sp_id: &str, required: bool) -> anyhow::Result<()> {
+    sqlx::query("UPDATE service_principals SET app_role_assignment_required = ? WHERE id = ?")
+        .bind(required)
+        .bind(sp_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

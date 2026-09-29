@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_RSA_SHA256, RsaKeySize};
 use rsa::RsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
@@ -32,6 +32,7 @@ pub struct LoadedKey {
     pub n: Vec<u8>,
     pub e: Vec<u8>,
     pub encoding_key: EncodingKey,
+    pub decoding_key: DecodingKey,
 }
 
 #[derive(Serialize)]
@@ -106,6 +107,33 @@ impl KeyStore {
         Ok((keys, idx))
     }
 
+    /// Verify a token we issued: RS256, signed by a published key, not expired.
+    /// Issuer and audience checks are left to the caller.
+    pub async fn verify(&self, token: &str) -> anyhow::Result<serde_json::Value> {
+        self.verify_inner(token, true).await
+    }
+
+    /// Like [`verify`](Self::verify) but accepts expired tokens (for hints).
+    pub async fn verify_ignoring_expiry(&self, token: &str) -> anyhow::Result<serde_json::Value> {
+        self.verify_inner(token, false).await
+    }
+
+    async fn verify_inner(&self, token: &str, check_exp: bool) -> anyhow::Result<serde_json::Value> {
+        let kid = jsonwebtoken::decode_header(token)?
+            .kid
+            .ok_or_else(|| anyhow!("token has no kid"))?;
+        let keys = self.published().await?;
+        let key = keys
+            .iter()
+            .find(|k| k.kid == kid)
+            .ok_or_else(|| anyhow!("unknown kid"))?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_aud = false;
+        validation.validate_exp = check_exp;
+        validation.set_required_spec_claims(&["exp", "iss"]);
+        Ok(jsonwebtoken::decode::<serde_json::Value>(token, &key.decoding_key, &validation)?.claims)
+    }
+
     pub async fn sign<T: Serialize>(&self, claims: &T) -> anyhow::Result<String> {
         let (keys, idx) = self.active().await?;
         let key = &keys[idx];
@@ -123,9 +151,11 @@ async fn load_keys(pool: &SqlitePool) -> anyhow::Result<Vec<LoadedKey>> {
     rows.into_iter()
         .map(|(kid, pem, cert_der, status)| {
             let private = RsaPrivateKey::from_pkcs8_pem(&pem).context("bad signing key PEM")?;
+            let (n, e) = (private.n().to_bytes_be(), private.e().to_bytes_be());
             Ok(LoadedKey {
-                n: private.n().to_bytes_be(),
-                e: private.e().to_bytes_be(),
+                decoding_key: DecodingKey::from_rsa_raw_components(&n, &e),
+                n,
+                e,
                 encoding_key: EncodingKey::from_rsa_pem(pem.as_bytes())?,
                 kid,
                 status,

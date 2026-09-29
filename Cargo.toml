@@ -13,6 +13,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 getrandom = "0.4.3"
 hex = "0.4.3"
+hmac = "0.13"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }
 rsa = { version = "0.9.10", features = ["sha2", "pem"] }
@@ -34,5 +35,5 @@ url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13.5", features = ["form", "json", "rustls"] }
+reqwest = { version = "0.13.5", features = ["cookies", "form", "json", "rustls"] }
 tempfile = "3.27.0"

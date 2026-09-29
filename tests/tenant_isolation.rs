@@ -131,3 +131,96 @@ async fn domains_are_unique_across_tenants() {
         .unwrap_err();
     assert!(err.to_string().contains("already registered"), "{err}");
 }
+
+mod user_isolation {
+    use super::common::{Browser, REDIRECT, TestServer, aadsts, pkce, user_fixture, user_fixture_in};
+
+    #[tokio::test]
+    async fn users_sessions_and_codes_stay_in_their_tenant() {
+        let s = TestServer::start().await;
+        let a = user_fixture(&s).await;
+        let tenant_b = s.tenant("Fabrikam", "fabrikam.com").await;
+        let b_fx = user_fixture_in(&s, tenant_b, "bob@fabrikam.com").await;
+        let browser = Browser::new();
+        let (verifier, challenge) = pkce();
+
+        // Tenant A's user cannot sign in to tenant B's app.
+        let page = browser
+            .authorize(
+                &s,
+                &b_fx.tenant.id,
+                &[
+                    ("client_id", &b_fx.web.app_id),
+                    ("response_type", "code"),
+                    ("redirect_uri", REDIRECT),
+                    ("scope", "openid"),
+                ],
+            )
+            .await;
+        let denied = browser.login(&page, &a.upn, &a.password).await;
+        assert_eq!(denied.status, 401);
+        assert!(denied.body.contains("AADSTS50126"));
+
+        // Tenant A's app is unknown at tenant B's authorize endpoint.
+        let page = browser
+            .authorize(
+                &s,
+                &b_fx.tenant.id,
+                &[
+                    ("client_id", &a.web.app_id),
+                    ("response_type", "code"),
+                    ("redirect_uri", REDIRECT),
+                    ("scope", "openid"),
+                ],
+            )
+            .await;
+        assert!(page.body.contains("AADSTS700016"));
+
+        // Sign in at A; the session gives no SSO at B.
+        let page = browser
+            .authorize(
+                &s,
+                &a.tenant.id,
+                &[
+                    ("client_id", &a.web.app_id),
+                    ("response_type", "code"),
+                    ("redirect_uri", REDIRECT),
+                    ("scope", "openid"),
+                    ("code_challenge", &challenge),
+                    ("code_challenge_method", "S256"),
+                ],
+            )
+            .await;
+        let code = browser.login(&page, &a.upn, &a.password).await.redirect_params()["code"].clone();
+        let page = browser
+            .authorize(
+                &s,
+                &b_fx.tenant.id,
+                &[
+                    ("client_id", &b_fx.web.app_id),
+                    ("response_type", "code"),
+                    ("redirect_uri", REDIRECT),
+                    ("scope", "openid"),
+                    ("prompt", "none"),
+                ],
+            )
+            .await;
+        assert_eq!(page.redirect_params()["error"], "login_required");
+
+        // A's code cannot be redeemed at B's token endpoint.
+        let (status, body) = s
+            .token(
+                &b_fx.tenant.id,
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &a.web.app_id),
+                    ("client_secret", &a.web.secret),
+                    ("code", &code),
+                    ("redirect_uri", REDIRECT),
+                    ("code_verifier", &verifier),
+                ],
+            )
+            .await;
+        assert_eq!((status, aadsts(&body)), (400, 700005));
+    }
+}

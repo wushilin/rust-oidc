@@ -5,9 +5,13 @@ the same endpoint layout, token claims, error format and client-secret semantics
 written for Entra should work with configuration changes only. Storage is SQLite, and
 tenants (realms) are built in.
 
-**Status: phase 1.** Tenants, app registrations, service principals, app roles, signing
-keys, discovery, JWKS and the `client_credentials` grant are done. User sign-in
-(authorize, auth code + PKCE, refresh tokens), TOTP MFA and the admin console come next.
+**Status: phase 2.** Done:
+- Tenants, app registrations, service principals, app roles and signing keys.
+- Service-account tokens (`client_credentials`).
+- Interactive sign-in: authorize and login page, auth code + PKCE, ID tokens, refresh
+  tokens, UserInfo and logout.
+
+TOTP MFA and the admin console come next.
 
 ## Quick start
 
@@ -42,8 +46,38 @@ metadata always use the GUID.
 |---|---|
 | Discovery | `/rust-oidc/{tenant}/v2.0/.well-known/openid-configuration` |
 | Keys (JWKS) | `/rust-oidc/{tenant}/discovery/v2.0/keys` (also `/rust-oidc/common/...`) |
+| Authorize | `/rust-oidc/{tenant}/oauth2/v2.0/authorize` (GET or POST) |
 | Token | `/rust-oidc/{tenant}/oauth2/v2.0/token` |
+| Logout | `/rust-oidc/{tenant}/oauth2/v2.0/logout` |
+| UserInfo | `/rust-oidc/oidc/userinfo` (accepts the "Graph" token, as in Entra) |
 | Issuer | `https://host/rust-oidc/{tid}/v2.0` |
+
+## Sign-in behaviour (as in Entra)
+
+- **Response modes:** `query`, `fragment` and `form_post`.
+- **Prompts:** `prompt=none|login|select_account|consent`, plus `max_age` and `login_hint`.
+- **Client rules depend on the redirect URI's platform:**
+  - `web` is a confidential client and must authenticate.
+  - `spa` must use PKCE and redeem codes cross-origin. Its refresh tokens have a fixed 24h lifetime.
+  - `publicClient` needs no secret.
+- **Redirect URIs match exactly**, except that the port is ignored for `http://localhost`.
+- **Scopes:** `api://{app}/{scope}` or `/.default`, with one resource per request. Without
+  a resource you get a token for Graph's app ID, which the UserInfo endpoint accepts.
+- **Refresh tokens:** a refresh token can be used for a different resource. Refresh
+  tokens rotate on each use, and replaying an old one revokes the whole chain.
+- **`sub` is pairwise** (different for each app). `oid` is the stable user ID.
+- **`client_info`** is returned for MSAL.
+- **Accounts lock** for 60 seconds after 10 failed sign-ins, doubling after each further failure.
+- **A password reset** revokes the user's refresh tokens and sessions.
+
+```sh
+$B user create --tenant contoso.com --upn alice@contoso.com --display-name "Alice Smith" --email alice@contoso.com
+$B group create --tenant contoso.com --name engineering
+$B group add-member --tenant contoso.com --group engineering --user alice@contoso.com
+$B app add-redirect-uri --tenant contoso.com --app W --platform web --uri https://portal.contoso.com/signin-oidc
+$B app add-scope --tenant contoso.com --app A --value Orders.Read
+$B app assignment-required --tenant contoso.com --app W --required true
+```
 
 ## Configuration
 
@@ -90,8 +124,8 @@ Running servers pick up rotations within 30 seconds.
 ## Tests
 
 ```sh
-cargo test          # protocol, error codes, key rotation, tenant isolation
-compat/run.sh       # MSAL Python + MSAL Node against a TLS server (needs python3, node)
+cargo test          # protocol, error codes, sign-in flows, key rotation, tenant isolation
+compat/run.sh       # MSAL Python (app + user), MSAL Node, openid-client (certified RP) over TLS
 ```
 
 ## Deliberate differences from Entra
@@ -99,4 +133,6 @@ compat/run.sh       # MSAL Python + MSAL Node against a TLS server (needs python
 - `groups` holds group names, not object IDs.
 - There is no interactive consent. Apps are treated as admin-consented.
 - The implicit grant is not supported.
+- Refresh tokens rotate, and replaying an old one revokes the chain. Entra keeps old refresh tokens valid.
+- ID tokens include `email_verified` when an email is present.
 - Client secrets are stored as SHA-256 hashes. They are ~200-bit random values, so a slow hash adds nothing.

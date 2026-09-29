@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -23,27 +23,75 @@ pub async fn token(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match handle(&st, &tenant_key, &headers, &body).await {
+    let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+    let mut resp = match handle(&st, &tenant_key, &headers, &params).await {
         Ok(resp) => resp,
         Err(err) => err.correlate(&headers).into_response(),
+    };
+    // SPAs redeem codes cross-origin. Like Entra, allow the origins of the
+    // client's registered SPA redirect URIs (for errors too, so they are readable).
+    if let Some(origin) = allowed_spa_origin(&st, &headers, &params).await {
+        let h = resp.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        h.insert(header::VARY, HeaderValue::from_static("Origin"));
     }
+    resp
 }
 
-async fn handle(st: &AppState, tenant_key: &str, headers: &HeaderMap, body: &[u8]) -> Result<Response, AadError> {
-    let params: HashMap<String, String> = url::form_urlencoded::parse(body).into_owned().collect();
+/// CORS preflight for the token endpoint.
+pub async fn preflight(headers: HeaderMap) -> Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let h = resp.headers_mut();
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    }
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("POST, OPTIONS"),
+    );
+    if let Some(req) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, req.clone());
+    }
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+    h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    resp
+}
 
+async fn allowed_spa_origin(
+    st: &AppState,
+    headers: &HeaderMap,
+    params: &HashMap<String, String>,
+) -> Option<HeaderValue> {
+    let origin = headers.get(header::ORIGIN)?.to_str().ok()?;
+    let app = apps::find(&st.pool, param(params, "client_id")?).await.ok()??;
+    let uris = apps::redirect_uris(&st.pool, &app).await.ok()?;
+    uris.iter()
+        .filter(|(platform, _)| platform == apps::PLATFORM_SPA)
+        .filter_map(|(_, uri)| url::Url::parse(uri).ok())
+        .any(|u| u.origin().ascii_serialization() == origin)
+        .then(|| HeaderValue::from_str(origin).ok())?
+}
+
+async fn handle(
+    st: &AppState,
+    tenant_key: &str,
+    headers: &HeaderMap,
+    params: &HashMap<String, String>,
+) -> Result<Response, AadError> {
     let tenant = tenant::resolve(&st.pool, tenant_key)
         .await?
         .ok_or_else(|| AadError::tenant_not_found(tenant_key))?;
 
-    let grant_type = param(&params, "grant_type").ok_or_else(|| AadError::missing_parameter("grant_type"))?;
+    let grant_type = param(params, "grant_type").ok_or_else(|| AadError::missing_parameter("grant_type"))?;
     match grant_type {
-        "client_credentials" => client_credentials(st, &tenant, headers, &params).await,
+        "client_credentials" => client_credentials(st, &tenant, headers, params).await,
+        "authorization_code" => super::user_grants::authorization_code(st, &tenant, headers, params).await,
+        "refresh_token" => super::user_grants::refresh_token(st, &tenant, headers, params).await,
         other => Err(AadError::unsupported_grant_type(other)),
     }
 }
 
-fn param<'a>(params: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+pub(super) fn param<'a>(params: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
     params.get(name).map(String::as_str).filter(|v| !v.is_empty())
 }
 
@@ -97,7 +145,7 @@ fn form_decode(value: &str) -> String {
         .unwrap_or_default()
 }
 
-async fn authenticate_confidential_client(
+pub(super) async fn authenticate_confidential_client(
     st: &AppState,
     tenant: &Tenant,
     headers: &HeaderMap,

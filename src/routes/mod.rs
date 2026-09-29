@@ -1,5 +1,9 @@
+mod authorize;
 mod discovery;
+mod logout;
 mod token;
+mod user_grants;
+mod userinfo;
 
 use axum::Router;
 use axum::http::HeaderValue;
@@ -19,6 +23,7 @@ pub fn router(state: AppState) -> Router {
             get(discovery::openid_configuration),
         )
         .route("/{tenant}/discovery/v2.0/keys", get(discovery::keys))
+        .route("/oidc/userinfo", get(userinfo::userinfo).post(userinfo::userinfo))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
             HeaderValue::from_static("*"),
@@ -26,7 +31,16 @@ pub fn router(state: AppState) -> Router {
 
     let routes = Router::new()
         .merge(public_metadata)
-        .route("/{tenant}/oauth2/v2.0/token", post(token::token))
+        .route(
+            "/{tenant}/oauth2/v2.0/token",
+            post(token::token).options(token::preflight),
+        )
+        .route(
+            "/{tenant}/oauth2/v2.0/authorize",
+            get(authorize::authorize).post(authorize::authorize),
+        )
+        .route("/{tenant}/login", post(authorize::login))
+        .route("/{tenant}/oauth2/v2.0/logout", get(logout::logout).post(logout::logout))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone());
 

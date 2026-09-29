@@ -1,0 +1,12 @@
+{
+  "name": "rust-oidc-compat-msal-node",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test_app_auth.mjs"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^7.0.0",
+    "jose": "^6.2.12"
+  }
+}

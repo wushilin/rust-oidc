@@ -40,6 +40,10 @@ fn get<'a>(p: &'a Params, name: &str) -> Option<&'a str> {
     p.get(name).map(String::as_str).filter(|v| !v.is_empty())
 }
 
+fn is_openid_request(p: &Params) -> bool {
+    get(p, "scope").is_some_and(|s| s.split_whitespace().any(|x| x == "openid"))
+}
+
 pub async fn authorize(
     State(st): State<AppState>,
     Path(tenant_key): Path<String>,
@@ -159,8 +163,9 @@ async fn validate_client(
     let registered = apps::redirect_uris(&st.pool, &app).await.map_err(internal)?;
     let requested = match get(params, "redirect_uri") {
         Some(uri) => uri.to_string(),
-        // Entra falls back to the only registered URI when none is given.
-        None if registered.len() == 1 => registered[0].1.clone(),
+        // Entra falls back to the only registered URI when none is given. OIDC
+        // Core makes redirect_uri mandatory, so only plain OAuth requests get that.
+        None if registered.len() == 1 && !is_openid_request(params) => registered[0].1.clone(),
         None => return Err(page_error(tn, AadError::missing_parameter("redirect_uri"))),
     };
     let platform = registered

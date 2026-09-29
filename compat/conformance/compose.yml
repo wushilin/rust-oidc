@@ -25,6 +25,11 @@ services:
       BASE_MTLS_URL: https://localhost.emobix.co.uk:8444
       MONGODB_HOST: mongodb
       SPRING_PROFILES_ACTIVE: dev
+      # Placeholders required at startup (the suite's own login providers; unused in dev mode).
+      OIDC_GOOGLE_CLIENTID: google-client
+      OIDC_GOOGLE_SECRET: google-secret
+      OIDC_GITLAB_CLIENTID: gitlab-client
+      OIDC_GITLAB_SECRET: gitlab-secret
     extra_hosts:
       - "gate.wushilin.net:${RUST_OIDC_HOST_IP:-192.168.44.113}"
     depends_on:

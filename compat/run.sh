@@ -5,10 +5,10 @@
 # provisions a tenant, an API app with app roles and a client app with a secret,
 # then runs the MSAL Python and MSAL Node suites.
 #
-# Usage: compat/run.sh [python|node|rp|kafka|grafana|oauth2-proxy]...   (default: all)
+# Usage: compat/run.sh [python|node|rp|kafka|grafana|oauth2-proxy|msidweb]...   (default: all)
 #
 # The kafka, grafana and oauth2-proxy suites need podman and are skipped when it
-# is not installed.
+# is not installed; msidweb likewise needs the .NET 8 SDK (dotnet).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +16,7 @@ COMPAT="$ROOT/compat"
 # 18443 is taken by the conformance suite's nginx (compat/conformance), and the
 # server now binds 0.0.0.0 for the Kafka container, so the two would collide.
 PORT="${PORT:-18444}"
-SUITES=("${@:-python node rp kafka grafana oauth2-proxy}")
+SUITES=("${@:-python node rp kafka grafana oauth2-proxy msidweb}")
 SUITES=(${SUITES[@]})
 
 WORK="$(mktemp -d)"
@@ -109,6 +109,18 @@ con.commit()
 assert n == 1, f"expected to verify exactly one user, updated {n}"
 PY
 
+# ---- fixtures for the msidweb suite ----
+# A second tenant with its own API and client. Its tokens are genuinely signed by
+# this server but carry another tenant's issuer, which Microsoft.Identity.Web must
+# refuse when configured for Contoso (the issuer-validation negative case).
+OTHER_TENANT_DOMAIN="fabrikam.test"
+"$BIN" tenant create --name Fabrikam --domain "$OTHER_TENANT_DOMAIN" >/dev/null
+OTHER_API_APP_ID=$("$BIN" app create --tenant "$OTHER_TENANT_DOMAIN" --name fabrikam-api | json '["appId"]')
+OTHER_CLIENT_APP_ID=$("$BIN" app create --tenant "$OTHER_TENANT_DOMAIN" --name fabrikam-worker | json '["appId"]')
+"$BIN" app role add --tenant "$OTHER_TENANT_DOMAIN" --app "$OTHER_API_APP_ID" --value Orders.Read --member-types Application >/dev/null
+"$BIN" app role assign --tenant "$OTHER_TENANT_DOMAIN" --resource "$OTHER_API_APP_ID" --role Orders.Read --app "$OTHER_CLIENT_APP_ID" >/dev/null
+OTHER_CLIENT_SECRET=$("$BIN" app secret add --tenant "$OTHER_TENANT_DOMAIN" --app "$OTHER_CLIENT_APP_ID" --days 1 | json '["secretText"]')
+
 # ---- server ----
 export RUST_OIDC_BASE="https://localhost:$PORT/rust-oidc"
 # Bound to [::] so the Kafka container can reach it via the host gateway and the
@@ -131,6 +143,7 @@ export CA_FILE="$WORK/tls/cert.pem"
 export GRAFANA_APP_ID GRAFANA_SECRET GRAFANA_PORT GRAFANA_BAD_PORT
 export VERIFIED_UPN
 export OAUTH2_PROXY_APP_ID OAUTH2_PROXY_SECRET OAUTH2_PROXY_PORT OAUTH2_PROXY_UPSTREAM_PORT
+export OTHER_TENANT_DOMAIN OTHER_API_APP_ID OTHER_CLIENT_APP_ID OTHER_CLIENT_SECRET
 export EXPECTED_ROLES="Orders.Read,Orders.Write"
 
 # jose and oauth4webapi use the WebCrypto global, which Node 18 exposes in ESM
@@ -170,6 +183,9 @@ for suite in "${SUITES[@]}"; do
       ;;
     oauth2-proxy)
       "$COMPAT/oauth2-proxy/test_oauth2_proxy.sh" || status=1
+      ;;
+    msidweb)
+      "$COMPAT/microsoft-identity-web/test_msidweb.sh" || status=1
       ;;
     *) echo "unknown suite: $suite"; status=1 ;;
   esac

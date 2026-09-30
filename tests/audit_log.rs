@@ -344,9 +344,12 @@ async fn unknown_user_value_without_a_domain_is_not_logged() {
     assert_eq!(resp.status, 401);
     let with_junk_at = b.login(&resp, "p@ss word!", "whatever").await;
     assert_eq!(with_junk_at.status, 401);
+    // A DNS-shaped password fragment is not one of the tenant's domains.
+    let dns_shaped = b.login(&with_junk_at, "x@corp.example", "whatever").await;
+    assert_eq!(dns_shaped.status, 401);
 
     let failed = rows(&s, &f.tenant.id, "auth.sign_in_failed").await;
-    assert_eq!(failed.len(), 2);
+    assert_eq!(failed.len(), 3);
     for row in &failed {
         assert_eq!(row.actor, "anonymous");
         assert_eq!(row.details["reason"], "unknown_user");

@@ -191,6 +191,7 @@ async fn ropc_unknown_user_audit_row_keeps_no_local_part() {
     let scope = format!("openid api://{}/Orders.Read", f.api.app_id);
     ropc(&s, &f, "CorrectHorse-Battery9!", "x", &scope).await;
     ropc(&s, &f, "nobody@contoso.com", "x", &scope).await;
+    ropc(&s, &f, "x@corp.example", "x", &scope).await;
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(rust_oidc::db::q(
         &s.pool,
         "SELECT actor, details FROM audit_log WHERE tenant_id = ? AND action = ? ORDER BY id",
@@ -200,11 +201,13 @@ async fn ropc_unknown_user_audit_row_keeps_no_local_part() {
     .fetch_all(&s.pool)
     .await
     .unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     let (first, second) = (rows[0].1.as_deref().unwrap(), rows[1].1.as_deref().unwrap());
     assert!(!first.contains("CorrectHorse") && !first.contains("domain"), "{first}");
     assert!(
         second.contains(r#""domain":"contoso.com""#) && !second.contains("nobody"),
         "{second}"
     );
+    let third = rows[2].1.as_deref().unwrap();
+    assert!(!third.contains("corp.example") && !third.contains("domain"), "{third}");
 }

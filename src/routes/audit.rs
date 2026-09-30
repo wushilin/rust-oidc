@@ -158,18 +158,12 @@ impl ClientFailures<'_> {
     }
 }
 
-/// The part after the last `@` of `value`, if it looks like a DNS name: only
-/// letters, digits, `-` and `.`, at least one interior dot, no empty labels.
-/// Anything else yields `None`, so a mistyped password logs nothing.
-pub fn plausible_domain(value: &str) -> Option<String> {
-    let domain = value.trim().rsplit_once('@')?.1;
-    let ok = domain.len() <= 253
-        && domain.contains('.')
-        && domain.split('.').all(|l| !l.is_empty() && l.len() <= 63)
-        && domain
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
-    ok.then(|| domain.to_ascii_lowercase())
+/// The tenant's own verified domain that `value` names after its last `@`, as
+/// stored. Anything else, including a lookup failure, yields `None`.
+async fn own_domain(st: &AppState, tenant_id: &str, value: &str) -> Option<String> {
+    let submitted = crate::util::fold(value.trim().rsplit_once('@')?.1);
+    let domains = crate::tenant::domains(&st.pool, tenant_id).await.ok()?;
+    domains.into_iter().find(|d| crate::util::fold(d) == submitted)
 }
 
 /// Truncate an attacker-controlled string for `details`.
@@ -216,7 +210,9 @@ pub async fn sign_in_failure(
     });
     // The submitted name is only safe to log when it resolved to an account,
     // because then it is a real UPN. Otherwise it may be anything, including a
-    // password typed into the wrong box, so at most its domain is kept.
+    // password typed into the wrong box. The one thing still worth keeping is
+    // the domain, and only when it is one of this tenant's own: that is our
+    // public data, so it cannot be a fragment of what the user typed.
     let mut details = serde_json::json!({
         "reason": reason,
         "via": channel.as_str(),
@@ -224,7 +220,7 @@ pub async fn sign_in_failure(
     });
     if trace.user_id.is_some() {
         details["upn"] = clip(submitted_upn).into();
-    } else if let Some(domain) = plausible_domain(submitted_upn) {
+    } else if let Some(domain) = own_domain(st, tenant_id, submitted_upn).await {
         details["domain"] = domain.into();
     }
     record(
@@ -239,29 +235,5 @@ pub async fn sign_in_failure(
     if trace.lockout_triggered {
         let details = serde_json::json!({ "via": channel.as_str(), "clientId": client_id });
         record(st, tenant_id, actor, Event::Lockout, trace.user_id.as_deref(), details).await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::plausible_domain;
-
-    #[test]
-    fn only_dns_shaped_domains_survive() {
-        assert_eq!(plausible_domain("Bob@Contoso.COM").as_deref(), Some("contoso.com"));
-        assert_eq!(plausible_domain("a@b@example.org").as_deref(), Some("example.org"));
-        for junk in [
-            "hunter2",
-            "no-at.sign",
-            "x@nodot",
-            "x@has space.com",
-            "x@bad..dots.com",
-            "x@.lead.com",
-            "x@trail.com.",
-            "x@",
-            "p@ss w0rd!.x",
-        ] {
-            assert_eq!(plausible_domain(junk), None, "{junk}");
-        }
     }
 }

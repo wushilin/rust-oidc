@@ -27,6 +27,9 @@ use crate::{html, scopes, users};
 pub const DEVICE_CODE_LIFETIME: i64 = 900;
 /// Minimum seconds between polls; a faster device gets `slow_down`.
 pub const POLL_INTERVAL: i64 = 5;
+/// How long past `expires_at` a row is kept, so a device that polls just after
+/// expiry still gets `expired_token` rather than an unknown-code error.
+const DEVICE_CODE_RETENTION: i64 = DEVICE_CODE_LIFETIME;
 const USER_CODE_LEN: usize = 8;
 /// Digits and letters that cannot be confused when read off a screen.
 const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ23456789";
@@ -160,6 +163,10 @@ async fn issue_device_code(st: &AppState, tenant_key: &str, params: &Params) -> 
     let user_code = new_user_code();
     let ts = now();
     let expires_at = ts + DEVICE_CODE_LIFETIME;
+    // Best effort, like the client-assertion jti prune: a failure must not block issuing.
+    if let Err(e) = prune_expired(&st.pool, ts).await {
+        tracing::warn!("device code prune failed: {e}");
+    }
     sqlx::query(crate::db::q(
         &st.pool,
         "INSERT INTO device_codes (device_code_hash, user_code, tenant_id, client_app_id, scope, status,
@@ -194,6 +201,16 @@ async fn issue_device_code(st: &AppState, tenant_key: &str, params: &Params) -> 
         .into_response();
     no_store(resp.headers_mut());
     Ok(resp)
+}
+
+/// Delete device codes that expired more than [`DEVICE_CODE_RETENTION`] ago.
+/// Idempotent, and cheap: a range delete on the `expires_at` index.
+pub(crate) async fn prune_expired(pool: &crate::db::DbPool, ts: i64) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(crate::db::q(pool, "DELETE FROM device_codes WHERE expires_at < ?"))
+        .bind(ts - DEVICE_CODE_RETENTION)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 // ---- GET|POST /{tenant}/oauth2/deviceauth ----
@@ -608,4 +625,56 @@ pub(super) async fn device_code_grant(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn insert(pool: &crate::db::DbPool, tenant: &str, hash: &str, expires_at: i64) {
+        sqlx::query(crate::db::q(
+            pool,
+            "INSERT INTO device_codes (device_code_hash, user_code, tenant_id, client_app_id, scope, status,
+                                       interval_secs, created_at, expires_at)
+             VALUES (?, ?, ?, 'app', 'openid', 'pending', 5, 0, ?)",
+        ))
+        .bind(hash)
+        .bind(hash)
+        .bind(tenant)
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn hashes(pool: &crate::db::DbPool) -> Vec<String> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT device_code_hash FROM device_codes ORDER BY device_code_hash")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.into_iter().map(|r| r.0).collect()
+    }
+
+    #[tokio::test]
+    async fn prune_removes_long_expired_codes_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::connect(&format!("sqlite://{}", dir.path().join("t.db").display()))
+            .await
+            .unwrap();
+        let t = crate::tenant::create(&pool, "Contoso", "contoso.test", false)
+            .await
+            .unwrap();
+        let ts = 1_000_000;
+        insert(&pool, &t.id, "old", ts - DEVICE_CODE_RETENTION - 1).await;
+        insert(&pool, &t.id, "just-expired", ts - 1).await;
+        insert(&pool, &t.id, "live", ts + DEVICE_CODE_LIFETIME).await;
+
+        assert_eq!(prune_expired(&pool, ts).await.unwrap(), 1);
+        assert_eq!(hashes(&pool).await, ["just-expired", "live"]);
+        assert_eq!(prune_expired(&pool, ts).await.unwrap(), 0, "idempotent");
+        // Once past the retention window the recently expired code goes too; the live one never does.
+        assert_eq!(prune_expired(&pool, ts + DEVICE_CODE_RETENTION).await.unwrap(), 1);
+        assert_eq!(hashes(&pool).await, ["live"]);
+    }
 }

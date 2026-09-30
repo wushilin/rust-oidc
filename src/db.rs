@@ -1,7 +1,7 @@
 use std::sync::Once;
 use std::time::Duration;
 
-use sqlx::any::AnyPoolOptions;
+use sqlx::any::{AnyPoolOptions, AnyTypeInfo, AnyTypeInfoKind, AnyValueRef};
 use sqlx::pool::PoolConnectionMetadata;
 use sqlx::Executor;
 
@@ -43,15 +43,62 @@ impl Engine {
     }
 }
 
-/// A 0/1 column. The `Any` driver reports SQLite booleans as BIGINT and refuses
-/// to decode them into `bool`, so row structs read this and convert.
-#[derive(sqlx::Type)]
-#[sqlx(transparent)]
-pub struct Flag(i64);
+/// A boolean column, whichever way the engine stores it. Postgres BOOLEAN
+/// arrives as a bool; SQLite and MySQL (TINYINT(1)) arrive as integers. The
+/// `Any` driver's own `bool` decode accepts only the former. Anything else
+/// (text, blob, float, NULL) is an error, never a silent false: a disabled
+/// account must not read back as enabled or the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flag(bool);
+
+/// What a column held, as far as `Flag` cares.
+#[derive(Debug)]
+enum Raw {
+    Bool(bool),
+    Int(i64),
+    Other(AnyTypeInfoKind),
+}
+
+impl Flag {
+    fn from_raw(raw: Raw) -> Result<Self, sqlx::error::BoxDynError> {
+        match raw {
+            Raw::Bool(b) => Ok(Flag(b)),
+            Raw::Int(i) => Ok(Flag(i != 0)),
+            Raw::Other(kind) => Err(format!("expected a boolean or integer column, got {kind:?}").into()),
+        }
+    }
+}
 
 impl From<Flag> for bool {
     fn from(f: Flag) -> bool {
-        f.0 != 0
+        f.0
+    }
+}
+
+impl sqlx::Type<Db> for Flag {
+    fn type_info() -> AnyTypeInfo {
+        <bool as sqlx::Type<Db>>::type_info()
+    }
+
+    fn compatible(ty: &AnyTypeInfo) -> bool {
+        matches!(
+            ty.kind(),
+            AnyTypeInfoKind::Bool | AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt
+        )
+    }
+}
+
+impl<'r> sqlx::Decode<'r, Db> for Flag {
+    fn decode(value: AnyValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        let kind = sqlx::ValueRef::type_info(&value).kind();
+        let raw = match kind {
+            AnyTypeInfoKind::Bool => Raw::Bool(<bool as sqlx::Decode<Db>>::decode(value)?),
+            AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => {
+                Raw::Int(<i64 as sqlx::Decode<Db>>::decode(value)?)
+            }
+            other => Raw::Other(other),
+        };
+        Self::from_raw(raw)
     }
 }
 
@@ -119,4 +166,33 @@ pub async fn audit(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(raw: Raw) -> Result<bool, sqlx::error::BoxDynError> {
+        Flag::from_raw(raw).map(bool::from)
+    }
+
+    #[test]
+    fn integers_decode_by_zero_or_not() {
+        assert!(!decode(Raw::Int(0)).unwrap());
+        assert!(decode(Raw::Int(1)).unwrap());
+        assert!(decode(Raw::Int(2)).unwrap());
+    }
+
+    #[test]
+    fn bools_decode_as_themselves() {
+        assert!(decode(Raw::Bool(true)).unwrap());
+        assert!(!decode(Raw::Bool(false)).unwrap());
+    }
+
+    #[test]
+    fn anything_else_is_rejected_not_false() {
+        assert!(decode(Raw::Other(AnyTypeInfoKind::Text)).is_err());
+        assert!(decode(Raw::Other(AnyTypeInfoKind::Double)).is_err());
+        assert!(decode(Raw::Other(AnyTypeInfoKind::Null)).is_err());
+    }
 }

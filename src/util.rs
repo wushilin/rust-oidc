@@ -63,3 +63,11 @@ pub fn generate_client_secret() -> String {
         random_string(ALPHABET, 34)
     )
 }
+
+/// Fold an identifier for case-insensitive lookup and uniqueness (UPNs, tenant
+/// domains, group names). Uses full Unicode `to_lowercase`, not
+/// `to_ascii_lowercase`: a UPN may contain non-ASCII, and folding must be the
+/// same on every engine and must not depend on the database's locale or collation.
+pub fn fold(value: &str) -> String {
+    value.trim().to_lowercase()
+}

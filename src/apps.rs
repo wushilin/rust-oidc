@@ -85,9 +85,10 @@ pub async fn find(pool: &DbPool, app_id: &str) -> anyhow::Result<Option<Applicat
     }
     Ok(sqlx::query_as(
         crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id, app_id, tenant_id, display_name, allow_password_grant FROM applications
-         WHERE app_id = ? COLLATE NOCASE AND deleted_at IS NULL"),
+         WHERE app_id = ? AND deleted_at IS NULL"),
     )
-    .bind(app_id)
+    // GUIDs are stored lowercase; fold the probe so `ABC-..` still finds them.
+    .bind(crate::util::fold(app_id))
     .fetch_optional(pool)
     .await?)
 }
@@ -116,10 +117,10 @@ pub async fn service_principal(
 ) -> anyhow::Result<Option<ServicePrincipal>> {
     Ok(sqlx::query_as(
         crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required FROM service_principals
-         WHERE tenant_id = ? AND app_id = ? COLLATE NOCASE"),
+         WHERE tenant_id = ? AND app_id = ?"),
     )
     .bind(tenant_id)
-    .bind(app_id)
+    .bind(crate::util::fold(app_id))
     .fetch_optional(pool)
     .await?)
 }
@@ -353,18 +354,18 @@ pub async fn assign_role(
             (sp.id, "ServicePrincipal", MEMBER_APPLICATION)
         }
         Principal::User(upn) => {
-            let row: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id FROM users WHERE tenant_id = ? AND upn = ?"))
+            let row: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ?"))
                 .bind(&tenant.id)
-                .bind(upn)
+                .bind(crate::util::fold(upn))
                 .fetch_optional(pool)
                 .await?;
             let (id,) = row.with_context(|| format!("user '{upn}' not found"))?;
             (id, "User", MEMBER_USER)
         }
         Principal::Group(name) => {
-            let row: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id FROM groups WHERE tenant_id = ? AND name = ?"))
+            let row: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id FROM user_groups WHERE tenant_id = ? AND name_folded = ?"))
                 .bind(&tenant.id)
-                .bind(name)
+                .bind(crate::util::fold(name))
                 .fetch_optional(pool)
                 .await?;
             let (id,) = row.with_context(|| format!("group '{name}' not found"))?;

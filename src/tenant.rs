@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::DbPool;
 use sqlx::FromRow;
 
-use crate::util::{is_guid, new_guid, now};
+use crate::util::{fold, is_guid, new_guid, now};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,18 +64,18 @@ pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>>
     let row: Option<TenantRow> = if is_guid(key) {
         sqlx::query_as(
             crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id, name, is_root, enabled, settings FROM tenants
-             WHERE id = ? COLLATE NOCASE AND deleted_at IS NULL AND enabled = 1"),
+             WHERE id = ? AND deleted_at IS NULL AND enabled = 1"),
         )
-        .bind(key)
+        .bind(fold(key))
         .fetch_optional(pool)
         .await?
     } else {
         sqlx::query_as(
             crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
              JOIN tenant_domains d ON d.tenant_id = t.id
-             WHERE d.domain = ? AND t.deleted_at IS NULL AND t.enabled = 1"),
+             WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = 1"),
         )
-        .bind(key)
+        .bind(fold(key))
         .fetch_optional(pool)
         .await?
     };
@@ -174,15 +174,16 @@ async fn insert_domain(
     domain: &str,
     is_default: bool,
 ) -> anyhow::Result<()> {
-    let taken: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(engine, "SELECT tenant_id FROM tenant_domains WHERE domain = ?"))
-        .bind(domain)
+    let taken: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(engine, "SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?"))
+        .bind(fold(domain))
         .fetch_optional(&mut *tx)
         .await?;
     if taken.is_some() {
         bail!("domain '{domain}' is already registered to a tenant");
     }
-    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO tenant_domains (domain, tenant_id, is_default, created_at) VALUES (?, ?, ?, ?)"))
+    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO tenant_domains (domain, domain_folded, tenant_id, is_default, created_at) VALUES (?, ?, ?, ?, ?)"))
         .bind(domain)
+        .bind(fold(domain))
         .bind(tenant_id)
         .bind(is_default)
         .bind(now())
@@ -195,11 +196,11 @@ async fn insert_domain(
 pub async fn find_for_admin(pool: &DbPool, key: &str) -> anyhow::Result<Tenant> {
     let row: Option<TenantRow> = sqlx::query_as(
         crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
-         WHERE t.deleted_at IS NULL AND (t.id = ? COLLATE NOCASE
-               OR t.id IN (SELECT tenant_id FROM tenant_domains WHERE domain = ?))"),
+         WHERE t.deleted_at IS NULL AND (t.id = ?
+               OR t.id IN (SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?))"),
     )
-    .bind(key)
-    .bind(key)
+    .bind(fold(key))
+    .bind(fold(key))
     .fetch_optional(pool)
     .await?;
     match row {

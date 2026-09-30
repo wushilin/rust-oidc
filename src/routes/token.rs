@@ -16,6 +16,7 @@ use crate::AppState;
 use crate::apps::{self, Application, SecretCheck, ServicePrincipal};
 use crate::claims::Azpacr;
 use crate::error::{AadError, no_store};
+use crate::ratelimit::{Limit, app_key};
 use crate::tenant::{self, Tenant};
 use crate::util::{b64url, ct_eq, now, random_bytes};
 
@@ -255,6 +256,18 @@ pub(super) async fn authenticate_confidential_client(
             )
             .await);
     };
+    // Refuse before the secret is looked up and compared. A client secret is
+    // stored as a plain SHA-256 (it is a ~200-bit random value, so a slow hash
+    // adds nothing), which makes the saving here a query rather than a lot of
+    // CPU -- the real reason for the guard is that a refused request must not
+    // reach the audit write either. Checked only once the client id has
+    // resolved, so a throttled application never affects any other.
+    if let Some(retry) = st
+        .limits
+        .check(Limit::ClientAuthFailure, &app_key(&tenant.id, &app.app_id))
+    {
+        return Err(AadError::throttled(retry));
+    }
     let Some(secret) = secret else {
         return Err(failures
             .fail(
@@ -377,6 +390,17 @@ async fn authenticate_with_assertion(
             )
             .await);
     };
+
+    // Refuse before the signature check. Unlike the secret path this one really
+    // is expensive -- an RSA verification per attempt -- so a throttled caller
+    // must not be able to buy it. Both paths count into the same per-application
+    // bucket, since both are client authentication for the same application.
+    if let Some(retry) = st
+        .limits
+        .check(Limit::ClientAuthFailure, &app_key(&tenant.id, &app.app_id))
+    {
+        return Err(AadError::throttled(retry));
+    }
 
     // Only a certificate registered on this app can sign for it.
     let ts = now();

@@ -15,7 +15,7 @@ possible**, and **no magic values**.
 |---|---|---|
 | A | **Branch integration**: merge `feat/admin-console` to `main`, open a PR, or keep it? | Asked twice, still unanswered. The branch carries everything below plus the half-built console. |
 | B | **TOTP MFA, four questions** in `docs/superpowers/specs/2026-09-30-totp-mfa-design.md`: where the seed-encryption key comes from; whether a missing key should fail startup closed; whether enabling `mfa_required` revokes existing refresh families; recovery codes now or later. | The key-management one is operational and affects deployment. Guessing it would bake in an ops burden you did not choose. |
-| C | **Rate limiting**: none exists anywhere in the project, and unauthenticated callers can append audit rows. Needs limits, scope and storage chosen. | Real gap, its own piece of work, and the limits are a product decision. |
+| C | **Rate limiting — now built; only the numbers are still yours.** Implemented in `src/ratelimit.rs` (decisions 29-38). What remains for you: the four allowances are **invented** (decision 37), there is no way to tune them without a rebuild, and the counters are in-process so multiple instances multiply the effective limits (decision 38). | The limits are a product decision and the per-instance behaviour is an operational one. |
 | D | **`acr`**: emit it when `acr_values` is requested, or accept the omission? | Evidence is genuinely ambiguous — see decision 5. |
 
 ---
@@ -125,6 +125,103 @@ same actor.
 **21. Retention is a CLI command, default 90 days.** `audit prune --older-than-days`,
 following the `key prune` precedent — there is no scheduler in the server process, so
 this needs cron. **The 90 days is my number, pulled from nothing.**
+
+---
+
+## Rate limiting (question C: the gap was settled, the numbers were not)
+
+The gap was real: `grep -rniE "rate_?limit|throttl|governor" src/ Cargo.toml` returned
+nothing, and every limited failure also writes an `audit_log` row, so an
+unauthenticated caller could append rows indefinitely -- growing the table and pushing
+the evidence of a real attack out of the operator's retention window. Implemented in
+`src/ratelimit.rs`, tested in `tests/rate_limit.rs`.
+
+**29. The observable behaviour follows Entra: `429` plus `Retry-After`.** Verified from
+Microsoft Learn ("Understanding client and server throttling in MSAL.NET", fetched
+30 Sep 2026): *"Microsoft Entra ID will reply with `429 Too Many Requests`, with a
+`Retry-After: 60` header"* for `client_credentials`, and `HTTP 429` with `Retry-After`
+generally. MSAL already knows how to handle it. **The window is 60 seconds because that
+is the only interval Entra documents.**
+
+**30. Entra's doubling back-off is NOT applied to throttling.** The doubling escalation
+is documented for *account lockout*, which this project already implements separately
+(`src/users.rs`, smart lockout). Entra's documented throttle is a flat `Retry-After: 60`.
+Applying the doubling here would be inventing behaviour. *To reverse:* give `Limit` an
+escalation like `users::lockout_secs`.
+
+**31. The `error` value IS verified; the AADSTS number is not.** Entra's own
+token-endpoint error table (v2-oauth2-auth-code-flow, fetched 30 Sep 2026) lists
+`temporarily_unavailable` -- *"The server is temporarily too busy to handle the request.
+Retry the request after a small delay."* -- and the authorize-endpoint table lists it
+too. So that value is Entra's documented code for exactly this condition, not a guess.
+**The number is still a guess:** `90055` is Entra's `TenantThrottlingError` ("There are
+too many incoming requests"), whose first sentence is quoted, but its documented cause
+(a blocked tenant) is narrower than ours, and Entra does not document which AADSTS
+number accompanies its 429. Same caveat as decision 16.
+
+**32. The remote address is deliberately NOT a rate-limit key.** rust-oidc is normally
+behind a TLS-terminating proxy (the deployed service is), where the socket peer is the
+proxy: an IP-keyed bucket would put the whole world into one bucket and throttle the
+entire service. Trusting a forwarded header instead needs a trusted-proxy configuration
+this project does not have. Every bucket is therefore keyed on a **tenant** or an
+**application**, both of which had to resolve before the request got this far, so a
+caller cannot escape its bucket by varying a parameter, a header or an address -- and
+the key space is bounded by real entities rather than by requests. *To reverse:* add a
+trusted-proxy setting and an IP-keyed bucket alongside these.
+
+**33. Buckets are chosen so that tripping one costs a legitimate caller little or
+nothing.** Two of the four count requests that can never be legitimate (a `client_id`
+or an account the tenant does not have), so refusing those has no collateral damage at
+all. The other two are keyed per application, so one application's flood cannot affect
+another -- the same trade Entra's smart lockout already makes per user account. The
+residual cost is asserted by a test rather than left to be discovered: an attacker who
+knows a client id **can** throttle that client's token requests
+(`a_throttled_application_is_refused_even_with_the_right_secret`).
+
+**34. The unknown-account cap changes the audit row, not the response.** An unknown
+account and a wrong password are deliberately indistinguishable at the token endpoint.
+Returning 429 only for the unknown one would turn the rate limiter into an
+account-enumeration oracle, so that bucket suppresses the *audit row* beyond its
+allowance and leaves the response exactly as it was.
+`unknown_user_sign_ins_are_capped_without_becoming_an_enumeration_oracle` asserts both
+halves, and I teeth-checked it by adding the 429 -- the assertion fires.
+
+**35. Evidence is bounded rather than discarded: one row per bucket per window records
+the trip.** `security.throttled` is written by the single event that reaches the
+allowance, never by the refusals that follow, so the fact of a flood survives while its
+volume does not. Without this, capping the rows would hide the attack instead of the
+noise.
+
+**36. Password spraying against *known* accounts gets no new bucket.** Smart lockout
+already caps each account at 10 failures, so the rows are bounded by
+10 x accounts per lockout window -- bounded, not indefinite. A tenant-wide sign-in
+bucket would have been the one piece of collateral damage worth avoiding: an attacker
+could have used it to refuse every user's sign-in. *To reverse:* add
+`Limit::SignInFailure` keyed per tenant, and accept that.
+
+**37. The limits are mine, invented, and not tunable without a rebuild.**
+
+| Bucket | Key | Allowance per 60s |
+|---|---|---|
+| `ClientAuthFailure` | tenant + application | 20 |
+| `UnknownClient` | tenant | 20 |
+| `UnknownUser` | tenant | 20 |
+| `DeviceCodeRequest` | tenant + application | 60 |
+
+**Every one of these four numbers is invented.** Entra does not publish its thresholds.
+They are set well above any plausible legitimate rate -- a working client does not fail
+client authentication at all -- but they are guesses, and there is no configuration knob,
+so changing them needs a rebuild. That is the first thing to revisit if any of them
+proves wrong, and adding env-var overrides is the obvious reversal.
+
+**38. Counters are in-process, so multiple instances multiply the effective limits.**
+N instances behind a load balancer allow up to N times the rate, and a caller can be
+refused by one instance and served by the next. **This matters operationally and is the
+main reason not to treat these numbers as exact.** The alternative -- counters in the
+database -- would turn every limited request into a write, which hands an attacker a
+cheaper denial of service than the one being prevented. The deployed service runs a
+single instance, so today the limits are exact there. *To reverse:* move the counters
+into a shared store.
 
 ---
 

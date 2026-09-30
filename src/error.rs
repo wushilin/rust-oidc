@@ -25,6 +25,8 @@ pub struct AadError {
     pub code: u32,
     pub message: String,
     pub correlation_id: Option<String>,
+    /// Seconds for the `Retry-After` header. Only a throttled response sets it.
+    pub retry_after: Option<u64>,
 }
 
 impl AadError {
@@ -35,6 +37,7 @@ impl AadError {
             code,
             message: message.into(),
             correlation_id: None,
+            retry_after: None,
         }
     }
 
@@ -253,6 +256,35 @@ impl AadError {
         )
     }
 
+    /// Too many requests on one of the buckets in [`crate::ratelimit`].
+    ///
+    /// The observable shape follows Entra: `429 Too Many Requests` with a
+    /// `Retry-After` header (learn.microsoft.com, "Understanding client and
+    /// server throttling in MSAL.NET", fetched 30 Sep 2026), which is what MSAL
+    /// already knows how to handle.
+    ///
+    /// `temporarily_unavailable` is Entra's own documented code for this
+    /// condition: its token-endpoint and authorize-endpoint error tables both
+    /// list it as "The server is temporarily too busy to handle the request"
+    /// (v2-oauth2-auth-code-flow, fetched 30 Sep 2026).
+    ///
+    /// The AADSTS **number** is not verified. 90055 is Entra's
+    /// `TenantThrottlingError` ("There are too many incoming requests"), whose
+    /// first sentence is quoted here, but its documented cause (a blocked
+    /// tenant) is narrower than this, and Entra does not say which number
+    /// accompanies its 429. Same caveat as AADSTS700054 — see
+    /// `docs/decisions-log.md`.
+    pub fn throttled(retry_after: crate::ratelimit::RetryAfter) -> Self {
+        let mut err = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable",
+            90055,
+            "There are too many incoming requests. Retry after the interval in the Retry-After header.",
+        );
+        err.retry_after = Some(retry_after.0);
+        err
+    }
+
     pub fn server_error() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -300,6 +332,9 @@ impl IntoResponse for AadError {
         }
         if let Some(id) = self.correlation_id.and_then(|c| HeaderValue::from_str(&c).ok()) {
             headers.insert("client-request-id", id);
+        }
+        if let Some(secs) = self.retry_after {
+            headers.insert(axum::http::header::RETRY_AFTER, HeaderValue::from(secs));
         }
         resp
     }

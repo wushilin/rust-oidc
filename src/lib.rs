@@ -8,6 +8,7 @@ pub mod error;
 pub mod groups;
 pub mod html;
 pub mod keys;
+pub mod ratelimit;
 pub mod rbac;
 pub mod routes;
 pub mod scopes;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use crate::db::DbPool;
 use config::PublicUrl;
 use keys::KeyStore;
+use ratelimit::Limiter;
 use secrets::Secrets;
 
 #[derive(Clone)]
@@ -31,6 +33,8 @@ pub struct AppState {
     pub public_url: Arc<PublicUrl>,
     pub keys: Arc<KeyStore>,
     pub secrets: Arc<Secrets>,
+    /// Rate-limit counters. In-process: see [`ratelimit::Limiter`].
+    pub limits: Arc<Limiter>,
 }
 
 impl AppState {
@@ -41,6 +45,7 @@ impl AppState {
             pool,
             public_url: Arc::new(public_url),
             keys,
+            limits: Arc::new(Limiter::new()),
         }
     }
 }

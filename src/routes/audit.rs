@@ -14,6 +14,7 @@
 use serde_json::Value;
 
 use crate::AppState;
+use crate::ratelimit::{Hit, Limit, app_key};
 use crate::users::{AuthResult, AuthTrace};
 
 /// Actor for events where no user or client has been identified, such as a
@@ -44,6 +45,10 @@ pub enum Event {
     DeviceApproved,
     DeviceDenied,
     DeviceRedeemed,
+    /// A rate-limit bucket reached its allowance. Written once per window, by
+    /// the event that trips it, so the flood it reports cannot itself flood the
+    /// table. See [`crate::ratelimit`].
+    Throttled,
 }
 
 impl Event {
@@ -64,6 +69,7 @@ impl Event {
             Self::DeviceApproved => "device.approved",
             Self::DeviceDenied => "device.denied",
             Self::DeviceRedeemed => "device.redeemed",
+            Self::Throttled => "security.throttled",
         }
     }
 }
@@ -180,9 +186,14 @@ impl ClaimedShape {
 }
 
 /// Reports failed client authentication for one request. Each `fail` audits
-/// and hands the error back, so a call site reads
-/// `return Err(failures.fail(.., err).await)`. The error is returned
-/// untouched, so the audit cannot change any response.
+/// and hands an error back, so a call site reads
+/// `return Err(failures.fail(.., err).await)`.
+///
+/// The error is returned untouched **except** when this failure is past its
+/// rate-limit allowance, in which case nothing is recorded and the caller is
+/// told to back off instead ([`crate::ratelimit`]). That is the one case where
+/// auditing changes a response, and it is deliberate: it is what stops an
+/// unauthenticated caller appending audit rows indefinitely.
 pub struct ClientFailures<'a> {
     pub st: &'a AppState,
     pub tenant_id: &'a str,
@@ -201,6 +212,20 @@ impl ClientFailures<'_> {
         reason: Reason,
         err: crate::error::AadError,
     ) -> crate::error::AadError {
+        // Bucket this failure before recording it. An unresolved client id is
+        // counted per tenant (never a legitimate request); a resolved one per
+        // application, so one application's flood cannot throttle another.
+        let (limit, key) = match app_id {
+            Some(id) => (Limit::ClientAuthFailure, app_key(self.tenant_id, id)),
+            None => (Limit::UnknownClient, self.tenant_id.to_string()),
+        };
+        let hit = self.st.limits.hit(limit, &key);
+        if let Hit::AlreadyOver(retry) = hit {
+            // Past the allowance nothing more is recorded -- that is what bounds
+            // the table -- and the caller is told to back off instead of being
+            // told why its credentials were wrong.
+            return crate::error::AadError::throttled(retry);
+        }
         // The claimed id is only safe to log once it has resolved to an app,
         // because then it is our own registered value. Before that it is
         // whatever the caller put in the field: a client that transposes
@@ -222,8 +247,36 @@ impl ClientFailures<'_> {
             details,
         )
         .await;
+        // Recorded *after* this failure's own row, and only by the event that
+        // reached the allowance, so the log reads "the last failure, then the
+        // throttle" and the refusals that follow add nothing.
+        if hit == Hit::Reached {
+            throttled(self.st, self.tenant_id, app_id, limit).await;
+        }
         err
     }
+}
+
+/// Record that a rate-limit bucket reached its allowance. Written exactly once
+/// per bucket per window, by the event that trips it.
+pub async fn throttled(st: &AppState, tenant_id: &str, app_id: Option<&str>, limit: Limit) {
+    let mut details = serde_json::json!({
+        "limit": limit.as_str(),
+        "allowance": limit.allowance(),
+        "windowSeconds": limit.window_secs(),
+    });
+    if let Some(id) = app_id {
+        details["clientId"] = id.into();
+    }
+    record(
+        st,
+        tenant_id,
+        app_id.unwrap_or(ANONYMOUS),
+        Event::Throttled,
+        app_id,
+        details,
+    )
+    .await;
 }
 
 /// The tenant's own verified domain that `value` names after its last `@`, as
@@ -270,6 +323,23 @@ pub async fn sign_in_failure(
         (AuthResult::InvalidCredentials, true) => SignInReason::BadPassword,
         (AuthResult::InvalidCredentials, false) => SignInReason::UnknownUser,
     };
+    // A sign-in naming an account this tenant does not have can never be a
+    // legitimate one, and it is the only failure whose key space is unbounded:
+    // every distinct name the attacker invents is another row. Cap those rows
+    // per tenant per window.
+    //
+    // Unlike the token endpoint this does **not** change the response. An
+    // unknown account and a wrong password are deliberately indistinguishable to
+    // the caller, and returning 429 only for the unknown one would turn the rate
+    // limiter into an account-enumeration oracle. The cap applies to the audit
+    // row alone.
+    if reason == SignInReason::UnknownUser {
+        match st.limits.hit(Limit::UnknownUser, tenant_id) {
+            Hit::Under => {}
+            Hit::Reached => throttled(st, tenant_id, None, Limit::UnknownUser).await,
+            Hit::AlreadyOver(_) => return,
+        }
+    }
     // A known account is the actor; otherwise the submitted name is only data.
     // For the password grant the authenticated client stands in.
     let actor = trace.user_id.as_deref().unwrap_or(match channel {

@@ -19,6 +19,7 @@ use crate::AppState;
 use crate::apps::{self, Application};
 use crate::claims::Amr;
 use crate::error::{AadError, no_store};
+use crate::ratelimit::{Hit, Limit};
 use crate::session::{self, CSRF_COOKIE};
 use crate::tenant::{self, Tenant};
 use crate::users::AuthResult;
@@ -155,6 +156,21 @@ async fn issue_device_code(st: &AppState, tenant_key: &str, params: &Params) -> 
     };
     if !sp.enabled {
         return Err(AadError::app_disabled(&app.app_id, &app.display_name));
+    }
+
+    // Every device authorization request inserts a `device_codes` row and an
+    // audit row, and the device is a public client with no secret to check, so
+    // the request itself is the thing to bound. Keyed per application: a flood
+    // against one application cannot stop another's devices enrolling.
+    //
+    // One atomic count-and-decide rather than a check followed by a count: two
+    // concurrent requests could each pass a separate check and both be served,
+    // putting the bucket one over its allowance.
+    let key = crate::ratelimit::app_key(&tenant.id, &app.app_id);
+    match st.limits.hit(Limit::DeviceCodeRequest, &key) {
+        Hit::Under => {}
+        Hit::Reached => audit::throttled(st, &tenant.id, Some(&app.app_id), Limit::DeviceCodeRequest).await,
+        Hit::AlreadyOver(retry) => return Err(AadError::throttled(retry)),
     }
 
     let scope = get(params, "scope").unwrap_or("openid");

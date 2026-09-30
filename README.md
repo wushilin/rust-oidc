@@ -69,6 +69,12 @@ metadata always use the GUID.
 - **`client_info`** is returned for MSAL.
 - **Accounts lock** for 60 seconds after 10 failed sign-ins, doubling after each further failure.
 - **A password reset** revokes the user's refresh tokens and sessions.
+- **Throttling:** too many failed client authentications for one app, too many requests
+  naming a client id or an account the tenant does not have, or too many device
+  authorization requests for one app, get `429` with a `Retry-After` header, as Entra
+  does. The counters are in-process, so several server instances multiply the effective
+  limits. See `src/ratelimit.rs` and `docs/decisions-log.md` for the numbers, all of
+  which are guesses.
 
 ```sh
 $B user create --tenant contoso.com --upn alice@contoso.com --display-name "Alice Smith" --email alice@contoso.com
@@ -132,7 +138,8 @@ compat/run.sh       # MSAL Python (app + user), MSAL Node, openid-client (certif
 
 - `groups` holds group names, not object IDs.
 - There is no interactive consent. Apps are treated as admin-consented.
-- The implicit grant is not supported.
+- The implicit and hybrid response types are **off by default** on every app, as in
+  Entra, and enabled per app (`app implicit --id-tokens/--access-tokens`).
 - Refresh tokens rotate, and replaying an old one revokes the chain. Entra keeps old refresh tokens valid.
 - ID tokens include `email_verified` when an email is present.
 - Client secrets are stored as SHA-256 hashes. They are ~200-bit random values, so a slow hash adds nothing.

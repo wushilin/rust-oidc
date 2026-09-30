@@ -7,8 +7,10 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use sqlx::SqlitePool;
 
+use rust_oidc::admin::bindings::{self as role_bindings, PrincipalType};
 use rust_oidc::apps::{self, Principal};
 use rust_oidc::config::PublicUrl;
+use rust_oidc::rbac::{RoleId, Scope};
 use rust_oidc::server::{self, TlsArgs};
 use rust_oidc::{AppState, db, directory, groups, keys, routes, tenant, users};
 
@@ -391,7 +393,8 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await?;
-            directory::assign(&pool, &t.id, directory::GLOBAL_ADMINISTRATOR, &user_id, "User").await?;
+            role_bindings::create(&pool, PrincipalType::User, &user_id, RoleId::GlobalAdministrator, &Scope::All, "bootstrap").await?;
+            role_bindings::create(&pool, PrincipalType::User, &user_id, RoleId::PlatformAdministrator, &Scope::All, "bootstrap").await?;
             keys::ensure(&pool).await?;
             db::audit(
                 &pool,
@@ -485,7 +488,13 @@ async fn user_cmd(pool: &SqlitePool, cmd: UserCmd) -> anyhow::Result<()> {
             )
             .await?;
             if let Some(role) = directory_role {
-                directory::assign(pool, &t.id, &role, &id, "User").await?;
+                let Some(found) = directory::find(&role) else {
+                    bail!("unknown directory role '{role}'");
+                };
+                let Some(role_id) = RoleId::ALL.iter().copied().find(|r| r.template_id() == Some(found.template_id)) else {
+                    bail!("directory role '{role}' has no RBAC role");
+                };
+                role_bindings::create(pool, PrincipalType::User, &id, role_id, &Scope::Tenants(vec![t.id.clone()]), "cli").await?;
             }
             db::audit(
                 pool,

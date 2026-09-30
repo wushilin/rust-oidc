@@ -1,10 +1,7 @@
 //! Built-in directory roles. Template ids are Microsoft's well-known GUIDs, so
 //! apps that check the `wids` claim behave the same as against Entra ID.
 
-use anyhow::bail;
 use sqlx::SqlitePool;
-
-use crate::util::now;
 
 pub struct DirectoryRole {
     pub template_id: &'static str,
@@ -50,45 +47,17 @@ pub fn find(name_or_id: &str) -> Option<&'static DirectoryRole> {
         .find(|r| r.template_id.eq_ignore_ascii_case(name_or_id) || r.name.eq_ignore_ascii_case(name_or_id))
 }
 
-pub async fn assign(
-    pool: &SqlitePool,
-    tenant_id: &str,
-    role: &str,
-    principal_id: &str,
-    principal_type: &str,
-) -> anyhow::Result<()> {
-    let Some(role) = find(role) else {
-        bail!("unknown directory role '{role}'");
-    };
-    sqlx::query(
-        "INSERT OR IGNORE INTO directory_role_assignments
-            (tenant_id, role_template_id, principal_id, principal_type, created_at)
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(tenant_id)
-    .bind(role.template_id)
-    .bind(principal_id)
-    .bind(principal_type)
-    .bind(now())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Directory role template ids held by the user, directly or through groups
-/// (the `wids` claim).
+/// `wids`: the directory roles this user holds in `tenant_id`, derived from role
+/// bindings. Roles without a Microsoft template id (ours alone) are not `wids`.
 pub async fn wids_for_user(pool: &SqlitePool, tenant_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT role_template_id FROM directory_role_assignments
-         WHERE tenant_id = ?1
-           AND ((principal_type = 'User' AND principal_id = ?2)
-             OR (principal_type = 'Group' AND principal_id IN
-                   (SELECT group_id FROM group_members WHERE user_id = ?2)))
-         ORDER BY role_template_id",
-    )
-    .bind(tenant_id)
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(r,)| r).collect())
+    let bindings = crate::admin::bindings::effective_for_user(pool, user_id).await?;
+    let mut out: Vec<String> = bindings
+        .iter()
+        .filter(|b| b.scope.covers(tenant_id))
+        .filter_map(|b| b.role.template_id())
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
 }

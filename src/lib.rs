@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod apps;
 pub mod claims;
 pub mod config;

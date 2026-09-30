@@ -760,9 +760,16 @@ async fn groups_wids_and_assignment_required() {
     groups::add_member(&s.pool, &f.tenant, "engineering", &f.upn)
         .await
         .unwrap();
-    directory::assign(&s.pool, &f.tenant.id, "Global Administrator", &f.user_id, "User")
-        .await
-        .unwrap();
+    rust_oidc::admin::bindings::create(
+        &s.pool,
+        rust_oidc::admin::bindings::PrincipalType::User,
+        &f.user_id,
+        rust_oidc::rbac::RoleId::GlobalAdministrator,
+        &rust_oidc::rbac::Scope::Tenants(vec![f.tenant.id.clone()]),
+        "test",
+    )
+    .await
+    .unwrap();
 
     let sp = apps::service_principal(&s.pool, &f.tenant.id, &f.web.app_id)
         .await

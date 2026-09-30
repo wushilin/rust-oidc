@@ -2,7 +2,10 @@
 # Based on the suite's docker-compose-prebuilt.yml, with:
 #  - host port 18443 -> nginx 8443 (8443 is taken on titanl); the suite still
 #    believes it lives at https://localhost.emobix.co.uk:8443 inside the network
-#  - gate.wushilin.net pinned to titanl so the suite reaches rust-oidc
+#  - gate.wushilin.net pinned to the host running rust-oidc. Under ROOTLESS podman
+#    the container cannot reach the host's LAN IP (connection refused); the host is
+#    only reachable via the host-gateway address (host.containers.internal,
+#    169.254.1.2). Set RUST_OIDC_HOST_IP to a real IP when rust-oidc runs elsewhere.
 services:
   mongodb:
     image: docker.io/library/mongo:6.0.13
@@ -31,6 +34,6 @@ services:
       OIDC_GITLAB_CLIENTID: gitlab-client
       OIDC_GITLAB_SECRET: gitlab-secret
     extra_hosts:
-      - "gate.wushilin.net:${RUST_OIDC_HOST_IP:-192.168.44.113}"
+      - "gate.wushilin.net:${RUST_OIDC_HOST_IP:-host-gateway}"
     depends_on:
       - mongodb

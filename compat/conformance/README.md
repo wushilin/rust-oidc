@@ -17,4 +17,16 @@ Setup on the test host (done on titanl):
    The suite UI is at https://<host>:18443/.
 
 The server container resolves `gate.wushilin.net` to the host running rust-oidc
-(`RUST_OIDC_HOST_IP`, default 192.168.44.113).
+(`RUST_OIDC_HOST_IP`, default `host-gateway`).
+
+Under rootless podman the container cannot reach the host's own LAN IP -- the
+connection is refused even with no firewall, because the container's netns only
+reaches the host through the host-gateway address (`host.containers.internal`,
+169.254.1.2). `host-gateway` is therefore the right default. Override
+`RUST_OIDC_HOST_IP` with a real IP only when rust-oidc runs on a different host.
+Symptom if this is wrong: every test module goes INTERRUPTED and the server log
+shows `GetDynamicServerConfiguration: ... Connection refused`.
+
+Recreate the stack with `podman-compose -p oidf down && podman-compose -p oidf up -d`;
+`--force-recreate server` fails because nginx depends on it, and leaves the old
+container (and its old env) in place.

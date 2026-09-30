@@ -29,6 +29,11 @@ mkdir -p "$WORK/mongo-data"
 python3 "$HERE/make_config.py" "$FIXTURE" > "$WORK/config.json"
 chmod 600 "$WORK/config.json"
 
+# The plan runner writes its zip/HTML exports here but does not create the dir;
+# without this every plan dies with "No such file or directory: /work/results/...zip"
+# after its modules have already run.
+mkdir -p "$WORK/results"
+
 # Wait for the suite API.
 for _ in $(seq 1 90); do
   curl -sk -o /dev/null -w '%{http_code}' https://localhost:18443/api/runner/available 2>/dev/null | grep -q 200 && break

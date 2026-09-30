@@ -145,10 +145,11 @@ pub async fn create(pool: &DbPool, name: &str, domain: &str, is_root: bool) -> a
     let settings = TenantSettings::default();
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
-    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO tenants (id, name, is_root, enabled, settings, created_at) VALUES (?, ?, ?, 1, ?, ?)"))
+    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO tenants (id, name, is_root, enabled, settings, created_at) VALUES (?, ?, ?, ?, ?, ?)"))
         .bind(&id)
         .bind(name)
         .bind(is_root)
+        .bind(true)
         .bind(serde_json::to_string(&settings)?)
         .bind(now())
         .execute(&mut *tx)

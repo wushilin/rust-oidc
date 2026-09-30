@@ -2,4 +2,4 @@
 --
 -- The grant hands the user's password to the client, cannot do MFA and defeats
 -- conditional access, so it is off unless an administrator turns it on.
-ALTER TABLE applications ADD COLUMN allow_password_grant TINYINT(1) NOT NULL DEFAULT 0;
+ALTER TABLE applications ADD COLUMN allow_password_grant SMALLINT NOT NULL DEFAULT 0;

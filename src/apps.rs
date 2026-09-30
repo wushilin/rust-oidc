@@ -64,10 +64,11 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, display_name: &str) -> anyho
         .bind(&identifier_uri)
         .execute(&mut *tx)
         .await?;
-    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO service_principals (id, tenant_id, app_id, enabled, created_at) VALUES (?, ?, ?, 1, ?)"))
+    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO service_principals (id, tenant_id, app_id, enabled, created_at) VALUES (?, ?, ?, ?, ?)"))
         .bind(&sp_id)
         .bind(&tenant.id)
         .bind(&application.app_id)
+        .bind(true)
         .bind(ts)
         .execute(&mut *tx)
         .await?;
@@ -274,7 +275,7 @@ pub async fn add_role(
     let id = new_guid();
     sqlx::query(
         crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO app_roles (id, application_id, value, display_name, description, allowed_member_types, enabled)
-         VALUES (?, ?, ?, ?, ?, ?, 1)"),
+         VALUES (?, ?, ?, ?, ?, ?, ?)"),
     )
     .bind(&id)
     .bind(&app.id)
@@ -282,6 +283,7 @@ pub async fn add_role(
     .bind(display_name)
     .bind(description)
     .bind(serde_json::to_string(member_types)?)
+    .bind(true)
     .execute(pool)
     .await
     .with_context(|| format!("app role '{value}' already exists"))?;
@@ -525,13 +527,14 @@ pub async fn add_scope(
     }
     let id = new_guid();
     sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO app_scopes (id, application_id, value, display_name, type, enabled) VALUES (?, ?, ?, ?, ?, 1)"),
+        crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO app_scopes (id, application_id, value, display_name, type, enabled) VALUES (?, ?, ?, ?, ?, ?)"),
     )
     .bind(&id)
     .bind(&app.id)
     .bind(value)
     .bind(display_name)
     .bind(scope_type)
+    .bind(true)
     .execute(pool)
     .await
     .with_context(|| format!("scope '{value}' already exists"))?;

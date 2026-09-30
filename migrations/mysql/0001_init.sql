@@ -6,7 +6,9 @@
 -- VARCHAR (ids are GUID strings: VARCHAR(64); hashes VARCHAR(128); UPNs and
 -- domains VARCHAR(320)). Free-form columns stay TEXT. MySQL has no partial
 -- indexes, so "at most one row where X" is a unique index over a generated
--- column that is NULL for every other row. Booleans are TINYINT(1).
+-- column that is NULL for every other row. Booleans are SMALLINT, not TINYINT(1): sqlx's Any driver cannot map
+-- MySQL's TINYINT at all (it returns "Any driver does not support MySql type
+-- Tiny"), while SMALLINT arrives as an integer that db::Flag decodes.
 --
 -- Collation: every table is utf8mb4 with the default utf8mb4_unicode_ci, which
 -- is case- AND accent-insensitive. That is right for names (display names, and
@@ -22,12 +24,12 @@
 CREATE TABLE tenants (
     id          VARCHAR(64) COLLATE utf8mb4_bin PRIMARY KEY,         -- tenant id (tid), GUID
     name        TEXT NOT NULL,
-    is_root     TINYINT(1) NOT NULL DEFAULT 0,   -- the platform (system) tenant
-    enabled     TINYINT(1) NOT NULL DEFAULT 1,
+    is_root     SMALLINT NOT NULL DEFAULT 0,   -- the platform (system) tenant
+    enabled     SMALLINT NOT NULL DEFAULT 1,
     settings    TEXT NOT NULL DEFAULT ('{}'),    -- JSON TenantSettings
     created_at  BIGINT NOT NULL,
     deleted_at  BIGINT,
-    single_root TINYINT GENERATED ALWAYS AS (CASE WHEN is_root = 1 THEN 1 END) STORED
+    single_root SMALLINT GENERATED ALWAYS AS (CASE WHEN is_root = 1 THEN 1 END) STORED
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE UNIQUE INDEX tenants_single_root ON tenants(single_root);
 
@@ -36,7 +38,7 @@ CREATE UNIQUE INDEX tenants_single_root ON tenants(single_root);
 CREATE TABLE tenant_domains (
     domain      VARCHAR(320) PRIMARY KEY,
     tenant_id   VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
-    is_default  TINYINT(1) NOT NULL DEFAULT 0,
+    is_default  SMALLINT NOT NULL DEFAULT 0,
     created_at  BIGINT NOT NULL,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -47,12 +49,12 @@ CREATE TABLE users (
     tenant_id       VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
     upn             VARCHAR(320) NOT NULL,
     email           TEXT,
-    email_verified  TINYINT(1) NOT NULL DEFAULT 0,
+    email_verified  SMALLINT NOT NULL DEFAULT 0,
     display_name    TEXT,
     given_name      TEXT,
     family_name     TEXT,
     password_hash   TEXT,
-    enabled         TINYINT(1) NOT NULL DEFAULT 1,
+    enabled         SMALLINT NOT NULL DEFAULT 1,
     created_at      BIGINT NOT NULL,
     updated_at      BIGINT NOT NULL,
     UNIQUE (tenant_id, upn),
@@ -140,7 +142,7 @@ CREATE TABLE app_roles (
     display_name          TEXT NOT NULL,
     description           TEXT,
     allowed_member_types  TEXT NOT NULL,         -- JSON array: ["User"], ["Application"] or both
-    enabled               TINYINT(1) NOT NULL DEFAULT 1,
+    enabled               SMALLINT NOT NULL DEFAULT 1,
     UNIQUE (application_id, value),
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -151,7 +153,7 @@ CREATE TABLE app_scopes (
     value           VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,       -- emitted in the `scp` claim
     display_name    TEXT NOT NULL,
     type            VARCHAR(16) COLLATE utf8mb4_bin NOT NULL DEFAULT 'User',
-    enabled         TINYINT(1) NOT NULL DEFAULT 1,
+    enabled         SMALLINT NOT NULL DEFAULT 1,
     UNIQUE (application_id, value),
     CHECK (type IN ('User', 'Admin')),
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
@@ -163,8 +165,8 @@ CREATE TABLE service_principals (
     id                            VARCHAR(64) COLLATE utf8mb4_bin PRIMARY KEY, -- oid of app-only tokens
     tenant_id                     VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
     app_id                        VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
-    app_role_assignment_required  TINYINT(1) NOT NULL DEFAULT 0,
-    enabled                       TINYINT(1) NOT NULL DEFAULT 1,
+    app_role_assignment_required  SMALLINT NOT NULL DEFAULT 0,
+    enabled                       SMALLINT NOT NULL DEFAULT 1,
     created_at                    BIGINT NOT NULL,
     UNIQUE (tenant_id, app_id),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
@@ -197,7 +199,7 @@ CREATE TABLE signing_keys (
     created_at       BIGINT NOT NULL,
     retired_at       BIGINT,
     not_after        BIGINT NOT NULL,
-    single_active    TINYINT GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN 1 END) STORED,
+    single_active    SMALLINT GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN 1 END) STORED,
     CHECK (status IN ('next', 'active', 'retired'))
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE UNIQUE INDEX signing_keys_single_active ON signing_keys(single_active);

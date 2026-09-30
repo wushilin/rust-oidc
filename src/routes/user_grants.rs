@@ -396,10 +396,12 @@ async fn revoke_family(st: &AppState, family_id: &str) -> anyhow::Result<()> {
 }
 
 /// A replayed authorization code revokes the refresh tokens it produced (RFC 6749 §4.1.2).
+/// The derived table matters: MySQL refuses to update a table that the same
+/// statement selects from directly (error 1093).
 async fn revoke_code_family(st: &AppState, code_hash: &str) -> anyhow::Result<()> {
     sqlx::query(
         crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE refresh_tokens SET revoked_at = ? WHERE revoked_at IS NULL
-         AND family_id IN (SELECT family_id FROM refresh_tokens WHERE code_hash = ?)"),
+         AND family_id IN (SELECT family_id FROM (SELECT family_id FROM refresh_tokens WHERE code_hash = ?) AS fam)"),
     )
     .bind(now())
     .bind(code_hash)

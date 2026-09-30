@@ -88,7 +88,7 @@ async fn concurrent_session_creates_for_one_cookie_all_succeed() {
             "SELECT COUNT(*) FROM sessions WHERE tenant_id = ?",
         ))
         .bind(&t.id)
-        .fetch_one(&pool)
+        .fetch_one(&*pool)
         .await
         .unwrap();
         assert_eq!(n, 1);
@@ -134,7 +134,7 @@ async fn concurrent_and_repeated_membership_is_idempotent() {
             r.expect("adding an existing member is not an error");
         }
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM group_members")
-            .fetch_one(&pool)
+            .fetch_one(&*pool)
             .await
             .unwrap();
         assert_eq!(n, 1);

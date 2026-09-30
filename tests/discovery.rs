@@ -66,7 +66,8 @@ async fn unknown_tenant_is_aadsts90002() {
 async fn disabled_tenant_does_not_resolve() {
     let s = TestServer::start().await;
     let t = s.tenant("Contoso", "contoso.com").await;
-    sqlx::query("UPDATE tenants SET enabled = 0 WHERE id = ?")
+    sqlx::query(rust_oidc::db::sql_stmt(rust_oidc::db::engine_of(&s.pool), "UPDATE tenants SET enabled = ? WHERE id = ?"))
+        .bind(false)
         .bind(&t.id)
         .execute(&s.pool)
         .await

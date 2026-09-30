@@ -32,33 +32,37 @@ async fn a_sqlite_url_still_connects_and_migrates() {
 
 /// The schema relies on ON DELETE CASCADE (a deleted tenant's role bindings must
 /// grant nothing). SQLite enforces it only with `PRAGMA foreign_keys = ON`, which
-/// `db::connect` sets on every connection.
+/// `db::connect` sets on every connection; Postgres and MySQL always enforce it.
 #[tokio::test]
-async fn foreign_key_cascades_fire_on_sqlite() {
-    let s = common::TestServer::start().await;
-    let t = s.tenant("Contoso", "contoso.com").await;
-    sqlx::query(
-        "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at)
-         VALUES ('b1', 'User', 'u1', 'GlobalReader', 'tenants', 0)",
-    )
-    .execute(&s.pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES ('b1', ?)")
-        .bind(&t.id)
-        .execute(&s.pool)
+async fn foreign_key_cascades_fire_on_every_engine() {
+    use rust_oidc::db::{engine_of, sql_stmt};
+    for pool in common::all_engine_pools().await {
+        let e = engine_of(&pool);
+        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.com", false).await.unwrap();
+        sqlx::query(sql_stmt(
+            e,
+            "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at)
+             VALUES ('b1', 'User', 'u1', 'GlobalReader', 'tenants', 0)",
+        ))
+        .execute(&*pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM tenants WHERE id = ?")
-        .bind(&t.id)
-        .execute(&s.pool)
-        .await
-        .unwrap();
-    let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM role_binding_tenants")
-        .fetch_one(&s.pool)
-        .await
-        .unwrap();
-    assert_eq!(left.0, 0, "cascade did not fire: foreign_keys pragma is off");
+        sqlx::query(sql_stmt(e, "INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES ('b1', ?)"))
+            .bind(&t.id)
+            .execute(&*pool)
+            .await
+            .unwrap();
+        sqlx::query(sql_stmt(e, "DELETE FROM tenants WHERE id = ?"))
+            .bind(&t.id)
+            .execute(&*pool)
+            .await
+            .unwrap();
+        let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM role_binding_tenants")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+        assert_eq!(left.0, 0, "{}: cascade did not fire", e.as_str());
+    }
 }
 
 #[tokio::test]

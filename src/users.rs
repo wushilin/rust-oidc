@@ -47,17 +47,19 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, user: NewUser<'_>) -> anyhow
     sqlx::query(
         crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO users (id, tenant_id, upn, upn_folded, email, email_verified, display_name, given_name,
                             family_name, password_hash, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 1, ?, ?)"),
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
     )
     .bind(&id)
     .bind(&tenant.id)
     .bind(&upn)
     .bind(crate::util::fold(&upn))
     .bind(user.email)
+    .bind(false)
     .bind(user.display_name)
     .bind(user.given_name)
     .bind(user.family_name)
     .bind(hash_password(user.password)?)
+    .bind(true)
     .bind(ts)
     .bind(ts)
     .execute(pool)

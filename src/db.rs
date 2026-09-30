@@ -45,7 +45,8 @@ impl Engine {
 }
 
 /// A boolean column, whichever way the engine stores it. Postgres BOOLEAN
-/// arrives as a bool; SQLite and MySQL (TINYINT(1)) arrive as integers. The
+/// arrives as a bool; SQLite INTEGER and MySQL SMALLINT arrive as integers (MySQL columns must not
+/// be TINYINT: the `Any` driver refuses that type outright). The
 /// `Any` driver's own `bool` decode accepts only the former. Anything else
 /// (text, blob, float, NULL) is an error, never a silent false: a disabled
 /// account must not read back as enabled or the reverse.
@@ -105,6 +106,11 @@ impl<'r> sqlx::Decode<'r, Db> for Flag {
 
 static INSTALL_DRIVERS: Once = Once::new();
 
+/// Register the sqlx `Any` drivers (idempotent; installing twice panics).
+pub fn install_drivers() {
+    INSTALL_DRIVERS.call_once(sqlx::any::install_default_drivers);
+}
+
 /// Query parameter that lets SQLite create a missing database file.
 const SQLITE_MODE_PARAM: &str = "mode=";
 const SQLITE_MEMORY_PATH: &str = ":memory:";
@@ -114,7 +120,7 @@ pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
     let engine = Engine::from_url(url)
         .ok_or_else(|| anyhow::anyhow!("unsupported database URL scheme; use sqlite://, postgres:// or mysql://"))?;
     // Installing the drivers twice panics; tests create many pools per process.
-    INSTALL_DRIVERS.call_once(sqlx::any::install_default_drivers);
+    install_drivers();
 
     let mut url = url.to_string();
     // Only the query string counts: a directory named `mode=x` must not suppress it.

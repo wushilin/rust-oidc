@@ -222,12 +222,19 @@ pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
         .bind(now())
         .execute(&mut *tx)
         .await?;
-    sqlx::query(
-        "UPDATE signing_keys SET status = 'active'
-         WHERE kid = (SELECT kid FROM signing_keys WHERE status = 'next' ORDER BY created_at LIMIT 1)",
+    // Two statements, not `UPDATE ... WHERE kid = (SELECT ... FROM signing_keys)`:
+    // MySQL refuses to update a table it also selects from (error 1093).
+    let next: Option<(String,)> = sqlx::query_as(
+        "SELECT kid FROM signing_keys WHERE status = 'next' ORDER BY created_at LIMIT 1",
     )
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
+    if let Some((kid,)) = next {
+        sqlx::query(crate::db::sql_stmt(engine, "UPDATE signing_keys SET status = 'active' WHERE kid = ?"))
+            .bind(kid)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     generate(pool, "next").await?;
     Ok(())

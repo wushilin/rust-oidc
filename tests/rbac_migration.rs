@@ -12,6 +12,11 @@ use common::*;
 #[tokio::test]
 async fn sqlite_fresh_database_has_the_new_schema_and_no_old_table() {
     let s = TestServer::start().await;
+    if rust_oidc::db::engine_of(&s.pool) != rust_oidc::db::Engine::Sqlite {
+        // The other engines' schema is covered by tests/db_migrations.rs.
+        eprintln!("skipping: this test inspects sqlite_master");
+        return;
+    }
     let f = user_fixture(&s).await;
 
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM role_bindings")
@@ -60,17 +65,19 @@ async fn effective_bindings_keep_two_roles_scopes_separate() {
         ("b-admin", RoleId::GlobalAdministrator, &f.tenant.id),
         ("b-reader", RoleId::GlobalReader, &other.id),
     ] {
-        sqlx::query(
+        let e = rust_oidc::db::engine_of(&s.pool);
+        sqlx::query(rust_oidc::db::sql_stmt(
+            e,
             "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at)
              VALUES (?, 'User', ?, ?, 'tenants', 0)",
-        )
+        ))
         .bind(id)
         .bind(&f.user_id)
         .bind(role.as_str())
         .execute(&s.pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES (?, ?)")
+        sqlx::query(rust_oidc::db::sql_stmt(e, "INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES (?, ?)"))
             .bind(id)
             .bind(tenant)
             .execute(&s.pool)

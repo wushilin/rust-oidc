@@ -13,7 +13,7 @@ pub struct TestServer {
     pub base: String,
     pub pool: DbPool,
     pub http: reqwest::Client,
-    _dir: tempfile::TempDir,
+    _guard: EnginePool,
 }
 
 pub struct TestApp {
@@ -24,9 +24,14 @@ pub struct TestApp {
 
 impl TestServer {
     pub async fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}", dir.path().join("test.db").display());
-        let pool = db::connect(&url).await.unwrap();
+        let engine = match std::env::var(ENV_SERVER_ENGINE) {
+            Ok(raw) => db::Engine::parse(&raw).unwrap_or_else(|| panic!("{ENV_SERVER_ENGINE}={raw} is not an engine")),
+            Err(_) => db::Engine::Sqlite,
+        };
+        let guard = pool_for(engine)
+            .await
+            .unwrap_or_else(|| panic!("{ENV_SERVER_ENGINE}={} but its database env var is not set", engine.as_str()));
+        let pool = (*guard).clone();
         keys::ensure(&pool).await.unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -40,7 +45,7 @@ impl TestServer {
             base,
             pool,
             http: reqwest::Client::new(),
-            _dir: dir,
+            _guard: guard,
         }
     }
 
@@ -342,11 +347,195 @@ pub fn decode_unverified(token: &str) -> Value {
     .unwrap()
 }
 
-/// One migrated pool per engine available to this run. Task 6 adds Postgres and
-/// MySQL when their URLs are configured; until then SQLite only.
-pub async fn all_engine_pools() -> Vec<DbPool> {
-    // Kept (not deleted on drop): the pool outlives this function.
+/// Env var holding an admin URL for a scratch Postgres server (`postgres://user:pw@host:port/postgres`).
+pub const ENV_POSTGRES: &str = "RUST_OIDC_TEST_POSTGRES";
+/// Env var holding an admin URL for a scratch MySQL server (`mysql://root:pw@host:port/`).
+pub const ENV_MYSQL: &str = "RUST_OIDC_TEST_MYSQL";
+/// Env var selecting the engine `TestServer::start` runs on (`sqlite` when unset).
+pub const ENV_SERVER_ENGINE: &str = "RUST_OIDC_TEST_ENGINE";
+
+static DB_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A freshly migrated pool on its own empty database, dropped with this value.
+/// Derefs to the pool, so it is used exactly like one.
+pub struct EnginePool {
+    pool: DbPool,
+    cleanup: Cleanup,
+}
+
+enum Cleanup {
+    Dir(std::path::PathBuf),
+    /// Admin URL and the name of the database to drop.
+    Database(String, String),
+}
+
+impl std::ops::Deref for EnginePool {
+    type Target = DbPool;
+    fn deref(&self) -> &DbPool {
+        &self.pool
+    }
+}
+
+impl Drop for EnginePool {
+    fn drop(&mut self) {
+        match &self.cleanup {
+            Cleanup::Dir(dir) => {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            Cleanup::Database(admin, name) => {
+                let (admin, name) = (admin.clone(), name.clone());
+                // The owning runtime may already be winding down, so use a private one.
+                // Do NOT `pool.close().await` here: the pool's connection tasks live on the
+                // owning runtime, which is blocked on this thread's join, so it deadlocks.
+                // Instead the drop terminates the pool's sessions itself (PG `FORCE`).
+                let _ = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    rt.block_on(drop_database(&admin, &name));
+                })
+                .join();
+            }
+        }
+    }
+}
+
+fn database_url(admin: &str, name: &str) -> String {
+    let (base, query) = match admin.split_once('?') {
+        Some((b, q)) => (b, format!("?{q}")),
+        None => (admin, String::new()),
+    };
+    let (server, _) = base.rsplit_once('/').expect("admin URL needs a path: scheme://user:pw@host:port/db");
+    format!("{server}/{name}{query}")
+}
+
+async fn admin_connection(admin: &str) -> sqlx::AnyConnection {
+    use sqlx::Connection;
+    db::install_drivers();
+    sqlx::AnyConnection::connect(admin).await.expect("cannot reach the admin database")
+}
+
+async fn drop_database(admin: &str, name: &str) {
+    use sqlx::{Executor, Row};
+    // A test that panicked mid-transaction leaves a session holding metadata locks
+    // that would block DROP DATABASE forever, so kill the sessions first (MySQL;
+    // Postgres does it with `WITH (FORCE)`), and never wait more than a little.
+    let work = async {
+        let mut conn = admin_connection(admin).await;
+        let stmt = match db::Engine::from_url(admin) {
+            Some(db::Engine::Postgres) => format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
+            _ => {
+                let rows = sqlx::query("SELECT id FROM information_schema.processlist WHERE db = ?")
+                    .bind(name)
+                    .fetch_all(&mut conn)
+                    .await
+                    .unwrap_or_default();
+                for row in rows {
+                    if let Ok(id) = row.try_get::<i64, _>(0) {
+                        let _ = conn.execute(sqlx::AssertSqlSafe(format!("KILL {id}"))).await;
+                    }
+                }
+                format!("DROP DATABASE IF EXISTS {name}")
+            }
+        };
+        if let Err(e) = conn.execute(sqlx::AssertSqlSafe(stmt)).await {
+            eprintln!("could not drop test database {name}: {e}");
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), work).await.is_err() {
+        eprintln!("timed out dropping test database {name}");
+    }
+}
+
+async fn fresh_server_database(engine: db::Engine, admin: &str, migrate: bool) -> EnginePool {
+    use sqlx::Executor;
+    let name = format!(
+        "rust_oidc_t_{}_{}_{}",
+        std::process::id(),
+        DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        rand_suffix()
+    );
+    let mut conn = admin_connection(admin).await;
+    let create = match engine {
+        // Postgres: match the server default; MySQL: utf8mb4 is what the migrations assume.
+        db::Engine::MySql => format!("CREATE DATABASE {name} CHARACTER SET utf8mb4"),
+        _ => format!("CREATE DATABASE {name}"),
+    };
+    conn.execute(sqlx::AssertSqlSafe(create)).await.expect("create test database");
+    drop(conn);
+    let url = database_url(admin, &name);
+    let pool = if migrate {
+        db::connect(&url).await.expect("connect + migrate")
+    } else {
+        sqlx::any::AnyPoolOptions::new().max_connections(2).connect(&url).await.expect("connect")
+    };
+    EnginePool { pool, cleanup: Cleanup::Database(admin.to_string(), name) }
+}
+
+fn rand_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos())
+}
+
+async fn fresh_sqlite() -> EnginePool {
     let dir = tempfile::tempdir().unwrap().keep();
     let url = format!("sqlite://{}", dir.join("engine.db").display());
-    vec![db::connect(&url).await.unwrap()]
+    EnginePool { pool: db::connect(&url).await.unwrap(), cleanup: Cleanup::Dir(dir) }
+}
+
+/// A fresh pool on one specific engine, or `None` when that engine is not configured.
+pub async fn pool_for(engine: db::Engine) -> Option<EnginePool> {
+    match engine {
+        db::Engine::Sqlite => Some(fresh_sqlite().await),
+        db::Engine::Postgres => match std::env::var(ENV_POSTGRES) {
+            Ok(admin) => Some(fresh_server_database(engine, &admin, true).await),
+            Err(_) => None,
+        },
+        db::Engine::MySql => match std::env::var(ENV_MYSQL) {
+            Ok(admin) => Some(fresh_server_database(engine, &admin, true).await),
+            Err(_) => None,
+        },
+    }
+}
+
+/// A pool on an empty, UNMIGRATED database, for tests that apply migration files
+/// by hand. `None` when the engine is not configured.
+pub async fn blank_pool_for(engine: db::Engine) -> Option<EnginePool> {
+    match engine {
+        db::Engine::Sqlite => {
+            let dir = tempfile::tempdir().unwrap().keep();
+            db::install_drivers();
+            let url = format!("sqlite://{}?mode=rwc", dir.join("blank.db").display());
+            let pool = sqlx::any::AnyPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+            sqlx::raw_sql("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
+            Some(EnginePool { pool, cleanup: Cleanup::Dir(dir) })
+        }
+        db::Engine::Postgres => match std::env::var(ENV_POSTGRES) {
+            Ok(admin) => Some(fresh_server_database(engine, &admin, false).await),
+            Err(_) => None,
+        },
+        db::Engine::MySql => match std::env::var(ENV_MYSQL) {
+            Ok(admin) => Some(fresh_server_database(engine, &admin, false).await),
+            Err(_) => None,
+        },
+    }
+}
+
+/// One freshly migrated pool per engine available to this run: SQLite always,
+/// Postgres and MySQL when their env vars are set. Each pool has its own empty
+/// database, dropped when the value is dropped. Skipped engines are announced so
+/// a green run can never silently mean "SQLite only".
+pub async fn all_engine_pools() -> Vec<EnginePool> {
+    let mut pools = Vec::new();
+    for engine in db::Engine::ALL {
+        match pool_for(*engine).await {
+            Some(p) => pools.push(p),
+            None => {
+                let var = if *engine == db::Engine::Postgres { ENV_POSTGRES } else { ENV_MYSQL };
+                // Straight to the stderr handle: `eprintln!` is swallowed by the test
+                // harness's output capture on passing tests, which would defeat the point.
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "skipping {}: {var} not set", engine.as_str());
+            }
+        }
+    }
+    pools
 }

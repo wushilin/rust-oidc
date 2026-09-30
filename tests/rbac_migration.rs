@@ -32,3 +32,40 @@ async fn directory_role_assignments_become_tenant_scoped_bindings() {
         .unwrap_or((None,));
     let _ = t;
 }
+
+/// Scopes must not bleed between two roles held by one principal. The migration
+/// keys its tenant join on (principal, role); this pins the resulting shape.
+#[tokio::test]
+async fn one_principals_two_roles_keep_separate_tenant_scopes() {
+    use rust_oidc::rbac::{RoleId, Scope};
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let other = s.tenant("Other", "other.test").await;
+    for (id, role, tenant) in [
+        ("b-admin", RoleId::GlobalAdministrator, &f.tenant.id),
+        ("b-reader", RoleId::GlobalReader, &other.id),
+    ] {
+        sqlx::query(
+            "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at)
+             VALUES (?, 'User', ?, ?, 'tenants', 0)",
+        )
+        .bind(id)
+        .bind(&f.user_id)
+        .bind(role.as_str())
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES (?, ?)")
+            .bind(id)
+            .bind(tenant)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+    }
+    let eff = rust_oidc::admin::bindings::effective_for_user(&s.pool, &f.user_id)
+        .await
+        .unwrap();
+    let scope_of = |role: RoleId| eff.iter().find(|b| b.role == role).unwrap().scope.clone();
+    assert_eq!(scope_of(RoleId::GlobalAdministrator), Scope::Tenants(vec![f.tenant.id.clone()]));
+    assert_eq!(scope_of(RoleId::GlobalReader), Scope::Tenants(vec![other.id.clone()]));
+}

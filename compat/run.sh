@@ -5,9 +5,10 @@
 # provisions a tenant, an API app with app roles and a client app with a secret,
 # then runs the MSAL Python and MSAL Node suites.
 #
-# Usage: compat/run.sh [python|node|rp|kafka]...   (default: all)
+# Usage: compat/run.sh [python|node|rp|kafka|grafana|oauth2-proxy]...   (default: all)
 #
-# The kafka suite needs podman and is skipped when it is not installed.
+# The kafka, grafana and oauth2-proxy suites need podman and are skipped when it
+# is not installed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,7 +16,7 @@ COMPAT="$ROOT/compat"
 # 18443 is taken by the conformance suite's nginx (compat/conformance), and the
 # server now binds 0.0.0.0 for the Kafka container, so the two would collide.
 PORT="${PORT:-18444}"
-SUITES=("${@:-python node rp kafka}")
+SUITES=("${@:-python node rp kafka grafana oauth2-proxy}")
 SUITES=(${SUITES[@]})
 
 WORK="$(mktemp -d)"
@@ -76,6 +77,38 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/client-key.pem" \
 CLIENT_CERT_KEY="$WORK/client-key.pem"
 CLIENT_CERT_THUMBPRINT=$(openssl x509 -in "$WORK/client-cert.pem" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
 
+# ---- fixtures for the container relying-party suites (grafana, oauth2-proxy) ----
+# Each RP is a confidential web app with its own registered redirect URI. Grafana
+# gets two ports: the second instance is deliberately misconfigured (wrong secret).
+GRAFANA_PORT="${GRAFANA_PORT:-13000}"
+GRAFANA_BAD_PORT="${GRAFANA_BAD_PORT:-13001}"
+OAUTH2_PROXY_PORT="${OAUTH2_PROXY_PORT:-14180}"
+OAUTH2_PROXY_UPSTREAM_PORT="${OAUTH2_PROXY_UPSTREAM_PORT:-14181}"
+GRAFANA_APP_ID=$("$BIN" app create --tenant "$TENANT_DOMAIN" --name grafana | json '["appId"]')
+for p in "$GRAFANA_PORT" "$GRAFANA_BAD_PORT"; do
+  "$BIN" app add-redirect-uri --tenant "$TENANT_DOMAIN" --app "$GRAFANA_APP_ID" --platform web \
+    --uri "http://localhost:$p/login/generic_oauth" >/dev/null
+done
+GRAFANA_SECRET=$("$BIN" app secret add --tenant "$TENANT_DOMAIN" --app "$GRAFANA_APP_ID" --days 1 | json '["secretText"]')
+OAUTH2_PROXY_APP_ID=$("$BIN" app create --tenant "$TENANT_DOMAIN" --name oauth2-proxy | json '["appId"]')
+"$BIN" app add-redirect-uri --tenant "$TENANT_DOMAIN" --app "$OAUTH2_PROXY_APP_ID" --platform web \
+  --uri "http://localhost:$OAUTH2_PROXY_PORT/oauth2/callback" >/dev/null
+OAUTH2_PROXY_SECRET=$("$BIN" app secret add --tenant "$TENANT_DOMAIN" --app "$OAUTH2_PROXY_APP_ID" --days 1 | json '["secretText"]')
+# oauth2-proxy refuses an ID token whose email_verified is false, which is what a
+# freshly created user has (alice, above). The CLI has no way to verify an email
+# (only the admin console does), so a second user is created and flipped directly
+# in the throwaway database. alice stays unverified as the negative case.
+VERIFIED_UPN="bob@$TENANT_DOMAIN"
+RUST_OIDC_PASSWORD="$USER_PASSWORD" "$BIN" user create --tenant "$TENANT_DOMAIN" --upn "$VERIFIED_UPN" \
+  --display-name "Bob Jones" --given-name Bob --family-name Jones --email bob@example.org >/dev/null
+python3 - "$WORK/db.sqlite" "$VERIFIED_UPN" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+n = con.execute("UPDATE users SET email_verified = 1 WHERE upn = ?", (sys.argv[2],)).rowcount
+con.commit()
+assert n == 1, f"expected to verify exactly one user, updated {n}"
+PY
+
 # ---- server ----
 export RUST_OIDC_BASE="https://localhost:$PORT/rust-oidc"
 # Bound to [::] so the Kafka container can reach it via the host gateway and the
@@ -95,6 +128,9 @@ export TENANT_ID TENANT_DOMAIN API_APP_ID CLIENT_APP_ID CLIENT_SECRET
 export API_SECRET DOWNSTREAM_APP_ID CLIENT_CERT_KEY CLIENT_CERT_THUMBPRINT
 export USER_UPN USER_PASSWORD WEB_APP_ID WEB_SECRET WEB_REDIRECT_URI
 export CA_FILE="$WORK/tls/cert.pem"
+export GRAFANA_APP_ID GRAFANA_SECRET GRAFANA_PORT GRAFANA_BAD_PORT
+export VERIFIED_UPN
+export OAUTH2_PROXY_APP_ID OAUTH2_PROXY_SECRET OAUTH2_PROXY_PORT OAUTH2_PROXY_UPSTREAM_PORT
 export EXPECTED_ROLES="Orders.Read,Orders.Write"
 
 # jose and oauth4webapi use the WebCrypto global, which Node 18 exposes in ESM
@@ -128,6 +164,12 @@ for suite in "${SUITES[@]}"; do
       ;;
     kafka)
       "$COMPAT/kafka/test_oauthbearer.sh" || status=1
+      ;;
+    grafana)
+      "$COMPAT/grafana/test_grafana.sh" || status=1
+      ;;
+    oauth2-proxy)
+      "$COMPAT/oauth2-proxy/test_oauth2_proxy.sh" || status=1
       ;;
     *) echo "unknown suite: $suite"; status=1 ;;
   esac

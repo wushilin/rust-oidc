@@ -66,7 +66,10 @@ fn has_token(body: &str, needle: &str, allow_path_before: bool) -> bool {
 /// The call goes through `db::sql_stmt`, `db::q`, or an imported bare `q(`/`sql_stmt(`.
 /// A path ending in `::q(` from some other module does not count.
 fn routed(body: &str) -> bool {
-    has_token(body, "sql_stmt(", true) || has_token(body, "db::q(", true) || has_token(body, "q(", false)
+    has_token(body, "db::sql_stmt(", true)
+        || has_token(body, "db::q(", true)
+        || has_token(body, "sql_stmt(", false)
+        || has_token(body, "q(", false)
 }
 
 /// Offending `sqlx::query*(` calls in `src`, as "line N" strings.
@@ -140,5 +143,15 @@ fn the_scanner_keeps_its_teeth_with_q_wrapping() {
     // Look-alikes do not count as routing.
     assert_eq!(unrouted("sqlx::query(other::q(\"UPDATE t SET a = ?\"))"), vec![1]);
     assert_eq!(unrouted("sqlx::query(faq(\"UPDATE t SET a = ?\"))"), vec![1]);
+    assert_eq!(
+        unrouted("sqlx::query(other::sql_stmt(e, \"UPDATE t SET a = ?\"))"),
+        vec![1]
+    );
+    assert_eq!(unrouted("sqlx::query(my_sql_stmt(e, \"UPDATE t SET a = ?\"))"), vec![1]);
+    assert_eq!(
+        unrouted("sqlx::query(mydb::sql_stmt(e, \"UPDATE t SET a = ?\"))"),
+        vec![1]
+    );
+    assert!(unrouted("sqlx::query(crate::db::sql_stmt(e, \"UPDATE t SET a = ?\"))").is_empty());
     assert_eq!(unrouted("sqlx::query(mydb::q(pool, \"UPDATE t SET a = ?\"))"), vec![1]);
 }

@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
+use super::audit::{self, Event};
 use crate::AppState;
 use crate::apps;
 use crate::html;
@@ -37,6 +38,7 @@ pub async fn logout(
     let Ok(Some(tenant)) = tenant::resolve(&st.pool, &tenant_key).await else {
         return html::signed_out(None);
     };
+    let signed_in = session::find(&st.pool, &headers, &tenant.id).await.ok().flatten();
     if let Err(e) = session::end(&st.pool, &headers, &tenant.id).await {
         tracing::error!(error = ?e, "ending session failed");
     }
@@ -52,6 +54,8 @@ pub async fn logout(
         None => None,
     };
     let client_id = get("client_id").map(str::to_string).or(hinted_client);
+    // Attacker-controlled and unvalidated at this point, so clipped.
+    let client_id_for_audit = client_id.as_deref().map(audit::clip);
 
     let mut target = None;
     if let (Some(uri), Some(client_id)) = (get("post_logout_redirect_uri"), client_id)
@@ -66,6 +70,23 @@ pub async fn logout(
         target = Some(url);
     }
 
+    // Only a real session ending is an event; anonymous hits on this endpoint are noise.
+    if let Some(s) = signed_in {
+        let details = serde_json::json!({
+            "via": "end_session",
+            "clientId": client_id_for_audit,
+            "redirected": target.is_some(),
+        });
+        audit::record(
+            &st,
+            &tenant.id,
+            &s.user_id,
+            Event::SessionEnd,
+            Some(&s.user_id),
+            details,
+        )
+        .await;
+    }
     let mut resp = match target {
         Some(url) => {
             let mut r = StatusCode::FOUND.into_response();

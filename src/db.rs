@@ -158,38 +158,88 @@ pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
 /// ASCII-only on SQLite and locale-dependent on Postgres, so rows with non-ASCII
 /// identifiers would otherwise never match `util::fold` and their owners could
 /// not sign in. Idempotent: a no-op once every row agrees. Returns rows rewritten.
+///
+/// Fails closed: if two rows in one uniqueness scope fold to the same value they
+/// are the same identity under the rule, and neither is silently merged or
+/// dropped. All conflicts across all tables are detected before any row is
+/// written and reported together, leaving the data untouched.
 pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
-    let engine = engine_of(pool);
-    let mut fixed = 0;
-    // (select, update) per table: rows are (key, display value, stored fold).
-    let plans: [(&'static str, &'static str); 3] = [
-        (
-            "SELECT id, upn, upn_folded FROM users",
-            "UPDATE users SET upn_folded = ? WHERE id = ?",
-        ),
-        (
-            "SELECT domain, domain, domain_folded FROM tenant_domains",
-            "UPDATE tenant_domains SET domain_folded = ? WHERE domain = ?",
-        ),
-        (
-            "SELECT id, name, name_folded FROM user_groups",
-            "UPDATE user_groups SET name_folded = ? WHERE id = ?",
-        ),
+    use std::collections::BTreeMap;
+
+    struct Plan {
+        table: &'static str,
+        scope_desc: &'static str,
+        /// Rows are (key, scope, display value, stored fold); scope is "" when global.
+        select: &'static str,
+        update: &'static str,
+    }
+    let plans = [
+        Plan {
+            table: "users",
+            scope_desc: "tenant_id",
+            select: "SELECT id, tenant_id, upn, upn_folded FROM users",
+            update: "UPDATE users SET upn_folded = ? WHERE id = ?",
+        },
+        Plan {
+            table: "tenant_domains",
+            scope_desc: "global",
+            select: "SELECT domain, '', domain, domain_folded FROM tenant_domains",
+            update: "UPDATE tenant_domains SET domain_folded = ? WHERE domain = ?",
+        },
+        Plan {
+            table: "user_groups",
+            scope_desc: "tenant_id",
+            select: "SELECT id, tenant_id, name, name_folded FROM user_groups",
+            update: "UPDATE user_groups SET name_folded = ? WHERE id = ?",
+        },
     ];
-    for (select, update) in plans {
-        let rows: Vec<(String, String, Option<String>)> =
-            sqlx::query_as(sql_stmt(engine, select)).fetch_all(pool).await?;
-        for (key, display, stored) in rows {
+    let engine = engine_of(pool);
+
+    let mut conflicts = Vec::new();
+    // (update statement, key, wanted fold) for rows that disagree.
+    let mut writes: Vec<(&'static str, String, String)> = Vec::new();
+    for plan in &plans {
+        let rows: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(sql_stmt(engine, plan.select)).fetch_all(pool).await?;
+        let mut claims: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+        for (key, scope, display, stored) in rows {
             let want = crate::util::fold(&display);
             if stored.as_deref() != Some(want.as_str()) {
-                sqlx::query(sql_stmt(engine, update))
-                    .bind(want)
-                    .bind(key)
-                    .execute(pool)
-                    .await?;
-                fixed += 1;
+                writes.push((plan.update, key.clone(), want.clone()));
+            }
+            claims.entry((scope, want)).or_default().push((key, display));
+        }
+        for ((scope, folded), members) in claims {
+            if members.len() > 1 {
+                let rows = members
+                    .iter()
+                    .map(|(key, display)| format!("      id/key '{key}' = '{display}'"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                conflicts.push(format!(
+                    "  table {} (unique per {}{}): folded value '{folded}' is claimed by {} rows:\n{rows}",
+                    plan.table,
+                    plan.scope_desc,
+                    if scope.is_empty() { String::new() } else { format!(" = '{scope}'") },
+                    members.len(),
+                ));
             }
         }
+    }
+    if !conflicts.is_empty() {
+        anyhow::bail!(
+            "refusing to start: {} case-insensitive identity conflict(s) found while normalising \
+             identifiers; rows that differ only by case are the same identity.\n{}\n\
+             Rename or remove one of the conflicting rows in each group, then restart. \
+             No data was modified.",
+            conflicts.len(),
+            conflicts.join("\n"),
+        );
+    }
+
+    let fixed = writes.len();
+    for (update, key, want) in writes {
+        sqlx::query(sql_stmt(engine, update)).bind(want).bind(key).execute(pool).await?;
     }
     Ok(fixed)
 }

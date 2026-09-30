@@ -74,3 +74,46 @@ async fn reconcile_repairs_non_ascii_folded_columns_and_is_idempotent() {
         assert_eq!(reconcile_folded(&pool).await.unwrap(), 0, "second run changes nothing");
     }
 }
+
+async fn raw_user(pool: &rust_oidc::db::DbPool, id: &str, tenant: &str, upn: &str, folded: &str) {
+    use rust_oidc::db::{engine_of, sql_stmt};
+    sqlx::query(sql_stmt(engine_of(pool), "INSERT INTO users (id, tenant_id, upn, upn_folded, enabled, email_verified, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, 0, 0)"))
+        .bind(id).bind(tenant).bind(upn).bind(folded).execute(pool).await.unwrap();
+}
+
+async fn folded_snapshot(pool: &rust_oidc::db::DbPool) -> Vec<(String, Option<String>)> {
+    use rust_oidc::db::{engine_of, sql_stmt};
+    sqlx::query_as(sql_stmt(engine_of(pool), "SELECT id, upn_folded FROM users ORDER BY id"))
+        .fetch_all(pool).await.unwrap()
+}
+
+/// Two rows that only collide under Unicode folding must stop startup with an
+/// actionable message, and must leave the data untouched.
+#[tokio::test]
+async fn reconcile_refuses_collisions_names_every_conflict_and_writes_nothing() {
+    use rust_oidc::db::reconcile_folded;
+    for pool in common::all_engine_pools().await {
+        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.test", false).await.unwrap();
+        // ASCII-only lower() left the É alone, so these do not collide yet.
+        raw_user(&pool, "u-1", &t.id, "ÉLODIE@contoso.test", "Élodie@contoso.test").await;
+        raw_user(&pool, "u-2", &t.id, "élodie@contoso.test", "élodie@contoso.test").await;
+        // A second, distinct conflict, plus an innocent row needing repair.
+        raw_user(&pool, "u-3", &t.id, "ÀNDRÉ@contoso.test", "Àndré@contoso.test").await;
+        raw_user(&pool, "u-4", &t.id, "àndré@contoso.test", "àndré@contoso.test").await;
+        raw_user(&pool, "u-5", &t.id, "ÖZ@contoso.test", "Öz@contoso.test").await;
+        let before = folded_snapshot(&pool).await;
+
+        let err = reconcile_folded(&pool).await.unwrap_err().to_string();
+        for needle in [
+            "users", "élodie@contoso.test", "ÉLODIE@contoso.test", "u-1", "u-2",
+            "àndré@contoso.test", "ÀNDRÉ@contoso.test", "u-3", "u-4", "2 case-insensitive",
+            "Rename or remove", &t.id,
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+        assert!(!err.contains("u-5"), "non-conflicting row must not be listed: {err}");
+        assert_eq!(folded_snapshot(&pool).await, before, "nothing may be written");
+        // A retry behaves the same until the operator repairs the data.
+        assert!(reconcile_folded(&pool).await.is_err());
+    }
+}

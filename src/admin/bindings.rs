@@ -105,11 +105,13 @@ async fn scope_of(pool: &SqlitePool, binding_id: &str, kind: ScopeKind) -> anyho
 pub async fn effective_for_user(pool: &SqlitePool, user_id: &str) -> anyhow::Result<Vec<EffectiveBinding>> {
     let rows = sqlx::query(
         "SELECT id, role_id, scope_kind FROM role_bindings
-         WHERE (principal_type = 'User'  AND principal_id = ?1)
-            OR (principal_type = 'Group' AND principal_id IN
+         WHERE (principal_type = ?2 AND principal_id = ?1)
+            OR (principal_type = ?3 AND principal_id IN
                 (SELECT group_id FROM group_members WHERE user_id = ?1))",
     )
     .bind(user_id)
+    .bind(PrincipalType::User.as_str())
+    .bind(PrincipalType::Group.as_str())
     .fetch_all(pool)
     .await?;
 
@@ -144,9 +146,10 @@ pub async fn list_for_tenant(pool: &SqlitePool, tenant_id: &str) -> anyhow::Resu
         "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
          FROM role_bindings b
          LEFT JOIN role_binding_tenants rbt ON rbt.binding_id = b.id
-         WHERE b.scope_kind = 'all' OR rbt.tenant_id = ?
+         WHERE b.scope_kind = ? OR rbt.tenant_id = ?
          GROUP BY b.id ORDER BY b.created_at",
     )
+    .bind(ScopeKind::All.as_str())
     .bind(tenant_id)
     .fetch_all(pool)
     .await?;

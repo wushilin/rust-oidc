@@ -1,42 +1,50 @@
-
 //! The migration must carry existing directory role assignments across.
 mod common;
 use common::*;
 
 #[tokio::test]
-async fn directory_role_assignments_become_tenant_scoped_bindings() {
+async fn a_fresh_database_has_the_new_schema_and_no_old_table() {
     let s = TestServer::start().await;
-    let t = s.tenant("Contoso", "contoso.com").await;
-    // A row inserted the way bootstrap used to, then read back as a binding.
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM role_bindings WHERE scope_kind = 'tenants'",
-    )
-    .fetch_one(&s.pool)
-    .await
-    .unwrap();
+    let f = user_fixture(&s).await;
+
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM role_bindings")
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
     assert_eq!(count, 0, "fresh database starts with no bindings");
 
+    // Absence must fail: query sqlite_master for each table by name.
+    for table in ["role_bindings", "role_binding_tenants", "admin_sessions"] {
+        let found: Option<(String,)> = sqlx::query_as("SELECT name FROM sqlite_master WHERE name = ?")
+            .bind(table)
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap();
+        assert!(found.is_some(), "{table} should exist");
+    }
+
     // The old table must be gone, so there is only one source of truth.
-    let exists: Option<(String,)> =
+    let old: Option<(String,)> =
         sqlx::query_as("SELECT name FROM sqlite_master WHERE name = 'directory_role_assignments'")
             .fetch_optional(&s.pool)
             .await
             .unwrap();
-    assert!(exists.is_none(), "directory_role_assignments should be dropped");
+    assert!(old.is_none(), "directory_role_assignments should be dropped");
 
-    // users.deleted_at exists and defaults to NULL.
-    let _: (Option<i64>,) = sqlx::query_as("SELECT deleted_at FROM users LIMIT 0")
-        .fetch_optional(&s.pool)
+    // users.deleted_at exists (the query errors if not) and defaults to NULL.
+    let (deleted_at,): (Option<i64>,) = sqlx::query_as("SELECT deleted_at FROM users WHERE id = ?")
+        .bind(&f.user_id)
+        .fetch_one(&s.pool)
         .await
-        .unwrap()
-        .unwrap_or((None,));
-    let _ = t;
+        .unwrap();
+    assert_eq!(deleted_at, None);
 }
 
-/// Scopes must not bleed between two roles held by one principal. The migration
-/// keys its tenant join on (principal, role); this pins the resulting shape.
+/// Storage-shape test, not a migration test: bindings inserted by hand for one
+/// principal must expand through `effective_for_user` with separate scopes.
+/// The migration itself is covered by the seeded test below.
 #[tokio::test]
-async fn one_principals_two_roles_keep_separate_tenant_scopes() {
+async fn effective_bindings_keep_two_roles_scopes_separate() {
     use rust_oidc::rbac::{RoleId, Scope};
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
@@ -113,6 +121,8 @@ async fn migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_root_ad
         ("t3", USER_ADMIN, "single"),
         ("root", GLOBAL_ADMIN, "rootadmin"),
         ("t1", GLOBAL_ADMIN, "tenantadmin"),
+        ("t1", GLOBAL_ADMIN, "samerole"),
+        ("t2", GLOBAL_ADMIN, "samerole"),
     ] {
         sqlx::query(
             "INSERT INTO directory_role_assignments
@@ -184,11 +194,19 @@ async fn migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_root_ad
         vec![("GlobalAdministrator".to_string(), "tenants".to_string(), s(&["t1"]))],
         "a non-root Global Administrator is not"
     );
-    let (bloated,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM (SELECT binding_id FROM role_binding_tenants GROUP BY binding_id HAVING COUNT(*) > 1)",
+    // The same role held in two tenants is ONE binding covering both.
+    assert_eq!(
+        shape("samerole").await,
+        vec![("GlobalAdministrator".to_string(), "tenants".to_string(), s(&["t1", "t2"]))],
+        "one binding per (principal, role), holding exactly that pair's tenants"
+    );
+    let (duplicated,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM (
+             SELECT principal_id, role_id FROM role_bindings
+             GROUP BY principal_id, role_id HAVING COUNT(*) > 1)",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(bloated, 0, "no binding may carry more than one tenant here");
+    assert_eq!(duplicated, 0, "no (principal, role) pair may have more than one binding");
 }

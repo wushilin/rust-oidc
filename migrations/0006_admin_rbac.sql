@@ -19,25 +19,31 @@ CREATE TABLE role_binding_tenants (
 
 -- Carry existing directory role assignments across as tenant-scoped bindings.
 -- Only User and Group principals: a service principal cannot use the console.
+-- One binding per (principal, role), however many tenants held it; the join
+-- below then attaches all of that pair's tenants to it.
 INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at, created_by)
-SELECT lower(hex(randomblob(16))), principal_type, principal_id,
-       CASE role_template_id
-           WHEN '62e90394-69f5-4237-9190-012177145e10' THEN 'GlobalAdministrator'
-           WHEN 'f2ef992c-3afb-46b9-b7cf-a126ee74c451' THEN 'GlobalReader'
-           WHEN 'fe930be7-5e62-47db-91af-98c3a49a38b1' THEN 'UserAdministrator'
-           WHEN 'fdd7a751-b60b-444a-984c-02652fe8fa1c' THEN 'GroupsAdministrator'
-           WHEN '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3' THEN 'ApplicationAdministrator'
-           WHEN '158c047a-c907-4556-b7ef-446551a6b5f7' THEN 'CloudApplicationAdministrator'
-           WHEN 'e8611ab8-c189-46e8-94e1-60213ab1f814' THEN 'PrivilegedRoleAdministrator'
-       END,
-       'tenants', created_at, 'migration'
-FROM directory_role_assignments
-WHERE principal_type IN ('User', 'Group')
-  AND role_template_id IN (
-      '62e90394-69f5-4237-9190-012177145e10','f2ef992c-3afb-46b9-b7cf-a126ee74c451',
-      'fe930be7-5e62-47db-91af-98c3a49a38b1','fdd7a751-b60b-444a-984c-02652fe8fa1c',
-      '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3','158c047a-c907-4556-b7ef-446551a6b5f7',
-      'e8611ab8-c189-46e8-94e1-60213ab1f814');
+SELECT lower(hex(randomblob(16))), principal_type, principal_id, role_id,
+       'tenants', min(created_at), 'migration'
+FROM (
+    SELECT principal_type, principal_id, created_at,
+           CASE role_template_id
+               WHEN '62e90394-69f5-4237-9190-012177145e10' THEN 'GlobalAdministrator'
+               WHEN 'f2ef992c-3afb-46b9-b7cf-a126ee74c451' THEN 'GlobalReader'
+               WHEN 'fe930be7-5e62-47db-91af-98c3a49a38b1' THEN 'UserAdministrator'
+               WHEN 'fdd7a751-b60b-444a-984c-02652fe8fa1c' THEN 'GroupsAdministrator'
+               WHEN '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3' THEN 'ApplicationAdministrator'
+               WHEN '158c047a-c907-4556-b7ef-446551a6b5f7' THEN 'CloudApplicationAdministrator'
+               WHEN 'e8611ab8-c189-46e8-94e1-60213ab1f814' THEN 'PrivilegedRoleAdministrator'
+           END AS role_id
+    FROM directory_role_assignments
+    WHERE principal_type IN ('User', 'Group')
+      AND role_template_id IN (
+          '62e90394-69f5-4237-9190-012177145e10','f2ef992c-3afb-46b9-b7cf-a126ee74c451',
+          'fe930be7-5e62-47db-91af-98c3a49a38b1','fdd7a751-b60b-444a-984c-02652fe8fa1c',
+          '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3','158c047a-c907-4556-b7ef-446551a6b5f7',
+          'e8611ab8-c189-46e8-94e1-60213ab1f814')
+)
+GROUP BY principal_type, principal_id, role_id;
 
 -- A binding collects only the tenants of the assignment that produced it: the
 -- join key includes the role, or a principal holding different roles in

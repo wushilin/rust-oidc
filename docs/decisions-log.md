@@ -16,7 +16,14 @@ possible**, and **no magic values**.
 | A | **Branch integration**: merge `feat/admin-console` to `main`, open a PR, or keep it? | Asked twice, still unanswered. The branch carries everything below plus the half-built console. |
 | B | **TOTP MFA, four questions** in `docs/superpowers/specs/2026-09-30-totp-mfa-design.md`: where the seed-encryption key comes from; whether a missing key should fail startup closed; whether enabling `mfa_required` revokes existing refresh families; recovery codes now or later. | The key-management one is operational and affects deployment. Guessing it would bake in an ops burden you did not choose. |
 | C | **Rate limiting — now built; only the numbers are still yours.** Implemented in `src/ratelimit.rs` (decisions 29-38). What remains for you: the four allowances are **invented** (decision 37), there is no way to tune them without a rebuild, and the counters are in-process so multiple instances multiply the effective limits (decision 38). | The limits are a product decision and the per-instance behaviour is an operational one. |
-| D | **`acr`**: emit it when `acr_values` is requested, or accept the omission? | Evidence is genuinely ambiguous — see decision 5. |
+| D | **`acr`**: emit it when `acr_values` is requested, or accept the omission? | Evidence is genuinely ambiguous — see decision 5. Untouched; still needs a capture from a live Entra tenant, which I cannot do. |
+
+**None of this is deployed.** Everything above lives on `feat/admin-console` only.
+The running service at `gate.wushilin.net:9443` still serves a build that predates even
+commit `bc217fa`: its discovery advertises `"response_types_supported": ["code"]`, and a
+token request with a bad `client_id` still answers `400` with no `Retry-After`, so it has
+no rate limiting. Deploying is out of scope for the work that produced these notes, and
+it is downstream of question A.
 
 ---
 

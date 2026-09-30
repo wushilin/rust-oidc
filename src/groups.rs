@@ -40,11 +40,14 @@ pub async fn add_member(pool: &DbPool, tenant: &Tenant, group: &str, upn: &str) 
         .fetch_optional(pool)
         .await?;
     let (user_id,) = user_id.with_context(|| format!("user '{upn}' not found"))?;
-    sqlx::query(crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)"))
-        .bind(group_id)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
+    // Already a member is success: the primary key (group_id, user_id) makes it a no-op.
+    crate::db::inserted(
+        sqlx::query(crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)"))
+            .bind(group_id)
+            .bind(user_id)
+            .execute(pool)
+            .await,
+    )?;
     Ok(())
 }
 

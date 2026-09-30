@@ -353,16 +353,20 @@ async fn authenticate_with_assertion(
         .bind(ts)
         .execute(&st.pool)
         .await;
-    let first_use = sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)
-         ON CONFLICT (jti, client_app_id) DO NOTHING"),
-    )
-    .bind(jti)
-    .bind(&app.app_id)
-    .bind(exp)
-    .execute(&st.pool)
-    .await?;
-    if first_use.rows_affected() != 1 {
+    // The primary key makes the insert the atomic "first use" test: a unique
+    // violation is a replay, any other error is a real failure.
+    let first_use = crate::db::inserted(
+        sqlx::query(crate::db::sql_stmt(
+            crate::db::engine_of(&st.pool),
+            "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)",
+        ))
+        .bind(jti)
+        .bind(&app.app_id)
+        .bind(exp)
+        .execute(&st.pool)
+        .await,
+    )?;
+    if !first_use {
         return Err(AadError::replayed_client_assertion());
     }
 

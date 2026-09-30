@@ -375,20 +375,24 @@ pub async fn assign_role(
     if !role.allows(member_type) {
         bail!("app role '{role_value}' cannot be assigned to {member_type} principals");
     }
-    sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT OR IGNORE INTO app_role_assignments
-            (id, tenant_id, resource_id, app_role_id, principal_id, principal_type, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)"),
-    )
-    .bind(new_guid())
-    .bind(&tenant.id)
-    .bind(&resource_sp.id)
-    .bind(&role.id)
-    .bind(&principal_id)
-    .bind(principal_type)
-    .bind(now())
-    .execute(pool)
-    .await?;
+    // Re-assigning is a no-op: UNIQUE (resource_id, app_role_id, principal_id).
+    crate::db::inserted(
+        sqlx::query(crate::db::sql_stmt(
+            crate::db::engine_of(pool),
+            "INSERT INTO app_role_assignments
+                (id, tenant_id, resource_id, app_role_id, principal_id, principal_type, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(new_guid())
+        .bind(&tenant.id)
+        .bind(&resource_sp.id)
+        .bind(&role.id)
+        .bind(&principal_id)
+        .bind(principal_type)
+        .bind(now())
+        .execute(pool)
+        .await,
+    )?;
     Ok(())
 }
 
@@ -696,27 +700,58 @@ pub async fn add_key_credential(
     display_name: Option<&str>,
 ) -> anyhow::Result<String> {
     let cert = parse_certificate(cert_pem)?;
-    sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO app_key_credentials
-            (application_id, key_id, display_name, cert_der, public_n, public_e, created_at, not_before, not_after)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (application_id, key_id) DO UPDATE SET
-            display_name = excluded.display_name, cert_der = excluded.cert_der,
-            public_n = excluded.public_n, public_e = excluded.public_e,
-            not_before = excluded.not_before, not_after = excluded.not_after"),
+    let engine = crate::db::engine_of(pool);
+    // UPDATE first, INSERT if nothing matched; a unique violation means a
+    // concurrent registration inserted it meanwhile, so go round and UPDATE.
+    // (sqlx's MySQL driver sets FOUND_ROWS, so an unchanged row still counts.)
+    for _ in 0..crate::db::UPSERT_ATTEMPTS {
+        let updated = sqlx::query(crate::db::sql_stmt(
+            engine,
+            "UPDATE app_key_credentials SET display_name = ?, cert_der = ?, public_n = ?, public_e = ?,
+                not_before = ?, not_after = ?
+             WHERE application_id = ? AND key_id = ?",
+        ))
+        .bind(display_name)
+        .bind(&cert.cert_der)
+        .bind(&cert.n)
+        .bind(&cert.e)
+        .bind(cert.not_before)
+        .bind(cert.not_after)
+        .bind(&app.id)
+        .bind(&cert.key_id)
+        .execute(pool)
+        .await?;
+        if updated.rows_affected() > 0 {
+            return Ok(cert.key_id);
+        }
+        let done = crate::db::inserted(
+            sqlx::query(crate::db::sql_stmt(
+                engine,
+                "INSERT INTO app_key_credentials
+                    (application_id, key_id, display_name, cert_der, public_n, public_e, created_at, not_before, not_after)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ))
+            .bind(&app.id)
+            .bind(&cert.key_id)
+            .bind(display_name)
+            .bind(&cert.cert_der)
+            .bind(&cert.n)
+            .bind(&cert.e)
+            .bind(now())
+            .bind(cert.not_before)
+            .bind(cert.not_after)
+            .execute(pool)
+            .await,
+        )?;
+        if done {
+            return Ok(cert.key_id);
+        }
+    }
+    anyhow::bail!(
+        "certificate credential {} could not be registered after {} attempts (concurrent writers)",
+        cert.key_id,
+        crate::db::UPSERT_ATTEMPTS
     )
-    .bind(&app.id)
-    .bind(&cert.key_id)
-    .bind(display_name)
-    .bind(&cert.cert_der)
-    .bind(&cert.n)
-    .bind(&cert.e)
-    .bind(now())
-    .bind(cert.not_before)
-    .bind(cert.not_after)
-    .execute(pool)
-    .await?;
-    Ok(cert.key_id)
 }
 
 pub async fn key_credentials(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<KeyCredential>> {

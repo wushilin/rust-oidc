@@ -244,6 +244,26 @@ pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
     Ok(fixed)
 }
 
+/// Attempts an upsert makes before giving up. A unique violation means another
+/// writer got there first; a fresh attempt then sees its committed row.
+pub const UPSERT_ATTEMPTS: usize = 3;
+
+/// Engine-neutral test for "this row already exists".
+pub fn is_unique_violation(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(e) if e.is_unique_violation())
+}
+
+/// Turn the outcome of a plain `INSERT` into "was a row inserted": a unique
+/// violation is `Ok(false)`, any other error propagates. Replaces
+/// the SQLite-only and Postgres-only ignore-duplicate insert forms.
+pub fn inserted(result: Result<sqlx::any::AnyQueryResult, sqlx::Error>) -> Result<bool, sqlx::Error> {
+    match result {
+        Ok(done) => Ok(done.rows_affected() > 0),
+        Err(e) if is_unique_violation(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The filesystem path of a file-backed database, if the URL names one, so the
 /// caller can create its parent directory. `None` for server engines and for
 /// in-memory or empty SQLite paths. Handles `sqlite:path` and `sqlite://path`.

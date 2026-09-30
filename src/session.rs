@@ -85,23 +85,50 @@ pub async fn create(
 ) -> anyhow::Result<String> {
     let cookie = cookie(headers, SESSION_COOKIE).unwrap_or_else(new_token);
     let ts = now();
-    sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO sessions (cookie_hash, tenant_id, user_id, auth_time, amr, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (cookie_hash, tenant_id) DO UPDATE SET
-            user_id = excluded.user_id, auth_time = excluded.auth_time, amr = excluded.amr,
-            created_at = excluded.created_at, expires_at = excluded.expires_at"),
-    )
-    .bind(sha256_hex(cookie.as_bytes()))
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(ts)
-    .bind(serde_json::to_string(amr)?)
-    .bind(ts)
-    .bind(ts + lifetime)
-    .execute(pool)
-    .await?;
-    Ok(cookie)
+    let engine = crate::db::engine_of(pool);
+    let hash = sha256_hex(cookie.as_bytes());
+    let amr_json = serde_json::to_string(amr)?;
+    // Refresh the browser's row if it exists, else insert; a unique violation
+    // means a concurrent sign-in inserted it first, so go round and refresh.
+    for _ in 0..crate::db::UPSERT_ATTEMPTS {
+        let updated = sqlx::query(crate::db::sql_stmt(
+            engine,
+            "UPDATE sessions SET user_id = ?, auth_time = ?, amr = ?, created_at = ?, expires_at = ?
+             WHERE cookie_hash = ? AND tenant_id = ?",
+        ))
+        .bind(user_id)
+        .bind(ts)
+        .bind(&amr_json)
+        .bind(ts)
+        .bind(ts + lifetime)
+        .bind(&hash)
+        .bind(tenant_id)
+        .execute(pool)
+        .await?;
+        if updated.rows_affected() > 0 {
+            return Ok(cookie);
+        }
+        let done = crate::db::inserted(
+            sqlx::query(crate::db::sql_stmt(
+                engine,
+                "INSERT INTO sessions (cookie_hash, tenant_id, user_id, auth_time, amr, created_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ))
+            .bind(&hash)
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(ts)
+            .bind(&amr_json)
+            .bind(ts)
+            .bind(ts + lifetime)
+            .execute(pool)
+            .await,
+        )?;
+        if done {
+            return Ok(cookie);
+        }
+    }
+    anyhow::bail!("session could not be recorded after {} attempts (concurrent writers)", crate::db::UPSERT_ATTEMPTS)
 }
 
 pub async fn end(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {

@@ -23,18 +23,18 @@ use std::sync::Arc;
 use config::PublicUrl;
 use keys::KeyStore;
 use secrets::Secrets;
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     pub public_url: Arc<PublicUrl>,
     pub keys: Arc<KeyStore>,
     pub secrets: Arc<Secrets>,
 }
 
 impl AppState {
-    pub fn new(pool: SqlitePool, public_url: PublicUrl) -> Self {
+    pub fn new(pool: DbPool, public_url: PublicUrl) -> Self {
         let keys = Arc::new(KeyStore::new(pool.clone()));
         Self {
             secrets: Arc::new(Secrets::new(pool.clone())),

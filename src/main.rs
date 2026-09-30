@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use sqlx::SqlitePool;
+use rust_oidc::db::DbPool;
 
 use rust_oidc::admin::bindings::{self as role_bindings, PrincipalType};
 use rust_oidc::apps::{self, Principal};
@@ -417,7 +417,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn tenant_cmd(pool: &SqlitePool, cmd: TenantCmd) -> anyhow::Result<()> {
+async fn tenant_cmd(pool: &DbPool, cmd: TenantCmd) -> anyhow::Result<()> {
     match cmd {
         TenantCmd::Create { name, domain } => {
             let t = tenant::create(pool, &name, &domain, false).await?;
@@ -460,7 +460,7 @@ async fn tenant_cmd(pool: &SqlitePool, cmd: TenantCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn user_cmd(pool: &SqlitePool, cmd: UserCmd) -> anyhow::Result<()> {
+async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
     match cmd {
         UserCmd::Create {
             tenant: key,
@@ -521,7 +521,7 @@ async fn user_cmd(pool: &SqlitePool, cmd: UserCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn group_cmd(pool: &SqlitePool, cmd: GroupCmd) -> anyhow::Result<()> {
+async fn group_cmd(pool: &DbPool, cmd: GroupCmd) -> anyhow::Result<()> {
     match cmd {
         GroupCmd::Create {
             tenant: key,
@@ -562,7 +562,7 @@ async fn group_cmd(pool: &SqlitePool, cmd: GroupCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn app_cmd(pool: &SqlitePool, cmd: AppCmd) -> anyhow::Result<()> {
+async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
     match cmd {
         AppCmd::Create { tenant: key, name } => {
             let t = tenant::find_for_admin(pool, &key).await?;
@@ -860,7 +860,7 @@ async fn app_cmd(pool: &SqlitePool, cmd: AppCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn key_cmd(pool: &SqlitePool, cmd: KeyCmd) -> anyhow::Result<()> {
+async fn key_cmd(pool: &DbPool, cmd: KeyCmd) -> anyhow::Result<()> {
     match cmd {
         KeyCmd::List => {
             let rows: Vec<(String, String, i64, Option<i64>, i64)> = sqlx::query_as(

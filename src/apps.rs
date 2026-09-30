@@ -1,7 +1,8 @@
 //! Application registrations and service principals, modelled on Entra ID.
 
 use anyhow::{Context, bail};
-use sqlx::{FromRow, SqlitePool};
+use crate::db::DbPool;
+use sqlx::FromRow;
 
 use crate::tenant::Tenant;
 use crate::util::{b64url, ct_eq, generate_client_secret, is_guid, new_guid, now, sha256_hex};
@@ -13,6 +14,7 @@ pub struct Application {
     pub tenant_id: String,
     pub display_name: String,
     /// ROPC is refused unless an administrator has turned it on for this app.
+    #[sqlx(try_from = "crate::db::Flag")]
     pub allow_password_grant: bool,
 }
 
@@ -21,7 +23,9 @@ pub struct ServicePrincipal {
     pub id: String,
     pub tenant_id: String,
     pub app_id: String,
+    #[sqlx(try_from = "crate::db::Flag")]
     pub enabled: bool,
+    #[sqlx(try_from = "crate::db::Flag")]
     pub app_role_assignment_required: bool,
 }
 
@@ -33,7 +37,7 @@ pub struct CreatedApp {
 
 /// Register an app in its home tenant: application object, default identifier
 /// URI `api://{appId}` and the home-tenant service principal.
-pub async fn create(pool: &SqlitePool, tenant: &Tenant, display_name: &str) -> anyhow::Result<CreatedApp> {
+pub async fn create(pool: &DbPool, tenant: &Tenant, display_name: &str) -> anyhow::Result<CreatedApp> {
     let application = Application {
         id: new_guid(),
         app_id: new_guid(),
@@ -74,7 +78,7 @@ pub async fn create(pool: &SqlitePool, tenant: &Tenant, display_name: &str) -> a
     })
 }
 
-pub async fn find(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<Application>> {
+pub async fn find(pool: &DbPool, app_id: &str) -> anyhow::Result<Option<Application>> {
     if !is_guid(app_id) {
         return Ok(None);
     }
@@ -87,14 +91,14 @@ pub async fn find(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<Appl
     .await?)
 }
 
-pub async fn find_in_tenant(pool: &SqlitePool, tenant: &Tenant, app_id: &str) -> anyhow::Result<Application> {
+pub async fn find_in_tenant(pool: &DbPool, tenant: &Tenant, app_id: &str) -> anyhow::Result<Application> {
     match find(pool, app_id).await? {
         Some(app) if app.tenant_id == tenant.id => Ok(app),
         _ => bail!("application '{app_id}' not found in tenant '{}'", tenant.name),
     }
 }
 
-pub async fn list(pool: &SqlitePool, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
+pub async fn list(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
     Ok(sqlx::query_as(
         "SELECT id, app_id, tenant_id, display_name, allow_password_grant FROM applications
          WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
@@ -105,7 +109,7 @@ pub async fn list(pool: &SqlitePool, tenant_id: &str) -> anyhow::Result<Vec<Appl
 }
 
 pub async fn service_principal(
-    pool: &SqlitePool,
+    pool: &DbPool,
     tenant_id: &str,
     app_id: &str,
 ) -> anyhow::Result<Option<ServicePrincipal>> {
@@ -119,7 +123,7 @@ pub async fn service_principal(
     .await?)
 }
 
-pub async fn add_identifier_uri(pool: &SqlitePool, app: &Application, uri: &str) -> anyhow::Result<()> {
+pub async fn add_identifier_uri(pool: &DbPool, app: &Application, uri: &str) -> anyhow::Result<()> {
     url::Url::parse(uri).with_context(|| format!("identifier URI '{uri}' is not a valid URI"))?;
     sqlx::query("INSERT INTO app_identifier_uris (application_id, tenant_id, uri) VALUES (?, ?, ?)")
         .bind(&app.id)
@@ -131,7 +135,7 @@ pub async fn add_identifier_uri(pool: &SqlitePool, app: &Application, uri: &str)
     Ok(())
 }
 
-pub async fn identifier_uris(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<String>> {
+pub async fn identifier_uris(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT uri FROM app_identifier_uris WHERE application_id = ? ORDER BY uri")
             .bind(&app.id)
@@ -143,7 +147,7 @@ pub async fn identifier_uris(pool: &SqlitePool, app: &Application) -> anyhow::Re
 /// Resolve a resource named in a scope (`api://...` or a bare appId) to the
 /// resource's service principal in `tenant_id`.
 pub async fn resolve_resource(
-    pool: &SqlitePool,
+    pool: &DbPool,
     tenant_id: &str,
     resource: &str,
 ) -> anyhow::Result<Option<(Application, ServicePrincipal)>> {
@@ -174,7 +178,7 @@ pub struct NewSecret {
 }
 
 pub async fn add_secret(
-    pool: &SqlitePool,
+    pool: &DbPool,
     app: &Application,
     display_name: Option<&str>,
     valid_days: i64,
@@ -203,7 +207,7 @@ pub async fn add_secret(
     Ok(NewSecret { key_id, secret, end_at })
 }
 
-pub async fn remove_secret(pool: &SqlitePool, app: &Application, key_id: &str) -> anyhow::Result<()> {
+pub async fn remove_secret(pool: &DbPool, app: &Application, key_id: &str) -> anyhow::Result<()> {
     let res = sqlx::query("DELETE FROM app_secrets WHERE application_id = ? AND key_id = ?")
         .bind(&app.id)
         .bind(key_id)
@@ -222,7 +226,7 @@ pub enum SecretCheck {
     Invalid,
 }
 
-pub async fn verify_secret(pool: &SqlitePool, app: &Application, secret: &str) -> anyhow::Result<SecretCheck> {
+pub async fn verify_secret(pool: &DbPool, app: &Application, secret: &str) -> anyhow::Result<SecretCheck> {
     let rows: Vec<(String, i64, i64)> =
         sqlx::query_as("SELECT secret_hash, start_at, end_at FROM app_secrets WHERE application_id = ?")
             .bind(&app.id)
@@ -248,7 +252,7 @@ pub const MEMBER_USER: &str = "User";
 pub const MEMBER_APPLICATION: &str = "Application";
 
 pub async fn add_role(
-    pool: &SqlitePool,
+    pool: &DbPool,
     app: &Application,
     value: &str,
     display_name: &str,
@@ -288,6 +292,7 @@ pub struct AppRole {
     pub value: String,
     pub display_name: String,
     pub allowed_member_types: String,
+    #[sqlx(try_from = "crate::db::Flag")]
     pub enabled: bool,
 }
 
@@ -299,7 +304,7 @@ impl AppRole {
     }
 }
 
-pub async fn roles(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<AppRole>> {
+pub async fn roles(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<AppRole>> {
     Ok(sqlx::query_as(
         "SELECT id, value, display_name, allowed_member_types, enabled FROM app_roles
          WHERE application_id = ? ORDER BY value",
@@ -320,7 +325,7 @@ pub enum Principal {
 
 /// Assign app role `role_value` of `resource` to a principal in the same tenant.
 pub async fn assign_role(
-    pool: &SqlitePool,
+    pool: &DbPool,
     tenant: &Tenant,
     resource: &Application,
     role_value: &str,
@@ -388,7 +393,7 @@ pub async fn assign_role(
 /// Role values of `resource_sp` assigned to the client service principal
 /// `client_sp_id` (the `roles` claim of an app-only token).
 pub async fn app_roles_for_service_principal(
-    pool: &SqlitePool,
+    pool: &DbPool,
     resource_sp_id: &str,
     client_sp_id: &str,
 ) -> anyhow::Result<Vec<String>> {
@@ -439,7 +444,7 @@ pub fn validate_redirect_uri(platform: &str, uri: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn add_redirect_uri(pool: &SqlitePool, app: &Application, platform: &str, uri: &str) -> anyhow::Result<()> {
+pub async fn add_redirect_uri(pool: &DbPool, app: &Application, platform: &str, uri: &str) -> anyhow::Result<()> {
     validate_redirect_uri(platform, uri)?;
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT platform FROM app_redirect_uris WHERE application_id = ? AND uri = ?")
@@ -459,7 +464,7 @@ pub async fn add_redirect_uri(pool: &SqlitePool, app: &Application, platform: &s
     Ok(())
 }
 
-pub async fn redirect_uris(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<(String, String)>> {
+pub async fn redirect_uris(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<(String, String)>> {
     Ok(
         sqlx::query_as("SELECT platform, uri FROM app_redirect_uris WHERE application_id = ? ORDER BY platform, uri")
             .bind(&app.id)
@@ -485,7 +490,7 @@ pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
 
 /// The platform of the registered redirect URI matching `requested`, if any.
 pub async fn match_redirect_uri(
-    pool: &SqlitePool,
+    pool: &DbPool,
     app: &Application,
     requested: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -499,7 +504,7 @@ pub async fn match_redirect_uri(
 // ---- delegated permission scopes ----
 
 pub async fn add_scope(
-    pool: &SqlitePool,
+    pool: &DbPool,
     app: &Application,
     value: &str,
     display_name: &str,
@@ -526,7 +531,7 @@ pub async fn add_scope(
     Ok(id)
 }
 
-pub async fn enabled_scopes(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<String>> {
+pub async fn enabled_scopes(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT value FROM app_scopes WHERE application_id = ? AND enabled = 1 ORDER BY value")
             .bind(&app.id)
@@ -537,7 +542,7 @@ pub async fn enabled_scopes(pool: &SqlitePool, app: &Application) -> anyhow::Res
 
 /// Role values of `resource_sp_id` a user holds directly or through group
 /// membership (the `roles` claim of user tokens).
-pub async fn app_roles_for_user(pool: &SqlitePool, resource_sp_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
+pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT r.value, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
@@ -560,7 +565,7 @@ pub async fn app_roles_for_user(pool: &SqlitePool, resource_sp_id: &str, user_id
 
 /// Whether the user may sign in to an app that requires assignment
 /// (`appRoleAssignmentRequired`), directly or through a group.
-pub async fn user_is_assigned(pool: &SqlitePool, sp_id: &str, user_id: &str) -> anyhow::Result<bool> {
+pub async fn user_is_assigned(pool: &DbPool, sp_id: &str, user_id: &str) -> anyhow::Result<bool> {
     let (n,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM app_role_assignments
          WHERE resource_id = ?1
@@ -575,7 +580,7 @@ pub async fn user_is_assigned(pool: &SqlitePool, sp_id: &str, user_id: &str) -> 
     Ok(n > 0)
 }
 
-pub async fn set_assignment_required(pool: &SqlitePool, sp_id: &str, required: bool) -> anyhow::Result<()> {
+pub async fn set_assignment_required(pool: &DbPool, sp_id: &str, required: bool) -> anyhow::Result<()> {
     sqlx::query("UPDATE service_principals SET app_role_assignment_required = ? WHERE id = ?")
         .bind(required)
         .bind(sp_id)
@@ -603,7 +608,7 @@ pub fn normalize_thumbprint(raw: &str) -> String {
 }
 
 /// Allow or forbid the resource owner password grant for this app.
-pub async fn set_password_grant_allowed(pool: &SqlitePool, app: &Application, allowed: bool) -> anyhow::Result<()> {
+pub async fn set_password_grant_allowed(pool: &DbPool, app: &Application, allowed: bool) -> anyhow::Result<()> {
     sqlx::query("UPDATE applications SET allow_password_grant = ? WHERE id = ?")
         .bind(allowed)
         .bind(&app.id)
@@ -681,7 +686,7 @@ pub fn parse_certificate(pem: &str) -> anyhow::Result<ParsedCertificate> {
 
 /// Register a certificate credential. Returns its thumbprint (`key_id`).
 pub async fn add_key_credential(
-    pool: &SqlitePool,
+    pool: &DbPool,
     app: &Application,
     cert_pem: &str,
     display_name: Option<&str>,
@@ -710,7 +715,7 @@ pub async fn add_key_credential(
     Ok(cert.key_id)
 }
 
-pub async fn key_credentials(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<KeyCredential>> {
+pub async fn key_credentials(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<KeyCredential>> {
     Ok(sqlx::query_as::<_, KeyCredential>(
         "SELECT key_id, display_name, public_n, public_e, not_before, not_after
          FROM app_key_credentials WHERE application_id = ? ORDER BY created_at",
@@ -720,7 +725,7 @@ pub async fn key_credentials(pool: &SqlitePool, app: &Application) -> anyhow::Re
     .await?)
 }
 
-pub async fn remove_key_credential(pool: &SqlitePool, app: &Application, key_id: &str) -> anyhow::Result<bool> {
+pub async fn remove_key_credential(pool: &DbPool, app: &Application, key_id: &str) -> anyhow::Result<bool> {
     let done = sqlx::query("DELETE FROM app_key_credentials WHERE application_id = ? AND key_id = ?")
         .bind(&app.id)
         .bind(key_id)

@@ -1,11 +1,11 @@
 use anyhow::{Context, bail};
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use crate::tenant::Tenant;
 use crate::util::{new_guid, now};
 
 pub async fn create(
-    pool: &SqlitePool,
+    pool: &DbPool,
     tenant: &Tenant,
     name: &str,
     description: Option<&str>,
@@ -26,7 +26,7 @@ pub async fn create(
     Ok(id)
 }
 
-pub async fn add_member(pool: &SqlitePool, tenant: &Tenant, group: &str, upn: &str) -> anyhow::Result<()> {
+pub async fn add_member(pool: &DbPool, tenant: &Tenant, group: &str, upn: &str) -> anyhow::Result<()> {
     let group_id: Option<(String,)> = sqlx::query_as("SELECT id FROM groups WHERE tenant_id = ? AND name = ?")
         .bind(&tenant.id)
         .bind(group)
@@ -48,7 +48,7 @@ pub async fn add_member(pool: &SqlitePool, tenant: &Tenant, group: &str, upn: &s
 }
 
 /// Names of the user's groups (the `groups` claim).
-pub async fn names_for_user(pool: &SqlitePool, user_id: &str) -> anyhow::Result<Vec<String>> {
+pub async fn names_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT g.name FROM groups g JOIN group_members m ON m.group_id = g.id WHERE m.user_id = ? ORDER BY g.name",
     )

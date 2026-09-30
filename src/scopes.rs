@@ -9,7 +9,7 @@
 //!   Graph's appId as audience, and that token is what `/oidc/userinfo` accepts.
 //!   Bare names like `User.Read` are Graph scopes, as in Entra.
 
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use crate::apps::{self, Application, ServicePrincipal};
 use crate::error::AadError;
@@ -59,7 +59,7 @@ fn invalid_scope(scope: &str) -> AadError {
     )
 }
 
-pub async fn resolve(pool: &SqlitePool, tenant: &Tenant, scope: &str) -> Result<Grant, AadError> {
+pub async fn resolve(pool: &DbPool, tenant: &Tenant, scope: &str) -> Result<Grant, AadError> {
     let mut oidc = Vec::new();
     let mut graph_scopes: Vec<String> = Vec::new();
     // (identifier as requested, resolved resource, requested values)

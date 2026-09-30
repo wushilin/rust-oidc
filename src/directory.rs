@@ -1,7 +1,7 @@
 //! Built-in directory roles. Template ids are Microsoft's well-known GUIDs, so
 //! apps that check the `wids` claim behave the same as against Entra ID.
 
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 pub struct DirectoryRole {
     pub template_id: &'static str,
@@ -49,7 +49,7 @@ pub fn find(name_or_id: &str) -> Option<&'static DirectoryRole> {
 
 /// `wids`: the directory roles this user holds in `tenant_id`, derived from role
 /// bindings. Roles without a Microsoft template id (ours alone) are not `wids`.
-pub async fn wids_for_user(pool: &SqlitePool, tenant_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
+pub async fn wids_for_user(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
     let bindings = crate::admin::bindings::effective_for_user(pool, user_id).await?;
     let mut out: Vec<String> = bindings
         .iter()

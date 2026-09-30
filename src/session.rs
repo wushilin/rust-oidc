@@ -7,7 +7,7 @@
 //! double-submit token on the login form.
 
 use axum::http::{HeaderMap, HeaderValue, header};
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use crate::config::PublicUrl;
 use crate::util::{b64url, now, random_bytes, sha256_hex};
@@ -52,7 +52,7 @@ pub fn new_token() -> String {
     b64url(&random_bytes(32))
 }
 
-pub async fn find(pool: &SqlitePool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<Option<Session>> {
+pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<Option<Session>> {
     let Some(cookie) = cookie(headers, SESSION_COOKIE) else {
         return Ok(None);
     };
@@ -76,7 +76,7 @@ pub async fn find(pool: &SqlitePool, headers: &HeaderMap, tenant_id: &str) -> an
 /// cookie if it has one, so sessions in other tenants are kept. Returns the
 /// cookie value to set.
 pub async fn create(
-    pool: &SqlitePool,
+    pool: &DbPool,
     headers: &HeaderMap,
     tenant_id: &str,
     user_id: &str,
@@ -104,7 +104,7 @@ pub async fn create(
     Ok(cookie)
 }
 
-pub async fn end(pool: &SqlitePool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {
+pub async fn end(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {
     if let Some(cookie) = cookie(headers, SESSION_COOKIE) {
         sqlx::query("DELETE FROM sessions WHERE cookie_hash = ? AND tenant_id = ?")
             .bind(sha256_hex(cookie.as_bytes()))
@@ -116,7 +116,7 @@ pub async fn end(pool: &SqlitePool, headers: &HeaderMap, tenant_id: &str) -> any
 }
 
 /// Whether this browser still has a session in any tenant.
-pub async fn has_any(pool: &SqlitePool, headers: &HeaderMap) -> anyhow::Result<bool> {
+pub async fn has_any(pool: &DbPool, headers: &HeaderMap) -> anyhow::Result<bool> {
     let Some(cookie) = cookie(headers, SESSION_COOKIE) else {
         return Ok(false);
     };

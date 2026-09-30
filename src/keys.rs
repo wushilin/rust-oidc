@@ -17,7 +17,7 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::traits::PublicKeyParts;
 use serde::Serialize;
 use sha1::{Digest, Sha1};
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 use tokio::sync::RwLock;
 
 use crate::util::{b64, b64url, now};
@@ -73,12 +73,12 @@ impl LoadedKey {
 }
 
 pub struct KeyStore {
-    pool: SqlitePool,
+    pool: DbPool,
     cache: RwLock<Option<(Instant, Arc<Vec<LoadedKey>>)>>,
 }
 
 impl KeyStore {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: DbPool) -> Self {
         Self {
             pool,
             cache: RwLock::new(None),
@@ -141,7 +141,7 @@ impl KeyStore {
     }
 }
 
-async fn load_keys(pool: &SqlitePool) -> anyhow::Result<Vec<LoadedKey>> {
+async fn load_keys(pool: &DbPool) -> anyhow::Result<Vec<LoadedKey>> {
     let rows: Vec<(String, String, Vec<u8>, String)> = sqlx::query_as(
         "SELECT kid, private_key_pem, cert_der, status FROM signing_keys
          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'next' THEN 1 ELSE 2 END, created_at DESC",
@@ -166,7 +166,7 @@ async fn load_keys(pool: &SqlitePool) -> anyhow::Result<Vec<LoadedKey>> {
 }
 
 /// Generate a key + self-signed certificate and store it with `status`.
-pub async fn generate(pool: &SqlitePool, status: &str) -> anyhow::Result<String> {
+pub async fn generate(pool: &DbPool, status: &str) -> anyhow::Result<String> {
     let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     let mut dn = DistinguishedName::new();
@@ -195,7 +195,7 @@ pub async fn generate(pool: &SqlitePool, status: &str) -> anyhow::Result<String>
 }
 
 /// Make sure there is an active key and a pre-published next key.
-pub async fn ensure(pool: &SqlitePool) -> anyhow::Result<()> {
+pub async fn ensure(pool: &DbPool) -> anyhow::Result<()> {
     let count = |status: &'static str| async move {
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM signing_keys WHERE status = ?")
             .bind(status)
@@ -214,7 +214,7 @@ pub async fn ensure(pool: &SqlitePool) -> anyhow::Result<()> {
 
 /// active -> retired, next -> active, new next. The new active key was already
 /// published as `next`, so clients that cache JWKS have had time to see it.
-pub async fn rotate(pool: &SqlitePool) -> anyhow::Result<()> {
+pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
     ensure(pool).await?;
     let mut tx = pool.begin().await?;
     sqlx::query("UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'")
@@ -233,7 +233,7 @@ pub async fn rotate(pool: &SqlitePool) -> anyhow::Result<()> {
 }
 
 /// Delete keys retired more than `older_than_secs` ago (must exceed token lifetimes).
-pub async fn prune(pool: &SqlitePool, older_than_secs: i64) -> anyhow::Result<u64> {
+pub async fn prune(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
     let res = sqlx::query("DELETE FROM signing_keys WHERE status = 'retired' AND retired_at < ?")
         .bind(now() - older_than_secs)
         .execute(pool)

@@ -1,6 +1,6 @@
 use anyhow::{Context, anyhow, bail};
 use argon2::{Argon2, PasswordHasher};
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use crate::tenant::{self, Tenant};
 use crate::util::{new_guid, now};
@@ -22,7 +22,7 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 }
 
 /// Like Entra, a UPN must be `local@domain` where `domain` is verified in the tenant.
-pub async fn validate_upn(pool: &SqlitePool, tenant: &Tenant, upn: &str) -> anyhow::Result<String> {
+pub async fn validate_upn(pool: &DbPool, tenant: &Tenant, upn: &str) -> anyhow::Result<String> {
     let upn = upn.trim();
     let Some((local, domain)) = upn.rsplit_once('@') else {
         bail!("UPN '{upn}' must be in the form user@domain");
@@ -37,7 +37,7 @@ pub async fn validate_upn(pool: &SqlitePool, tenant: &Tenant, upn: &str) -> anyh
     Ok(format!("{local}@{domain}"))
 }
 
-pub async fn create(pool: &SqlitePool, tenant: &Tenant, user: NewUser<'_>) -> anyhow::Result<String> {
+pub async fn create(pool: &DbPool, tenant: &Tenant, user: NewUser<'_>) -> anyhow::Result<String> {
     let upn = validate_upn(pool, tenant, user.upn).await?;
     if user.password.chars().count() < 8 {
         bail!("password must be at least 8 characters");
@@ -70,14 +70,16 @@ pub struct User {
     pub tenant_id: String,
     pub upn: String,
     pub email: Option<String>,
+    #[sqlx(try_from = "crate::db::Flag")]
     pub email_verified: bool,
     pub display_name: Option<String>,
     pub given_name: Option<String>,
     pub family_name: Option<String>,
+    #[sqlx(try_from = "crate::db::Flag")]
     pub enabled: bool,
 }
 
-pub async fn find(pool: &SqlitePool, tenant_id: &str, user_id: &str) -> anyhow::Result<Option<User>> {
+pub async fn find(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<Option<User>> {
     Ok(sqlx::query_as(
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users WHERE tenant_id = ? AND id = ?",
@@ -110,11 +112,12 @@ fn lockout_secs(failures: i64) -> i64 {
 static DUMMY_HASH: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| hash_password("not-a-real-password").expect("argon2"));
 
-pub async fn authenticate(pool: &SqlitePool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<AuthResult> {
+pub async fn authenticate(pool: &DbPool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<AuthResult> {
     #[derive(sqlx::FromRow)]
     struct Row {
         id: String,
         password_hash: Option<String>,
+        #[sqlx(try_from = "crate::db::Flag")]
         enabled: bool,
         failed_logins: i64,
         locked_until: Option<i64>,
@@ -166,7 +169,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default().verify_password(password.as_bytes(), hash).is_ok()
 }
 
-pub async fn set_password(pool: &SqlitePool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<()> {
+pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<()> {
     if password.chars().count() < 8 {
         bail!("password must be at least 8 characters");
     }

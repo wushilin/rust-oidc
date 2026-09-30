@@ -2,18 +2,18 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 use tokio::sync::OnceCell;
 
 use crate::util::{b64url, now, random_bytes};
 
 pub struct Secrets {
-    pool: SqlitePool,
+    pool: DbPool,
     pairwise: OnceCell<Vec<u8>>,
 }
 
 impl Secrets {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: DbPool) -> Self {
         Self {
             pool,
             pairwise: OnceCell::new(),
@@ -35,7 +35,7 @@ impl Secrets {
     }
 }
 
-async fn load_or_create(pool: &SqlitePool, name: &str) -> anyhow::Result<Vec<u8>> {
+async fn load_or_create(pool: &DbPool, name: &str) -> anyhow::Result<Vec<u8>> {
     sqlx::query("INSERT OR IGNORE INTO server_secrets (name, value, created_at) VALUES (?, ?, ?)")
         .bind(name)
         .bind(random_bytes(32))

@@ -1,6 +1,7 @@
 //! Storage for role bindings, and expansion into effective grants.
 
-use sqlx::{Row, SqlitePool};
+use crate::db::DbPool;
+use sqlx::Row;
 
 use crate::rbac::{EffectiveBinding, RoleId, Scope, ScopeKind};
 use crate::util::{new_guid, now};
@@ -38,7 +39,7 @@ pub struct StoredBinding {
 }
 
 pub async fn create(
-    pool: &SqlitePool,
+    pool: &DbPool,
     principal_type: PrincipalType,
     principal_id: &str,
     role: RoleId,
@@ -73,7 +74,7 @@ pub async fn create(
     Ok(id)
 }
 
-pub async fn delete(pool: &SqlitePool, binding_id: &str) -> anyhow::Result<bool> {
+pub async fn delete(pool: &DbPool, binding_id: &str) -> anyhow::Result<bool> {
     let done = sqlx::query("DELETE FROM role_bindings WHERE id = ?")
         .bind(binding_id)
         .execute(pool)
@@ -83,7 +84,7 @@ pub async fn delete(pool: &SqlitePool, binding_id: &str) -> anyhow::Result<bool>
 
 /// Scope rows join `tenants`, so a binding naming a deleted tenant yields no
 /// tenant ids and therefore grants nothing.
-async fn scope_of(pool: &SqlitePool, binding_id: &str, kind: ScopeKind) -> anyhow::Result<Scope> {
+async fn scope_of(pool: &DbPool, binding_id: &str, kind: ScopeKind) -> anyhow::Result<Scope> {
     match kind {
         ScopeKind::All => Ok(Scope::All),
         ScopeKind::Tenants => {
@@ -102,7 +103,7 @@ async fn scope_of(pool: &SqlitePool, binding_id: &str, kind: ScopeKind) -> anyho
 
 /// Every binding held by the user directly or through a group they belong to.
 /// Recomputed on each call: never cache this in a session.
-pub async fn effective_for_user(pool: &SqlitePool, user_id: &str) -> anyhow::Result<Vec<EffectiveBinding>> {
+pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<EffectiveBinding>> {
     let rows = sqlx::query(
         "SELECT id, role_id, scope_kind FROM role_bindings
          WHERE (principal_type = ?2 AND principal_id = ?1)
@@ -132,7 +133,7 @@ pub async fn effective_for_user(pool: &SqlitePool, user_id: &str) -> anyhow::Res
     Ok(out)
 }
 
-pub async fn list_all(pool: &SqlitePool) -> anyhow::Result<Vec<StoredBinding>> {
+pub async fn list_all(pool: &DbPool) -> anyhow::Result<Vec<StoredBinding>> {
     let rows = sqlx::query(
         "SELECT id, principal_type, principal_id, role_id, scope_kind FROM role_bindings ORDER BY created_at",
     )
@@ -141,7 +142,7 @@ pub async fn list_all(pool: &SqlitePool) -> anyhow::Result<Vec<StoredBinding>> {
     hydrate(pool, rows).await
 }
 
-pub async fn list_for_tenant(pool: &SqlitePool, tenant_id: &str) -> anyhow::Result<Vec<StoredBinding>> {
+pub async fn list_for_tenant(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<StoredBinding>> {
     let rows = sqlx::query(
         "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
          FROM role_bindings b
@@ -156,7 +157,7 @@ pub async fn list_for_tenant(pool: &SqlitePool, tenant_id: &str) -> anyhow::Resu
     hydrate(pool, rows).await
 }
 
-async fn hydrate(pool: &SqlitePool, rows: Vec<sqlx::sqlite::SqliteRow>) -> anyhow::Result<Vec<StoredBinding>> {
+async fn hydrate(pool: &DbPool, rows: Vec<sqlx::any::AnyRow>) -> anyhow::Result<Vec<StoredBinding>> {
     let mut out = Vec::new();
     for row in rows {
         let id: String = row.get("id");

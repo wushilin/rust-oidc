@@ -7,11 +7,11 @@ use rust_oidc::config::PublicUrl;
 use rust_oidc::tenant::{self, Tenant};
 use rust_oidc::{AppState, db, keys, routes};
 use serde_json::Value;
-use sqlx::SqlitePool;
+use rust_oidc::db::DbPool;
 
 pub struct TestServer {
     pub base: String,
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     pub http: reqwest::Client,
     _dir: tempfile::TempDir,
 }

@@ -1,6 +1,7 @@
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use crate::db::DbPool;
+use sqlx::FromRow;
 
 use crate::util::{is_guid, new_guid, now};
 
@@ -38,7 +39,9 @@ pub struct Tenant {
 struct TenantRow {
     id: String,
     name: String,
+    #[sqlx(try_from = "crate::db::Flag")]
     is_root: bool,
+    #[sqlx(try_from = "crate::db::Flag")]
     enabled: bool,
     settings: String,
 }
@@ -57,7 +60,7 @@ impl From<TenantRow> for Tenant {
 
 /// Resolve the `{tenant}` path segment: a tenant GUID or one of its verified
 /// domains. Deleted and disabled tenants do not resolve.
-pub async fn resolve(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<Tenant>> {
+pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> = if is_guid(key) {
         sqlx::query_as(
             "SELECT id, name, is_root, enabled, settings FROM tenants
@@ -79,7 +82,7 @@ pub async fn resolve(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<Tena
     Ok(row.map(Tenant::from))
 }
 
-pub async fn root(pool: &SqlitePool) -> anyhow::Result<Option<Tenant>> {
+pub async fn root(pool: &DbPool) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> =
         sqlx::query_as("SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = 1")
             .fetch_optional(pool)
@@ -87,7 +90,7 @@ pub async fn root(pool: &SqlitePool) -> anyhow::Result<Option<Tenant>> {
     Ok(row.map(Tenant::from))
 }
 
-pub async fn list(pool: &SqlitePool) -> anyhow::Result<Vec<(Tenant, Vec<String>)>> {
+pub async fn list(pool: &DbPool) -> anyhow::Result<Vec<(Tenant, Vec<String>)>> {
     let rows: Vec<TenantRow> = sqlx::query_as(
         "SELECT id, name, is_root, enabled, settings FROM tenants
          WHERE deleted_at IS NULL ORDER BY is_root DESC, created_at",
@@ -103,7 +106,7 @@ pub async fn list(pool: &SqlitePool) -> anyhow::Result<Vec<(Tenant, Vec<String>)
     Ok(out)
 }
 
-pub async fn domains(pool: &SqlitePool, tenant_id: &str) -> anyhow::Result<Vec<String>> {
+pub async fn domains(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain")
             .bind(tenant_id)
@@ -130,7 +133,7 @@ pub fn normalize_domain(domain: &str) -> anyhow::Result<String> {
     Ok(d)
 }
 
-pub async fn create(pool: &SqlitePool, name: &str, domain: &str, is_root: bool) -> anyhow::Result<Tenant> {
+pub async fn create(pool: &DbPool, name: &str, domain: &str, is_root: bool) -> anyhow::Result<Tenant> {
     let domain = normalize_domain(domain)?;
     let id = new_guid();
     let settings = TenantSettings::default();
@@ -154,7 +157,7 @@ pub async fn create(pool: &SqlitePool, name: &str, domain: &str, is_root: bool) 
     })
 }
 
-pub async fn add_domain(pool: &SqlitePool, tenant_id: &str, domain: &str) -> anyhow::Result<()> {
+pub async fn add_domain(pool: &DbPool, tenant_id: &str, domain: &str) -> anyhow::Result<()> {
     let domain = normalize_domain(domain)?;
     let mut tx = pool.begin().await?;
     insert_domain(&mut tx, tenant_id, &domain, false).await?;
@@ -163,7 +166,7 @@ pub async fn add_domain(pool: &SqlitePool, tenant_id: &str, domain: &str) -> any
 }
 
 async fn insert_domain(
-    tx: &mut sqlx::SqliteConnection,
+    tx: &mut sqlx::AnyConnection,
     tenant_id: &str,
     domain: &str,
     is_default: bool,
@@ -186,7 +189,7 @@ async fn insert_domain(
 }
 
 /// Resolve a tenant for CLI use; unlike [`resolve`] this also finds disabled tenants.
-pub async fn find_for_admin(pool: &SqlitePool, key: &str) -> anyhow::Result<Tenant> {
+pub async fn find_for_admin(pool: &DbPool, key: &str) -> anyhow::Result<Tenant> {
     let row: Option<TenantRow> = sqlx::query_as(
         "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
          WHERE t.deleted_at IS NULL AND (t.id = ?1 COLLATE NOCASE

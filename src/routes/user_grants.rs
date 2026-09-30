@@ -626,7 +626,19 @@ pub async fn password(
     )
     .await;
     let user = match outcome {
-        users::AuthResult::Ok(user) => user,
+        users::AuthResult::Ok(user) => {
+            // The browser and device flows both audit a successful sign-in; without
+            // this one, a password verified through ROPC leaves only `token.issued`,
+            // so "when did this user last authenticate" is unanswerable for a client
+            // that uses the password grant. No session is created, so no
+            // `session.create` belongs here.
+            let details = serde_json::json!({
+                "via": Channel::Ropc.as_str(),
+                "clientId": client.app.app_id,
+            });
+            audit::record(st, &tenant.id, &user.id, Event::SignIn, Some(&user.id), details).await;
+            user
+        }
         // An unknown user and a wrong password give the same answer, so the token
         // endpoint cannot be used to discover which accounts exist.
         users::AuthResult::InvalidCredentials => {

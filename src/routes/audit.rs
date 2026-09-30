@@ -17,7 +17,10 @@ use crate::AppState;
 use crate::users::{AuthResult, AuthTrace};
 
 /// Actor for events where no user or client has been identified, such as a
-/// failed sign-in for an unknown account. The submitted name goes in `details`.
+/// failed sign-in for an unknown account. The submitted name is deliberately
+/// *not* recorded: an identifier that did not resolve is not an identifier, so
+/// it may hold anything the caller typed. See [`sign_in_failure`] and
+/// [`ClientFailures::fail`].
 pub const ANONYMOUS: &str = "anonymous";
 
 /// Longest attacker-supplied string kept in `details`.
@@ -74,6 +77,8 @@ pub enum Channel {
     Device,
     /// The password grant at the token endpoint.
     Ropc,
+    /// The RP-initiated logout endpoint.
+    EndSession,
 }
 
 impl Channel {
@@ -82,6 +87,7 @@ impl Channel {
             Self::Authorize => "authorize",
             Self::Device => "device",
             Self::Ropc => "password_grant",
+            Self::EndSession => "end_session",
         }
     }
 }
@@ -123,6 +129,56 @@ impl Reason {
     }
 }
 
+/// Why a password check failed. Distinguishes an unknown account from a wrong
+/// password in the log even though the HTTP response cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInReason {
+    Locked,
+    Disabled,
+    BadPassword,
+    UnknownUser,
+}
+
+impl SignInReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Disabled => "disabled",
+            Self::BadPassword => "bad_password",
+            Self::UnknownUser => "unknown_user",
+        }
+    }
+}
+
+/// The shape of a client id that did not resolve. Recorded instead of the value
+/// itself, which is caller text and may be a credential (see
+/// [`ClientFailures::fail`]). One bit of diagnostics, no content: it separates
+/// "a well-formed id we do not know" from "something that is not an id at all",
+/// which is what a transposed `client_id`/`client_secret` pair looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimedShape {
+    Guid,
+    Other,
+}
+
+impl ClaimedShape {
+    pub fn of(claimed: &str) -> Self {
+        let guid = claimed.len() == 36
+            && claimed.chars().enumerate().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => c == '-',
+                _ => c.is_ascii_hexdigit(),
+            });
+        if guid { Self::Guid } else { Self::Other }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Guid => "guid",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Reports failed client authentication for one request. Each `fail` audits
 /// and hands the error back, so a call site reads
 /// `return Err(failures.fail(.., err).await)`. The error is returned
@@ -131,7 +187,8 @@ pub struct ClientFailures<'a> {
     pub st: &'a AppState,
     pub tenant_id: &'a str,
     pub event: Event,
-    /// The client id as claimed by the request. Unverified, so clipped.
+    /// The client id as claimed by the request. Unverified caller text, so only
+    /// its [`ClaimedShape`] is ever recorded, never the value.
     pub claimed: &'a str,
 }
 
@@ -144,7 +201,18 @@ impl ClientFailures<'_> {
         reason: Reason,
         err: crate::error::AadError,
     ) -> crate::error::AadError {
-        let details = serde_json::json!({ "reason": reason.as_str(), "clientId": clip(self.claimed) });
+        // The claimed id is only safe to log once it has resolved to an app,
+        // because then it is our own registered value. Before that it is
+        // whatever the caller put in the field: a client that transposes
+        // client_id and client_secret -- in the body or in the username half of
+        // a Basic credential -- would otherwise write its secret here verbatim,
+        // and a secret is short enough to survive `clip` intact. Same rule the
+        // sign-in path applies to a submitted UPN.
+        let mut details = serde_json::json!({ "reason": reason.as_str() });
+        match app_id {
+            Some(id) => details["clientId"] = id.into(),
+            None => details["claimedShape"] = ClaimedShape::of(self.claimed).as_str().into(),
+        }
         record(
             self.st,
             self.tenant_id,
@@ -197,10 +265,10 @@ pub async fn sign_in_failure(
 ) {
     let reason = match (result, trace.user_id.is_some()) {
         (AuthResult::Ok(_), _) => return,
-        (AuthResult::Locked, _) => "locked",
-        (AuthResult::Disabled, _) => "disabled",
-        (AuthResult::InvalidCredentials, true) => "bad_password",
-        (AuthResult::InvalidCredentials, false) => "unknown_user",
+        (AuthResult::Locked, _) => SignInReason::Locked,
+        (AuthResult::Disabled, _) => SignInReason::Disabled,
+        (AuthResult::InvalidCredentials, true) => SignInReason::BadPassword,
+        (AuthResult::InvalidCredentials, false) => SignInReason::UnknownUser,
     };
     // A known account is the actor; otherwise the submitted name is only data.
     // For the password grant the authenticated client stands in.
@@ -214,7 +282,7 @@ pub async fn sign_in_failure(
     // the domain, and only when it is one of this tenant's own: that is our
     // public data, so it cannot be a fragment of what the user typed.
     let mut details = serde_json::json!({
-        "reason": reason,
+        "reason": reason.as_str(),
         "via": channel.as_str(),
         "clientId": client_id,
     });

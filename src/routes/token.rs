@@ -243,10 +243,13 @@ pub(super) async fn authenticate_confidential_client(
         event: Event::TokenClientAuthFailed,
         claimed: &client_id,
     };
+    // An app registered elsewhere but with no service principal in this tenant is
+    // still a known app, so audit its real id rather than the claimed string.
+    let registered = app.as_ref().map(|a| a.app_id.clone());
     let (Some(app), Some(sp)) = (app, sp) else {
         return Err(failures
             .fail(
-                None,
+                registered.as_deref(),
                 Reason::UnknownClient,
                 AadError::app_not_found(&client_id, &tenant.id),
             )

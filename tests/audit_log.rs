@@ -36,7 +36,10 @@ async fn rows(s: &TestServer, tenant_id: &str, action: &str) -> Vec<Row> {
         .collect()
 }
 
-/// Every audit row of the tenant, serialized, to search for leaked secrets.
+/// Every audit row of the tenant, to search for leaked secrets. Columns are
+/// concatenated raw: `{:?}` would escape a quote, a backslash or a non-ASCII
+/// character in the haystack but not in the needle, so a leaked value
+/// containing one would sit in the table while the assertion passed.
 async fn everything(s: &TestServer, tenant_id: &str) -> String {
     let all: Vec<RawRow> = sqlx::query_as(rust_oidc::db::q(
         &s.pool,
@@ -46,7 +49,17 @@ async fn everything(s: &TestServer, tenant_id: &str) -> String {
     .fetch_all(&s.pool)
     .await
     .unwrap();
-    format!("{all:?}")
+    all.into_iter()
+        .map(|(actor, action, target, details)| {
+            format!(
+                "{actor}\n{}\n{}\n{}",
+                action.unwrap_or_default(),
+                target.unwrap_or_default(),
+                details.unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn authorize_params<'a>(f: &'a UserFixture, scope: &'a str, challenge: &'a str) -> Vec<(&'a str, &'a str)> {
@@ -224,6 +237,129 @@ async fn bad_client_secret_is_audited() {
     assert_eq!(failed[0].actor, f.web.app_id);
     assert_eq!(failed[0].details["reason"], "invalid_secret");
     assert!(!everything(&s, &f.tenant.id).await.contains("definitely-wrong-secret"));
+}
+
+/// A client that swaps its id and secret sends the secret in the `client_id`
+/// field, where it does not resolve to any app. The audit row must record that
+/// something unrecognised was presented without keeping the value: it is a
+/// credential, and short enough to survive clipping intact.
+#[tokio::test]
+async fn transposed_client_credentials_do_not_leak_the_secret() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let scope = format!("api://{}/.default", f.api.app_id);
+    let secret = f.web.secret.clone();
+
+    // The secret in the client_id slot, via the form body.
+    let (status, _) = s
+        .token(
+            &f.tenant.id,
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", &secret),
+                ("client_secret", &f.web.app_id),
+                ("scope", &scope),
+            ],
+        )
+        .await;
+    // An unregistered client id is "application not found", which Entra answers
+    // with 400, unlike a wrong secret (401).
+    assert_eq!(status, 400);
+
+    // And via the username half of a Basic credential, which is the other way
+    // round a client library can build the pair.
+    let resp = s
+        .http
+        .post(s.url(&format!("/{}/oauth2/v2.0/token", f.tenant.id)))
+        .basic_auth(&secret, Some(&f.web.app_id))
+        .form(&[("grant_type", "client_credentials"), ("scope", &scope)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+
+    // The security property first, so a regression reports the leak itself rather
+    // than tripping over a diagnostic field on the way.
+    let log = everything(&s, &f.tenant.id).await;
+    assert!(!log.contains(&secret), "the client secret reached the audit log: {log}");
+
+    let failed = rows(&s, &f.tenant.id, "token.client_auth_failed").await;
+    assert_eq!(failed.len(), 2);
+    for row in &failed {
+        assert_eq!(row.actor, rust_oidc::routes::audit::ANONYMOUS);
+        assert_eq!(row.target, None);
+        assert_eq!(row.details["reason"], "unknown_client");
+        // Recorded instead of the value: a secret is not GUID-shaped, so this
+        // distinguishes a transposition from an id we simply do not know.
+        assert_eq!(row.details["claimedShape"], "other");
+        assert_eq!(row.details["clientId"], Value::Null);
+    }
+}
+
+/// A password verified through ROPC is a sign-in. Without its own event the log
+/// would hold only `token.issued`, and "when did this user last authenticate"
+/// would be unanswerable for any client using the password grant.
+#[tokio::test]
+async fn a_successful_password_grant_is_audited_as_a_sign_in() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let app = rust_oidc::apps::find_in_tenant(&s.pool, &f.tenant, &f.web.app_id)
+        .await
+        .unwrap();
+    rust_oidc::apps::set_password_grant_allowed(&s.pool, &app, true)
+        .await
+        .unwrap();
+
+    let (status, _) = s
+        .token(
+            &f.tenant.id,
+            &[
+                ("grant_type", "password"),
+                ("client_id", &f.web.app_id),
+                ("client_secret", &f.web.secret),
+                ("username", &f.upn),
+                ("password", &f.password),
+                ("scope", "openid"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let signed_in = rows(&s, &f.tenant.id, "auth.sign_in").await;
+    assert_eq!(signed_in.len(), 1);
+    assert_eq!(signed_in[0].actor, f.user_id);
+    assert_eq!(signed_in[0].target.as_deref(), Some(f.user_id.as_str()));
+    assert_eq!(signed_in[0].details["via"], "password_grant");
+    assert_eq!(signed_in[0].details["clientId"], f.web.app_id);
+    // No browser session exists for this grant, so none is recorded.
+    assert!(rows(&s, &f.tenant.id, "session.create").await.is_empty());
+    assert!(!everything(&s, &f.tenant.id).await.contains(&f.password));
+}
+
+/// The counterpart: a well-formed id that happens not to be registered is
+/// reported as such, so the shape field is a real diagnostic and not a constant.
+#[tokio::test]
+async fn an_unregistered_guid_client_id_is_recorded_as_a_guid() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let unknown = "11111111-2222-3333-4444-555555555555";
+    let (status, _) = s
+        .token(
+            &f.tenant.id,
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", unknown),
+                ("client_secret", "irrelevant"),
+                ("scope", "https://graph.microsoft.com/.default"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400);
+    let failed = rows(&s, &f.tenant.id, "token.client_auth_failed").await;
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].details["claimedShape"], "guid");
+    // Still not the value itself, even though this one is harmless.
+    assert!(!everything(&s, &f.tenant.id).await.contains(unknown));
 }
 
 #[tokio::test]

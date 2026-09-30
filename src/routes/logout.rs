@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use super::audit::{self, Event};
+use super::audit::{self, Channel, Event};
 use crate::AppState;
 use crate::apps;
 use crate::html;
@@ -54,14 +54,21 @@ pub async fn logout(
         None => None,
     };
     let client_id = get("client_id").map(str::to_string).or(hinted_client);
-    // Attacker-controlled and unvalidated at this point, so clipped.
-    let client_id_for_audit = client_id.as_deref().map(audit::clip);
+    // Resolve the claimed id once. `client_id` is caller text until it names a
+    // real app in this tenant, so only the registered id is ever audited -- the
+    // same rule the token endpoint applies to a claimed client id.
+    let registered = match &client_id {
+        Some(id) => apps::find(&st.pool, id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|app| app.tenant_id == tenant.id),
+        None => None,
+    };
 
     let mut target = None;
-    if let (Some(uri), Some(client_id)) = (get("post_logout_redirect_uri"), client_id)
-        && let Ok(Some(app)) = apps::find(&st.pool, &client_id).await
-        && app.tenant_id == tenant.id
-        && let Ok(Some(_)) = apps::match_redirect_uri(&st.pool, &app, uri).await
+    if let (Some(uri), Some(app)) = (get("post_logout_redirect_uri"), &registered)
+        && let Ok(Some(_)) = apps::match_redirect_uri(&st.pool, app, uri).await
         && let Ok(mut url) = url::Url::parse(uri)
     {
         if let Some(state) = get("state") {
@@ -73,8 +80,8 @@ pub async fn logout(
     // Only a real session ending is an event; anonymous hits on this endpoint are noise.
     if let Some(s) = signed_in {
         let details = serde_json::json!({
-            "via": "end_session",
-            "clientId": client_id_for_audit,
+            "via": Channel::EndSession.as_str(),
+            "clientId": registered.as_ref().map(|app| app.app_id.clone()),
             "redirected": target.is_some(),
         });
         audit::record(

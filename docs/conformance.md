@@ -2,11 +2,19 @@
 
 This records what the official OpenID Foundation conformance suite reports against
 rust-oidc, and which of its complaints we accept rather than fix. It is derived from
-the three plan exports in `~/.cache/rust-oidc-conformance/results` (run 29 Sep 2026):
-the basic, config and form_post certification plans. `compat/conformance/README.md`
-covers how to run them.
+the three plan exports in `~/.cache/rust-oidc-conformance/results` (latest run
+**30 Sep 2026**, superseding 29 Sep): the basic, config and form_post certification
+plans. `compat/conformance/README.md` covers how to run them.
 
 Every module not listed below passed cleanly.
+
+**What the suite actually tests.** `compat/conformance/run.sh` points the suite at the
+*deployed* service (`https://gate.wushilin.net:9443/rust-oidc`), not at a binary built
+from the working tree. At the 30 Sep run that deployment still advertised
+`"response_types_supported": ["code"]`, so it predates commit `bc217fa` (implicit and
+hybrid response types). Every result below is therefore evidence about the deployed
+build, not about `HEAD`. The implicit/hybrid work is covered by `tests/implicit_flow.rs`
+instead, and the certification plans used here exercise only `code` in any case.
 
 ## Why there are accepted deviations
 
@@ -184,4 +192,52 @@ null and the static-client check threw.
 client1's credentials. rust-oidc accepts either method on any confidential client
 (`client_credentials_from_request`, `src/routes/token.rs:180-210`, which also rejects
 presenting both at once with AADSTS50148), as Entra does, so one client covers both.
-This module has not yet been re-run with the corrected config.
+
+**Re-run and confirmed on 30 Sep 2026.** In both plans that contain the module it went
+from one FAILURE to a clean pass:
+
+| Plan | 29 Sep | 30 Sep |
+|---|---|---|
+| `oidcc-basic-certification-test-plan` | FAILURE `GetStaticClientConfiguration` | no failure, no warning |
+| `oidcc-formpost-basic-certification-test-plan` | FAILURE `GetStaticClientConfiguration` | no failure, no warning |
+
+The module's log shows it now reaches the server: the browser automation fills the
+sign-in form, the token request is made with `client_secret_post`, and
+`CallProtectedResource` / `EnsureHttpStatusCodeIs200` both succeed. Nothing else
+changed between the two runs — a per-module diff of all three plans shows this module
+as the only difference.
+
+## Accepted: three Entra extension fields in the discovery document
+
+The config plan raises one WARNING that was present on 29 Sep too but was not recorded
+here: `oidcc-discovery-endpoint-verification` /
+`CheckForUnexpectedParametersInServerMetadata`, against the RFC 8414 schema. Its
+`unknown_properties` list is exactly three fields:
+
+`cloud_instance_name`, `http_logout_supported`, `tenant_region_scope`.
+
+All three are verified present in Entra's own live document (fetched 30 Sep 2026):
+`"cloud_instance_name": "microsoftonline.com"`, `"http_logout_supported": true`,
+`"tenant_region_scope": null`. They are Microsoft extensions, not spec fields, so the
+suite is right that they are unregistered and we are right to emit them. The suite's
+own remedy is to name them in `server.allow_unexpected_metadata_fields`, which
+`make_config.py` now does — listing the three explicitly, so a *fourth* unregistered
+field added by accident in future would still warn.
+
+Re-run to confirm rather than assume: the config plan now reports **0 warnings, 0
+failures** (`oidcc-config-certification-test-plan--qjcSXaU5rJG7f-30-Sep-2026.zip`).
+That plan is now completely clean.
+
+### Two related divergences found in the same comparison
+
+- **`http_logout_supported` and `frontchannel_logout_supported`: Entra says `true`, we
+  say `false`.** Deliberate. Both fields advertise front-channel logout *notification*
+  to registered RPs (the logout iframe); rust-oidc implements RP-initiated logout at
+  `end_session_endpoint` but does not notify other RPs. Advertising `true` would be a
+  false capability claim, which is worse than the divergence. Revisit if front-channel
+  logout notification is ever implemented.
+- **Entra's other extension fields are omitted on purpose:** `cloud_graph_host_name`,
+  `msgraph_host`, `rbac_url`, `kerberos_endpoint`, `mtls_endpoint_aliases`,
+  `tls_client_certificate_bound_access_tokens`. The first four name Microsoft's own
+  services and would be fabrications here; the last two belong with the unimplemented
+  mTLS client authentication recorded above.

@@ -143,4 +143,32 @@ three engines because they happened to carry no placeholders.
 
 **25. The conformance harness reuses client1's credentials for the
 `client_secret_post` block.** rust-oidc accepts either auth method on any confidential
-client, as Entra does, so one client covers both. Not yet re-run against a server.
+client, as Entra does, so one client covers both. **Now verified** (30 Sep 2026):
+`oidcc-server-client-secret-post` went from one FAILURE to a clean pass in both the
+basic and the form_post plan, and a per-module diff of all three plans shows it as the
+only change. See `docs/conformance.md`.
+
+**26. The three Entra extension fields in our discovery document are declared to the
+suite rather than removed.** `cloud_instance_name`, `http_logout_supported` and
+`tenant_region_scope` are flagged by `CheckForUnexpectedParametersInServerMetadata`
+against the RFC 8414 schema. All three are verified present in Entra's own live
+document, so they stay; `make_config.py` names them in
+`server.allow_unexpected_metadata_fields`, which is the suite's documented mechanism.
+They are listed one by one on purpose, not suppressed wholesale, so a fourth
+unregistered field added by accident still warns. Re-ran the config plan to confirm:
+it is now 0 warnings, 0 failures.
+*To reverse:* drop the array from `make_config.py` and accept the warning, or stop
+emitting the fields and diverge from Entra.
+
+**27. `http_logout_supported` and `frontchannel_logout_supported` stay `false`, against
+Entra, which publishes `true` for both.** They advertise front-channel logout
+*notification* to registered RPs; we implement RP-initiated logout only. Advertising a
+capability we do not have is worse than the divergence. *To reverse:* implement
+front-channel logout notification, then flip both in `src/routes/discovery.rs`.
+
+**28. The conformance suite tests the deployed service, not the working tree.**
+`compat/conformance/run.sh` points at `https://gate.wushilin.net:9443/rust-oidc`. At the
+30 Sep run that deployment still advertised `response_types_supported: ["code"]`, so it
+predates commit `bc217fa`. I did **not** redeploy (out of scope), so the results are
+evidence about the deployed build only. Recorded at the top of `docs/conformance.md`
+so a future reader does not over-read them.

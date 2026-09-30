@@ -49,7 +49,19 @@ logout = [{
 config = {
     "alias": "rust-oidc",
     "description": "rust-oidc (Entra ID v2 compatible)",
-    "server": {"discoveryUrl": f"{base}/{fx['tenantId']}/v2.0/.well-known/openid-configuration"},
+    "server": {
+        "discoveryUrl": f"{base}/{fx['tenantId']}/v2.0/.well-known/openid-configuration",
+        # CheckForUnexpectedParametersInServerMetadata validates the discovery document
+        # against the RFC 8414 schema. These three are Microsoft extensions, verified
+        # present in Entra's own live document, so we emit them deliberately; the suite
+        # documents this array as the way to say so. Listed one by one on purpose: a
+        # fourth unregistered field appearing by accident must still raise the warning.
+        "allow_unexpected_metadata_fields": [
+            "cloud_instance_name",
+            "http_logout_supported",
+            "tenant_region_scope",
+        ],
+    },
     "client": {"client_id": fx["client1"]["id"], "client_secret": fx["client1"]["secret"]},
     "client2": {"client_id": fx["client2"]["id"], "client_secret": fx["client2"]["secret"]},
     # The basic/formpost certification plans run one module per client-auth method and

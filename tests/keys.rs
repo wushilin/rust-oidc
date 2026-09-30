@@ -41,3 +41,17 @@ async fn rotation_promotes_prepublished_key_and_keeps_old_one() {
     assert_eq!(keys::prune(&s.pool, 3600).await.unwrap(), 0);
     assert_eq!(keys::prune(&s.pool, -1).await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn concurrent_rotations_leave_exactly_one_active_key_and_do_not_error() {
+    let s = TestServer::start().await;
+    let results = futures::future::join_all((0..4).map(|_| keys::rotate(&s.pool))).await;
+    for r in &results {
+        assert!(r.is_ok(), "rotation failed: {r:?}");
+    }
+    let all = kids(&KeyStore::new(s.pool.clone())).await;
+    let count = |st: &str| all.iter().filter(|(_, s)| s == st).count();
+    assert_eq!(count("active"), 1, "{all:?}");
+    assert!(count("next") >= 1, "a next key stays published: {all:?}");
+    assert_eq!(count("retired"), 4, "each rotation retired one key: {all:?}");
+}

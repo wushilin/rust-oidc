@@ -213,17 +213,52 @@ pub async fn ensure(pool: &DbPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Attempts `rotate` makes before giving up; each retry follows a lost race.
+const ROTATE_ATTEMPTS: usize = 5;
+
 /// active -> retired, next -> active, new next. The new active key was already
 /// published as `next`, so clients that cache JWKS have had time to see it.
+///
+/// Safe under concurrent rotations. The transaction opens with a no-op write to
+/// the active row, which takes that row's lock (Postgres/MySQL: a row lock, so a
+/// second rotation waits and then reads the winner's committed state; SQLite:
+/// the single write lock, taken before any read so the snapshot is fresh). No
+/// `SELECT ... FOR UPDATE`, which SQLite lacks. Each racer then performs its own
+/// rotation in turn. If the winner consumed the last `next` key and has not yet
+/// published a new one, the loser publishes one and retries rather than retiring
+/// the active key with nothing to promote. The unique index on the active key
+/// stays as a backstop, and a violation is retried too.
 pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
-    ensure(pool).await?;
+    for _ in 0..ROTATE_ATTEMPTS {
+        ensure(pool).await?;
+        match try_rotate(pool).await {
+            Ok(true) => {
+                generate(pool, "next").await?;
+                return Ok(());
+            }
+            // Nothing to promote yet: a concurrent rotation used the last `next` key.
+            Ok(false) => {}
+            Err(e)
+                if e.downcast_ref::<sqlx::Error>()
+                    .is_some_and(crate::db::is_unique_violation) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(anyhow!(
+        "key rotation kept losing races with concurrent rotations; try again"
+    ))
+}
+
+/// One rotation attempt. `Ok(false)` means there was no `next` key to promote
+/// and nothing was changed.
+async fn try_rotate(pool: &DbPool) -> anyhow::Result<bool> {
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
+    // Mutex on the active row; see `rotate`.
     sqlx::query(crate::db::sql_stmt(
         engine,
-        "UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'",
+        "UPDATE signing_keys SET status = status WHERE status = 'active'",
     ))
-    .bind(now())
     .execute(&mut *tx)
     .await?;
     // Two statements, not `UPDATE ... WHERE kid = (SELECT ... FROM signing_keys)`:
@@ -232,18 +267,26 @@ pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
         sqlx::query_as("SELECT kid FROM signing_keys WHERE status = 'next' ORDER BY created_at LIMIT 1")
             .fetch_optional(&mut *tx)
             .await?;
-    if let Some((kid,)) = next {
-        sqlx::query(crate::db::sql_stmt(
-            engine,
-            "UPDATE signing_keys SET status = 'active' WHERE kid = ?",
-        ))
-        .bind(kid)
-        .execute(&mut *tx)
-        .await?;
-    }
+    let Some((kid,)) = next else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'",
+    ))
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "UPDATE signing_keys SET status = 'active' WHERE kid = ?",
+    ))
+    .bind(kid)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
-    generate(pool, "next").await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Delete keys retired more than `older_than_secs` ago (must exceed token lifetimes).

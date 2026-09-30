@@ -58,11 +58,12 @@ pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow
     };
     let row: Option<(String, i64, String)> = sqlx::query_as(
         crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT s.user_id, s.auth_time, s.amr FROM sessions s JOIN users u ON u.id = s.user_id
-         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = 1"),
+         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = ?"),
     )
     .bind(sha256_hex(cookie.as_bytes()))
     .bind(tenant_id)
     .bind(now())
+    .bind(true)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(user_id, auth_time, amr)| Session {

@@ -23,6 +23,6 @@ CREATE TABLE device_codes (
     redeemed_at      BIGINT,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX device_codes_user_code ON device_codes(user_code);
 CREATE INDEX device_codes_expires ON device_codes(expires_at);

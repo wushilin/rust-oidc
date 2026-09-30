@@ -9,7 +9,7 @@ CREATE TABLE role_bindings (
     scope_kind     VARCHAR(32) COLLATE utf8mb4_bin NOT NULL,       -- ScopeKind: all | tenants
     created_at     BIGINT NOT NULL,
     created_by     TEXT
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX role_bindings_principal ON role_bindings(principal_type, principal_id);
 
 CREATE TABLE role_binding_tenants (
@@ -18,7 +18,7 @@ CREATE TABLE role_binding_tenants (
     PRIMARY KEY (binding_id, tenant_id),
     FOREIGN KEY (binding_id) REFERENCES role_bindings(id) ON DELETE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Carry existing directory role assignments across as tenant-scoped bindings.
 -- Only User and Group principals: a service principal cannot use the console.
@@ -92,7 +92,7 @@ CREATE TABLE admin_sessions (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (home_tenant) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (acting_tenant) REFERENCES tenants(id) ON DELETE SET NULL
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX admin_sessions_expires ON admin_sessions(expires_at);
 
 -- Soft delete for users, mirroring applications.deleted_at.

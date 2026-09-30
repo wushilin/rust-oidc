@@ -14,7 +14,7 @@
 
 -- The legacy constraints (UNIQUE(tenant_id, upn), UNIQUE(tenant_id, name), the
 -- tenant_domains primary key) sit on columns at the table default
--- utf8mb4_0900_ai_ci, which is accent-insensitive: `jose@x` would be refused as
+-- utf8mb4_unicode_ci, which is accent-insensitive: `jose@x` would be refused as
 -- a duplicate of `josé@x` before the folded index is consulted. The folded
 -- column is the identity authority, so the legacy constraint must be
 -- byte-exact and never reject a pair the folded index considers distinct.

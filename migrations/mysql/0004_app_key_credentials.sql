@@ -15,7 +15,7 @@ CREATE TABLE app_key_credentials (
     not_after      BIGINT NOT NULL,
     PRIMARY KEY (application_id, key_id),
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Replay protection for client assertions: a `jti` may be presented once while
 -- the assertion is still within its lifetime. Rows are pruned once expired.
@@ -24,5 +24,5 @@ CREATE TABLE client_assertion_jti (
     client_app_id VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
     expires_at    BIGINT NOT NULL,
     PRIMARY KEY (jti, client_app_id)
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX client_assertion_jti_expires ON client_assertion_jti(expires_at);

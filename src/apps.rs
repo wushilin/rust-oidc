@@ -407,11 +407,12 @@ pub async fn app_roles_for_service_principal(
         crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT r.value, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND a.principal_id = ? AND a.principal_type = 'ServicePrincipal'
-           AND r.enabled = 1
+           AND r.enabled = ?
          ORDER BY r.value"),
     )
     .bind(resource_sp_id)
     .bind(client_sp_id)
+    .bind(true)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -539,8 +540,9 @@ pub async fn add_scope(
 
 pub async fn enabled_scopes(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> =
-        sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT value FROM app_scopes WHERE application_id = ? AND enabled = 1 ORDER BY value"))
+        sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT value FROM app_scopes WHERE application_id = ? AND enabled = ? ORDER BY value"))
             .bind(&app.id)
+            .bind(true)
             .fetch_all(pool)
             .await?;
     Ok(rows.into_iter().map(|(v,)| v).collect())
@@ -552,13 +554,14 @@ pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &s
     let rows: Vec<(String, String)> = sqlx::query_as(
         crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT DISTINCT r.value, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
-         WHERE a.resource_id = ? AND r.enabled = 1
+         WHERE a.resource_id = ? AND r.enabled = ?
            AND ((a.principal_type = 'User' AND a.principal_id = ?)
              OR (a.principal_type = 'Group' AND a.principal_id IN
                    (SELECT group_id FROM group_members WHERE user_id = ?)))
          ORDER BY r.value"),
     )
     .bind(resource_sp_id)
+    .bind(true)
     .bind(user_id)
     .bind(user_id)
     .fetch_all(pool)

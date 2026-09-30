@@ -8,7 +8,7 @@
 -- indexes, so "at most one row where X" is a unique index over a generated
 -- column that is NULL for every other row. Booleans are TINYINT(1).
 --
--- Collation: every table is utf8mb4 with the default utf8mb4_0900_ai_ci, which
+-- Collation: every table is utf8mb4 with the default utf8mb4_unicode_ci, which
 -- is case- AND accent-insensitive. That is right for names (display names, and
 -- upn / domain / group name, which the application folds explicitly) and WRONG
 -- for anything compared for exact equality: redirect and identifier URIs, role
@@ -28,7 +28,7 @@ CREATE TABLE tenants (
     created_at  BIGINT NOT NULL,
     deleted_at  BIGINT,
     single_root TINYINT GENERATED ALWAYS AS (CASE WHEN is_root = 1 THEN 1 END) STORED
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE UNIQUE INDEX tenants_single_root ON tenants(single_root);
 
 -- Verified domains. Like Entra, a domain belongs to exactly one tenant, which is
@@ -39,7 +39,7 @@ CREATE TABLE tenant_domains (
     is_default  TINYINT(1) NOT NULL DEFAULT 0,
     created_at  BIGINT NOT NULL,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX tenant_domains_tenant ON tenant_domains(tenant_id);
 
 CREATE TABLE users (
@@ -57,7 +57,7 @@ CREATE TABLE users (
     updated_at      BIGINT NOT NULL,
     UNIQUE (tenant_id, upn),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `groups` (
     id            VARCHAR(64) COLLATE utf8mb4_bin PRIMARY KEY,       -- object id
@@ -67,7 +67,7 @@ CREATE TABLE `groups` (
     created_at    BIGINT NOT NULL,
     UNIQUE (tenant_id, name),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE group_members (
     group_id    VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
@@ -75,7 +75,7 @@ CREATE TABLE group_members (
     PRIMARY KEY (group_id, user_id),
     FOREIGN KEY (group_id) REFERENCES `groups`(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Built-in directory roles (Global Administrator, ...). role_template_id is
 -- Microsoft's well-known template GUID; emitted in the `wids` claim.
@@ -88,7 +88,7 @@ CREATE TABLE directory_role_assignments (
     PRIMARY KEY (tenant_id, role_template_id, principal_id),
     CHECK (principal_type IN ('User', 'Group', 'ServicePrincipal')),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Application registration (Entra "App registrations"). Owned by its home tenant.
 CREATE TABLE applications (
@@ -100,7 +100,7 @@ CREATE TABLE applications (
     created_at        BIGINT NOT NULL,
     deleted_at        BIGINT,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE app_identifier_uris (
     application_id  VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
@@ -108,7 +108,7 @@ CREATE TABLE app_identifier_uris (
     uri             VARCHAR(512) COLLATE utf8mb4_bin NOT NULL,
     PRIMARY KEY (tenant_id, uri),
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE app_redirect_uris (
     application_id  VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
@@ -117,7 +117,7 @@ CREATE TABLE app_redirect_uris (
     PRIMARY KEY (application_id, platform, uri),
     CHECK (platform IN ('web', 'spa', 'publicClient')),
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Client secrets (Entra "passwordCredentials"). Secrets are high-entropy random
 -- strings, so a SHA-256 hash is sufficient; only the hint is kept in clear.
@@ -131,7 +131,7 @@ CREATE TABLE app_secrets (
     end_at          BIGINT NOT NULL,
     created_at      BIGINT NOT NULL,
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE app_roles (
     id                    VARCHAR(64) COLLATE utf8mb4_bin PRIMARY KEY,
@@ -143,7 +143,7 @@ CREATE TABLE app_roles (
     enabled               TINYINT(1) NOT NULL DEFAULT 1,
     UNIQUE (application_id, value),
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE app_scopes (
     id              VARCHAR(64) COLLATE utf8mb4_bin PRIMARY KEY,
@@ -155,7 +155,7 @@ CREATE TABLE app_scopes (
     UNIQUE (application_id, value),
     CHECK (type IN ('User', 'Admin')),
     FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- The application's identity inside a tenant (Entra "Enterprise applications").
 -- Today there is exactly one, in the home tenant; multi-tenant apps add more.
@@ -169,7 +169,7 @@ CREATE TABLE service_principals (
     UNIQUE (tenant_id, app_id),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (app_id) REFERENCES applications(app_id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE app_role_assignments (
     id              VARCHAR(64) COLLATE utf8mb4_bin PRIMARY KEY,
@@ -184,7 +184,7 @@ CREATE TABLE app_role_assignments (
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (resource_id) REFERENCES service_principals(id) ON DELETE CASCADE,
     FOREIGN KEY (app_role_id) REFERENCES app_roles(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX app_role_assignments_principal ON app_role_assignments(principal_id);
 
 -- Token signing keys, shared by all tenants (as in Entra). Each RSA key is
@@ -199,7 +199,7 @@ CREATE TABLE signing_keys (
     not_after        BIGINT NOT NULL,
     single_active    TINYINT GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN 1 END) STORED,
     CHECK (status IN ('next', 'active', 'retired'))
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE UNIQUE INDEX signing_keys_single_active ON signing_keys(single_active);
 
 CREATE TABLE audit_log (
@@ -210,4 +210,4 @@ CREATE TABLE audit_log (
     target      TEXT,
     details     TEXT,
     created_at  BIGINT NOT NULL
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

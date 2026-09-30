@@ -64,18 +64,20 @@ pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>>
     let row: Option<TenantRow> = if is_guid(key) {
         sqlx::query_as(
             crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id, name, is_root, enabled, settings FROM tenants
-             WHERE id = ? AND deleted_at IS NULL AND enabled = 1"),
+             WHERE id = ? AND deleted_at IS NULL AND enabled = ?"),
         )
         .bind(fold(key))
+        .bind(true)
         .fetch_optional(pool)
         .await?
     } else {
         sqlx::query_as(
             crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
              JOIN tenant_domains d ON d.tenant_id = t.id
-             WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = 1"),
+             WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = ?"),
         )
         .bind(fold(key))
+        .bind(true)
         .fetch_optional(pool)
         .await?
     };
@@ -84,7 +86,11 @@ pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>>
 
 pub async fn root(pool: &DbPool) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> =
-        sqlx::query_as("SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = 1")
+        sqlx::query_as(crate::db::sql_stmt(
+            crate::db::engine_of(pool),
+            "SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = ?",
+        ))
+            .bind(true)
             .fetch_optional(pool)
             .await?;
     Ok(row.map(Tenant::from))

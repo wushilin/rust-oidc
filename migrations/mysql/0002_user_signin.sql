@@ -9,7 +9,7 @@ CREATE TABLE server_secrets (
     name        VARCHAR(255) COLLATE utf8mb4_bin PRIMARY KEY,
     value       LONGBLOB NOT NULL,
     created_at  BIGINT NOT NULL
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Browser sign-in sessions. One browser cookie can hold a session in several
 -- tenants, like Entra's ESTSAUTH cookie. Only a hash of the cookie is stored.
@@ -24,7 +24,7 @@ CREATE TABLE sessions (
     PRIMARY KEY (cookie_hash, tenant_id),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX sessions_user ON sessions(user_id);
 
 CREATE TABLE auth_codes (
@@ -45,7 +45,7 @@ CREATE TABLE auth_codes (
     redeemed_at            BIGINT,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Opaque refresh tokens, rotated on every use. `family_id` groups a chain of
 -- rotations; replaying a rotated token revokes the whole family.
@@ -66,6 +66,6 @@ CREATE TABLE refresh_tokens (
     revoked_at      BIGINT,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE INDEX refresh_tokens_family ON refresh_tokens(family_id);
 CREATE INDEX refresh_tokens_user ON refresh_tokens(user_id);

@@ -1,9 +1,16 @@
 //! The migration must carry existing directory role assignments across.
+//!
+//! DELIBERATELY SQLite-ONLY, not an oversight. The tests named `sqlite_*` test
+//! migration MECHANICS: they apply `migrations/sqlite/*.sql` by `include_str!`
+//! and inspect `sqlite_master`. Both are engine-specific. The postgres and mysql
+//! sets are kept in step by `migration_drift.rs` (role arms) and by the
+//! per-engine suite run; a per-engine copy of these tests is not worth the
+//! maintenance. `effective_bindings_*` is engine-neutral behaviour.
 mod common;
 use common::*;
 
 #[tokio::test]
-async fn a_fresh_database_has_the_new_schema_and_no_old_table() {
+async fn sqlite_fresh_database_has_the_new_schema_and_no_old_table() {
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
 
@@ -84,7 +91,7 @@ const USER_ADMIN: &str = "fe930be7-5e62-47db-91af-98c3a49a38b1";
 /// Runs the real migration SQL over real rows: 0001..0005 by hand, seed the old
 /// schema, then 0006. The normal migrator is deliberately not used.
 #[tokio::test]
-async fn migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_root_admins() {
+async fn sqlite_migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_root_admins() {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     let dir = tempfile::tempdir().unwrap();
     let opts = SqliteConnectOptions::new()

@@ -5,13 +5,17 @@
 # provisions a tenant, an API app with app roles and a client app with a secret,
 # then runs the MSAL Python and MSAL Node suites.
 #
-# Usage: compat/run.sh [python|node|rp]...   (default: all)
+# Usage: compat/run.sh [python|node|rp|kafka]...   (default: all)
+#
+# The kafka suite needs podman and is skipped when it is not installed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPAT="$ROOT/compat"
-PORT="${PORT:-18443}"
-SUITES=("${@:-python node rp}")
+# 18443 is taken by the conformance suite's nginx (compat/conformance), and the
+# server now binds 0.0.0.0 for the Kafka container, so the two would collide.
+PORT="${PORT:-18444}"
+SUITES=("${@:-python node rp kafka}")
 SUITES=(${SUITES[@]})
 
 WORK="$(mktemp -d)"
@@ -29,7 +33,8 @@ export RUST_LOG="${RUST_LOG:-warn}"
 json() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
 
 # ---- fixtures ----
-"$BIN" dev-cert --out "$WORK/tls" --names localhost,127.0.0.1 >/dev/null
+# host.containers.internal is how the Kafka container reaches this server.
+"$BIN" dev-cert --out "$WORK/tls" --names localhost,127.0.0.1,host.containers.internal >/dev/null
 RUST_OIDC_PASSWORD='Compat-Admin-1!' "$BIN" bootstrap --domain root.test --admin-upn admin@root.test >/dev/null
 TENANT_DOMAIN="contoso.test"
 TENANT_ID=$("$BIN" tenant create --name Contoso --domain "$TENANT_DOMAIN" | json '["tenantId"]')
@@ -54,9 +59,29 @@ WEB_REDIRECT_URI="https://app.contoso.test/callback"
 "$BIN" app add-redirect-uri --tenant "$TENANT_DOMAIN" --app "$WEB_APP_ID" --platform web --uri "$WEB_REDIRECT_URI"
 WEB_SECRET=$("$BIN" app secret add --tenant "$TENANT_DOMAIN" --app "$WEB_APP_ID" --days 1 | json '["secretText"]')
 
+# ---- fixtures for the phase-5 grants ----
+# ROPC is opt-in per app, so turn it on deliberately for the web app.
+"$BIN" app password-grant --tenant "$TENANT_DOMAIN" --app "$WEB_APP_ID" --allowed true >/dev/null
+# The middle tier needs its own credential to perform on-behalf-of, and a
+# downstream API to exchange the user's token for.
+API_SECRET=$("$BIN" app secret add --tenant "$TENANT_DOMAIN" --app "$API_APP_ID" --days 1 | json '["secretText"]')
+DOWNSTREAM_APP_ID=$("$BIN" app create --tenant "$TENANT_DOMAIN" --name reports-api | json '["appId"]')
+"$BIN" app add-scope --tenant "$TENANT_DOMAIN" --app "$DOWNSTREAM_APP_ID" --value Reports.Read >/dev/null
+# A certificate credential, so MSAL can authenticate with private_key_jwt. MSAL
+# derives x5t from the hex thumbprint, which independently checks our convention.
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/client-key.pem" \
+  -out "$WORK/client-cert.pem" -days 2 -subj "/CN=billing-worker" 2>/dev/null
+"$BIN" app key add --tenant "$TENANT_DOMAIN" --app "$CLIENT_APP_ID" \
+  --cert "$WORK/client-cert.pem" --name "compat cert" >/dev/null
+CLIENT_CERT_KEY="$WORK/client-key.pem"
+CLIENT_CERT_THUMBPRINT=$(openssl x509 -in "$WORK/client-cert.pem" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
+
 # ---- server ----
 export RUST_OIDC_BASE="https://localhost:$PORT/rust-oidc"
-"$BIN" serve --bind "127.0.0.1:$PORT" --public-url "$RUST_OIDC_BASE" \
+# Bound to [::] so the Kafka container can reach it via the host gateway and the
+# Node suites still connect over ::1: Node 18 resolves localhost to IPv6 first
+# and does not fall back, so an IPv4-only bind fails with ECONNREFUSED ::1.
+"$BIN" serve --bind "[::]:$PORT" --public-url "$RUST_OIDC_BASE" \
   --tls-mode files --tls-cert "$WORK/tls/cert.pem" --tls-key "$WORK/tls/key.pem" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
@@ -65,10 +90,20 @@ for _ in $(seq 1 50); do
 done
 curl -sf --cacert "$WORK/tls/cert.pem" "$RUST_OIDC_BASE/healthz" >/dev/null || { cat "$WORK/server.log"; exit 1; }
 
+export PORT
 export TENANT_ID TENANT_DOMAIN API_APP_ID CLIENT_APP_ID CLIENT_SECRET
+export API_SECRET DOWNSTREAM_APP_ID CLIENT_CERT_KEY CLIENT_CERT_THUMBPRINT
 export USER_UPN USER_PASSWORD WEB_APP_ID WEB_SECRET WEB_REDIRECT_URI
 export CA_FILE="$WORK/tls/cert.pem"
 export EXPECTED_ROLES="Orders.Read,Orders.Write"
+
+# jose and oauth4webapi use the WebCrypto global, which Node 18 exposes in ESM
+# only behind a flag (it is unflagged from Node 19). Without this both Node
+# suites die with "ReferenceError: crypto is not defined".
+NODE_FLAGS=()
+if [[ "$(node -p 'process.versions.node.split(".")[0]')" -lt 19 ]]; then
+  NODE_FLAGS=(--experimental-global-webcrypto)
+fi
 
 status=0
 for suite in "${SUITES[@]}"; do
@@ -81,14 +116,18 @@ for suite in "${SUITES[@]}"; do
       }
       "$COMPAT/.venv/bin/python" "$COMPAT/msal-python/test_app_auth.py" || status=1
       "$COMPAT/.venv/bin/python" "$COMPAT/msal-python/test_user_auth.py" || status=1
+      "$COMPAT/.venv/bin/python" "$COMPAT/msal-python/test_new_grants.py" || status=1
       ;;
     node)
       [[ -d "$COMPAT/msal-node/node_modules" ]] || (cd "$COMPAT/msal-node" && npm ci --silent)
-      NODE_EXTRA_CA_CERTS="$CA_FILE" node "$COMPAT/msal-node/test_app_auth.mjs" || status=1
+      NODE_EXTRA_CA_CERTS="$CA_FILE" node "${NODE_FLAGS[@]}" "$COMPAT/msal-node/test_app_auth.mjs" || status=1
       ;;
     rp)
       [[ -d "$COMPAT/openid-client/node_modules" ]] || (cd "$COMPAT/openid-client" && npm ci --silent)
-      NODE_EXTRA_CA_CERTS="$CA_FILE" node "$COMPAT/openid-client/test_rp.mjs" || status=1
+      NODE_EXTRA_CA_CERTS="$CA_FILE" node "${NODE_FLAGS[@]}" "$COMPAT/openid-client/test_rp.mjs" || status=1
+      ;;
+    kafka)
+      "$COMPAT/kafka/test_oauthbearer.sh" || status=1
       ;;
     *) echo "unknown suite: $suite"; status=1 ;;
   esac

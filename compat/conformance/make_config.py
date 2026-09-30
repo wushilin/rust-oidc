@@ -52,6 +52,12 @@ config = {
     "server": {"discoveryUrl": f"{base}/{fx['tenantId']}/v2.0/.well-known/openid-configuration"},
     "client": {"client_id": fx["client1"]["id"], "client_secret": fx["client1"]["secret"]},
     "client2": {"client_id": fx["client2"]["id"], "client_secret": fx["client2"]["secret"]},
+    # The basic/formpost certification plans run one module per client-auth method and
+    # OIDCCServerTestClientSecretPost overwrites config.client with config.client_secret_post,
+    # so the key must exist or the module dies at GetStaticClientConfiguration before it ever
+    # reaches the server. rust-oidc accepts either method on any confidential client (as Entra
+    # does), so client1 can serve both.
+    "client_secret_post": {"client_id": fx["client1"]["id"], "client_secret": fx["client1"]["secret"]},
     "browser": flow() + logout,
     "override": {
         "oidcc-prompt-login": {"browser": flow("update-image-placeholder-optional")},

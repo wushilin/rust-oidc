@@ -1,5 +1,7 @@
 # OpenID Foundation conformance suite
 
+Results, accepted deviations and open gaps: `docs/conformance.md`.
+
 Runs the official OIDF conformance suite (prebuilt images, dev mode) against a
 deployed rust-oidc using podman.
 

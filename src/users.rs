@@ -1,6 +1,6 @@
+use crate::db::DbPool;
 use anyhow::{Context, anyhow, bail};
 use argon2::{Argon2, PasswordHasher};
-use crate::db::DbPool;
 
 use crate::tenant::{self, Tenant};
 use crate::util::{new_guid, now};
@@ -44,11 +44,12 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, user: NewUser<'_>) -> anyhow
     }
     let id = new_guid();
     let ts = now();
-    sqlx::query(
-        crate::db::q(pool, "INSERT INTO users (id, tenant_id, upn, upn_folded, email, email_verified, display_name, given_name,
+    sqlx::query(crate::db::q(
+        pool,
+        "INSERT INTO users (id, tenant_id, upn, upn_folded, email, email_verified, display_name, given_name,
                             family_name, password_hash, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
-    )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ))
     .bind(&id)
     .bind(&tenant.id)
     .bind(&upn)
@@ -83,10 +84,11 @@ pub struct User {
 }
 
 pub async fn find(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<Option<User>> {
-    Ok(sqlx::query_as(
-        crate::db::q(pool, "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
-         FROM users WHERE tenant_id = ? AND id = ?"),
-    )
+    Ok(sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
+         FROM users WHERE tenant_id = ? AND id = ?",
+    ))
     .bind(tenant_id)
     .bind(user_id)
     .fetch_optional(pool)
@@ -148,21 +150,27 @@ pub async fn authenticate(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
     if !ok {
         let failures = row.failed_logins + 1;
         let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
-        sqlx::query(crate::db::q(pool, "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?"))
-            .bind(failures)
-            .bind(locked_until)
-            .bind(&row.id)
-            .execute(pool)
-            .await?;
+        sqlx::query(crate::db::q(
+            pool,
+            "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?",
+        ))
+        .bind(failures)
+        .bind(locked_until)
+        .bind(&row.id)
+        .execute(pool)
+        .await?;
         return Ok(AuthResult::InvalidCredentials);
     }
     if !row.enabled {
         return Ok(AuthResult::Disabled);
     }
-    sqlx::query(crate::db::q(pool, "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?"))
-        .bind(&row.id)
-        .execute(pool)
-        .await?;
+    sqlx::query(crate::db::q(
+        pool,
+        "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?",
+    ))
+    .bind(&row.id)
+    .execute(pool)
+    .await?;
     let user = find(pool, &tenant.id, &row.id).await?.context("user vanished")?;
     Ok(AuthResult::Ok(user))
 }
@@ -176,10 +184,11 @@ pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
     if password.chars().count() < 8 {
         bail!("password must be at least 8 characters");
     }
-    let res = sqlx::query(
-        crate::db::q(pool, "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
-         WHERE tenant_id = ? AND upn_folded = ?"),
-    )
+    let res = sqlx::query(crate::db::q(
+        pool,
+        "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
+         WHERE tenant_id = ? AND upn_folded = ?",
+    ))
     .bind(hash_password(password)?)
     .bind(now())
     .bind(&tenant.id)
@@ -190,16 +199,22 @@ pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
         bail!("user '{upn}' not found");
     }
     // As in Entra, a password reset revokes the user's refresh tokens and sessions.
-    let user: (String,) = sqlx::query_as(crate::db::q(pool, "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ?"))
-        .bind(&tenant.id)
-        .bind(crate::util::fold(upn))
-        .fetch_one(pool)
-        .await?;
-    sqlx::query(crate::db::q(pool, "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL"))
-        .bind(now())
-        .bind(&user.0)
-        .execute(pool)
-        .await?;
+    let user: (String,) = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ?",
+    ))
+    .bind(&tenant.id)
+    .bind(crate::util::fold(upn))
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(crate::db::q(
+        pool,
+        "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+    ))
+    .bind(now())
+    .bind(&user.0)
+    .execute(pool)
+    .await?;
     sqlx::query(crate::db::q(pool, "DELETE FROM sessions WHERE user_id = ?"))
         .bind(&user.0)
         .execute(pool)

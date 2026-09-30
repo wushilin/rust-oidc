@@ -282,7 +282,11 @@ async fn thumbprint_is_matched_across_spellings() {
             .unwrap();
         raw.iter().map(|b| format!("{b:02X}")).collect::<String>()
     };
-    for (label, spelling) in [("padded base64url", padded), ("standard base64", standard), ("hex", hex)] {
+    for (label, spelling) in [
+        ("padded base64url", padded),
+        ("standard base64", standard),
+        ("hex", hex),
+    ] {
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         header.x5t = Some(spelling.clone());
         let now = std::time::SystemTime::now()

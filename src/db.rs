@@ -1,9 +1,9 @@
 use std::sync::Once;
 use std::time::Duration;
 
+use sqlx::Executor;
 use sqlx::any::{AnyPoolOptions, AnyTypeInfo, AnyTypeInfoKind, AnyValueRef};
 use sqlx::pool::PoolConnectionMetadata;
-use sqlx::Executor;
 
 /// The one place an engine is named. Everything above this module uses `DbPool`.
 pub type Db = sqlx::Any;
@@ -252,7 +252,11 @@ pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
                     "  table {} (unique per {}{}): folded value '{folded}' is claimed by {} rows:\n{rows}",
                     plan.table,
                     plan.scope_desc,
-                    if scope.is_empty() { String::new() } else { format!(" = '{scope}'") },
+                    if scope.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" = '{scope}'")
+                    },
                     members.len(),
                 ));
             }
@@ -279,7 +283,11 @@ pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
     let fixed = writes.len();
     let mut tx = pool.begin().await?;
     for (update, key, want) in writes {
-        sqlx::query(sql_stmt(engine, update)).bind(want).bind(key).execute(&mut *tx).await?;
+        sqlx::query(sql_stmt(engine, update))
+            .bind(want)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(fixed)

@@ -231,10 +231,7 @@ pub fn device_approval(p: &DeviceApproval) -> Response {
     let scopes = if p.scopes.is_empty() {
         String::new()
     } else {
-        format!(
-            r#"<p class="code">Permissions: {}</p>"#,
-            escape(&p.scopes.join(", "))
-        )
+        format!(r#"<p class="code">Permissions: {}</p>"#, escape(&p.scopes.join(", ")))
     };
     let body = format!(
         r#"<h1>Are you trying to sign in to {client}?</h1>
@@ -258,10 +255,6 @@ pub fn device_approval(p: &DeviceApproval) -> Response {
 
 /// Terminal page for the device flow: approved, or declined.
 pub fn device_result(tenant_name: Option<&str>, heading: &str, message: &str) -> Response {
-    let body = format!(
-        r#"<h1>{}</h1><p class="sub">{}</p>"#,
-        escape(heading),
-        escape(message)
-    );
+    let body = format!(r#"<h1>{}</h1><p class="sub">{}</p>"#, escape(heading), escape(message));
     respond(StatusCode::OK, page(heading, tenant_name, &body), CSP_DEFAULT)
 }

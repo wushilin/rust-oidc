@@ -102,11 +102,12 @@ pub async fn authorization_code(
     params: &Params,
 ) -> Result<Response, AadError> {
     let code = param(params, "code").ok_or_else(|| AadError::missing_parameter("code"))?;
-    let row: Option<CodeRow> = sqlx::query_as(
-        crate::db::q(&st.pool, "SELECT code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce, code_challenge,
+    let row: Option<CodeRow> = sqlx::query_as(crate::db::q(
+        &st.pool,
+        "SELECT code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce, code_challenge,
                 code_challenge_method, auth_time, amr, expires_at, redeemed_at
-         FROM auth_codes WHERE code_hash = ?"),
-    )
+         FROM auth_codes WHERE code_hash = ?",
+    ))
     .bind(sha256_hex(code.as_bytes()))
     .fetch_optional(&st.pool)
     .await?;
@@ -154,11 +155,14 @@ pub async fn authorization_code(
         }
     }
     // Single use, race-safe: only one redemption can flip redeemed_at.
-    let res = sqlx::query(crate::db::q(&st.pool, "UPDATE auth_codes SET redeemed_at = ? WHERE code_hash = ? AND redeemed_at IS NULL"))
-        .bind(now())
-        .bind(&row.code_hash)
-        .execute(&st.pool)
-        .await?;
+    let res = sqlx::query(crate::db::q(
+        &st.pool,
+        "UPDATE auth_codes SET redeemed_at = ? WHERE code_hash = ? AND redeemed_at IS NULL",
+    ))
+    .bind(now())
+    .bind(&row.code_hash)
+    .execute(&st.pool)
+    .await?;
     if res.rows_affected() != 1 {
         return Err(AadError::invalid_grant(
             54005,
@@ -215,11 +219,12 @@ pub async fn refresh_token(
     params: &Params,
 ) -> Result<Response, AadError> {
     let token = param(params, "refresh_token").ok_or_else(|| AadError::missing_parameter("refresh_token"))?;
-    let row: Option<RefreshRow> = sqlx::query_as(
-        crate::db::q(&st.pool, "SELECT token_hash, family_id, tenant_id, client_app_id, platform, user_id, scope, auth_time, amr,
+    let row: Option<RefreshRow> = sqlx::query_as(crate::db::q(
+        &st.pool,
+        "SELECT token_hash, family_id, tenant_id, client_app_id, platform, user_id, scope, auth_time, amr,
                 expires_at, used_at, revoked_at
-         FROM refresh_tokens WHERE token_hash = ?"),
-    )
+         FROM refresh_tokens WHERE token_hash = ?",
+    ))
     .bind(sha256_hex(token.as_bytes()))
     .fetch_optional(&st.pool)
     .await?;
@@ -252,11 +257,14 @@ pub async fn refresh_token(
             AadError::invalid_grant(700082, "The refresh token has expired due to inactivity.")
         });
     }
-    let res = sqlx::query(crate::db::q(&st.pool, "UPDATE refresh_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL"))
-        .bind(now())
-        .bind(&row.token_hash)
-        .execute(&st.pool)
-        .await?;
+    let res = sqlx::query(crate::db::q(
+        &st.pool,
+        "UPDATE refresh_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+    ))
+    .bind(now())
+    .bind(&row.token_hash)
+    .execute(&st.pool)
+    .await?;
     if res.rows_affected() != 1 {
         revoke_family(st, &row.family_id).await?;
         return Err(revoked());
@@ -351,11 +359,12 @@ pub(super) async fn issue(
                 tenant.settings.refresh_token_lifetime_secs
             },
         );
-        sqlx::query(
-            crate::db::q(&st.pool, "INSERT INTO refresh_tokens (token_hash, family_id, code_hash, tenant_id, client_app_id, platform, user_id,
+        sqlx::query(crate::db::q(
+            &st.pool,
+            "INSERT INTO refresh_tokens (token_hash, family_id, code_hash, tenant_id, client_app_id, platform, user_id,
                                          scope, auth_time, amr, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ))
         .bind(sha256_hex(refresh.as_bytes()))
         .bind(&family.id)
         .bind(&family.code_hash)
@@ -387,11 +396,14 @@ pub(super) async fn issue(
 }
 
 async fn revoke_family(st: &AppState, family_id: &str) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(&st.pool, "UPDATE refresh_tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL"))
-        .bind(now())
-        .bind(family_id)
-        .execute(&st.pool)
-        .await?;
+    sqlx::query(crate::db::q(
+        &st.pool,
+        "UPDATE refresh_tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL",
+    ))
+    .bind(now())
+    .bind(family_id)
+    .execute(&st.pool)
+    .await?;
     Ok(())
 }
 
@@ -430,12 +442,14 @@ pub async fn on_behalf_of(
     // The middle tier must prove who it is; the user token alone is not enough.
     let client = authenticate_confidential_client(st, tenant, headers, params).await?;
 
-    let requested = param(params, "requested_token_use")
-        .ok_or_else(|| AadError::missing_parameter("requested_token_use"))?;
+    let requested =
+        param(params, "requested_token_use").ok_or_else(|| AadError::missing_parameter("requested_token_use"))?;
     if requested != REQUESTED_TOKEN_USE_OBO {
         return Err(AadError::invalid_request(
             500131,
-            format!("The value '{requested}' for 'requested_token_use' is not valid. Expected '{REQUESTED_TOKEN_USE_OBO}'."),
+            format!(
+                "The value '{requested}' for 'requested_token_use' is not valid. Expected '{REQUESTED_TOKEN_USE_OBO}'."
+            ),
         ));
     }
 
@@ -551,7 +565,10 @@ pub async fn password(
             ));
         }
         users::AuthResult::Disabled => {
-            return Err(AadError::invalid_grant(50057, "AADSTS50057: The user account is disabled."));
+            return Err(AadError::invalid_grant(
+                50057,
+                "AADSTS50057: The user account is disabled.",
+            ));
         }
     };
 

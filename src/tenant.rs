@@ -1,6 +1,6 @@
+use crate::db::DbPool;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
-use crate::db::DbPool;
 use sqlx::FromRow;
 
 use crate::util::{fold, is_guid, new_guid, now};
@@ -62,20 +62,22 @@ impl From<TenantRow> for Tenant {
 /// domains. Deleted and disabled tenants do not resolve.
 pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> = if is_guid(key) {
-        sqlx::query_as(
-            crate::db::q(pool, "SELECT id, name, is_root, enabled, settings FROM tenants
-             WHERE id = ? AND deleted_at IS NULL AND enabled = ?"),
-        )
+        sqlx::query_as(crate::db::q(
+            pool,
+            "SELECT id, name, is_root, enabled, settings FROM tenants
+             WHERE id = ? AND deleted_at IS NULL AND enabled = ?",
+        ))
         .bind(fold(key))
         .bind(true)
         .fetch_optional(pool)
         .await?
     } else {
-        sqlx::query_as(
-            crate::db::q(pool, "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
+        sqlx::query_as(crate::db::q(
+            pool,
+            "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
              JOIN tenant_domains d ON d.tenant_id = t.id
-             WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = ?"),
-        )
+             WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = ?",
+        ))
         .bind(fold(key))
         .bind(true)
         .fetch_optional(pool)
@@ -85,12 +87,13 @@ pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>>
 }
 
 pub async fn root(pool: &DbPool) -> anyhow::Result<Option<Tenant>> {
-    let row: Option<TenantRow> =
-        sqlx::query_as(crate::db::q(pool, "SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = ?",
-        ))
-            .bind(true)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<TenantRow> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = ?",
+    ))
+    .bind(true)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(Tenant::from))
 }
 
@@ -111,11 +114,13 @@ pub async fn list(pool: &DbPool) -> anyhow::Result<Vec<(Tenant, Vec<String>)>> {
 }
 
 pub async fn domains(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as(crate::db::q(pool, "SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain"))
-            .bind(tenant_id)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String,)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain",
+    ))
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(|(d,)| d).collect())
 }
 
@@ -143,15 +148,18 @@ pub async fn create(pool: &DbPool, name: &str, domain: &str, is_root: bool) -> a
     let settings = TenantSettings::default();
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
-    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO tenants (id, name, is_root, enabled, settings, created_at) VALUES (?, ?, ?, ?, ?, ?)"))
-        .bind(&id)
-        .bind(name)
-        .bind(is_root)
-        .bind(true)
-        .bind(serde_json::to_string(&settings)?)
-        .bind(now())
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "INSERT INTO tenants (id, name, is_root, enabled, settings, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ))
+    .bind(&id)
+    .bind(name)
+    .bind(is_root)
+    .bind(true)
+    .bind(serde_json::to_string(&settings)?)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
     insert_domain(&mut tx, engine, &id, &domain, true).await?;
     tx.commit().await?;
     Ok(Tenant {
@@ -179,31 +187,38 @@ async fn insert_domain(
     domain: &str,
     is_default: bool,
 ) -> anyhow::Result<()> {
-    let taken: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(engine, "SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?"))
-        .bind(fold(domain))
-        .fetch_optional(&mut *tx)
-        .await?;
+    let taken: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?",
+    ))
+    .bind(fold(domain))
+    .fetch_optional(&mut *tx)
+    .await?;
     if taken.is_some() {
         bail!("domain '{domain}' is already registered to a tenant");
     }
-    sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO tenant_domains (domain, domain_folded, tenant_id, is_default, created_at) VALUES (?, ?, ?, ?, ?)"))
-        .bind(domain)
-        .bind(fold(domain))
-        .bind(tenant_id)
-        .bind(is_default)
-        .bind(now())
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "INSERT INTO tenant_domains (domain, domain_folded, tenant_id, is_default, created_at) VALUES (?, ?, ?, ?, ?)",
+    ))
+    .bind(domain)
+    .bind(fold(domain))
+    .bind(tenant_id)
+    .bind(is_default)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 
 /// Resolve a tenant for CLI use; unlike [`resolve`] this also finds disabled tenants.
 pub async fn find_for_admin(pool: &DbPool, key: &str) -> anyhow::Result<Tenant> {
-    let row: Option<TenantRow> = sqlx::query_as(
-        crate::db::q(pool, "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
+    let row: Option<TenantRow> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
          WHERE t.deleted_at IS NULL AND (t.id = ?
-               OR t.id IN (SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?))"),
-    )
+               OR t.id IN (SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?))",
+    ))
     .bind(fold(key))
     .bind(fold(key))
     .fetch_optional(pool)

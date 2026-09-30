@@ -4,10 +4,10 @@ use std::net::SocketAddr;
 
 use rust_oidc::apps::{self, Principal};
 use rust_oidc::config::PublicUrl;
+use rust_oidc::db::DbPool;
 use rust_oidc::tenant::{self, Tenant};
 use rust_oidc::{AppState, db, keys, routes};
 use serde_json::Value;
-use rust_oidc::db::DbPool;
 
 pub struct TestServer {
     pub base: String,
@@ -28,9 +28,12 @@ impl TestServer {
             Ok(raw) => db::Engine::parse(&raw).unwrap_or_else(|| panic!("{ENV_SERVER_ENGINE}={raw} is not an engine")),
             Err(_) => db::Engine::Sqlite,
         };
-        let guard = pool_for(engine)
-            .await
-            .unwrap_or_else(|| panic!("{ENV_SERVER_ENGINE}={} but its database env var is not set", engine.as_str()));
+        let guard = pool_for(engine).await.unwrap_or_else(|| {
+            panic!(
+                "{ENV_SERVER_ENGINE}={} but its database env var is not set",
+                engine.as_str()
+            )
+        });
         let pool = (*guard).clone();
         keys::ensure(&pool).await.unwrap();
 
@@ -389,7 +392,10 @@ impl Drop for EnginePool {
                 // owning runtime, which is blocked on this thread's join, so it deadlocks.
                 // Instead the drop terminates the pool's sessions itself (PG `FORCE`).
                 let _ = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(drop_database(&admin, &name));
                 })
                 .join();
@@ -403,14 +409,18 @@ fn database_url(admin: &str, name: &str) -> String {
         Some((b, q)) => (b, format!("?{q}")),
         None => (admin, String::new()),
     };
-    let (server, _) = base.rsplit_once('/').expect("admin URL needs a path: scheme://user:pw@host:port/db");
+    let (server, _) = base
+        .rsplit_once('/')
+        .expect("admin URL needs a path: scheme://user:pw@host:port/db");
     format!("{server}/{name}{query}")
 }
 
 async fn admin_connection(admin: &str) -> sqlx::AnyConnection {
     use sqlx::Connection;
     db::install_drivers();
-    sqlx::AnyConnection::connect(admin).await.expect("cannot reach the admin database")
+    sqlx::AnyConnection::connect(admin)
+        .await
+        .expect("cannot reach the admin database")
 }
 
 async fn drop_database(admin: &str, name: &str) {
@@ -440,7 +450,10 @@ async fn drop_database(admin: &str, name: &str) {
             eprintln!("could not drop test database {name}: {e}");
         }
     };
-    if tokio::time::timeout(std::time::Duration::from_secs(30), work).await.is_err() {
+    if tokio::time::timeout(std::time::Duration::from_secs(30), work)
+        .await
+        .is_err()
+    {
         eprintln!("timed out dropping test database {name}");
     }
 }
@@ -459,26 +472,41 @@ async fn fresh_server_database(engine: db::Engine, admin: &str, migrate: bool) -
         db::Engine::MySql => format!("CREATE DATABASE {name} CHARACTER SET utf8mb4"),
         _ => format!("CREATE DATABASE {name}"),
     };
-    conn.execute(sqlx::AssertSqlSafe(create)).await.expect("create test database");
+    conn.execute(sqlx::AssertSqlSafe(create))
+        .await
+        .expect("create test database");
     drop(conn);
     let url = database_url(admin, &name);
     let pool = if migrate {
         db::connect(&url).await.expect("connect + migrate")
     } else {
-        sqlx::any::AnyPoolOptions::new().max_connections(2).connect(&url).await.expect("connect")
+        sqlx::any::AnyPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect")
     };
-    EnginePool { pool, cleanup: Cleanup::Database(admin.to_string(), name) }
+    EnginePool {
+        pool,
+        cleanup: Cleanup::Database(admin.to_string(), name),
+    }
 }
 
 fn rand_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos()
+    )
 }
 
 async fn fresh_sqlite() -> EnginePool {
     let dir = tempfile::tempdir().unwrap().keep();
     let url = format!("sqlite://{}", dir.join("engine.db").display());
-    EnginePool { pool: db::connect(&url).await.unwrap(), cleanup: Cleanup::Dir(dir) }
+    EnginePool {
+        pool: db::connect(&url).await.unwrap(),
+        cleanup: Cleanup::Dir(dir),
+    }
 }
 
 /// A fresh pool on one specific engine, or `None` when that engine is not configured.
@@ -504,9 +532,16 @@ pub async fn blank_pool_for(engine: db::Engine) -> Option<EnginePool> {
             let dir = tempfile::tempdir().unwrap().keep();
             db::install_drivers();
             let url = format!("sqlite://{}?mode=rwc", dir.join("blank.db").display());
-            let pool = sqlx::any::AnyPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+            let pool = sqlx::any::AnyPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap();
             sqlx::raw_sql("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
-            Some(EnginePool { pool, cleanup: Cleanup::Dir(dir) })
+            Some(EnginePool {
+                pool,
+                cleanup: Cleanup::Dir(dir),
+            })
         }
         db::Engine::Postgres => match std::env::var(ENV_POSTGRES) {
             Ok(admin) => Some(fresh_server_database(engine, &admin, false).await),
@@ -529,7 +564,11 @@ pub async fn all_engine_pools() -> Vec<EnginePool> {
         match pool_for(*engine).await {
             Some(p) => pools.push(p),
             None => {
-                let var = if *engine == db::Engine::Postgres { ENV_POSTGRES } else { ENV_MYSQL };
+                let var = if *engine == db::Engine::Postgres {
+                    ENV_POSTGRES
+                } else {
+                    ENV_MYSQL
+                };
                 // Straight to the stderr handle: `eprintln!` is swallowed by the test
                 // harness's output capture on passing tests, which would defeat the point.
                 use std::io::Write;

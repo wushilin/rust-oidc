@@ -55,16 +55,22 @@ async fn migration_0006_keeps_each_role_scoped_to_its_own_tenant_and_promotes_ro
         let e = engine_of(&pool);
         assert_eq!(e, *engine);
         for sql in before_0006(e) {
-            sqlx::raw_sql(sql).execute(&*pool).await.unwrap_or_else(|err| panic!("{}: {err}", e.as_str()));
-        }
-        for (id, root) in [("root", true), ("t1", false), ("t2", false), ("t3", false)] {
-            sqlx::query(sql_stmt(e, "INSERT INTO tenants (id, name, is_root, created_at) VALUES (?, ?, ?, 0)"))
-                .bind(id)
-                .bind(id)
-                .bind(root)
+            sqlx::raw_sql(sql)
                 .execute(&*pool)
                 .await
-                .unwrap();
+                .unwrap_or_else(|err| panic!("{}: {err}", e.as_str()));
+        }
+        for (id, root) in [("root", true), ("t1", false), ("t2", false), ("t3", false)] {
+            sqlx::query(sql_stmt(
+                e,
+                "INSERT INTO tenants (id, name, is_root, created_at) VALUES (?, ?, ?, 0)",
+            ))
+            .bind(id)
+            .bind(id)
+            .bind(root)
+            .execute(&*pool)
+            .await
+            .unwrap();
         }
         for (tenant, role, principal) in [
             ("t1", GLOBAL_ADMIN, "multi"),
@@ -151,7 +157,11 @@ async fn migration_0006_keeps_each_role_scoped_to_its_own_tenant_and_promotes_ro
         );
         assert_eq!(
             shape("samerole").await,
-            vec![("GlobalAdministrator".to_string(), "tenants".to_string(), s(&["t1", "t2"]))],
+            vec![(
+                "GlobalAdministrator".to_string(),
+                "tenants".to_string(),
+                s(&["t1", "t2"])
+            )],
             "{name}: one binding per (principal, role), holding exactly that pair's tenants"
         );
         let (duplicated,): (i64,) = sqlx::query_as(
@@ -162,7 +172,10 @@ async fn migration_0006_keeps_each_role_scoped_to_its_own_tenant_and_promotes_ro
         .fetch_one(&*pool)
         .await
         .unwrap();
-        assert_eq!(duplicated, 0, "{name}: no (principal, role) pair may have more than one binding");
+        assert_eq!(
+            duplicated, 0,
+            "{name}: no (principal, role) pair may have more than one binding"
+        );
     }
 }
 
@@ -192,8 +205,13 @@ async fn exactly_one_root_tenant_but_any_number_of_others() {
                 .await
                 .unwrap_or_else(|e| panic!("{name}: non-root tenant {i} refused: {e}"));
         }
-        let err = insert_tenant(&pool, "root-2", true).await.expect_err("second root must be refused");
-        assert!(is_unique_violation(&err), "{name}: expected a unique violation, got {err:?}");
+        let err = insert_tenant(&pool, "root-2", true)
+            .await
+            .expect_err("second root must be refused");
+        assert!(
+            is_unique_violation(&err),
+            "{name}: expected a unique violation, got {err:?}"
+        );
     }
 }
 
@@ -225,10 +243,17 @@ async fn exactly_one_active_signing_key_but_any_number_of_others() {
                 .await
                 .unwrap_or_else(|e| panic!("{name}: next key {i} refused: {e}"));
         }
-        let err = insert_key(&pool, "a2", "active").await.expect_err("second active key must be refused");
-        assert!(is_unique_violation(&err), "{name}: expected a unique violation, got {err:?}");
+        let err = insert_key(&pool, "a2", "active")
+            .await
+            .expect_err("second active key must be refused");
+        assert!(
+            is_unique_violation(&err),
+            "{name}: expected a unique violation, got {err:?}"
+        );
         // The rotation path retires the active key and promotes another in one go.
-        rust_oidc::keys::rotate(&pool).await.unwrap_or_else(|e| panic!("{name}: rotate: {e}"));
+        rust_oidc::keys::rotate(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: rotate: {e}"));
     }
 }
 
@@ -242,12 +267,18 @@ async fn unique_violations_are_recognised_and_other_errors_are_not() {
         let dup = insert_tenant(&pool, "dup", false).await.unwrap_err();
         assert!(is_unique_violation(&dup), "{name}: duplicate PK: {dup:?}");
 
-        let null = sqlx::query(sql_stmt(engine_of(&pool), "INSERT INTO tenants (id, name, created_at) VALUES (?, NULL, 0)"))
-            .bind("nn")
-            .execute(&*pool)
-            .await
-            .unwrap_err();
-        assert!(!is_unique_violation(&null), "{name}: NOT NULL misreported as unique: {null:?}");
+        let null = sqlx::query(sql_stmt(
+            engine_of(&pool),
+            "INSERT INTO tenants (id, name, created_at) VALUES (?, NULL, 0)",
+        ))
+        .bind("nn")
+        .execute(&*pool)
+        .await
+        .unwrap_err();
+        assert!(
+            !is_unique_violation(&null),
+            "{name}: NOT NULL misreported as unique: {null:?}"
+        );
     }
 }
 
@@ -257,18 +288,23 @@ async fn unique_violations_are_recognised_and_other_errors_are_not() {
 async fn column_defaults_apply() {
     for pool in common::all_engine_pools().await {
         let e = engine_of(&pool);
-        sqlx::query(sql_stmt(e, "INSERT INTO tenants (id, name, created_at) VALUES (?, ?, 0)"))
-            .bind("d1")
-            .bind("d1")
-            .execute(&*pool)
-            .await
-            .unwrap();
-        let (settings, enabled, root): (String, rust_oidc::db::Flag, rust_oidc::db::Flag) =
-            sqlx::query_as(sql_stmt(e, "SELECT settings, enabled, is_root FROM tenants WHERE id = ?"))
-                .bind("d1")
-                .fetch_one(&*pool)
-                .await
-                .unwrap();
+        sqlx::query(sql_stmt(
+            e,
+            "INSERT INTO tenants (id, name, created_at) VALUES (?, ?, 0)",
+        ))
+        .bind("d1")
+        .bind("d1")
+        .execute(&*pool)
+        .await
+        .unwrap();
+        let (settings, enabled, root): (String, rust_oidc::db::Flag, rust_oidc::db::Flag) = sqlx::query_as(sql_stmt(
+            e,
+            "SELECT settings, enabled, is_root FROM tenants WHERE id = ?",
+        ))
+        .bind("d1")
+        .fetch_one(&*pool)
+        .await
+        .unwrap();
         assert_eq!(settings, "{}", "{}", e.as_str());
         assert!(bool::from(enabled), "{}: enabled defaults to true", e.as_str());
         assert!(!bool::from(root), "{}: is_root defaults to false", e.as_str());
@@ -282,16 +318,22 @@ async fn accented_and_plain_identities_are_distinct_on_every_engine() {
     use rust_oidc::users::{NewUser, create};
     for pool in common::all_engine_pools().await {
         let name = engine_of(&pool).as_str();
-        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.test", false).await.unwrap();
+        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.test", false)
+            .await
+            .unwrap();
         for upn in ["jose@contoso.test", "josé@contoso.test"] {
-            create(&pool, &t, NewUser {
-                upn,
-                email: None,
-                display_name: None,
-                given_name: None,
-                family_name: None,
-                password: "Correct-Horse-9",
-            })
+            create(
+                &pool,
+                &t,
+                NewUser {
+                    upn,
+                    email: None,
+                    display_name: None,
+                    given_name: None,
+                    family_name: None,
+                    password: "Correct-Horse-9",
+                },
+            )
             .await
             .unwrap_or_else(|e| panic!("{name}: {upn}: {e}"));
         }

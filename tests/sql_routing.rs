@@ -60,7 +60,9 @@ fn unrouted(src: &str) -> Vec<usize> {
     while let Some(off) = src[from..].find("sqlx::query") {
         let at = from + off;
         from = at + 1;
-        let Some(paren) = src[at..].find('(').map(|p| at + p) else { continue };
+        let Some(paren) = src[at..].find('(').map(|p| at + p) else {
+            continue;
+        };
         // Only the call head `sqlx::query`, `query_as`, `query_scalar`, `query_as::<..>`.
         let head = &src[at..paren];
         if head.contains([';', '{', '}']) {

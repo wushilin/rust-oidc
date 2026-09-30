@@ -20,10 +20,10 @@ pub mod util;
 
 use std::sync::Arc;
 
+use crate::db::DbPool;
 use config::PublicUrl;
 use keys::KeyStore;
 use secrets::Secrets;
-use crate::db::DbPool;
 
 #[derive(Clone)]
 pub struct AppState {

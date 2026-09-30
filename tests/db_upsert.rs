@@ -58,7 +58,11 @@ async fn concurrent_upserts_of_one_row_all_succeed_and_agree() {
     for pool in common::all_engine_pools().await {
         let results = contend(|_| {
             let p = pool.clone();
-            async move { rust_oidc::secrets::Secrets::new(p).pairwise_sub("user-1", "app-1").await }
+            async move {
+                rust_oidc::secrets::Secrets::new(p)
+                    .pairwise_sub("user-1", "app-1")
+                    .await
+            }
         })
         .await;
         let mut seen = std::collections::HashSet::new();
@@ -74,7 +78,10 @@ async fn concurrent_session_creates_for_one_cookie_all_succeed() {
     for pool in common::all_engine_pools().await {
         let (t, uid, _) = fixture(&pool).await;
         let mut headers = HeaderMap::new();
-        headers.insert("cookie", format!("{}=shared-cookie", session::SESSION_COOKIE).parse().unwrap());
+        headers.insert(
+            "cookie",
+            format!("{}=shared-cookie", session::SESSION_COOKIE).parse().unwrap(),
+        );
         let results = contend(|_| {
             let (p, h, tid, uid) = (pool.clone(), headers.clone(), t.id.clone(), uid.clone());
             async move { session::create(&p, &h, &tid, &uid, &["pwd"], 3600).await }
@@ -100,7 +107,11 @@ async fn concurrent_session_creates_for_one_cookie_all_succeed() {
 async fn concurrent_certificate_registrations_leave_one_row_with_last_writer_fields() {
     use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256, RsaKeySize};
     let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048).unwrap();
-    let pem = CertificateParams::new(Vec::<String>::new()).unwrap().self_signed(&key_pair).unwrap().pem();
+    let pem = CertificateParams::new(Vec::<String>::new())
+        .unwrap()
+        .self_signed(&key_pair)
+        .unwrap()
+        .pem();
     for pool in common::all_engine_pools().await {
         let (_, _, app) = fixture(&pool).await;
         let results = contend(|i| {
@@ -113,13 +124,17 @@ async fn concurrent_certificate_registrations_leave_one_row_with_last_writer_fie
         }
         assert_eq!(apps::key_credentials(&pool, &app).await.unwrap().len(), 1);
         // A later registration of the same certificate refreshes it in place.
-        apps::add_key_credential(&pool, &app, &pem, Some("renamed")).await.unwrap();
+        apps::add_key_credential(&pool, &app, &pem, Some("renamed"))
+            .await
+            .unwrap();
         let creds = apps::key_credentials(&pool, &app).await.unwrap();
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].display_name.as_deref(), Some("renamed"));
         // Re-registering with identical arguments changes nothing. MySQL reports 0 affected
         // rows for that unless sqlx sets CLIENT_FOUND_ROWS, which the upsert relies on.
-        apps::add_key_credential(&pool, &app, &pem, Some("renamed")).await.expect("no-change re-registration");
+        apps::add_key_credential(&pool, &app, &pem, Some("renamed"))
+            .await
+            .expect("no-change re-registration");
         assert_eq!(apps::key_credentials(&pool, &app).await.unwrap().len(), 1);
     }
 }
@@ -151,6 +166,10 @@ async fn a_non_duplicate_insert_failure_is_not_swallowed() {
         let (t, _, _) = fixture(&pool).await;
         groups::create(&pool, &t, "Admins", None).await.unwrap();
         // Unknown user: a lookup error, not silently ignored.
-        assert!(groups::add_member(&pool, &t, "Admins", "nobody@contoso.com").await.is_err());
+        assert!(
+            groups::add_member(&pool, &t, "Admins", "nobody@contoso.com")
+                .await
+                .is_err()
+        );
     }
 }

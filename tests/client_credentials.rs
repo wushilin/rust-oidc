@@ -230,12 +230,15 @@ async fn disabled_service_principal_is_rejected() {
     let t = s.tenant("Contoso", "contoso.com").await;
     let api = s.app(&t, "api").await;
     let worker = s.app(&t, "worker").await;
-    sqlx::query(rust_oidc::db::sql_stmt(rust_oidc::db::engine_of(&s.pool), "UPDATE service_principals SET enabled = ? WHERE id = ?"))
-        .bind(false)
-        .bind(&worker.sp_id)
-        .execute(&s.pool)
-        .await
-        .unwrap();
+    sqlx::query(rust_oidc::db::sql_stmt(
+        rust_oidc::db::engine_of(&s.pool),
+        "UPDATE service_principals SET enabled = ? WHERE id = ?",
+    ))
+    .bind(false)
+    .bind(&worker.sp_id)
+    .execute(&s.pool)
+    .await
+    .unwrap();
     let (status, body) = s
         .client_credentials(&t.id, &worker, &format!("api://{}/.default", api.app_id))
         .await;

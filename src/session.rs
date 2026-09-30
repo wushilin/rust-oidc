@@ -6,8 +6,8 @@
 //! iframe) works, as with Entra's cookies; CSRF is covered by a separate
 //! double-submit token on the login form.
 
-use axum::http::{HeaderMap, HeaderValue, header};
 use crate::db::DbPool;
+use axum::http::{HeaderMap, HeaderValue, header};
 
 use crate::config::PublicUrl;
 use crate::util::{b64url, now, random_bytes, sha256_hex};
@@ -56,10 +56,11 @@ pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow
     let Some(cookie) = cookie(headers, SESSION_COOKIE) else {
         return Ok(None);
     };
-    let row: Option<(String, i64, String)> = sqlx::query_as(
-        crate::db::q(pool, "SELECT s.user_id, s.auth_time, s.amr FROM sessions s JOIN users u ON u.id = s.user_id
-         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = ?"),
-    )
+    let row: Option<(String, i64, String)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT s.user_id, s.auth_time, s.amr FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = ?",
+    ))
     .bind(sha256_hex(cookie.as_bytes()))
     .bind(tenant_id)
     .bind(now())
@@ -129,16 +130,22 @@ pub async fn create(
             return Ok(cookie);
         }
     }
-    anyhow::bail!("session could not be recorded after {} attempts (concurrent writers)", crate::db::UPSERT_ATTEMPTS)
+    anyhow::bail!(
+        "session could not be recorded after {} attempts (concurrent writers)",
+        crate::db::UPSERT_ATTEMPTS
+    )
 }
 
 pub async fn end(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {
     if let Some(cookie) = cookie(headers, SESSION_COOKIE) {
-        sqlx::query(crate::db::q(pool, "DELETE FROM sessions WHERE cookie_hash = ? AND tenant_id = ?"))
-            .bind(sha256_hex(cookie.as_bytes()))
-            .bind(tenant_id)
-            .execute(pool)
-            .await?;
+        sqlx::query(crate::db::q(
+            pool,
+            "DELETE FROM sessions WHERE cookie_hash = ? AND tenant_id = ?",
+        ))
+        .bind(sha256_hex(cookie.as_bytes()))
+        .bind(tenant_id)
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
@@ -148,10 +155,13 @@ pub async fn has_any(pool: &DbPool, headers: &HeaderMap) -> anyhow::Result<bool>
     let Some(cookie) = cookie(headers, SESSION_COOKIE) else {
         return Ok(false);
     };
-    let (n,): (i64,) = sqlx::query_as(crate::db::q(pool, "SELECT COUNT(*) FROM sessions WHERE cookie_hash = ? AND expires_at > ?"))
-        .bind(sha256_hex(cookie.as_bytes()))
-        .bind(now())
-        .fetch_one(pool)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT COUNT(*) FROM sessions WHERE cookie_hash = ? AND expires_at > ?",
+    ))
+    .bind(sha256_hex(cookie.as_bytes()))
+    .bind(now())
+    .fetch_one(pool)
+    .await?;
     Ok(n > 0)
 }

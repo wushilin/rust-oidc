@@ -379,13 +379,9 @@ mod tests {
                     w
                 }
                 RoleId::GlobalReader => READ_EVERYTHING.to_vec(),
-                RoleId::UserAdministrator => vec![
-                    (User, Read),
-                    (User, Write),
-                    (User, Reset),
-                    (Group, Read),
-                    (Audit, Read),
-                ],
+                RoleId::UserAdministrator => {
+                    vec![(User, Read), (User, Write), (User, Reset), (Group, Read), (Audit, Read)]
+                }
                 RoleId::GroupsAdministrator => {
                     vec![(Group, Read), (Group, Write), (User, Read), (Audit, Read)]
                 }
@@ -480,10 +476,7 @@ mod tests {
     fn allowed_at_all_scope_requires_an_all_binding() {
         let action = Action::new(Resource::User, Verb::Write);
         let all = [binding(RoleId::UserAdministrator, Scope::All)];
-        let some = [binding(
-            RoleId::UserAdministrator,
-            Scope::Tenants(vec!["t1".into()]),
-        )];
+        let some = [binding(RoleId::UserAdministrator, Scope::Tenants(vec!["t1".into()]))];
         assert!(allowed_at_all_scope(&all, action));
         assert!(!allowed_at_all_scope(&some, action));
         // Right scope, wrong role.

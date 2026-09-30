@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::DbPool;
 use anyhow::{Context, anyhow};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_RSA_SHA256, RsaKeySize};
@@ -17,7 +18,6 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::traits::PublicKeyParts;
 use serde::Serialize;
 use sha1::{Digest, Sha1};
-use crate::db::DbPool;
 use tokio::sync::RwLock;
 
 use crate::util::{b64, b64url, now};
@@ -179,10 +179,11 @@ pub async fn generate(pool: &DbPool, status: &str) -> anyhow::Result<String> {
     let cert_der = cert.der().to_vec();
     let kid = b64url(&Sha1::digest(&cert_der));
 
-    sqlx::query(
-        crate::db::q(pool, "INSERT INTO signing_keys (kid, private_key_pem, cert_der, status, created_at, not_after)
-         VALUES (?, ?, ?, ?, ?, ?)"),
-    )
+    sqlx::query(crate::db::q(
+        pool,
+        "INSERT INTO signing_keys (kid, private_key_pem, cert_der, status, created_at, not_after)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    ))
     .bind(&kid)
     .bind(key_pair.serialize_pem())
     .bind(&cert_der)
@@ -218,22 +219,27 @@ pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
     ensure(pool).await?;
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
-    sqlx::query(crate::db::sql_stmt(engine, "UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'"))
-        .bind(now())
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'",
+    ))
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
     // Two statements, not `UPDATE ... WHERE kid = (SELECT ... FROM signing_keys)`:
     // MySQL refuses to update a table it also selects from (error 1093).
-    let next: Option<(String,)> = sqlx::query_as(
-        "SELECT kid FROM signing_keys WHERE status = 'next' ORDER BY created_at LIMIT 1",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((kid,)) = next {
-        sqlx::query(crate::db::sql_stmt(engine, "UPDATE signing_keys SET status = 'active' WHERE kid = ?"))
-            .bind(kid)
-            .execute(&mut *tx)
+    let next: Option<(String,)> =
+        sqlx::query_as("SELECT kid FROM signing_keys WHERE status = 'next' ORDER BY created_at LIMIT 1")
+            .fetch_optional(&mut *tx)
             .await?;
+    if let Some((kid,)) = next {
+        sqlx::query(crate::db::sql_stmt(
+            engine,
+            "UPDATE signing_keys SET status = 'active' WHERE kid = ?",
+        ))
+        .bind(kid)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     generate(pool, "next").await?;
@@ -242,9 +248,12 @@ pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
 
 /// Delete keys retired more than `older_than_secs` ago (must exceed token lifetimes).
 pub async fn prune(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
-    let res = sqlx::query(crate::db::q(pool, "DELETE FROM signing_keys WHERE status = 'retired' AND retired_at < ?"))
-        .bind(now() - older_than_secs)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(crate::db::q(
+        pool,
+        "DELETE FROM signing_keys WHERE status = 'retired' AND retired_at < ?",
+    ))
+    .bind(now() - older_than_secs)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected())
 }

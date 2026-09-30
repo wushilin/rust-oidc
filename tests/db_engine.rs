@@ -38,7 +38,9 @@ async fn foreign_key_cascades_fire_on_every_engine() {
     use rust_oidc::db::{engine_of, sql_stmt};
     for pool in common::all_engine_pools().await {
         let e = engine_of(&pool);
-        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.com", false).await.unwrap();
+        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.com", false)
+            .await
+            .unwrap();
         sqlx::query(sql_stmt(
             e,
             "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at)
@@ -47,11 +49,14 @@ async fn foreign_key_cascades_fire_on_every_engine() {
         .execute(&*pool)
         .await
         .unwrap();
-        sqlx::query(sql_stmt(e, "INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES ('b1', ?)"))
-            .bind(&t.id)
-            .execute(&*pool)
-            .await
-            .unwrap();
+        sqlx::query(sql_stmt(
+            e,
+            "INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES ('b1', ?)",
+        ))
+        .bind(&t.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
         sqlx::query(sql_stmt(e, "DELETE FROM tenants WHERE id = ?"))
             .bind(&t.id)
             .execute(&*pool)
@@ -79,12 +84,23 @@ async fn a_directory_named_mode_does_not_suppress_create() {
 #[tokio::test]
 async fn booleans_round_trip_on_every_available_engine() {
     for pool in common::all_engine_pools().await {
-        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.test", false).await.unwrap();
-        let id = rust_oidc::users::create(&pool, &t, rust_oidc::users::NewUser {
-            upn: "alice@contoso.test", password: "Correct-Horse-9",
-            display_name: None, given_name: None, family_name: None,
-            email: Some("a@example.org"),
-        }).await.unwrap();
+        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.test", false)
+            .await
+            .unwrap();
+        let id = rust_oidc::users::create(
+            &pool,
+            &t,
+            rust_oidc::users::NewUser {
+                upn: "alice@contoso.test",
+                password: "Correct-Horse-9",
+                display_name: None,
+                given_name: None,
+                family_name: None,
+                email: Some("a@example.org"),
+            },
+        )
+        .await
+        .unwrap();
         let u = rust_oidc::users::find(&pool, &t.id, &id).await.unwrap().unwrap();
         assert!(u.enabled, "enabled must read back true");
         assert!(!u.email_verified, "email_verified must read back false");

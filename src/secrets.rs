@@ -1,8 +1,8 @@
 //! Server-wide secrets and derived identifiers.
 
+use crate::db::DbPool;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use crate::db::DbPool;
 use tokio::sync::OnceCell;
 
 use crate::util::{b64url, now, random_bytes};
@@ -42,31 +42,41 @@ impl Secrets {
 async fn load_or_create(pool: &DbPool, name: &str) -> anyhow::Result<Vec<u8>> {
     let engine = crate::db::engine_of(pool);
     for _ in 0..crate::db::UPSERT_ATTEMPTS {
-        let existing: Option<(Vec<u8>,)> =
-            sqlx::query_as(crate::db::sql_stmt(engine, "SELECT value FROM server_secrets WHERE name = ?"))
-                .bind(name)
-                .fetch_optional(pool)
-                .await?;
+        let existing: Option<(Vec<u8>,)> = sqlx::query_as(crate::db::sql_stmt(
+            engine,
+            "SELECT value FROM server_secrets WHERE name = ?",
+        ))
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
         if let Some((value,)) = existing {
             return Ok(value);
         }
         // Whether we inserted or lost the race, the next read returns the winner's value.
         crate::db::inserted(
-            sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO server_secrets (name, value, created_at) VALUES (?, ?, ?)"))
-                .bind(name)
-                .bind(random_bytes(32))
-                .bind(now())
-                .execute(pool)
-                .await,
+            sqlx::query(crate::db::sql_stmt(
+                engine,
+                "INSERT INTO server_secrets (name, value, created_at) VALUES (?, ?, ?)",
+            ))
+            .bind(name)
+            .bind(random_bytes(32))
+            .bind(now())
+            .execute(pool)
+            .await,
         )?;
     }
     // One last read after the final insert attempt.
-    let last: Option<(Vec<u8>,)> =
-        sqlx::query_as(crate::db::sql_stmt(engine, "SELECT value FROM server_secrets WHERE name = ?"))
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
+    let last: Option<(Vec<u8>,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT value FROM server_secrets WHERE name = ?",
+    ))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
     last.map(|(v,)| v).ok_or_else(|| {
-        anyhow::anyhow!("server secret '{name}' could not be created or read after {} attempts", crate::db::UPSERT_ATTEMPTS)
+        anyhow::anyhow!(
+            "server secret '{name}' could not be created or read after {} attempts",
+            crate::db::UPSERT_ATTEMPTS
+        )
     })
 }

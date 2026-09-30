@@ -33,12 +33,15 @@ async fn arbitrary_binary_survives_a_blob_column() {
     payload.extend((0..=255u8).cycle().take(70_000));
     for pool in common::all_engine_pools().await {
         let e = engine_of(&pool);
-        sqlx::query(sql_stmt(e, "INSERT INTO server_secrets (name, value, created_at) VALUES (?, ?, 0)"))
-            .bind("blob-test")
-            .bind(&payload)
-            .execute(&*pool)
-            .await
-            .unwrap();
+        sqlx::query(sql_stmt(
+            e,
+            "INSERT INTO server_secrets (name, value, created_at) VALUES (?, ?, 0)",
+        ))
+        .bind("blob-test")
+        .bind(&payload)
+        .execute(&*pool)
+        .await
+        .unwrap();
         let (back,): (Vec<u8>,) = sqlx::query_as(sql_stmt(e, "SELECT value FROM server_secrets WHERE name = ?"))
             .bind("blob-test")
             .fetch_one(&*pool)

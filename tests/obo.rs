@@ -117,7 +117,11 @@ async fn middle_tier_exchanges_a_user_token_for_a_downstream_token() {
     assert_eq!(status, 200, "{body}");
 
     let claims = s
-        .verify(&c.f.tenant.id, body["access_token"].as_str().unwrap(), &c.downstream.app_id)
+        .verify(
+            &c.f.tenant.id,
+            body["access_token"].as_str().unwrap(),
+            &c.downstream.app_id,
+        )
         .await;
     // Same user, but now for the downstream API and on behalf of the middle tier.
     assert_eq!(claims["oid"], c.f.user_id);
@@ -133,13 +137,15 @@ async fn obo_preserves_how_the_user_authenticated() {
     let s = TestServer::start().await;
     let c = chain(&s).await;
     // The original sign-in was a password, and auth_time must carry across.
-    let original = s
-        .verify(&c.f.tenant.id, &c.user_token, &c.f.api.app_id)
-        .await;
+    let original = s.verify(&c.f.tenant.id, &c.user_token, &c.f.api.app_id).await;
     let (status, body) = obo(&s, &c, &[]).await;
     assert_eq!(status, 200, "{body}");
     let claims = s
-        .verify(&c.f.tenant.id, body["access_token"].as_str().unwrap(), &c.downstream.app_id)
+        .verify(
+            &c.f.tenant.id,
+            body["access_token"].as_str().unwrap(),
+            &c.downstream.app_id,
+        )
         .await;
     assert_eq!(claims["amr"], original["amr"]);
     assert_eq!(claims["auth_time"], original["auth_time"]);

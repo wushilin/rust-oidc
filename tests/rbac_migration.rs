@@ -77,18 +77,24 @@ async fn effective_bindings_keep_two_roles_scopes_separate() {
         .execute(&s.pool)
         .await
         .unwrap();
-        sqlx::query(rust_oidc::db::sql_stmt(e, "INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES (?, ?)"))
-            .bind(id)
-            .bind(tenant)
-            .execute(&s.pool)
-            .await
-            .unwrap();
+        sqlx::query(rust_oidc::db::sql_stmt(
+            e,
+            "INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES (?, ?)",
+        ))
+        .bind(id)
+        .bind(tenant)
+        .execute(&s.pool)
+        .await
+        .unwrap();
     }
     let eff = rust_oidc::admin::bindings::effective_for_user(&s.pool, &f.user_id)
         .await
         .unwrap();
     let scope_of = |role: RoleId| eff.iter().find(|b| b.role == role).unwrap().scope.clone();
-    assert_eq!(scope_of(RoleId::GlobalAdministrator), Scope::Tenants(vec![f.tenant.id.clone()]));
+    assert_eq!(
+        scope_of(RoleId::GlobalAdministrator),
+        Scope::Tenants(vec![f.tenant.id.clone()])
+    );
     assert_eq!(scope_of(RoleId::GlobalReader), Scope::Tenants(vec![other.id.clone()]));
 }
 
@@ -105,7 +111,11 @@ async fn sqlite_migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_
         .filename(dir.path().join("m.db"))
         .create_if_missing(true)
         .foreign_keys(true);
-    let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
 
     for sql in [
         include_str!("../migrations/sqlite/0001_init.sql"),
@@ -211,7 +221,11 @@ async fn sqlite_migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_
     // The same role held in two tenants is ONE binding covering both.
     assert_eq!(
         shape("samerole").await,
-        vec![("GlobalAdministrator".to_string(), "tenants".to_string(), s(&["t1", "t2"]))],
+        vec![(
+            "GlobalAdministrator".to_string(),
+            "tenants".to_string(),
+            s(&["t1", "t2"])
+        )],
         "one binding per (principal, role), holding exactly that pair's tenants"
     );
     let (duplicated,): (i64,) = sqlx::query_as(
@@ -222,5 +236,8 @@ async fn sqlite_migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(duplicated, 0, "no (principal, role) pair may have more than one binding");
+    assert_eq!(
+        duplicated, 0,
+        "no (principal, role) pair may have more than one binding"
+    );
 }

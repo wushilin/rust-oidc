@@ -86,7 +86,9 @@ async fn handle(
     let grant_type = param(params, "grant_type").ok_or_else(|| AadError::missing_parameter("grant_type"))?;
     match GrantType::parse(grant_type) {
         Some(GrantType::ClientCredentials) => client_credentials(st, &tenant, headers, params).await,
-        Some(GrantType::AuthorizationCode) => super::user_grants::authorization_code(st, &tenant, headers, params).await,
+        Some(GrantType::AuthorizationCode) => {
+            super::user_grants::authorization_code(st, &tenant, headers, params).await
+        }
         Some(GrantType::RefreshToken) => super::user_grants::refresh_token(st, &tenant, headers, params).await,
         Some(GrantType::DeviceCode) => super::device::device_code_grant(st, &tenant, headers, params).await,
         Some(GrantType::JwtBearer) => super::user_grants::on_behalf_of(st, &tenant, headers, params).await,
@@ -271,8 +273,8 @@ async fn authenticate_with_assertion(
     params: &HashMap<String, String>,
     assertion: &str,
 ) -> Result<AuthenticatedClient, AadError> {
-    let assertion_type = param(params, "client_assertion_type")
-        .ok_or_else(|| AadError::missing_parameter("client_assertion_type"))?;
+    let assertion_type =
+        param(params, "client_assertion_type").ok_or_else(|| AadError::missing_parameter("client_assertion_type"))?;
     if assertion_type != ClientAuthMethod::ASSERTION_TYPE {
         return Err(AadError::invalid_request(
             700021,
@@ -349,14 +351,19 @@ async fn authenticate_with_assertion(
     if exp > ts + MAX_ASSERTION_LIFETIME {
         return Err(AadError::invalid_client_assertion());
     }
-    let _ = sqlx::query(crate::db::q(&st.pool, "DELETE FROM client_assertion_jti WHERE expires_at <= ?"))
-        .bind(ts)
-        .execute(&st.pool)
-        .await;
+    let _ = sqlx::query(crate::db::q(
+        &st.pool,
+        "DELETE FROM client_assertion_jti WHERE expires_at <= ?",
+    ))
+    .bind(ts)
+    .execute(&st.pool)
+    .await;
     // The primary key makes the insert the atomic "first use" test: a unique
     // violation is a replay, any other error is a real failure.
     let first_use = crate::db::inserted(
-        sqlx::query(crate::db::q(&st.pool, "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)",
+        sqlx::query(crate::db::q(
+            &st.pool,
+            "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)",
         ))
         .bind(jti)
         .bind(&app.app_id)

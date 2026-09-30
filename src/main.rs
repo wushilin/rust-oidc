@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use serde_json::json;
 use rust_oidc::db::DbPool;
+use serde_json::json;
 
 use rust_oidc::admin::bindings::{self as role_bindings, PrincipalType};
 use rust_oidc::apps::{self, Principal};
@@ -393,8 +393,24 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await?;
-            role_bindings::create(&pool, PrincipalType::User, &user_id, RoleId::GlobalAdministrator, &Scope::All, "bootstrap").await?;
-            role_bindings::create(&pool, PrincipalType::User, &user_id, RoleId::PlatformAdministrator, &Scope::All, "bootstrap").await?;
+            role_bindings::create(
+                &pool,
+                PrincipalType::User,
+                &user_id,
+                RoleId::GlobalAdministrator,
+                &Scope::All,
+                "bootstrap",
+            )
+            .await?;
+            role_bindings::create(
+                &pool,
+                PrincipalType::User,
+                &user_id,
+                RoleId::PlatformAdministrator,
+                &Scope::All,
+                "bootstrap",
+            )
+            .await?;
             keys::ensure(&pool).await?;
             db::audit(
                 &pool,
@@ -491,10 +507,22 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
                 let Some(found) = directory::find(&role) else {
                     bail!("unknown directory role '{role}'");
                 };
-                let Some(role_id) = RoleId::ALL.iter().copied().find(|r| r.template_id() == Some(found.template_id)) else {
+                let Some(role_id) = RoleId::ALL
+                    .iter()
+                    .copied()
+                    .find(|r| r.template_id() == Some(found.template_id))
+                else {
                     bail!("directory role '{role}' has no RBAC role");
                 };
-                role_bindings::create(pool, PrincipalType::User, &id, role_id, &Scope::Tenants(vec![t.id.clone()]), "cli").await?;
+                role_bindings::create(
+                    pool,
+                    PrincipalType::User,
+                    &id,
+                    role_id,
+                    &Scope::Tenants(vec![t.id.clone()]),
+                    "cli",
+                )
+                .await?;
             }
             db::audit(
                 pool,

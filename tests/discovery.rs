@@ -27,7 +27,10 @@ async fn discovery_by_guid_and_domain_uses_guid_issuer() {
             .iter()
             .map(|g| g.as_str().unwrap())
             .collect();
-        assert!(grants.contains(&"urn:ietf:params:oauth:grant-type:device_code"), "{grants:?}");
+        assert!(
+            grants.contains(&"urn:ietf:params:oauth:grant-type:device_code"),
+            "{grants:?}"
+        );
         let auth_methods: Vec<&str> = doc["token_endpoint_auth_methods_supported"]
             .as_array()
             .unwrap()
@@ -66,12 +69,15 @@ async fn unknown_tenant_is_aadsts90002() {
 async fn disabled_tenant_does_not_resolve() {
     let s = TestServer::start().await;
     let t = s.tenant("Contoso", "contoso.com").await;
-    sqlx::query(rust_oidc::db::sql_stmt(rust_oidc::db::engine_of(&s.pool), "UPDATE tenants SET enabled = ? WHERE id = ?"))
-        .bind(false)
-        .bind(&t.id)
-        .execute(&s.pool)
-        .await
-        .unwrap();
+    sqlx::query(rust_oidc::db::sql_stmt(
+        rust_oidc::db::engine_of(&s.pool),
+        "UPDATE tenants SET enabled = ? WHERE id = ?",
+    ))
+    .bind(false)
+    .bind(&t.id)
+    .execute(&s.pool)
+    .await
+    .unwrap();
     let (status, body) = s
         .get_json(&format!("/{}/v2.0/.well-known/openid-configuration", t.id))
         .await;

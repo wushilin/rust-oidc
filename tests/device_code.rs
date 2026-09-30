@@ -34,10 +34,7 @@ async fn poll(s: &TestServer, tenant: &str, client_id: &str, device_code: &str) 
 /// Approve a pending device code in the browser: enter the code, sign in, consent.
 async fn approve(s: &TestServer, b: &Browser, f: &UserFixture, user_code: &str) -> Page {
     let entry = b
-        .get(&s.url(&format!(
-            "/{}/oauth2/deviceauth?user_code={user_code}",
-            f.tenant.id
-        )))
+        .get(&s.url(&format!("/{}/oauth2/deviceauth?user_code={user_code}", f.tenant.id)))
         .await;
     // Not signed in yet, so the code entry leads to the sign-in page.
     let signed_in = b.login(&entry, &f.upn, &f.password).await;

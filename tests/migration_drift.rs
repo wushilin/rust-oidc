@@ -46,9 +46,10 @@ fn guid_literals(sql: &str) -> BTreeSet<String> {
         .filter(|s| {
             let parts: Vec<&str> = s.split('-').collect();
             parts.len() == 5
-                && [8, 4, 4, 4, 12].iter().zip(&parts).all(|(n, p)| {
-                    p.len() == *n && p.chars().all(|c| c.is_ascii_hexdigit())
-                })
+                && [8, 4, 4, 4, 12]
+                    .iter()
+                    .zip(&parts)
+                    .all(|(n, p)| p.len() == *n && p.chars().all(|c| c.is_ascii_hexdigit()))
         })
         .map(str::to_string)
         .collect()
@@ -60,8 +61,15 @@ fn every_dialect_carries_the_same_role_arms_in_both_inserts() {
     assert_eq!(want.len(), 7, "seven Entra-backed roles");
     for (engine, sql) in FILES {
         let blocks = case_blocks(sql);
-        assert_eq!(blocks.len(), 2, "{engine}: expected two CASE expressions (binding insert and tenant join)");
-        assert_eq!(blocks[0], blocks[1], "{engine}: the two INSERTs disagree on the arm list");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "{engine}: expected two CASE expressions (binding insert and tenant join)"
+        );
+        assert_eq!(
+            blocks[0], blocks[1],
+            "{engine}: the two INSERTs disagree on the arm list"
+        );
         assert_eq!(blocks[0], want, "{engine}: arms differ from RoleId::template_id");
     }
 }

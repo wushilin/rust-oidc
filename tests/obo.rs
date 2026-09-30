@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use rust_oidc::apps::MemberType;
 use rust_oidc::apps::{self, Principal};
 use serde_json::Value;
 
@@ -26,11 +27,11 @@ async fn chain(s: &TestServer) -> Chain {
     let app = apps::find_in_tenant(&s.pool, &f.tenant, &downstream.app_id)
         .await
         .unwrap();
-    apps::add_scope(&s.pool, &app, "Reports.Read", "Read reports", "User")
+    apps::add_scope(&s.pool, &app, "Reports.Read", "Read reports", apps::ScopeConsent::User)
         .await
         .unwrap();
     // A role on the downstream API, to prove roles are resolved for the user.
-    apps::add_role(&s.pool, &app, "Reports.Admin", "Admin", None, &[apps::MEMBER_USER])
+    apps::add_role(&s.pool, &app, "Reports.Admin", "Admin", None, &[apps::MemberType::User])
         .await
         .unwrap();
     apps::assign_role(
@@ -182,7 +183,8 @@ async fn an_app_only_token_cannot_be_exchanged() {
     let s = TestServer::start().await;
     let c = chain(&s).await;
     // client_credentials gives an app-only token; OBO is for user tokens only.
-    s.add_role(&c.f.tenant, &c.f.api, "Orders.Sync", &["Application"]).await;
+    s.add_role(&c.f.tenant, &c.f.api, "Orders.Sync", &[MemberType::Application])
+        .await;
     s.assign_to_app(&c.f.tenant, &c.f.api, "Orders.Sync", &c.f.web).await;
     let (status, app_token) = s
         .client_credentials(&c.f.tenant.id, &c.f.web, &format!("api://{}/.default", c.f.api.app_id))

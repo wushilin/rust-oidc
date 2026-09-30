@@ -254,6 +254,48 @@ unknown values (returns `None`), so a row written by a newer build cannot stop a
 one reading the table -- the same rule as `Amr` (decision 22). The console's audit view
 will need it.
 
+**42. A stored redirect platform is now an enum, and that closed a fail-open.**
+`app_redirect_uris.platform`, and the platform copied onto `auth_codes` and
+`refresh_tokens`, were `&str` compared against three consts.
+`authenticate_for_platform` tested `== "spa"` then `== "web"` and **fell through to
+the public-client branch for anything else** -- and the public-client branch requires
+no client authentication at all. So a confidential `web` client's authorization code
+whose platform string this build could not read would be redeemed for a full access
+token and ID token **with no secret**. It is now an exhaustive `match` on
+`RedirectPlatform`, and `stored_platform` refuses a value it cannot parse.
+
+*How reachable was it?* Not through the HTTP API today: `app_redirect_uris.platform`
+carries `CHECK (platform IN ('web','spa','publicClient'))` on all three engines, and
+the grant tables only ever get a value copied from there. **But `auth_codes.platform`
+and `refresh_tokens.platform` have no such CHECK on any engine** -- only a comment --
+so the guard was load-bearing for a hand-edited row, a restored database, and the
+realistic case: a newer build adding a fourth platform while an older binary still
+serves traffic during a rolling upgrade. Teeth-checked by restoring the fall-through;
+the token came back, signed, with no secret presented.
+*To reverse:* nothing to reverse. The optional extra step is a `CHECK` on those two
+columns, not done because SQLite cannot add one without rebuilding the table.
+
+**43. `PrincipalType` is one enum for two tables, with the narrower use guarded.**
+`app_role_assignments.principal_type` takes `User`/`Group`/`ServicePrincipal`;
+`role_bindings.principal_type` takes only the first two. Rather than two nearly
+identical enums, there is one in `src/directory.rs` and `bindings::create` refuses
+`ServicePrincipal` explicitly. `effective_for_user` already matched `User`/`Group` by
+name so such a row granted nothing, but that was an implicit property of a query two
+functions away; both halves now have a test.
+
+**44. `allowed_member_types` is parsed, not substring-matched.** The old code asked
+`types.contains("Application")` against the raw JSON text, so a hypothetical
+`ApplicationImpersonation` member type would have counted as `Application`. It now
+parses the array and compares enum values, dropping types this build does not know --
+dropping is the safe direction, since an unknown type grants nothing.
+
+**45. The CLI's `--platform`, `--type` and `--member-types` are `clap::ValueEnum`
+with explicit `value(name = ...)`.** The accepted spellings are unchanged
+(`publicClient`, not clap's default kebab-case `public-client`), so no documented
+command changes; clap now rejects a bad value with a list of the good ones instead of
+the server doing it in a `bail!`.
+
+
 ---
 
 ## Housekeeping

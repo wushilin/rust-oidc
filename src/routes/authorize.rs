@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 
 use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
-use crate::apps::{self, Application, PLATFORM_SPA, ServicePrincipal};
+use crate::apps::{self, Application, RedirectPlatform, ServicePrincipal};
 use crate::claims::{self, Amr, Azpacr};
 use crate::error::AadError;
 use crate::html;
@@ -83,7 +83,7 @@ struct Validated {
     client: Application,
     sp: ServicePrincipal,
     redirect_uri: url::Url,
-    platform: String,
+    platform: RedirectPlatform,
     response_mode: ResponseMode,
     state: Option<String>,
 }
@@ -204,7 +204,7 @@ async fn validate_client(
     st: &AppState,
     tenant_key: &str,
     params: &Params,
-) -> Result<(Tenant, Application, ServicePrincipal, url::Url, String), Response> {
+) -> Result<(Tenant, Application, ServicePrincipal, url::Url, RedirectPlatform), Response> {
     let page_error = |tenant: Option<&str>, err: AadError| html::error(tenant, &err.description());
     let internal = |e: anyhow::Error| page_error(None, AadError::from(e));
 
@@ -237,7 +237,7 @@ async fn validate_client(
     let platform = registered
         .iter()
         .find(|(_, uri)| apps::redirect_uri_matches(uri, &requested))
-        .map(|(p, _)| p.clone());
+        .map(|(p, _)| *p);
     let (Some(platform), Ok(url)) = (platform, url::Url::parse(&requested)) else {
         return Err(page_error(
             tn,
@@ -416,7 +416,7 @@ async fn continue_authorize(
         if challenge.len() < 43 || challenge.len() > 128 {
             return Err(AadError::invalid_request(501491, "Invalid size of Code_Challenge parameter.").into());
         }
-    } else if v.platform == PLATFORM_SPA && response_type.has_code() {
+    } else if v.platform == RedirectPlatform::Spa && response_type.has_code() {
         return Err(AadError::invalid_request(
             9002325,
             "Proof Key for Code Exchange is required for cross-origin authorization code redemption.",
@@ -527,7 +527,7 @@ async fn continue_authorize(
         .bind(&v.client.app_id)
         // Empty when the client omitted redirect_uri; then the token request may omit it too.
         .bind(get(params, "redirect_uri").unwrap_or_default())
-        .bind(&v.platform)
+        .bind(v.platform.as_str())
         .bind(&user.id)
         .bind(grant.granted.join(" "))
         .bind(nonce)

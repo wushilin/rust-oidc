@@ -711,7 +711,7 @@ pub(super) async fn device_code_grant(
         super::user_grants::Family {
             id: b64url(&random_bytes(16)),
             code_hash: Some(hash),
-            platform: apps::PLATFORM_PUBLIC.to_string(),
+            platform: apps::RedirectPlatform::PublicClient,
             auth_time,
             amr,
             spa_expires_at: None,

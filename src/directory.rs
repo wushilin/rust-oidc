@@ -3,6 +3,45 @@
 
 use crate::db::DbPool;
 
+/// What kind of directory object a principal is: the `principal_type` column of
+/// `app_role_assignments` and of `role_bindings`.
+///
+/// One enum for both tables even though their value sets differ: a console role
+/// binding may name only a user or a group (a service principal cannot use the
+/// console), and `admin::bindings::create` refuses `ServicePrincipal` rather than
+/// a second near-identical enum existing. The names are Entra's own, as Graph
+/// spells them in `appRoleAssignment.principalType`.
+///
+/// Not to be confused with [`crate::apps::Principal`], which is how the command
+/// line *names* a principal (by appId, UPN or group name) before it is resolved
+/// to an id and a `PrincipalType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrincipalType {
+    User,
+    Group,
+    ServicePrincipal,
+}
+
+impl PrincipalType {
+    pub const ALL: &'static [PrincipalType] = &[Self::User, Self::Group, Self::ServicePrincipal];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Group => "Group",
+            Self::ServicePrincipal => "ServicePrincipal",
+        }
+    }
+
+    /// A value read back from a stored row. `None` for anything this build does
+    /// not know: a row written by a newer build must not be misread as one of
+    /// ours, and the caller decides what an unknown principal type means (every
+    /// caller here treats it as granting nothing).
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.as_str() == raw)
+    }
+}
+
 pub struct DirectoryRole {
     pub template_id: &'static str,
     pub name: &'static str,

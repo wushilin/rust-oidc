@@ -4,6 +4,7 @@ use crate::db::DbPool;
 use anyhow::{Context, bail};
 use sqlx::FromRow;
 
+use crate::directory::PrincipalType;
 use crate::tenant::Tenant;
 use crate::util::{b64url, ct_eq, generate_client_secret, is_guid, new_guid, now, sha256_hex};
 
@@ -287,8 +288,122 @@ pub async fn verify_secret(pool: &DbPool, app: &Application, secret: &str) -> an
 
 // ---- app roles ----
 
-pub const MEMBER_USER: &str = "User";
-pub const MEMBER_APPLICATION: &str = "Application";
+/// Who may consent to a delegated permission: the `type` column of `app_scopes`.
+///
+/// Graph's `permissionScope.type`, verified against Microsoft's reference:
+/// *"The possible values are: `User` and `Admin`."*
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ScopeConsent {
+    /// Safe for a non-admin user to consent to on their own behalf.
+    #[value(name = "User")]
+    User,
+    /// Administrator consent is always required.
+    #[value(name = "Admin")]
+    Admin,
+}
+
+impl ScopeConsent {
+    pub const ALL: &'static [ScopeConsent] = &[Self::User, Self::Admin];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Admin => "Admin",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|s| s.as_str() == raw)
+    }
+}
+
+/// What kind of principal an app role may be assigned to: Entra's
+/// `appRole.allowedMemberTypes`, stored as a JSON array in
+/// `app_roles.allowed_member_types`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MemberType {
+    /// Users and groups.
+    #[value(name = "User")]
+    User,
+    /// Applications, through the client credentials grant.
+    #[value(name = "Application")]
+    Application,
+}
+
+impl MemberType {
+    pub const ALL: &'static [MemberType] = &[Self::User, Self::Application];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Application => "Application",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|m| m.as_str() == raw)
+    }
+
+    /// The member types in a stored `allowed_member_types` array.
+    ///
+    /// Values this build does not know are dropped rather than failing the read:
+    /// a role written by a newer build must still be usable for the types this
+    /// build does understand. Dropping is the safe direction -- an unknown type
+    /// grants nothing -- and it is why this replaces the old
+    /// `types.contains("Application")` substring test, which would have matched
+    /// a type merely *containing* the word.
+    pub fn parse_list(json: &str) -> Vec<MemberType> {
+        serde_json::from_str::<Vec<String>>(json)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| Self::parse(t))
+            .collect()
+    }
+}
+
+/// The platform a redirect URI is registered under, which decides the client
+/// rules: the `platform` column of `app_redirect_uris`, and of the `auth_codes`
+/// and `refresh_tokens` rows issued through them.
+///
+/// Entra's own values, as the application manifest spells them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RedirectPlatform {
+    /// Confidential client: must authenticate at the token endpoint.
+    #[value(name = "web")]
+    Web,
+    /// Single-page application: PKCE required, redeems cross-origin, 24h
+    /// refresh-token lifetime.
+    #[value(name = "spa")]
+    Spa,
+    /// Public client: no secret.
+    #[value(name = "publicClient")]
+    PublicClient,
+}
+
+impl RedirectPlatform {
+    pub const ALL: &'static [RedirectPlatform] = &[Self::Web, Self::Spa, Self::PublicClient];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Spa => "spa",
+            Self::PublicClient => "publicClient",
+        }
+    }
+
+    /// A platform read back from a stored row. `None` for anything this build
+    /// does not know.
+    ///
+    /// **Every caller must fail closed on `None`.** The rules this value selects
+    /// get *weaker* as they go — `web` authenticates, `spa` needs PKCE,
+    /// `publicClient` needs neither — so anything that treated an unrecognised
+    /// platform as "none of the above" would be treating it as a public client,
+    /// which is the weakest of the three. Before this was an enum, that is
+    /// exactly what `authenticate_for_platform` did.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.as_str() == raw)
+    }
+}
 
 pub async fn add_role(
     pool: &DbPool,
@@ -296,16 +411,12 @@ pub async fn add_role(
     value: &str,
     display_name: &str,
     description: Option<&str>,
-    member_types: &[&str],
+    member_types: &[MemberType],
 ) -> anyhow::Result<String> {
     if value.is_empty() || value.chars().any(|c| c.is_whitespace()) || value.starts_with('.') {
         bail!("invalid app role value '{value}' (no spaces, must not start with '.')");
     }
-    if member_types.is_empty()
-        || member_types
-            .iter()
-            .any(|t| *t != MEMBER_USER && *t != MEMBER_APPLICATION)
-    {
+    if member_types.is_empty() {
         bail!("allowed member types must be User and/or Application");
     }
     let id = new_guid();
@@ -319,7 +430,9 @@ pub async fn add_role(
     .bind(value)
     .bind(display_name)
     .bind(description)
-    .bind(serde_json::to_string(member_types)?)
+    .bind(serde_json::to_string(
+        &member_types.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
+    )?)
     .bind(true)
     .execute(pool)
     .await
@@ -338,10 +451,8 @@ pub struct AppRole {
 }
 
 impl AppRole {
-    pub fn allows(&self, member_type: &str) -> bool {
-        serde_json::from_str::<Vec<String>>(&self.allowed_member_types)
-            .map(|types| types.iter().any(|t| t == member_type))
-            .unwrap_or(false)
+    pub fn allows(&self, member_type: MemberType) -> bool {
+        MemberType::parse_list(&self.allowed_member_types).contains(&member_type)
     }
 }
 
@@ -391,7 +502,7 @@ pub async fn assign_role(
             let sp = service_principal(pool, &tenant.id, app_id)
                 .await?
                 .with_context(|| format!("app '{app_id}' not found in tenant '{}'", tenant.name))?;
-            (sp.id, "ServicePrincipal", MEMBER_APPLICATION)
+            (sp.id, PrincipalType::ServicePrincipal, MemberType::Application)
         }
         Principal::User(upn) => {
             let row: Option<(String,)> = sqlx::query_as(crate::db::q(
@@ -403,7 +514,7 @@ pub async fn assign_role(
             .fetch_optional(pool)
             .await?;
             let (id,) = row.with_context(|| format!("user '{upn}' not found"))?;
-            (id, "User", MEMBER_USER)
+            (id, PrincipalType::User, MemberType::User)
         }
         Principal::Group(name) => {
             let row: Option<(String,)> = sqlx::query_as(crate::db::q(
@@ -415,11 +526,14 @@ pub async fn assign_role(
             .fetch_optional(pool)
             .await?;
             let (id,) = row.with_context(|| format!("group '{name}' not found"))?;
-            (id, "Group", MEMBER_USER)
+            (id, PrincipalType::Group, MemberType::User)
         }
     };
     if !role.allows(member_type) {
-        bail!("app role '{role_value}' cannot be assigned to {member_type} principals");
+        bail!(
+            "app role '{role_value}' cannot be assigned to {} principals",
+            member_type.as_str()
+        );
     }
     // Re-assigning is a no-op: UNIQUE (resource_id, app_role_id, principal_id).
     crate::db::inserted(
@@ -434,7 +548,7 @@ pub async fn assign_role(
         .bind(&resource_sp.id)
         .bind(&role.id)
         .bind(&principal_id)
-        .bind(principal_type)
+        .bind(principal_type.as_str())
         .bind(now())
         .execute(pool)
         .await,
@@ -453,27 +567,24 @@ pub async fn app_roles_for_service_principal(
         pool,
         "SELECT r.value, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
-         WHERE a.resource_id = ? AND a.principal_id = ? AND a.principal_type = 'ServicePrincipal'
+         WHERE a.resource_id = ? AND a.principal_id = ? AND a.principal_type = ?
            AND r.enabled = ?
          ORDER BY r.value",
     ))
     .bind(resource_sp_id)
     .bind(client_sp_id)
+    .bind(PrincipalType::ServicePrincipal.as_str())
     .bind(true)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .filter(|(_, types)| types.contains(MEMBER_APPLICATION))
+        .filter(|(_, types)| MemberType::parse_list(types).contains(&MemberType::Application))
         .map(|(value, _)| value)
         .collect())
 }
 
 // ---- redirect URIs ----
-
-pub const PLATFORM_WEB: &str = "web";
-pub const PLATFORM_SPA: &str = "spa";
-pub const PLATFORM_PUBLIC: &str = "publicClient";
 
 fn is_loopback_http(url: &url::Url) -> bool {
     url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
@@ -481,24 +592,31 @@ fn is_loopback_http(url: &url::Url) -> bool {
 
 /// Entra's rules: web and SPA URIs must be https (or http on loopback); no
 /// fragments anywhere; public clients may use custom schemes.
-pub fn validate_redirect_uri(platform: &str, uri: &str) -> anyhow::Result<()> {
+pub fn validate_redirect_uri(platform: RedirectPlatform, uri: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(uri).with_context(|| format!("redirect URI '{uri}' is not an absolute URI"))?;
     if url.fragment().is_some() {
         bail!("redirect URI must not contain a fragment");
     }
     match platform {
-        PLATFORM_WEB | PLATFORM_SPA => {
+        RedirectPlatform::Web | RedirectPlatform::Spa => {
             if url.scheme() != "https" && !is_loopback_http(&url) {
-                bail!("{platform} redirect URIs must use https (http is allowed only for localhost)");
+                bail!(
+                    "{} redirect URIs must use https (http is allowed only for localhost)",
+                    platform.as_str()
+                );
             }
         }
-        PLATFORM_PUBLIC => {}
-        _ => bail!("platform must be one of web, spa, publicClient"),
+        RedirectPlatform::PublicClient => {}
     }
     Ok(())
 }
 
-pub async fn add_redirect_uri(pool: &DbPool, app: &Application, platform: &str, uri: &str) -> anyhow::Result<()> {
+pub async fn add_redirect_uri(
+    pool: &DbPool,
+    app: &Application,
+    platform: RedirectPlatform,
+    uri: &str,
+) -> anyhow::Result<()> {
     validate_redirect_uri(platform, uri)?;
     let existing: Option<(String,)> = sqlx::query_as(crate::db::q(
         pool,
@@ -516,21 +634,44 @@ pub async fn add_redirect_uri(pool: &DbPool, app: &Application, platform: &str, 
         "INSERT INTO app_redirect_uris (application_id, platform, uri) VALUES (?, ?, ?)",
     ))
     .bind(&app.id)
-    .bind(platform)
+    .bind(platform.as_str())
     .bind(uri)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn redirect_uris(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<(String, String)>> {
-    Ok(sqlx::query_as(crate::db::q(
+/// Every registered redirect URI, with its platform.
+///
+/// A row whose platform this build does not recognise is **skipped**, with a
+/// warning. Skipping is the fail-closed direction everywhere this is used: the
+/// URI then matches nothing (so the client is told its redirect URI is not
+/// registered) and grants no SPA CORS origin. Keeping it and defaulting the
+/// platform would be the unsafe direction, because the rules get weaker from
+/// `web` to `spa` to `publicClient`. `add_redirect_uri` only ever writes a
+/// [`RedirectPlatform`], so this cannot happen from our own writes.
+pub async fn redirect_uris(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<(RedirectPlatform, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::q(
         pool,
         "SELECT platform, uri FROM app_redirect_uris WHERE application_id = ? ORDER BY platform, uri",
     ))
     .bind(&app.id)
     .fetch_all(pool)
-    .await?)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(platform, uri)| match RedirectPlatform::parse(&platform) {
+            Some(p) => Some((p, uri)),
+            None => {
+                tracing::warn!(
+                    application = %app.app_id,
+                    %platform,
+                    "ignoring a redirect URI registered under an unknown platform"
+                );
+                None
+            }
+        })
+        .collect())
 }
 
 /// Exact match, except that the port is ignored for http loopback URIs, as in Entra.
@@ -549,7 +690,11 @@ pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
 }
 
 /// The platform of the registered redirect URI matching `requested`, if any.
-pub async fn match_redirect_uri(pool: &DbPool, app: &Application, requested: &str) -> anyhow::Result<Option<String>> {
+pub async fn match_redirect_uri(
+    pool: &DbPool,
+    app: &Application,
+    requested: &str,
+) -> anyhow::Result<Option<RedirectPlatform>> {
     Ok(redirect_uris(pool, app)
         .await?
         .into_iter()
@@ -564,13 +709,10 @@ pub async fn add_scope(
     app: &Application,
     value: &str,
     display_name: &str,
-    scope_type: &str,
+    consent: ScopeConsent,
 ) -> anyhow::Result<String> {
     if value.is_empty() || value.contains(char::is_whitespace) || value.starts_with('.') || value.contains('/') {
         bail!("invalid scope value '{value}'");
-    }
-    if scope_type != "User" && scope_type != "Admin" {
-        bail!("scope type must be User or Admin");
     }
     let id = new_guid();
     sqlx::query(crate::db::q(
@@ -581,7 +723,7 @@ pub async fn add_scope(
     .bind(&app.id)
     .bind(value)
     .bind(display_name)
-    .bind(scope_type)
+    .bind(consent.as_str())
     .bind(true)
     .execute(pool)
     .await
@@ -609,20 +751,22 @@ pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &s
         "SELECT DISTINCT r.value, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND r.enabled = ?
-           AND ((a.principal_type = 'User' AND a.principal_id = ?)
-             OR (a.principal_type = 'Group' AND a.principal_id IN
+           AND ((a.principal_type = ? AND a.principal_id = ?)
+             OR (a.principal_type = ? AND a.principal_id IN
                    (SELECT group_id FROM group_members WHERE user_id = ?)))
          ORDER BY r.value",
     ))
     .bind(resource_sp_id)
     .bind(true)
+    .bind(PrincipalType::User.as_str())
     .bind(user_id)
+    .bind(PrincipalType::Group.as_str())
     .bind(user_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .filter(|(_, types)| types.contains(MEMBER_USER))
+        .filter(|(_, types)| MemberType::parse_list(types).contains(&MemberType::User))
         .map(|(value, _)| value)
         .collect())
 }
@@ -634,12 +778,14 @@ pub async fn user_is_assigned(pool: &DbPool, sp_id: &str, user_id: &str) -> anyh
         pool,
         "SELECT COUNT(*) FROM app_role_assignments
          WHERE resource_id = ?
-           AND ((principal_type = 'User' AND principal_id = ?)
-             OR (principal_type = 'Group' AND principal_id IN
+           AND ((principal_type = ? AND principal_id = ?)
+             OR (principal_type = ? AND principal_id IN
                    (SELECT group_id FROM group_members WHERE user_id = ?)))",
     ))
     .bind(sp_id)
+    .bind(PrincipalType::User.as_str())
     .bind(user_id)
+    .bind(PrincipalType::Group.as_str())
     .bind(user_id)
     .fetch_one(pool)
     .await?;

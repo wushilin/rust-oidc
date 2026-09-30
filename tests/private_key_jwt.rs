@@ -6,6 +6,7 @@ mod common;
 
 use common::*;
 use rust_oidc::apps;
+use rust_oidc::apps::MemberType;
 use serde_json::Value;
 
 const ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -103,7 +104,8 @@ async fn fixture(s: &TestServer) -> Fixture {
     let tenant = s.tenant("Contoso", "contoso.com").await;
     let api = s.app(&tenant, "orders-api").await;
     let client = s.app(&tenant, "billing-worker").await;
-    s.add_role(&tenant, &api, "Orders.Read", &["Application"]).await;
+    s.add_role(&tenant, &api, "Orders.Read", &[MemberType::Application])
+        .await;
     s.assign_to_app(&tenant, &api, "Orders.Read", &client).await;
     let cert = make_cert("billing-worker");
     let token_url = register(s, &tenant, &client.app_id, &cert).await;

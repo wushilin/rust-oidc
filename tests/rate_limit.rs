@@ -12,7 +12,7 @@
 mod common;
 
 use common::*;
-use rust_oidc::apps::{self, MEMBER_APPLICATION};
+use rust_oidc::apps::{self, MemberType};
 use rust_oidc::ratelimit::Limit;
 use serde_json::Value;
 
@@ -36,7 +36,7 @@ async fn token_raw(s: &TestServer, tenant: &str, form: &[(&str, &str)]) -> (u16,
 /// A resource this tenant really has, so a successful client-credentials request
 /// is possible: the fixture's API app with one application role assigned.
 async fn grant_app_role(s: &TestServer, f: &UserFixture, client: &TestApp) -> String {
-    s.add_role(&f.tenant, &f.api, "Orders.Read", &[MEMBER_APPLICATION])
+    s.add_role(&f.tenant, &f.api, "Orders.Read", &[MemberType::Application])
         .await;
     s.assign_to_app(&f.tenant, &f.api, "Orders.Read", client).await;
     format!("api://{}/.default", f.api.app_id)

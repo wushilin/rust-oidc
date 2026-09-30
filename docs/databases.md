@@ -72,6 +72,30 @@ and continue.
   the same treatment, or a prefix length -- and a prefix index cannot serve a unique
   constraint the way the full column does.
 
+## Which closed sets the schema enforces, and which it does not
+
+Every closed set is a Rust enum (the "no magic values" rule), but only some are also
+constrained by the database. Where the schema does **not** constrain one, the Rust-side
+parse is load-bearing and must fail closed rather than default.
+
+| Column | `CHECK` in the schema? |
+|---|---|
+| `app_redirect_uris.platform` | **Yes**, all three engines: `CHECK (platform IN ('web','spa','publicClient'))` |
+| `auth_codes.platform` | **No** — only a `-- web \| spa \| publicClient` comment |
+| `refresh_tokens.platform` | **No** — same |
+| `app_scopes.type`, `app_roles.allowed_member_types`, `app_role_assignments.principal_type`, `role_bindings.principal_type`, `audit_log.action`, `audit_log.actor` | **No** |
+
+The two grant tables are the ones that mattered: `authenticate_for_platform` used to
+compare the stored platform as a string and fall through to *public client* rules for
+anything it did not recognise, so an unreadable value meant "no client authentication"
+(decision 42). `src/routes/user_grants.rs::stored_platform` now refuses instead.
+
+Adding a `CHECK` to those two columns would be defence in depth. It is not done because
+SQLite cannot add a constraint to an existing table without rebuilding it, and these
+migrations have only ever run against empty databases (see *Known limitations*).
+`tests/storage_vocabulary.rs` asserts both halves of the table above, so a migration
+that adds or drops one of these constraints is noticed.
+
 ## Not supported
 
 **SQL Server** and **Oracle** are outside sqlx: SQL Server support was dropped before sqlx

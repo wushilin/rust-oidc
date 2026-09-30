@@ -6,29 +6,13 @@ use sqlx::Row;
 use crate::rbac::{EffectiveBinding, RoleId, Scope, ScopeKind};
 use crate::util::{new_guid, now};
 
-/// Who a binding is granted to. Service principals cannot use the console.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrincipalType {
-    User,
-    Group,
-}
-
-impl PrincipalType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "User",
-            Self::Group => "Group",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "User" => Some(Self::User),
-            "Group" => Some(Self::Group),
-            _ => None,
-        }
-    }
-}
+/// Who a binding is granted to.
+///
+/// The same enum `app_role_assignments` uses, so the two `principal_type` columns
+/// have one spelling between them. A console role binding is narrower than an app
+/// role assignment: a service principal cannot use the console, and
+/// [`create`] refuses one rather than a second near-identical enum existing.
+pub use crate::directory::PrincipalType;
 
 pub struct StoredBinding {
     pub id: String,
@@ -46,6 +30,13 @@ pub async fn create(
     scope: &Scope,
     created_by: &str,
 ) -> anyhow::Result<String> {
+    // A service principal cannot sign in to the console, so a binding naming one
+    // could only ever be dead weight -- and `effective_for_user` would ignore it
+    // anyway. Refuse it here rather than leave that as an implicit property of a
+    // query two functions away.
+    if principal_type == PrincipalType::ServicePrincipal {
+        anyhow::bail!("a service principal cannot hold a console role");
+    }
     let id = new_guid();
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
@@ -142,9 +133,14 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
 }
 
 pub async fn list_all(pool: &DbPool) -> anyhow::Result<Vec<StoredBinding>> {
-    let rows = sqlx::query(
+    // Through `db::q` like every other statement, although this one carries no
+    // placeholder today: `tests/sql_routing.rs` only flags calls containing `?`,
+    // so an unrouted statement here would stay invisible until someone added a
+    // `WHERE` and broke Postgres.
+    let rows = sqlx::query(crate::db::q(
+        pool,
         "SELECT id, principal_type, principal_id, role_id, scope_kind FROM role_bindings ORDER BY created_at",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     hydrate(pool, rows).await

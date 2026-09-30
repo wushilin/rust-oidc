@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use rust_oidc::apps::{self, Principal};
+use rust_oidc::apps::{self, MemberType, Principal, ScopeConsent};
 use rust_oidc::config::PublicUrl;
 use rust_oidc::db::DbPool;
 use rust_oidc::tenant::{self, Tenant};
@@ -68,7 +68,7 @@ impl TestServer {
         }
     }
 
-    pub async fn add_role(&self, tenant: &Tenant, resource: &TestApp, value: &str, types: &[&str]) {
+    pub async fn add_role(&self, tenant: &Tenant, resource: &TestApp, value: &str, types: &[MemberType]) {
         let app = apps::find_in_tenant(&self.pool, tenant, &resource.app_id)
             .await
             .unwrap();
@@ -292,14 +292,14 @@ pub async fn user_fixture_in(s: &TestServer, tenant: Tenant, upn: &str) -> UserF
     let web = s.app(&tenant, "web-app").await;
     let api = s.app(&tenant, "orders-api").await;
     let web_app = apps::find(&s.pool, &web.app_id).await.unwrap().unwrap();
-    apps::add_redirect_uri(&s.pool, &web_app, apps::PLATFORM_WEB, REDIRECT)
+    apps::add_redirect_uri(&s.pool, &web_app, apps::RedirectPlatform::Web, REDIRECT)
         .await
         .unwrap();
-    apps::add_redirect_uri(&s.pool, &web_app, apps::PLATFORM_SPA, SPA_REDIRECT)
+    apps::add_redirect_uri(&s.pool, &web_app, apps::RedirectPlatform::Spa, SPA_REDIRECT)
         .await
         .unwrap();
     let api_app = apps::find(&s.pool, &api.app_id).await.unwrap().unwrap();
-    apps::add_scope(&s.pool, &api_app, "Orders.Read", "Read orders", "User")
+    apps::add_scope(&s.pool, &api_app, "Orders.Read", "Read orders", ScopeConsent::User)
         .await
         .unwrap();
     apps::add_role(
@@ -308,7 +308,7 @@ pub async fn user_fixture_in(s: &TestServer, tenant: Tenant, upn: &str) -> UserF
         "Orders.Approver",
         "Approver",
         None,
-        &[apps::MEMBER_USER],
+        &[apps::MemberType::User],
     )
     .await
     .unwrap();

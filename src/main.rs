@@ -8,7 +8,7 @@ use rust_oidc::db::{Actor, DbPool, Event};
 use serde_json::json;
 
 use rust_oidc::admin::bindings::{self as role_bindings, PrincipalType};
-use rust_oidc::apps::{self, Principal};
+use rust_oidc::apps::{self, MemberType, Principal, RedirectPlatform, ScopeConsent};
 use rust_oidc::config::PublicUrl;
 use rust_oidc::rbac::{RoleId, Scope};
 use rust_oidc::server::{self, TlsArgs};
@@ -183,8 +183,8 @@ enum AppCmd {
         tenant: String,
         #[arg(long)]
         app: String,
-        #[arg(long)]
-        platform: String,
+        #[arg(long, value_enum)]
+        platform: RedirectPlatform,
         #[arg(long)]
         uri: String,
     },
@@ -198,9 +198,9 @@ enum AppCmd {
         value: String,
         #[arg(long)]
         display_name: Option<String>,
-        /// User or Admin.
-        #[arg(long, default_value = "User")]
-        r#type: String,
+        /// Who may consent: User or Admin.
+        #[arg(long, value_enum, default_value = "User")]
+        r#type: ScopeConsent,
     },
     /// Allow front-channel tokens for this app: Entra's "ID tokens" and "access
     /// tokens" toggles under Implicit grant and hybrid flows. Both off by default,
@@ -315,8 +315,8 @@ enum RoleCmd {
         #[arg(long)]
         description: Option<String>,
         /// Allowed member types: User, Application.
-        #[arg(long, value_delimiter = ',', default_value = "User,Application")]
-        member_types: Vec<String>,
+        #[arg(long, value_enum, value_delimiter = ',', default_value = "User,Application")]
+        member_types: Vec<MemberType>,
     },
     /// Assign an app role of --resource to an app, user or group.
     Assign {
@@ -679,7 +679,7 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
                 "appId": a.app_id, "id": a.id, "displayName": a.display_name,
                 "identifierUris": apps::identifier_uris(pool, &a).await?,
                 "redirectUris": apps::redirect_uris(pool, &a).await?.into_iter()
-                    .map(|(platform, uri)| json!({ "platform": platform, "uri": uri })).collect::<Vec<_>>(),
+                    .map(|(platform, uri)| json!({ "platform": platform.as_str(), "uri": uri })).collect::<Vec<_>>(),
                 "scopes": apps::enabled_scopes(pool, &a).await?,
                 "appRoles": roles,
                 "servicePrincipalId": sp.map(|s| s.id),
@@ -699,14 +699,14 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            apps::add_redirect_uri(pool, &a, &platform, &uri).await?;
+            apps::add_redirect_uri(pool, &a, platform, &uri).await?;
             db::audit(
                 pool,
                 Some(&t.id),
                 Actor::Cli,
                 Event::AppRedirectUriAdd,
                 Some(&a.app_id),
-                json!({ "platform": platform, "uri": uri }),
+                json!({ "platform": platform.as_str(), "uri": uri }),
             )
             .await?;
         }
@@ -720,7 +720,7 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
             let display = display_name.unwrap_or_else(|| value.clone());
-            let id = apps::add_scope(pool, &a, &value, &display, &r#type).await?;
+            let id = apps::add_scope(pool, &a, &value, &display, r#type).await?;
             db::audit(
                 pool,
                 Some(&t.id),
@@ -905,9 +905,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         }) => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            let types: Vec<&str> = member_types.iter().map(String::as_str).collect();
             let display = display_name.unwrap_or_else(|| value.clone());
-            let id = apps::add_role(pool, &a, &value, &display, description.as_deref(), &types).await?;
+            let id = apps::add_role(pool, &a, &value, &display, description.as_deref(), &member_types).await?;
             db::audit(
                 pool,
                 Some(&t.id),
@@ -917,6 +916,7 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
                 json!({ "value": value }),
             )
             .await?;
+            let types: Vec<&str> = member_types.iter().map(|m| m.as_str()).collect();
             print_json(json!({ "id": id, "value": value, "allowedMemberTypes": types }));
         }
         AppCmd::Role(RoleCmd::Assign {

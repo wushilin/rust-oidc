@@ -3,7 +3,7 @@ mod common;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use common::{TestServer, aadsts};
-use rust_oidc::apps::{MEMBER_APPLICATION, MEMBER_USER};
+use rust_oidc::apps::MemberType;
 
 #[tokio::test]
 async fn issues_entra_v2_app_only_token() {
@@ -11,9 +11,9 @@ async fn issues_entra_v2_app_only_token() {
     let t = s.tenant("Contoso", "contoso.com").await;
     let api = s.app(&t, "orders-api").await;
     let worker = s.app(&t, "billing-worker").await;
-    s.add_role(&t, &api, "Orders.Read", &[MEMBER_APPLICATION]).await;
-    s.add_role(&t, &api, "Orders.Write", &[MEMBER_APPLICATION]).await;
-    s.add_role(&t, &api, "Orders.Admin", &[MEMBER_USER]).await;
+    s.add_role(&t, &api, "Orders.Read", &[MemberType::Application]).await;
+    s.add_role(&t, &api, "Orders.Write", &[MemberType::Application]).await;
+    s.add_role(&t, &api, "Orders.Admin", &[MemberType::User]).await;
     s.assign_to_app(&t, &api, "Orders.Read", &worker).await;
     s.assign_to_app(&t, &api, "Orders.Write", &worker).await;
 

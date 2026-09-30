@@ -117,7 +117,7 @@ async fn pairwise_sub_differs_per_client() {
     let f = user_fixture(&s).await;
     let other = s.app(&f.tenant, "other-app").await;
     let other_app = rust_oidc::apps::find(&s.pool, &other.app_id).await.unwrap().unwrap();
-    rust_oidc::apps::add_redirect_uri(&s.pool, &other_app, "web", REDIRECT)
+    rust_oidc::apps::add_redirect_uri(&s.pool, &other_app, rust_oidc::apps::RedirectPlatform::Web, REDIRECT)
         .await
         .unwrap();
     let b = Browser::new();
@@ -794,7 +794,7 @@ async fn groups_wids_and_assignment_required() {
 
     // Assign a web-app role to the group; group members may now sign in.
     let web = apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap();
-    apps::add_role(&s.pool, &web, "Reader", "Reader", None, &[apps::MEMBER_USER])
+    apps::add_role(&s.pool, &web, "Reader", "Reader", None, &[apps::MemberType::User])
         .await
         .unwrap();
     apps::assign_role(

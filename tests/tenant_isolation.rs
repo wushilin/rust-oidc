@@ -1,7 +1,7 @@
 mod common;
 
 use common::{TestServer, aadsts};
-use rust_oidc::apps::{self, MEMBER_APPLICATION, Principal};
+use rust_oidc::apps::{self, MemberType, Principal};
 
 #[tokio::test]
 async fn client_from_other_tenant_is_not_found() {
@@ -108,7 +108,7 @@ async fn cannot_assign_roles_across_tenants() {
     let b = s.tenant("Fabrikam", "fabrikam.com").await;
     let api_a = s.app(&a, "api").await;
     let worker_b = s.app(&b, "worker").await;
-    s.add_role(&a, &api_a, "Orders.Read", &[MEMBER_APPLICATION]).await;
+    s.add_role(&a, &api_a, "Orders.Read", &[MemberType::Application]).await;
     let app = apps::find(&s.pool, &api_a.app_id).await.unwrap().unwrap();
     let err = apps::assign_role(
         &s.pool,

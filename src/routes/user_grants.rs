@@ -20,7 +20,7 @@ use sqlx::FromRow;
 use super::audit::{self, Actor, Channel, Event};
 use super::token::{GrantType, authenticate_confidential_client, param};
 use crate::AppState;
-use crate::apps::{self, Application, PLATFORM_SPA, PLATFORM_WEB};
+use crate::apps::{self, Application, RedirectPlatform};
 use crate::claims::{self, Amr, Azpacr, IdType, SignIn};
 use crate::error::{AadError, no_store};
 use crate::scopes::{self, Grant};
@@ -33,6 +33,22 @@ const SPA_REFRESH_LIFETIME: i64 = 86_400;
 
 type Params = HashMap<String, String>;
 
+/// The platform stored on a grant.
+///
+/// A value this build cannot read is a **refusal**, never a default. The rules the
+/// platform selects get weaker from `web` (must authenticate) through `spa` (PKCE,
+/// cross-origin) to `publicClient` (neither), so guessing would mean skipping
+/// client authentication. `add_redirect_uri` only ever writes a
+/// [`RedirectPlatform`], so this is unreachable from our own writes -- it is the
+/// guard for a hand-edited row or a value from a newer build, and it is logged at
+/// error level because it means the table holds something we did not put there.
+fn stored_platform(raw: &str, grant: &str) -> Result<RedirectPlatform, AadError> {
+    RedirectPlatform::parse(raw).ok_or_else(|| {
+        tracing::error!(platform = %raw, grant, "stored grant carries an unknown platform; refusing it");
+        AadError::server_error()
+    })
+}
+
 /// Authenticate the client according to the platform the grant was issued to.
 /// Returns `azpacr`.
 async fn authenticate_for_platform(
@@ -40,11 +56,11 @@ async fn authenticate_for_platform(
     tenant: &Tenant,
     headers: &HeaderMap,
     params: &Params,
-    platform: &str,
+    platform: RedirectPlatform,
     expected_client: &str,
 ) -> Result<Azpacr, AadError> {
     let has_origin = headers.contains_key("origin");
-    if platform == PLATFORM_SPA {
+    if platform == RedirectPlatform::Spa {
         if !has_origin {
             return Err(AadError::invalid_request(
                 9002327,
@@ -57,25 +73,27 @@ async fn authenticate_for_platform(
             "Cross-origin token redemption is permitted only for the 'Single-Page Application' client-type.",
         ));
     }
-    if platform == PLATFORM_WEB {
-        let client = authenticate_confidential_client(st, tenant, headers, params).await?;
-        if !client.app.app_id.eq_ignore_ascii_case(expected_client) {
-            return Err(AadError::invalid_grant(
-                70000,
-                "The provided grant was issued to a different client.",
-            ));
+    let wrong_client = || AadError::invalid_grant(70000, "The provided grant was issued to a different client.");
+    // Exhaustive on purpose. This used to compare strings and fall through to the
+    // public-client branch for anything it did not recognise, which is the weakest
+    // of the three rule sets -- an unreadable platform meant "no authentication".
+    match platform {
+        RedirectPlatform::Web => {
+            let client = authenticate_confidential_client(st, tenant, headers, params).await?;
+            if !client.app.app_id.eq_ignore_ascii_case(expected_client) {
+                return Err(wrong_client());
+            }
+            // A web client may authenticate with a secret or a certificate.
+            Ok(client.azpacr)
         }
-        // A web client may authenticate with a secret or a certificate.
-        return Ok(client.azpacr);
+        RedirectPlatform::Spa | RedirectPlatform::PublicClient => {
+            let client_id = param(params, "client_id").ok_or_else(|| AadError::missing_parameter("client_id"))?;
+            if !client_id.eq_ignore_ascii_case(expected_client) {
+                return Err(wrong_client());
+            }
+            Ok(Azpacr::None)
+        }
     }
-    let client_id = param(params, "client_id").ok_or_else(|| AadError::missing_parameter("client_id"))?;
-    if !client_id.eq_ignore_ascii_case(expected_client) {
-        return Err(AadError::invalid_grant(
-            70000,
-            "The provided grant was issued to a different client.",
-        ));
-    }
-    Ok(Azpacr::None)
 }
 
 #[derive(FromRow)]
@@ -120,7 +138,8 @@ pub async fn authorization_code(
             "Provided Authorization Code is intended to use against other tenant, thus rejected.",
         ));
     }
-    let azpacr = authenticate_for_platform(st, tenant, headers, params, &row.platform, &row.client_app_id).await?;
+    let platform = stored_platform(&row.platform, "authorization_code")?;
+    let azpacr = authenticate_for_platform(st, tenant, headers, params, platform, &row.client_app_id).await?;
 
     if row.redeemed_at.is_some() {
         // Only the outcome and identifiers: never the code itself, nor its hash.
@@ -187,7 +206,7 @@ pub async fn authorization_code(
     let family = Family {
         id: new_guid(),
         code_hash: Some(row.code_hash.clone()),
-        platform: row.platform.clone(),
+        platform,
         auth_time: row.auth_time,
         amr,
         spa_expires_at: None,
@@ -248,7 +267,8 @@ pub async fn refresh_token(
             "Provided refresh token is intended to use against other tenant, thus rejected.",
         ));
     }
-    let azpacr = authenticate_for_platform(st, tenant, headers, params, &row.platform, &row.client_app_id).await?;
+    let platform = stored_platform(&row.platform, "refresh_token")?;
+    let azpacr = authenticate_for_platform(st, tenant, headers, params, platform, &row.client_app_id).await?;
 
     let revoked = || AadError::invalid_grant(50173, "The provided grant has expired due to it being revoked.");
     if row.revoked_at.is_some() {
@@ -260,7 +280,7 @@ pub async fn refresh_token(
         return Err(revoked());
     }
     if row.expires_at <= now() {
-        return Err(if row.platform == PLATFORM_SPA {
+        return Err(if platform == RedirectPlatform::Spa {
             AadError::invalid_grant(
                 700084,
                 "The refresh token was issued to a single page app (SPA), and therefore has a fixed, limited lifetime of 1.00:00:00, which cannot be extended. It is now expired and a new sign in request must be sent by the SPA to the sign in page.",
@@ -289,10 +309,10 @@ pub async fn refresh_token(
     let family = Family {
         id: row.family_id.clone(),
         code_hash: None,
-        platform: row.platform.clone(),
+        platform,
         auth_time: row.auth_time,
         amr: serde_json::from_str(&row.amr).unwrap_or_default(),
-        spa_expires_at: (row.platform == PLATFORM_SPA).then_some(row.expires_at),
+        spa_expires_at: (platform == RedirectPlatform::Spa).then_some(row.expires_at),
         rotation: true,
     };
     issue(
@@ -313,7 +333,7 @@ pub async fn refresh_token(
 pub(super) struct Family {
     pub(super) id: String,
     pub(super) code_hash: Option<String>,
-    pub(super) platform: String,
+    pub(super) platform: RedirectPlatform,
     pub(super) auth_time: i64,
     pub(super) amr: Vec<String>,
     /// SPA refresh tokens keep the family's original expiry.
@@ -367,7 +387,7 @@ pub(super) async fn issue(
         let refresh = b64url(&random_bytes(48));
         let ts = now();
         let expires_at = family.spa_expires_at.unwrap_or(
-            ts + if family.platform == PLATFORM_SPA {
+            ts + if family.platform == RedirectPlatform::Spa {
                 SPA_REFRESH_LIFETIME
             } else {
                 tenant.settings.refresh_token_lifetime_secs
@@ -384,7 +404,7 @@ pub(super) async fn issue(
         .bind(&family.code_hash)
         .bind(&tenant.id)
         .bind(client_app_id)
-        .bind(&family.platform)
+        .bind(family.platform.as_str())
         .bind(&user.id)
         .bind(grant.granted.join(" "))
         .bind(family.auth_time)
@@ -587,7 +607,7 @@ pub async fn on_behalf_of(
         Family {
             id: b64url(&random_bytes(16)),
             code_hash: None,
-            platform: PLATFORM_WEB.to_string(),
+            platform: RedirectPlatform::Web,
             auth_time,
             amr,
             spa_expires_at: None,
@@ -686,7 +706,7 @@ pub async fn password(
         Family {
             id: b64url(&random_bytes(16)),
             code_hash: None,
-            platform: PLATFORM_WEB.to_string(),
+            platform: RedirectPlatform::Web,
             auth_time: ts,
             amr: vec![Amr::Pwd.as_str().to_string()],
             spa_expires_at: None,

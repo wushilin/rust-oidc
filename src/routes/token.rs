@@ -69,7 +69,7 @@ async fn allowed_spa_origin(
     let app = apps::find(&st.pool, param(params, "client_id")?).await.ok()??;
     let uris = apps::redirect_uris(&st.pool, &app).await.ok()?;
     uris.iter()
-        .filter(|(platform, _)| platform == apps::PLATFORM_SPA)
+        .filter(|(platform, _)| *platform == apps::RedirectPlatform::Spa)
         .filter_map(|(_, uri)| url::Url::parse(uri).ok())
         .any(|u| u.origin().ascii_serialization() == origin)
         .then(|| HeaderValue::from_str(origin).ok())?

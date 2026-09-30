@@ -3,6 +3,18 @@
 //! Postgres. Routing is otherwise convention only, and an unwrapped query
 //! breaks on Postgres silently. The scan is multi-line aware: it takes the whole
 //! call, from `sqlx::query` to its balancing `)`.
+//!
+//! What it does NOT catch, so a clean run is not over-trusted:
+//! - SQL held in a `const`, `let` binding or `format!` and passed by variable:
+//!   the literal is not inside the call body, so it is never seen.
+//! - An unqualified `query(...)` via `use sqlx::query` (none exist today).
+//! - A raw string `r#"..."#` or a `'"'` char literal inside a call, which can
+//!   desync the paren/quote tracking.
+//!
+//! Deliberate loosenesses (the safe direction):
+//! - A Rust `?` operator inside `.bind(...)` counts as a placeholder: a false
+//!   positive, which fails loudly.
+//! - A call holding both a wrapped and an unwrapped literal passes.
 
 use std::fs;
 use std::path::Path;
@@ -51,7 +63,7 @@ fn unrouted(src: &str) -> Vec<usize> {
         let Some(paren) = src[at..].find('(').map(|p| at + p) else { continue };
         // Only the call head `sqlx::query`, `query_as`, `query_scalar`, `query_as::<..>`.
         let head = &src[at..paren];
-        if head.contains(char::is_whitespace) || head.contains(';') {
+        if head.contains([';', '{', '}']) {
             continue;
         }
         let body = call_body(src, paren);
@@ -86,6 +98,10 @@ fn the_scanner_flags_multiline_unwrapped_queries_and_passes_wrapped_ones() {
     assert_eq!(unrouted(bad), vec![2]);
     let ok = "sqlx::query(sql_stmt(e, \"UPDATE t SET a = ?\")).bind(1)";
     assert!(unrouted(ok).is_empty());
+    let tf_bad = "sqlx::query_as::<_, T>(\"SELECT a FROM t WHERE x = ?\")";
+    assert_eq!(unrouted(tf_bad), vec![1]);
+    let tf_ok = "sqlx::query_as::<_, T>(sql_stmt(e, \"SELECT a FROM t WHERE x = ?\"))";
+    assert!(unrouted(tf_ok).is_empty());
     let none = "sqlx::query(\"SELECT 1\")";
     assert!(unrouted(none).is_empty());
 }

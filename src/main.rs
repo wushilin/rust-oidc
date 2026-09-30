@@ -68,6 +68,8 @@ enum Command {
     App(AppCmd),
     #[command(subcommand)]
     Key(KeyCmd),
+    #[command(subcommand)]
+    Audit(AuditCmd),
     /// Write a self-signed TLS certificate for local development.
     DevCert {
         #[arg(long, default_value = "data/dev-cert")]
@@ -323,6 +325,19 @@ enum RoleCmd {
 }
 
 #[derive(Subcommand)]
+enum AuditCmd {
+    /// Delete audit rows older than --older-than-days.
+    ///
+    /// The table is append-only and unauthenticated requests can append to it,
+    /// so an operator or cron must run this. There is no scheduler in the
+    /// server process.
+    Prune {
+        #[arg(long, default_value_t = 90)]
+        older_than_days: i64,
+    },
+}
+
+#[derive(Subcommand)]
 enum KeyCmd {
     List,
     /// Promote the pre-published next key to active and publish a new next key.
@@ -428,6 +443,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Group(cmd) => group_cmd(&pool, cmd).await?,
         Command::App(cmd) => app_cmd(&pool, cmd).await?,
         Command::Key(cmd) => key_cmd(&pool, cmd).await?,
+        Command::Audit(AuditCmd::Prune { older_than_days }) => {
+            let n = db::prune_audit(&pool, older_than_days * 86_400).await?;
+            println!("deleted {n} audit row(s)");
+        }
         Command::DevCert { .. } => unreachable!(),
     }
     Ok(())

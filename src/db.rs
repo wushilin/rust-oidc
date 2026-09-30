@@ -411,6 +411,20 @@ pub async fn audit(
     Ok(())
 }
 
+/// Delete audit rows older than `older_than_secs`.
+///
+/// The table is append-only and grows without bound, and unauthenticated
+/// requests can append to it (a failed client authentication is an event), so
+/// retention is not optional. There is no scheduler in this process, so this
+/// follows `keys::prune`: an operator or cron calls the CLI.
+pub async fn prune_audit(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
+    let res = sqlx::query(q(pool, "DELETE FROM audit_log WHERE created_at < ?"))
+        .bind(crate::util::now() - older_than_secs)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

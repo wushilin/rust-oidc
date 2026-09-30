@@ -66,6 +66,11 @@ and continue.
 - Exact-match columns carry `COLLATE utf8mb4_bin`. The default collation is case- and
   accent-insensitive, which would otherwise loosen OAuth redirect-URI matching.
 - `GROUPS` is a reserved word, so the table is `user_groups`.
+- **A `TEXT` column cannot be indexed without a prefix length.** `0009` therefore narrows
+  `audit_log.actor`/`action`/`target` to `VARCHAR` (with `utf8mb4_bin`, since all three are
+  equality matches) before creating the indexes. Any future index on a `TEXT` column needs
+  the same treatment, or a prefix length -- and a prefix index cannot serve a unique
+  constraint the way the full column does.
 
 ## Not supported
 

@@ -368,7 +368,7 @@ async fn continue_authorize(
             needs_login |= now() - s.auth_time > max_age;
         }
         if let (Some(hint), Some(u)) = (login_hint, &user) {
-            needs_login |= !hint.eq_ignore_ascii_case(&u.upn);
+            needs_login |= crate::util::fold(hint) != crate::util::fold(&u.upn);
         }
     }
     if needs_login {

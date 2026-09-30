@@ -3,8 +3,7 @@
 -- gets a folded twin with a plain unique index; the display column keeps the
 -- original casing.
 -- SQLite's lower() only folds ASCII; rows holding non-ASCII UPNs/domains/names
--- are re-folded by the application on next write, and lookups of such rows
--- created before this migration are the only place the two can differ.
+-- are repaired at startup by db::reconcile_folded.
 -- The columns stay nullable because SQLite cannot add NOT NULL without a
 -- default; the application always writes them.
 

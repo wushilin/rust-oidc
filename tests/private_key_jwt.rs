@@ -158,6 +158,21 @@ async fn replaying_a_jti_is_rejected() {
     let (status, body) = assert_with(&s, &f.tenant.id, &f.client.app_id, &assertion, &f.scope).await;
     assert_eq!(status, 401, "a replayed assertion must be refused: {body}");
     assert_eq!(body["error"], "invalid_client");
+
+    // The replay is audited by its jti (an identifier), never by the assertion.
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT actor, details FROM audit_log WHERE tenant_id = ? AND action = ?",
+    ))
+    .bind(&f.tenant.id)
+    .bind("token.assertion_replayed")
+    .fetch_all(&s.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, f.client.app_id);
+    let details = rows[0].1.as_deref().unwrap();
+    assert!(details.contains("jti-used-twice") && !details.contains(&assertion));
 }
 
 #[tokio::test]

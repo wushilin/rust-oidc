@@ -17,7 +17,8 @@ use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
-use super::token::{authenticate_confidential_client, param};
+use super::audit::{self, Channel, Event};
+use super::token::{GrantType, authenticate_confidential_client, param};
 use crate::AppState;
 use crate::apps::{self, Application, PLATFORM_SPA, PLATFORM_WEB};
 use crate::claims::{self, Azpacr, IdType, SignIn};
@@ -122,7 +123,18 @@ pub async fn authorization_code(
     let azpacr = authenticate_for_platform(st, tenant, headers, params, &row.platform, &row.client_app_id).await?;
 
     if row.redeemed_at.is_some() {
-        revoke_code_family(st, &row.code_hash).await?;
+        // Only the outcome and identifiers: never the code itself, nor its hash.
+        let details = json!({ "clientId": row.client_app_id });
+        audit::record(
+            st,
+            &tenant.id,
+            &row.user_id,
+            Event::TokenCodeReplayed,
+            Some(&row.client_app_id),
+            details,
+        )
+        .await;
+        revoke_code_family(st, tenant, &row.user_id, &row.code_hash).await?;
         return Err(AadError::invalid_grant(
             54005,
             "OAuth2 Authorization code was already redeemed, please retry with a new valid code or use an existing refresh token.",
@@ -244,7 +256,7 @@ pub async fn refresh_token(
     }
     if row.used_at.is_some() {
         // A rotated token was replayed: assume theft and revoke the chain.
-        revoke_family(st, &row.family_id).await?;
+        revoke_family(st, tenant, &row.user_id, &row.family_id, RevokeCause::RefreshReuse).await?;
         return Err(revoked());
     }
     if row.expires_at <= now() {
@@ -266,7 +278,7 @@ pub async fn refresh_token(
     .execute(&st.pool)
     .await?;
     if res.rows_affected() != 1 {
-        revoke_family(st, &row.family_id).await?;
+        revoke_family(st, tenant, &row.user_id, &row.family_id, RevokeCause::RefreshReuse).await?;
         return Err(revoked());
     }
 
@@ -384,6 +396,23 @@ pub(super) async fn issue(
     if let Some(id_token) = issued.id_token {
         body.insert("id_token".into(), json!(id_token));
     }
+    let details = json!({
+        "grant": param(params, "grant_type").and_then(GrantType::parse).map(GrantType::as_str),
+        "clientId": client_app_id,
+        "resource": grant.resource.audience(),
+        "scope": grant.granted.join(" "),
+        "refreshToken": body.contains_key("refresh_token"),
+        "familyId": family.id,
+    });
+    audit::record(
+        st,
+        &tenant.id,
+        &user.id,
+        Event::TokenIssued,
+        Some(client_app_id),
+        details,
+    )
+    .await;
     if param(params, "client_info") == Some("1") {
         body.insert("client_info".into(), json!(claims::client_info(&user)));
     }
@@ -395,8 +424,32 @@ pub(super) async fn issue(
     Ok(resp)
 }
 
-async fn revoke_family(st: &AppState, family_id: &str) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(
+/// Why a refresh-token family was revoked, recorded as `cause`.
+#[derive(Clone, Copy)]
+enum RevokeCause {
+    /// A rotated refresh token was presented again.
+    RefreshReuse,
+    /// The authorization code that started the family was redeemed twice.
+    CodeReplay,
+}
+
+impl RevokeCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RefreshReuse => "refresh_reuse",
+            Self::CodeReplay => "code_replay",
+        }
+    }
+}
+
+async fn revoke_family(
+    st: &AppState,
+    tenant: &Tenant,
+    user_id: &str,
+    family_id: &str,
+    cause: RevokeCause,
+) -> anyhow::Result<()> {
+    let res = sqlx::query(crate::db::q(
         &st.pool,
         "UPDATE refresh_tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL",
     ))
@@ -404,6 +457,20 @@ async fn revoke_family(st: &AppState, family_id: &str) -> anyhow::Result<()> {
     .bind(family_id)
     .execute(&st.pool)
     .await?;
+    // Nothing revoked means nothing changed, so no event. The family id names
+    // a chain of tokens; it cannot be used as one.
+    if res.rows_affected() > 0 {
+        let details = json!({ "familyId": family_id, "cause": cause.as_str(), "tokens": res.rows_affected() });
+        audit::record(
+            st,
+            &tenant.id,
+            user_id,
+            Event::RefreshFamilyRevoked,
+            Some(user_id),
+            details,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -411,7 +478,7 @@ async fn revoke_family(st: &AppState, family_id: &str) -> anyhow::Result<()> {
 /// Two statements rather than one self-referencing UPDATE: MySQL refuses to update a
 /// table the same statement selects from (error 1093). Revocation is idempotent and
 /// monotonic, so splitting it loses nothing.
-async fn revoke_code_family(st: &AppState, code_hash: &str) -> anyhow::Result<()> {
+async fn revoke_code_family(st: &AppState, tenant: &Tenant, user_id: &str, code_hash: &str) -> anyhow::Result<()> {
     let engine = crate::db::engine_of(&st.pool);
     let families: Vec<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
@@ -421,7 +488,7 @@ async fn revoke_code_family(st: &AppState, code_hash: &str) -> anyhow::Result<()
     .fetch_all(&st.pool)
     .await?;
     for (id,) in families {
-        revoke_family(st, &id).await?;
+        revoke_family(st, tenant, user_id, &id, RevokeCause::CodeReplay).await?;
     }
     Ok(())
 }
@@ -547,7 +614,17 @@ pub async fn password(
     let password = param(params, "password").ok_or_else(|| AadError::missing_parameter("password"))?;
     let scope = param(params, "scope").ok_or_else(|| AadError::missing_parameter("scope"))?;
 
-    let outcome = users::authenticate(&st.pool, tenant, username, password).await?;
+    let (outcome, trace) = users::authenticate_traced(&st.pool, tenant, username, password).await?;
+    audit::sign_in_failure(
+        st,
+        &tenant.id,
+        username,
+        &outcome,
+        &trace,
+        Channel::Ropc,
+        &client.app.app_id,
+    )
+    .await;
     let user = match outcome {
         users::AuthResult::Ok(user) => user,
         // An unknown user and a wrong password give the same answer, so the token

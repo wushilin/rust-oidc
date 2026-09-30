@@ -101,6 +101,23 @@ async fn ropc_rejects_a_wrong_password() {
     assert_eq!(status, 400, "{err}");
     assert_eq!(err["error"], "invalid_grant");
     assert_eq!(aadsts(&err), 50126);
+    let (actor, details) = audit_row(&s, &f, "auth.sign_in_failed").await;
+    assert_eq!(actor, f.user_id);
+    assert!(details.contains("bad_password") && !details.contains("not-the-password"));
+}
+
+/// The single audit row with this action in the fixture's tenant.
+async fn audit_row(s: &TestServer, f: &UserFixture, action: &str) -> (String, String) {
+    let (actor, details): (String, Option<String>) = sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT actor, details FROM audit_log WHERE tenant_id = ? AND action = ?",
+    ))
+    .bind(&f.tenant.id)
+    .bind(action)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap();
+    (actor, details.unwrap_or_default())
 }
 
 #[tokio::test]
@@ -114,6 +131,10 @@ async fn ropc_rejects_an_unknown_user() {
     assert_eq!(err["error"], "invalid_grant");
     // Indistinguishable from a wrong password, so the endpoint is not a user oracle.
     assert_eq!(aadsts(&err), 50126);
+    // The audit log does tell them apart. The authenticated client is the actor.
+    let (actor, details) = audit_row(&s, &f, "auth.sign_in_failed").await;
+    assert_eq!(actor, f.web.app_id);
+    assert!(details.contains("unknown_user") && details.contains("nobody@contoso.com"));
 }
 
 #[tokio::test]

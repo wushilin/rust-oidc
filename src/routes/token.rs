@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value, json};
 
+use super::audit::{self, ClientFailures, Event, Reason};
 use crate::AppState;
 use crate::apps::{self, Application, SecretCheck, ServicePrincipal};
 use crate::claims::Azpacr;
@@ -236,17 +237,54 @@ pub(super) async fn authenticate_confidential_client(
         Some(app) => apps::service_principal(&st.pool, &tenant.id, &app.app_id).await?,
         None => None,
     };
-    let (Some(app), Some(sp)) = (app, sp) else {
-        return Err(AadError::app_not_found(&client_id, &tenant.id));
+    let failures = ClientFailures {
+        st,
+        tenant_id: &tenant.id,
+        event: Event::TokenClientAuthFailed,
+        claimed: &client_id,
     };
-    let secret = secret.ok_or_else(AadError::missing_client_credential)?;
+    let (Some(app), Some(sp)) = (app, sp) else {
+        return Err(failures
+            .fail(
+                None,
+                Reason::UnknownClient,
+                AadError::app_not_found(&client_id, &tenant.id),
+            )
+            .await);
+    };
+    let Some(secret) = secret else {
+        return Err(failures
+            .fail(
+                Some(&app.app_id),
+                Reason::MissingSecret,
+                AadError::missing_client_credential(),
+            )
+            .await);
+    };
     match apps::verify_secret(&st.pool, &app, &secret).await? {
         SecretCheck::Valid => {}
-        SecretCheck::Expired => return Err(AadError::expired_client_secret(&app.app_id)),
-        SecretCheck::Invalid => return Err(AadError::invalid_client_secret(&app.app_id)),
+        SecretCheck::Expired => {
+            return Err(failures
+                .fail(
+                    Some(&app.app_id),
+                    Reason::ExpiredSecret,
+                    AadError::expired_client_secret(&app.app_id),
+                )
+                .await);
+        }
+        SecretCheck::Invalid => {
+            return Err(failures
+                .fail(
+                    Some(&app.app_id),
+                    Reason::InvalidSecret,
+                    AadError::invalid_client_secret(&app.app_id),
+                )
+                .await);
+        }
     }
     if !sp.enabled {
-        return Err(AadError::app_disabled(&app.app_id, &app.display_name));
+        let err = AadError::app_disabled(&app.app_id, &app.display_name);
+        return Err(failures.fail(Some(&app.app_id), Reason::AppDisabled, err).await);
     }
     Ok(AuthenticatedClient {
         app,
@@ -285,14 +323,32 @@ async fn authenticate_with_assertion(
         ));
     }
 
-    let header = jsonwebtoken::decode_header(assertion).map_err(|_| AadError::invalid_client_assertion())?;
+    // Before the client is known the claimed id is only data (and unverified).
+    let claimed = param(params, "client_id")
+        .map(str::to_string)
+        .unwrap_or_else(|| unverified_issuer(assertion).unwrap_or_default());
+    let rejections = ClientFailures {
+        st,
+        tenant_id: &tenant.id,
+        event: Event::TokenAssertionRejected,
+        claimed: &claimed,
+    };
+
+    let Ok(header) = jsonwebtoken::decode_header(assertion) else {
+        return Err(rejections
+            .fail(None, Reason::MalformedAssertion, AadError::invalid_client_assertion())
+            .await);
+    };
     if header.alg != jsonwebtoken::Algorithm::RS256 {
-        return Err(AadError::invalid_client_assertion());
+        return Err(rejections
+            .fail(None, Reason::MalformedAssertion, AadError::invalid_client_assertion())
+            .await);
     }
-    let thumbprint = header
-        .x5t
-        .or(header.kid)
-        .ok_or_else(AadError::invalid_client_assertion)?;
+    let Some(thumbprint) = header.x5t.or(header.kid) else {
+        return Err(rejections
+            .fail(None, Reason::MalformedAssertion, AadError::invalid_client_assertion())
+            .await);
+    };
 
     // The assertion's issuer identifies the client when client_id is absent. This
     // reads the payload WITHOUT verifying it, so it is only used to find which
@@ -310,19 +366,39 @@ async fn authenticate_with_assertion(
         None => None,
     };
     let (Some(app), Some(sp)) = (app, sp) else {
-        return Err(AadError::app_not_found(&client_id, &tenant.id));
+        return Err(rejections
+            .fail(
+                None,
+                Reason::UnknownClient,
+                AadError::app_not_found(&client_id, &tenant.id),
+            )
+            .await);
     };
 
     // Only a certificate registered on this app can sign for it.
     let ts = now();
     let credentials = apps::key_credentials(&st.pool, &app).await?;
     let presented = apps::normalize_thumbprint(&thumbprint);
-    let credential = credentials
+    let Some(credential) = credentials
         .iter()
         .find(|c| ct_eq(&apps::normalize_thumbprint(&c.key_id), &presented))
-        .ok_or_else(AadError::invalid_client_assertion)?;
+    else {
+        return Err(rejections
+            .fail(
+                Some(&app.app_id),
+                Reason::UnknownKey,
+                AadError::invalid_client_assertion(),
+            )
+            .await);
+    };
     if !credential.is_current(ts) {
-        return Err(AadError::expired_client_certificate(&app.app_id));
+        return Err(rejections
+            .fail(
+                Some(&app.app_id),
+                Reason::ExpiredCertificate,
+                AadError::expired_client_certificate(&app.app_id),
+            )
+            .await);
     }
 
     // `aud` is the token endpoint; the issuer is also accepted, as Entra does.
@@ -335,21 +411,48 @@ async fn authenticate_with_assertion(
     // single-use credential; allow only real clock skew.
     validation.leeway = ASSERTION_CLOCK_SKEW;
     let key = jsonwebtoken::DecodingKey::from_rsa_raw_components(&credential.n, &credential.e);
-    let claims = jsonwebtoken::decode::<Value>(assertion, &key, &validation)
-        .map_err(|_| AadError::invalid_client_assertion())?
-        .claims;
+    let Ok(decoded) = jsonwebtoken::decode::<Value>(assertion, &key, &validation) else {
+        return Err(rejections
+            .fail(
+                Some(&app.app_id),
+                Reason::InvalidAssertion,
+                AadError::invalid_client_assertion(),
+            )
+            .await);
+    };
+    let claims = decoded.claims;
 
     // RFC 7523: the subject is the client itself.
     if claims["sub"].as_str() != Some(app.app_id.as_str()) {
-        return Err(AadError::invalid_client_assertion());
+        return Err(rejections
+            .fail(
+                Some(&app.app_id),
+                Reason::SubjectMismatch,
+                AadError::invalid_client_assertion(),
+            )
+            .await);
     }
     // A jti may be presented only once while the assertion is still valid.
-    let jti = claims["jti"].as_str().ok_or_else(AadError::invalid_client_assertion)?;
+    let Some(jti) = claims["jti"].as_str() else {
+        return Err(rejections
+            .fail(
+                Some(&app.app_id),
+                Reason::MissingJti,
+                AadError::invalid_client_assertion(),
+            )
+            .await);
+    };
     let exp = claims["exp"].as_i64().unwrap_or(ts);
     // Bound how long one assertion stays usable, and so how long the jti must be
     // remembered. Entra likewise expects short-lived assertions.
     if exp > ts + MAX_ASSERTION_LIFETIME {
-        return Err(AadError::invalid_client_assertion());
+        return Err(rejections
+            .fail(
+                Some(&app.app_id),
+                Reason::LifetimeTooLong,
+                AadError::invalid_client_assertion(),
+            )
+            .await);
     }
     let _ = sqlx::query(crate::db::q(
         &st.pool,
@@ -372,11 +475,24 @@ async fn authenticate_with_assertion(
         .await,
     )?;
     if !first_use {
+        // The jti is an identifier the client chose, not a credential; the
+        // signed assertion itself is never logged.
+        let details = json!({ "clientId": app.app_id, "jti": audit::clip(jti) });
+        audit::record(
+            st,
+            &tenant.id,
+            &app.app_id,
+            Event::TokenAssertionReplayed,
+            Some(&app.app_id),
+            details,
+        )
+        .await;
         return Err(AadError::replayed_client_assertion());
     }
 
     if !sp.enabled {
-        return Err(AadError::app_disabled(&app.app_id, &app.display_name));
+        let err = AadError::app_disabled(&app.app_id, &app.display_name);
+        return Err(rejections.fail(Some(&app.app_id), Reason::AppDisabled, err).await);
     }
     Ok(AuthenticatedClient {
         app,
@@ -438,6 +554,21 @@ async fn client_credentials(
     claims.insert("ver".into(), json!("2.0"));
 
     let access_token = st.keys.sign(&Value::Object(claims)).await?;
+    let details = json!({
+        "grant": GrantType::ClientCredentials.as_str(),
+        "clientId": client.app.app_id,
+        "resource": resource_app.app_id,
+        "azpacr": client.azpacr.as_str(),
+    });
+    audit::record(
+        st,
+        &tenant.id,
+        &client.app.app_id,
+        Event::TokenIssued,
+        Some(&resource_app.app_id),
+        details,
+    )
+    .await;
     let mut resp = Json(json!({
         "token_type": "Bearer",
         "expires_in": lifetime,

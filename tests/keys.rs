@@ -1,15 +1,15 @@
 mod common;
 
 use common::TestServer;
-use rust_oidc::keys::{self, KeyStore};
+use rust_oidc::keys::{self, KeyStatus, KeyStore};
 
-async fn kids(store: &KeyStore) -> Vec<(String, String)> {
+async fn kids(store: &KeyStore) -> Vec<(String, KeyStatus)> {
     store
         .published()
         .await
         .unwrap()
         .iter()
-        .map(|k| (k.kid.clone(), k.status.clone()))
+        .map(|k| (k.kid.clone(), k.status))
         .collect()
 }
 
@@ -17,8 +17,13 @@ async fn kids(store: &KeyStore) -> Vec<(String, String)> {
 async fn rotation_promotes_prepublished_key_and_keeps_old_one() {
     let s = TestServer::start().await;
     let before = kids(&KeyStore::new(s.pool.clone())).await;
-    let active = before.iter().find(|(_, st)| st == "active").unwrap().0.clone();
-    let next = before.iter().find(|(_, st)| st == "next").unwrap().0.clone();
+    let active = before
+        .iter()
+        .find(|(_, st)| *st == KeyStatus::Active)
+        .unwrap()
+        .0
+        .clone();
+    let next = before.iter().find(|(_, st)| *st == KeyStatus::Next).unwrap().0.clone();
 
     keys::rotate(&s.pool).await.unwrap();
 
@@ -26,11 +31,11 @@ async fn rotation_promotes_prepublished_key_and_keeps_old_one() {
     let after = kids(&store).await;
     assert_eq!(after.len(), 3);
     assert!(
-        after.contains(&(next.clone(), "active".into())),
+        after.contains(&(next.clone(), KeyStatus::Active)),
         "next key became active"
     );
     assert!(
-        after.contains(&(active.clone(), "retired".into())),
+        after.contains(&(active.clone(), KeyStatus::Retired)),
         "old key still published"
     );
 
@@ -52,8 +57,8 @@ async fn concurrent_rotations_leave_exactly_one_active_key_and_do_not_error() {
         assert!(r.is_ok(), "rotation failed: {r:?}");
     }
     let all = kids(&KeyStore::new(s.pool.clone())).await;
-    let count = |st: &str| all.iter().filter(|(_, s)| s == st).count();
-    assert_eq!(count("active"), 1, "{all:?}");
-    assert!(count("next") >= 1, "a next key stays published: {all:?}");
-    assert_eq!(count("retired"), 4, "each rotation retired one key: {all:?}");
+    let count = |st: KeyStatus| all.iter().filter(|(_, s)| *s == st).count();
+    assert_eq!(count(KeyStatus::Active), 1, "{all:?}");
+    assert!(count(KeyStatus::Next) >= 1, "a next key stays published: {all:?}");
+    assert_eq!(count(KeyStatus::Retired), 4, "each rotation retired one key: {all:?}");
 }

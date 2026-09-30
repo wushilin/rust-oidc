@@ -63,6 +63,29 @@ impl Azpacr {
     }
 }
 
+/// Authentication methods, emitted in the `amr` claim.
+///
+/// Only a password exists today. TOTP adds `Otp` and `Mfa`; see
+/// `docs/superpowers/specs/2026-09-30-totp-mfa-design.md`.
+///
+/// `amr` is *stored* as a list of strings (in `sessions.amr`, and carried
+/// forward by refresh tokens and OBO assertions) rather than as this enum, so a
+/// token minted by an older build cannot be dropped or rejected for naming a
+/// method this build does not know. The enum is for producing values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Amr {
+    /// Password.
+    Pwd,
+}
+
+impl Amr {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pwd => "pwd",
+        }
+    }
+}
+
 pub async fn issue(
     st: &AppState,
     sign_in: &SignIn,

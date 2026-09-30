@@ -25,9 +25,40 @@ use crate::util::{b64, b64url, now};
 const CERT_VALIDITY_DAYS: i64 = 5 * 365;
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Lifecycle of a signing key. The database enforces the same three values in a
+/// CHECK constraint (`0001_init.sql`), so a row can never hold anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    /// Pre-published so clients cache it before it ever signs anything.
+    Next,
+    /// The one key that signs. At most one, by unique index.
+    Active,
+    /// Published until every token it signed has expired, then pruned.
+    Retired,
+}
+
+impl KeyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Active => "active",
+            Self::Retired => "retired",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "next" => Some(Self::Next),
+            "active" => Some(Self::Active),
+            "retired" => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+
 pub struct LoadedKey {
     pub kid: String,
-    pub status: String,
+    pub status: KeyStatus,
     pub cert_der: Vec<u8>,
     pub n: Vec<u8>,
     pub e: Vec<u8>,
@@ -102,7 +133,7 @@ impl KeyStore {
         let keys = self.published().await?;
         let idx = keys
             .iter()
-            .position(|k| k.status == "active")
+            .position(|k| k.status == KeyStatus::Active)
             .ok_or_else(|| anyhow!("no active signing key; run `rust-oidc key rotate`"))?;
         Ok((keys, idx))
     }
@@ -142,14 +173,19 @@ impl KeyStore {
 }
 
 async fn load_keys(pool: &DbPool) -> anyhow::Result<Vec<LoadedKey>> {
-    let rows: Vec<(String, String, Vec<u8>, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, Vec<u8>, String)> = sqlx::query_as(crate::db::q(
+        pool,
         "SELECT kid, private_key_pem, cert_der, status FROM signing_keys
-         ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'next' THEN 1 ELSE 2 END, created_at DESC",
-    )
+         ORDER BY CASE status WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END, created_at DESC",
+    ))
+    .bind(KeyStatus::Active.as_str())
+    .bind(KeyStatus::Next.as_str())
     .fetch_all(pool)
     .await?;
     rows.into_iter()
         .map(|(kid, pem, cert_der, status)| {
+            let status = KeyStatus::parse(&status)
+                .ok_or_else(|| anyhow!("signing key {kid} has an unknown status {status:?}"))?;
             let private = RsaPrivateKey::from_pkcs8_pem(&pem).context("bad signing key PEM")?;
             let (n, e) = (private.n().to_bytes_be(), private.e().to_bytes_be());
             Ok(LoadedKey {
@@ -166,7 +202,7 @@ async fn load_keys(pool: &DbPool) -> anyhow::Result<Vec<LoadedKey>> {
 }
 
 /// Generate a key + self-signed certificate and store it with `status`.
-pub async fn generate(pool: &DbPool, status: &str) -> anyhow::Result<String> {
+pub async fn generate(pool: &DbPool, status: KeyStatus) -> anyhow::Result<String> {
     let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     let mut dn = DistinguishedName::new();
@@ -187,7 +223,7 @@ pub async fn generate(pool: &DbPool, status: &str) -> anyhow::Result<String> {
     .bind(&kid)
     .bind(key_pair.serialize_pem())
     .bind(&cert_der)
-    .bind(status)
+    .bind(status.as_str())
     .bind(now())
     .bind(params.not_after.unix_timestamp())
     .execute(pool)
@@ -197,18 +233,17 @@ pub async fn generate(pool: &DbPool, status: &str) -> anyhow::Result<String> {
 
 /// Make sure there is an active key and a pre-published next key.
 pub async fn ensure(pool: &DbPool) -> anyhow::Result<()> {
-    let count = |status: &'static str| async move {
+    let count = |status: KeyStatus| async move {
         let (n,): (i64,) = sqlx::query_as(crate::db::q(pool, "SELECT COUNT(*) FROM signing_keys WHERE status = ?"))
-            .bind(status)
+            .bind(status.as_str())
             .fetch_one(pool)
             .await?;
         anyhow::Ok(n)
     };
-    if count("active").await? == 0 {
-        generate(pool, "active").await?;
-    }
-    if count("next").await? == 0 {
-        generate(pool, "next").await?;
+    for status in [KeyStatus::Active, KeyStatus::Next] {
+        if count(status).await? == 0 {
+            generate(pool, status).await?;
+        }
     }
     Ok(())
 }
@@ -271,25 +306,31 @@ async fn try_rotate(pool: &DbPool) -> anyhow::Result<bool> {
     .await?;
     // Two statements, not `UPDATE ... WHERE kid = (SELECT ... FROM signing_keys)`:
     // MySQL refuses to update a table it also selects from (error 1093).
-    let next: Option<(String,)> =
-        sqlx::query_as("SELECT kid FROM signing_keys WHERE status = 'next' ORDER BY created_at LIMIT 1")
-            .fetch_optional(&mut *tx)
-            .await?;
+    let next: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT kid FROM signing_keys WHERE status = ? ORDER BY created_at LIMIT 1",
+    ))
+    .bind(KeyStatus::Next.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some((kid,)) = next else {
         tx.rollback().await?;
         return Ok(false);
     };
     sqlx::query(crate::db::sql_stmt(
         engine,
-        "UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'",
+        "UPDATE signing_keys SET status = ?, retired_at = ? WHERE status = ?",
     ))
+    .bind(KeyStatus::Retired.as_str())
     .bind(now())
+    .bind(KeyStatus::Active.as_str())
     .execute(&mut *tx)
     .await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
-        "UPDATE signing_keys SET status = 'active' WHERE kid = ?",
+        "UPDATE signing_keys SET status = ? WHERE kid = ?",
     ))
+    .bind(KeyStatus::Active.as_str())
     .bind(kid)
     .execute(&mut *tx)
     .await?;
@@ -301,8 +342,9 @@ async fn try_rotate(pool: &DbPool) -> anyhow::Result<bool> {
 pub async fn prune(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
     let res = sqlx::query(crate::db::q(
         pool,
-        "DELETE FROM signing_keys WHERE status = 'retired' AND retired_at < ?",
+        "DELETE FROM signing_keys WHERE status = ? AND retired_at < ?",
     ))
+    .bind(KeyStatus::Retired.as_str())
     .bind(now() - older_than_secs)
     .execute(pool)
     .await?;

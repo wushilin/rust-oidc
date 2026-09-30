@@ -21,7 +21,7 @@ use super::audit::{self, Channel, Event};
 use super::token::{GrantType, authenticate_confidential_client, param};
 use crate::AppState;
 use crate::apps::{self, Application, PLATFORM_SPA, PLATFORM_WEB};
-use crate::claims::{self, Azpacr, IdType, SignIn};
+use crate::claims::{self, Amr, Azpacr, IdType, SignIn};
 use crate::error::{AadError, no_store};
 use crate::scopes::{self, Grant};
 use crate::tenant::Tenant;
@@ -570,7 +570,7 @@ pub async fn on_behalf_of(
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec!["pwd".to_string()]);
+        .unwrap_or_else(|| vec![Amr::Pwd.as_str().to_string()]);
 
     issue(
         st,
@@ -678,7 +678,7 @@ pub async fn password(
             code_hash: None,
             platform: PLATFORM_WEB.to_string(),
             auth_time: ts,
-            amr: vec!["pwd".to_string()],
+            amr: vec![Amr::Pwd.as_str().to_string()],
             spa_expires_at: None,
             rotation: false,
         },

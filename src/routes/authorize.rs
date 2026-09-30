@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use super::audit::{self, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application, PLATFORM_SPA, ServicePrincipal};
+use crate::claims::Amr;
 use crate::error::AadError;
 use crate::html;
 use crate::scopes;
@@ -577,7 +578,7 @@ async fn signed_in(
     v: &Validated,
     user: &User,
 ) -> Result<Response, Response> {
-    let amr = ["pwd"];
+    let amr = [Amr::Pwd.as_str()];
     let lifetime = v.tenant.settings.session_lifetime_secs;
     let cookie = session::create(&st.pool, headers, &v.tenant.id, &user.id, &amr, lifetime)
         .await

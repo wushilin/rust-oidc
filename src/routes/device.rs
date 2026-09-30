@@ -17,6 +17,7 @@ use sqlx::Row;
 use super::audit::{self, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application};
+use crate::claims::Amr;
 use crate::error::{AadError, no_store};
 use crate::session::{self, CSRF_COOKIE};
 use crate::tenant::{self, Tenant};
@@ -448,7 +449,7 @@ async fn sign_in(
 
     // Start a browser session so the next code does not ask again.
     let lifetime = tenant.settings.session_lifetime_secs;
-    let amr = ["pwd"];
+    let amr = [Amr::Pwd.as_str()];
     let cookie = session::create(&st.pool, headers, &tenant.id, &user.id, &amr, lifetime)
         .await
         .map_err(|e| html::error(Some(&tenant.name), &AadError::from(e).description()))?;
@@ -638,7 +639,7 @@ pub(super) async fn device_code_grant(
     let amr: Vec<String> = row
         .get::<Option<String>, _>("amr")
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| vec!["pwd".to_string()]);
+        .unwrap_or_else(|| vec![Amr::Pwd.as_str().to_string()]);
     let grant = scopes::resolve(&st.pool, tenant, &scope).await?;
 
     super::user_grants::issue(

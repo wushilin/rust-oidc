@@ -2,7 +2,7 @@
 
 An OAuth 2.0 / OpenID Connect provider that follows the **Microsoft Entra ID v2.0** protocol:
 the same endpoint layout, token claims, error format and client-secret semantics. Apps
-written for Entra should work with configuration changes only. Storage is SQLite, and
+written for Entra should work with configuration changes only. Storage is SQLite by default (PostgreSQL and MySQL are also supported, see [docs/databases.md](docs/databases.md)), and
 tenants (realms) are built in.
 
 **Status: phase 2.** Done:
@@ -85,7 +85,7 @@ Every option can be passed as a flag or an environment variable.
 
 | Variable | Default | |
 |---|---|---|
-| `RUST_OIDC_DATABASE` | `sqlite://data/rust-oidc.db` | |
+| `RUST_OIDC_DATABASE` | `sqlite://data/rust-oidc.db` | SQLite, PostgreSQL or MySQL URL; see [docs/databases.md](docs/databases.md) |
 | `RUST_OIDC_PUBLIC_URL` | `http://localhost:8080/rust-oidc` | External base URL. Its path is the route prefix. |
 | `RUST_OIDC_BIND` | `0.0.0.0:8080` | |
 | `RUST_OIDC_TLS_MODE` | `none` | `none`, `files` or `acme` |

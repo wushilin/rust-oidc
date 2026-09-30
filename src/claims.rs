@@ -27,13 +27,48 @@ pub struct Issued {
     pub id_token: Option<String>,
 }
 
-/// `azpacr`: 0 = public client, 1 = client secret, 2 = certificate.
+/// Whether a token represents a signed-in user or an app itself, emitted as
+/// the `idtyp` claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdType {
+    User,
+    App,
+}
+
+impl IdType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::App => "app",
+        }
+    }
+}
+
+/// How the client authenticated, emitted as the `azpacr` claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Azpacr {
+    /// Public client: no credential.
+    None,
+    ClientSecret,
+    Certificate,
+}
+
+impl Azpacr {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "0",
+            Self::ClientSecret => "1",
+            Self::Certificate => "2",
+        }
+    }
+}
+
 pub async fn issue(
     st: &AppState,
     sign_in: &SignIn,
     grant: &Grant,
     nonce: Option<&str>,
-    azpacr: &str,
+    azpacr: Azpacr,
 ) -> anyhow::Result<Issued> {
     let pool = &st.pool;
     let user = &sign_in.user;
@@ -58,9 +93,9 @@ pub async fn issue(
     at.insert("exp".into(), json!(iat + lifetime));
     at.insert("amr".into(), json!(sign_in.amr));
     at.insert("azp".into(), json!(sign_in.client.app_id));
-    at.insert("azpacr".into(), json!(azpacr));
+    at.insert("azpacr".into(), json!(azpacr.as_str()));
     insert_nonempty(&mut at, "groups", &group_names);
-    at.insert("idtyp".into(), json!("user"));
+    at.insert("idtyp".into(), json!(IdType::User.as_str()));
     at.insert("name".into(), json!(name));
     at.insert("oid".into(), json!(user.id));
     at.insert("preferred_username".into(), json!(user.upn));

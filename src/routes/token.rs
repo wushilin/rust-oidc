@@ -13,9 +13,10 @@ use serde_json::{Map, Value, json};
 
 use crate::AppState;
 use crate::apps::{self, Application, SecretCheck, ServicePrincipal};
+use crate::claims::Azpacr;
 use crate::error::{AadError, no_store};
 use crate::tenant::{self, Tenant};
-use crate::util::{b64url, now, random_bytes};
+use crate::util::{b64url, ct_eq, now, random_bytes};
 
 pub async fn token(
     State(st): State<AppState>,
@@ -83,11 +84,55 @@ async fn handle(
         .ok_or_else(|| AadError::tenant_not_found(tenant_key))?;
 
     let grant_type = param(params, "grant_type").ok_or_else(|| AadError::missing_parameter("grant_type"))?;
-    match grant_type {
-        "client_credentials" => client_credentials(st, &tenant, headers, params).await,
-        "authorization_code" => super::user_grants::authorization_code(st, &tenant, headers, params).await,
-        "refresh_token" => super::user_grants::refresh_token(st, &tenant, headers, params).await,
-        other => Err(AadError::unsupported_grant_type(other)),
+    match GrantType::parse(grant_type) {
+        Some(GrantType::ClientCredentials) => client_credentials(st, &tenant, headers, params).await,
+        Some(GrantType::AuthorizationCode) => super::user_grants::authorization_code(st, &tenant, headers, params).await,
+        Some(GrantType::RefreshToken) => super::user_grants::refresh_token(st, &tenant, headers, params).await,
+        Some(GrantType::DeviceCode) => super::device::device_code_grant(st, &tenant, headers, params).await,
+        Some(GrantType::JwtBearer) => super::user_grants::on_behalf_of(st, &tenant, headers, params).await,
+        Some(GrantType::Password) => super::user_grants::password(st, &tenant, headers, params).await,
+        None => Err(AadError::unsupported_grant_type(grant_type)),
+    }
+}
+
+/// The `grant_type` values this server accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantType {
+    ClientCredentials,
+    AuthorizationCode,
+    RefreshToken,
+    DeviceCode,
+    /// On-behalf-of (RFC 7523 assertion grant).
+    JwtBearer,
+    /// Resource owner password credentials, opt-in per app.
+    Password,
+}
+
+impl GrantType {
+    pub const DEVICE_CODE: &'static str = "urn:ietf:params:oauth:grant-type:device_code";
+    pub const JWT_BEARER: &'static str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientCredentials => "client_credentials",
+            Self::AuthorizationCode => "authorization_code",
+            Self::RefreshToken => "refresh_token",
+            Self::DeviceCode => Self::DEVICE_CODE,
+            Self::JwtBearer => Self::JWT_BEARER,
+            Self::Password => "password",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "client_credentials" => Some(Self::ClientCredentials),
+            "authorization_code" => Some(Self::AuthorizationCode),
+            "refresh_token" => Some(Self::RefreshToken),
+            Self::DEVICE_CODE => Some(Self::DeviceCode),
+            Self::JWT_BEARER => Some(Self::JwtBearer),
+            "password" => Some(Self::Password),
+            _ => None,
+        }
     }
 }
 
@@ -100,6 +145,34 @@ pub(super) fn param<'a>(params: &'a HashMap<String, String>, name: &str) -> Opti
 pub struct AuthenticatedClient {
     pub app: Application,
     pub sp: ServicePrincipal,
+    /// How the client proved itself, reported as `azpacr`.
+    pub azpacr: Azpacr,
+}
+
+/// Client authentication methods this server accepts at the token endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuthMethod {
+    ClientSecretBasic,
+    ClientSecretPost,
+    PrivateKeyJwt,
+}
+
+/// Clock skew tolerated on a client assertion's `exp`/`nbf`, in seconds.
+const ASSERTION_CLOCK_SKEW: u64 = 10;
+/// Longest a client assertion may remain valid, in seconds.
+const MAX_ASSERTION_LIFETIME: i64 = 600;
+
+impl ClientAuthMethod {
+    /// RFC 7523 client assertion type for `private_key_jwt`.
+    pub const ASSERTION_TYPE: &'static str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+            Self::PrivateKeyJwt => "private_key_jwt",
+        }
+    }
 }
 
 /// client_secret_basic (RFC 6749 §2.3.1, form-urlencoded inside Basic) or client_secret_post.
@@ -151,6 +224,10 @@ pub(super) async fn authenticate_confidential_client(
     headers: &HeaderMap,
     params: &HashMap<String, String>,
 ) -> Result<AuthenticatedClient, AadError> {
+    // A client assertion replaces the secret entirely (private_key_jwt).
+    if let Some(assertion) = param(params, "client_assertion") {
+        return authenticate_with_assertion(st, tenant, params, assertion).await;
+    }
     let (client_id, secret) = client_credentials_from_request(headers, params)?;
     let app = apps::find(&st.pool, &client_id).await?;
     let sp = match &app {
@@ -169,7 +246,134 @@ pub(super) async fn authenticate_confidential_client(
     if !sp.enabled {
         return Err(AadError::app_disabled(&app.app_id, &app.display_name));
     }
-    Ok(AuthenticatedClient { app, sp })
+    Ok(AuthenticatedClient {
+        app,
+        sp,
+        azpacr: Azpacr::ClientSecret,
+    })
+}
+
+/// Read `iss` from an unverified assertion payload, to locate the client.
+/// The assertion is fully verified afterwards; nothing here is trusted.
+fn unverified_issuer(assertion: &str) -> Option<String> {
+    let payload = assertion.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("iss")?.as_str().map(str::to_string)
+}
+
+/// Verify a `private_key_jwt` client assertion (RFC 7523) signed with the key of
+/// a certificate registered on the app. Entra identifies the certificate by the
+/// `x5t` header; `kid` is accepted as well.
+async fn authenticate_with_assertion(
+    st: &AppState,
+    tenant: &Tenant,
+    params: &HashMap<String, String>,
+    assertion: &str,
+) -> Result<AuthenticatedClient, AadError> {
+    let assertion_type = param(params, "client_assertion_type")
+        .ok_or_else(|| AadError::missing_parameter("client_assertion_type"))?;
+    if assertion_type != ClientAuthMethod::ASSERTION_TYPE {
+        return Err(AadError::invalid_request(
+            700021,
+            format!(
+                "Client assertion type '{assertion_type}' is not supported. Expected '{}'.",
+                ClientAuthMethod::ASSERTION_TYPE
+            ),
+        ));
+    }
+
+    let header = jsonwebtoken::decode_header(assertion).map_err(|_| AadError::invalid_client_assertion())?;
+    if header.alg != jsonwebtoken::Algorithm::RS256 {
+        return Err(AadError::invalid_client_assertion());
+    }
+    let thumbprint = header
+        .x5t
+        .or(header.kid)
+        .ok_or_else(AadError::invalid_client_assertion)?;
+
+    // The assertion's issuer identifies the client when client_id is absent. This
+    // reads the payload WITHOUT verifying it, so it is only used to find which
+    // app to check against; every claim is verified against that app's key below.
+    let issuer = unverified_issuer(assertion).unwrap_or_default();
+    let client_id = match param(params, "client_id") {
+        Some(id) => id.to_string(),
+        None if !issuer.is_empty() => issuer.clone(),
+        None => return Err(AadError::missing_parameter("client_id")),
+    };
+
+    let app = apps::find(&st.pool, &client_id).await?;
+    let sp = match &app {
+        Some(app) => apps::service_principal(&st.pool, &tenant.id, &app.app_id).await?,
+        None => None,
+    };
+    let (Some(app), Some(sp)) = (app, sp) else {
+        return Err(AadError::app_not_found(&client_id, &tenant.id));
+    };
+
+    // Only a certificate registered on this app can sign for it.
+    let ts = now();
+    let credentials = apps::key_credentials(&st.pool, &app).await?;
+    let presented = apps::normalize_thumbprint(&thumbprint);
+    let credential = credentials
+        .iter()
+        .find(|c| ct_eq(&apps::normalize_thumbprint(&c.key_id), &presented))
+        .ok_or_else(AadError::invalid_client_assertion)?;
+    if !credential.is_current(ts) {
+        return Err(AadError::expired_client_certificate(&app.app_id));
+    }
+
+    // `aud` is the token endpoint; the issuer is also accepted, as Entra does.
+    let token_endpoint = st.public_url.tenant_url(&tenant.id, "oauth2/v2.0/token");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_audience(&[token_endpoint.as_str(), st.public_url.issuer(&tenant.id).as_str()]);
+    validation.set_issuer(&[app.app_id.as_str()]);
+    validation.required_spec_claims = ["exp", "aud", "iss", "sub"].iter().map(|c| c.to_string()).collect();
+    // The library default is a full minute, which is far too generous for a
+    // single-use credential; allow only real clock skew.
+    validation.leeway = ASSERTION_CLOCK_SKEW;
+    let key = jsonwebtoken::DecodingKey::from_rsa_raw_components(&credential.n, &credential.e);
+    let claims = jsonwebtoken::decode::<Value>(assertion, &key, &validation)
+        .map_err(|_| AadError::invalid_client_assertion())?
+        .claims;
+
+    // RFC 7523: the subject is the client itself.
+    if claims["sub"].as_str() != Some(app.app_id.as_str()) {
+        return Err(AadError::invalid_client_assertion());
+    }
+    // A jti may be presented only once while the assertion is still valid.
+    let jti = claims["jti"].as_str().ok_or_else(AadError::invalid_client_assertion)?;
+    let exp = claims["exp"].as_i64().unwrap_or(ts);
+    // Bound how long one assertion stays usable, and so how long the jti must be
+    // remembered. Entra likewise expects short-lived assertions.
+    if exp > ts + MAX_ASSERTION_LIFETIME {
+        return Err(AadError::invalid_client_assertion());
+    }
+    let _ = sqlx::query("DELETE FROM client_assertion_jti WHERE expires_at <= ?")
+        .bind(ts)
+        .execute(&st.pool)
+        .await;
+    let first_use = sqlx::query(
+        "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)
+         ON CONFLICT (jti, client_app_id) DO NOTHING",
+    )
+    .bind(jti)
+    .bind(&app.app_id)
+    .bind(exp)
+    .execute(&st.pool)
+    .await?;
+    if first_use.rows_affected() != 1 {
+        return Err(AadError::replayed_client_assertion());
+    }
+
+    if !sp.enabled {
+        return Err(AadError::app_disabled(&app.app_id, &app.display_name));
+    }
+    Ok(AuthenticatedClient {
+        app,
+        sp,
+        azpacr: Azpacr::Certificate,
+    })
 }
 
 // ---- grant: client_credentials ----
@@ -213,8 +417,8 @@ async fn client_credentials(
     claims.insert("nbf".into(), json!(iat));
     claims.insert("exp".into(), json!(iat + lifetime));
     claims.insert("azp".into(), json!(client.app.app_id));
-    claims.insert("azpacr".into(), json!("1"));
-    claims.insert("idtyp".into(), json!("app"));
+    claims.insert("azpacr".into(), json!(client.azpacr.as_str()));
+    claims.insert("idtyp".into(), json!(crate::claims::IdType::App.as_str()));
     claims.insert("oid".into(), json!(client.sp.id));
     if !roles.is_empty() {
         claims.insert("roles".into(), json!(roles));

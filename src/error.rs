@@ -126,6 +126,59 @@ impl AadError {
         )
     }
 
+    /// A client assertion that is malformed, wrongly targeted, expired, or not
+    /// signed by a certificate registered on the app. Deliberately one error for
+    /// all of these, so a caller cannot probe which part was wrong.
+    pub fn invalid_client_assertion() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            700027,
+            "AADSTS700027: The client assertion is not valid. Check that it is signed with a certificate registered on the application, names the application as both issuer and subject, targets this token endpoint as its audience, and has not expired.",
+        )
+    }
+
+    pub fn replayed_client_assertion() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            700028,
+            "AADSTS700028: The client assertion has already been used. Each assertion must carry a unique 'jti'.",
+        )
+    }
+
+    pub fn expired_client_certificate(app_id: &str) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            700024,
+            format!("The certificate credential used by app '{app_id}' is outside its validity period."),
+        )
+    }
+
+    /// The assertion presented to the on-behalf-of grant is not a user token this
+    /// server issued for the calling application.
+    pub fn invalid_obo_assertion() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            500133,
+            "AADSTS500133: The assertion is not valid for the on-behalf-of flow. It must be an unexpired user access token issued by this service whose audience is the calling application.",
+        )
+    }
+
+    /// ROPC attempted against an app that has not been opted in.
+    pub fn password_grant_not_allowed(app_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "unauthorized_client",
+            700034,
+            format!(
+                "The resource owner password credentials grant is not enabled for application '{app_id}'. Enable it deliberately, or use the authorization code flow instead."
+            ),
+        )
+    }
+
     pub fn invalid_scope(code: u32, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_scope", code, message)
     }
@@ -138,6 +191,48 @@ impl AadError {
             format!(
                 "The resource principal named {resource} was not found in the tenant named {tenant_name}. This can happen if the application has not been installed by the administrator of the tenant or consented to by any user in the tenant. You might have sent your authentication request to the wrong tenant."
             ),
+        )
+    }
+
+    // ---- device authorization grant (RFC 8628) polling responses ----
+
+    /// The user has not finished signing in yet; the device should keep polling.
+    pub fn authorization_pending() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "authorization_pending",
+            70016,
+            "AADSTS70016: OAuth 2.0 device flow error. Authorization is pending. Continue polling.",
+        )
+    }
+
+    /// The device polled faster than the advertised interval.
+    pub fn slow_down() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "slow_down",
+            70016,
+            "AADSTS70016: OAuth 2.0 device flow error. Polling too frequently. Wait for the interval before retrying.",
+        )
+    }
+
+    /// The user declined on the approval page.
+    pub fn authorization_declined() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "authorization_declined",
+            70017,
+            "AADSTS70017: OAuth 2.0 device flow error. The end user denied the authorization request.",
+        )
+    }
+
+    /// The device code lived longer than its lifetime.
+    pub fn device_code_expired() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "expired_token",
+            70019,
+            "AADSTS70019: Verification code expired. The user did not complete sign-in in time; restart the flow.",
         )
     }
 

@@ -60,7 +60,7 @@ pub async fn userinfo(State(st): State<AppState>, method: Method, headers: Heade
     };
     let str_claim = |name: &str| claims.get(name).and_then(Value::as_str).unwrap_or_default().to_string();
     let (tid, oid, aud) = (str_claim("tid"), str_claim("oid"), str_claim("aud"));
-    if aud != GRAPH_APP_ID || str_claim("idtyp") != "user" {
+    if aud != GRAPH_APP_ID || str_claim("idtyp") != crate::claims::IdType::User.as_str() {
         return unauthorized("The access token was not issued for the UserInfo endpoint.");
     }
     let Ok(Some(t)) = tenant::resolve(&st.pool, &tid).await else {

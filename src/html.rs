@@ -179,3 +179,89 @@ pub fn form_post(action: &url::Url, params: &[(&str, String)]) -> Response {
     );
     respond(StatusCode::OK, html, &csp)
 }
+
+// ---- device authorization grant pages ----
+
+pub struct DeviceCodeForm<'a> {
+    pub tenant_name: Option<&'a str>,
+    pub action: &'a str,
+    pub csrf: &'a str,
+    pub user_code: &'a str,
+    pub error: Option<&'a str>,
+}
+
+/// Where the user types the code shown on the device.
+pub fn device_code_entry(f: &DeviceCodeForm) -> Response {
+    let error = f
+        .error
+        .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, escape(e)))
+        .unwrap_or_default();
+    let body = format!(
+        r#"<h1>Enter code</h1><p class="sub">Type the code shown on your device.</p>
+<form method="post" action="{action}">
+<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="op" value="code">
+<label for="user_code">Code</label><input id="user_code" name="user_code" type="text" autocomplete="off" spellcheck="false" required value="{user_code}" autofocus>
+{error}
+<div class="actions"><button type="submit">Next</button></div></form>"#,
+        action = escape(f.action),
+        csrf = escape(f.csrf),
+        user_code = escape(f.user_code),
+    );
+    let status = if f.error.is_some() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    respond(status, page("Enter code", f.tenant_name, &body), CSP_DEFAULT)
+}
+
+pub struct DeviceApproval<'a> {
+    pub tenant_name: &'a str,
+    pub client_name: &'a str,
+    pub action: &'a str,
+    pub csrf: &'a str,
+    pub request: &'a str,
+    pub user_code: &'a str,
+    pub upn: &'a str,
+    pub scopes: &'a [String],
+}
+
+/// Confirms which app is being signed in to, before the device is approved.
+pub fn device_approval(p: &DeviceApproval) -> Response {
+    let scopes = if p.scopes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="code">Permissions: {}</p>"#,
+            escape(&p.scopes.join(", "))
+        )
+    };
+    let body = format!(
+        r#"<h1>Are you trying to sign in to {client}?</h1>
+<p class="sub">Signed in as {upn}. Only continue if you started this on your device.</p>
+<form method="post" action="{action}">
+<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="request" value="{request}">
+<p class="code">Code: {user_code}</p>{scopes}
+<div class="actions">
+<button class="link" type="submit" name="op" value="deny">Cancel</button>
+<button type="submit" name="op" value="approve">Continue</button>
+</div></form>"#,
+        client = escape(p.client_name),
+        upn = escape(p.upn),
+        action = escape(p.action),
+        csrf = escape(p.csrf),
+        request = escape(p.request),
+        user_code = escape(p.user_code),
+    );
+    respond(StatusCode::OK, page("Sign in", Some(p.tenant_name), &body), CSP_DEFAULT)
+}
+
+/// Terminal page for the device flow: approved, or declined.
+pub fn device_result(tenant_name: Option<&str>, heading: &str, message: &str) -> Response {
+    let body = format!(
+        r#"<h1>{}</h1><p class="sub">{}</p>"#,
+        escape(heading),
+        escape(message)
+    );
+    respond(StatusCode::OK, page(heading, tenant_name, &body), CSP_DEFAULT)
+}

@@ -3,6 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
 
+use super::token::{ClientAuthMethod, GrantType};
 use crate::AppState;
 use crate::error::AadError;
 use crate::tenant;
@@ -24,14 +25,26 @@ pub async fn openid_configuration(
 
     Ok(Json(json!({
         "token_endpoint": url.tenant_url(tid, "oauth2/v2.0/token"),
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "token_endpoint_auth_methods_supported": [
+            ClientAuthMethod::ClientSecretPost.as_str(),
+            ClientAuthMethod::ClientSecretBasic.as_str(),
+            ClientAuthMethod::PrivateKeyJwt.as_str(),
+        ],
         "jwks_uri": url.tenant_url(tid, "discovery/v2.0/keys"),
         "response_modes_supported": ["query", "fragment", "form_post"],
         "subject_types_supported": ["pairwise"],
         "id_token_signing_alg_values_supported": ["RS256"],
         "response_types_supported": ["code"],
         "scopes_supported": ["openid", "profile", "email", "offline_access"],
-        "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
+        "device_authorization_endpoint": url.tenant_url(tid, "oauth2/v2.0/devicecode"),
+        "grant_types_supported": [
+            GrantType::AuthorizationCode.as_str(),
+            GrantType::RefreshToken.as_str(),
+            GrantType::ClientCredentials.as_str(),
+            GrantType::DeviceCode.as_str(),
+            GrantType::JwtBearer.as_str(),
+            GrantType::Password.as_str(),
+        ],
         "code_challenge_methods_supported": ["S256", "plain"],
         "prompt_values_supported": ["none", "login", "consent", "select_account"],
         "claims_parameter_supported": false,

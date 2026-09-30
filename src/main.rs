@@ -203,6 +203,16 @@ enum AppCmd {
         #[arg(long, default_value = "User")]
         r#type: String,
     },
+    /// Allow the resource owner password grant (ROPC) for this app. Off by
+    /// default: the client sees the user's password and MFA cannot apply.
+    PasswordGrant {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        app: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        allowed: bool,
+    },
     /// Require users to be assigned (directly or via a group) before signing in.
     AssignmentRequired {
         #[arg(long)]
@@ -215,7 +225,42 @@ enum AppCmd {
     #[command(subcommand)]
     Secret(SecretCmd),
     #[command(subcommand)]
+    Key(AppKeyCmd),
+    #[command(subcommand)]
     Role(RoleCmd),
+}
+
+#[derive(Subcommand)]
+enum AppKeyCmd {
+    /// Register a certificate the app may sign client assertions with
+    /// (private_key_jwt). Takes the PEM certificate, never the private key.
+    Add {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        app: String,
+        /// Path to the PEM certificate, or `-` to read it from stdin.
+        #[arg(long)]
+        cert: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List the certificates registered on the app.
+    List {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        app: String,
+    },
+    Remove {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        app: String,
+        /// The certificate thumbprint, as shown by `app key list`.
+        #[arg(long)]
+        key_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -643,6 +688,95 @@ async fn app_cmd(pool: &SqlitePool, cmd: AppCmd) -> anyhow::Result<()> {
             print_json(
                 json!({ "keyId": s.key_id, "secretText": s.secret, "hint": &s.secret[..3], "endDateTime": end }),
             );
+        }
+        AppCmd::PasswordGrant {
+            tenant: key,
+            app,
+            allowed,
+        } => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let a = apps::find_in_tenant(pool, &t, &app).await?;
+            apps::set_password_grant_allowed(pool, &a, allowed).await?;
+            db::audit(
+                pool,
+                Some(&t.id),
+                "cli",
+                "app.password_grant",
+                Some(&a.app_id),
+                json!({ "allowed": allowed }),
+            )
+            .await?;
+            print_json(json!({ "appId": a.app_id, "allowPasswordGrant": allowed }));
+        }
+        AppCmd::Key(AppKeyCmd::Add {
+            tenant: key,
+            app,
+            cert,
+            name,
+        }) => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let a = apps::find_in_tenant(pool, &t, &app).await?;
+            let pem = if cert == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&cert).with_context(|| format!("reading {cert}"))?
+            };
+            if pem.contains("PRIVATE KEY") {
+                anyhow::bail!("that file contains a private key; register only the certificate");
+            }
+            let key_id = apps::add_key_credential(pool, &a, &pem, name.as_deref()).await?;
+            db::audit(
+                pool,
+                Some(&t.id),
+                "cli",
+                "app.key.add",
+                Some(&a.app_id),
+                json!({ "keyId": key_id }),
+            )
+            .await?;
+            print_json(json!({ "keyId": key_id }));
+        }
+        AppCmd::Key(AppKeyCmd::List { tenant: key, app }) => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let a = apps::find_in_tenant(pool, &t, &app).await?;
+            let rfc3339 = |ts: i64| -> anyhow::Result<String> {
+                Ok(time::OffsetDateTime::from_unix_timestamp(ts)?
+                    .format(&time::format_description::well_known::Rfc3339)?)
+            };
+            let mut out = Vec::new();
+            for c in apps::key_credentials(pool, &a).await? {
+                out.push(json!({
+                    "keyId": c.key_id,
+                    "displayName": c.display_name,
+                    "startDateTime": rfc3339(c.not_before)?,
+                    "endDateTime": rfc3339(c.not_after)?,
+                }));
+            }
+            print_json(json!(out));
+        }
+        AppCmd::Key(AppKeyCmd::Remove {
+            tenant: key,
+            app,
+            key_id,
+        }) => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let a = apps::find_in_tenant(pool, &t, &app).await?;
+            if !apps::remove_key_credential(pool, &a, &key_id).await? {
+                anyhow::bail!("no certificate with thumbprint {key_id} on app {}", a.app_id);
+            }
+            db::audit(
+                pool,
+                Some(&t.id),
+                "cli",
+                "app.key.remove",
+                Some(&a.app_id),
+                json!({ "keyId": key_id }),
+            )
+            .await?;
+            print_json(json!({ "removed": key_id }));
         }
         AppCmd::Secret(SecretCmd::Remove {
             tenant: key,

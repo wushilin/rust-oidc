@@ -33,6 +33,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4"] }
+x509-cert = { version = "0.3.0", features = ["pem"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13.5", features = ["cookies", "form", "json", "rustls"] }

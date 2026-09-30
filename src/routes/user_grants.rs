@@ -20,7 +20,7 @@ use sqlx::FromRow;
 use super::token::{authenticate_confidential_client, param};
 use crate::AppState;
 use crate::apps::{self, Application, PLATFORM_SPA, PLATFORM_WEB};
-use crate::claims::{self, SignIn};
+use crate::claims::{self, Azpacr, IdType, SignIn};
 use crate::error::{AadError, no_store};
 use crate::scopes::{self, Grant};
 use crate::tenant::Tenant;
@@ -41,7 +41,7 @@ async fn authenticate_for_platform(
     params: &Params,
     platform: &str,
     expected_client: &str,
-) -> Result<&'static str, AadError> {
+) -> Result<Azpacr, AadError> {
     let has_origin = headers.contains_key("origin");
     if platform == PLATFORM_SPA {
         if !has_origin {
@@ -64,7 +64,8 @@ async fn authenticate_for_platform(
                 "The provided grant was issued to a different client.",
             ));
         }
-        return Ok("1");
+        // A web client may authenticate with a secret or a certificate.
+        return Ok(client.azpacr);
     }
     let client_id = param(params, "client_id").ok_or_else(|| AadError::missing_parameter("client_id"))?;
     if !client_id.eq_ignore_ascii_case(expected_client) {
@@ -73,7 +74,7 @@ async fn authenticate_for_platform(
             "The provided grant was issued to a different client.",
         ));
     }
-    Ok("0")
+    Ok(Azpacr::None)
 }
 
 #[derive(FromRow)]
@@ -174,6 +175,7 @@ pub async fn authorization_code(
         auth_time: row.auth_time,
         amr,
         spa_expires_at: None,
+        rotation: false,
     };
     issue(
         st,
@@ -271,6 +273,7 @@ pub async fn refresh_token(
         auth_time: row.auth_time,
         amr: serde_json::from_str(&row.amr).unwrap_or_default(),
         spa_expires_at: (row.platform == PLATFORM_SPA).then_some(row.expires_at),
+        rotation: true,
     };
     issue(
         st,
@@ -287,18 +290,21 @@ pub async fn refresh_token(
     .await
 }
 
-struct Family {
-    id: String,
-    code_hash: Option<String>,
-    platform: String,
-    auth_time: i64,
-    amr: Vec<String>,
+pub(super) struct Family {
+    pub(super) id: String,
+    pub(super) code_hash: Option<String>,
+    pub(super) platform: String,
+    pub(super) auth_time: i64,
+    pub(super) amr: Vec<String>,
     /// SPA refresh tokens keep the family's original expiry.
-    spa_expires_at: Option<i64>,
+    pub(super) spa_expires_at: Option<i64>,
+    /// True when rotating an existing refresh token, which always yields a new
+    /// one even if `offline_access` is not asked for again.
+    pub(super) rotation: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn issue(
+pub(super) async fn issue(
     st: &AppState,
     tenant: &Tenant,
     headers: &HeaderMap,
@@ -307,7 +313,7 @@ async fn issue(
     user_id: &str,
     grant: &Grant,
     nonce: Option<&str>,
-    azpacr: &str,
+    azpacr: Azpacr,
     family: Family,
 ) -> Result<Response, AadError> {
     let user = users::find(&st.pool, &tenant.id, user_id)
@@ -335,7 +341,7 @@ async fn issue(
 
     // Entra issues a refresh token when offline_access was requested; on refresh
     // it always returns a new one (we rotate).
-    if grant.has("offline_access") || family.code_hash.is_none() {
+    if grant.has("offline_access") || family.rotation {
         let refresh = b64url(&random_bytes(48));
         let ts = now();
         let expires_at = family.spa_expires_at.unwrap_or(
@@ -400,4 +406,170 @@ async fn revoke_code_family(st: &AppState, code_hash: &str) -> anyhow::Result<()
     .execute(&st.pool)
     .await?;
     Ok(())
+}
+
+// ---- grant: urn:ietf:params:oauth:grant-type:jwt-bearer (on-behalf-of) ----
+
+/// The only `requested_token_use` value Entra defines for this grant.
+pub const REQUESTED_TOKEN_USE_OBO: &str = "on_behalf_of";
+
+/// Exchange the user token a middle-tier API received for a token to a
+/// downstream API, keeping the same user and how they authenticated.
+pub async fn on_behalf_of(
+    st: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    params: &Params,
+) -> Result<Response, AadError> {
+    // The middle tier must prove who it is; the user token alone is not enough.
+    let client = authenticate_confidential_client(st, tenant, headers, params).await?;
+
+    let requested = param(params, "requested_token_use")
+        .ok_or_else(|| AadError::missing_parameter("requested_token_use"))?;
+    if requested != REQUESTED_TOKEN_USE_OBO {
+        return Err(AadError::invalid_request(
+            500131,
+            format!("The value '{requested}' for 'requested_token_use' is not valid. Expected '{REQUESTED_TOKEN_USE_OBO}'."),
+        ));
+    }
+
+    let assertion = param(params, "assertion").ok_or_else(|| AadError::missing_parameter("assertion"))?;
+    let claims = st
+        .keys
+        .verify(assertion)
+        .await
+        .map_err(|_| AadError::invalid_obo_assertion())?;
+    let claim = |name: &str| {
+        claims
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // The assertion has to be a user token this server issued, for this tenant,
+    // and addressed to the very app that is now presenting it. Without the
+    // audience check any API could replay a token meant for someone else.
+    if claim("iss") != st.public_url.issuer(&tenant.id) || claim("tid") != tenant.id {
+        return Err(AadError::invalid_obo_assertion());
+    }
+    if !claim("aud").eq_ignore_ascii_case(&client.app.app_id) {
+        return Err(AadError::invalid_obo_assertion());
+    }
+    if claim("idtyp") != IdType::User.as_str() {
+        return Err(AadError::invalid_obo_assertion());
+    }
+    let user_id = claim("oid");
+    if user_id.is_empty() {
+        return Err(AadError::invalid_obo_assertion());
+    }
+
+    let scope = param(params, "scope").ok_or_else(|| AadError::missing_parameter("scope"))?;
+    let grant = scopes::resolve(&st.pool, tenant, scope).await?;
+
+    // Carry the original sign-in forward, so the downstream API sees how and when
+    // the user actually authenticated rather than the time of this exchange.
+    let auth_time = claims
+        .get("auth_time")
+        .or_else(|| claims.get("iat"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(now);
+    let amr: Vec<String> = claims
+        .get("amr")
+        .and_then(serde_json::Value::as_array)
+        .map(|vs| {
+            vs.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["pwd".to_string()]);
+
+    issue(
+        st,
+        tenant,
+        headers,
+        params,
+        &client.app.app_id,
+        &user_id,
+        &grant,
+        None,
+        client.azpacr,
+        Family {
+            id: b64url(&random_bytes(16)),
+            code_hash: None,
+            platform: PLATFORM_WEB.to_string(),
+            auth_time,
+            amr,
+            spa_expires_at: None,
+            rotation: false,
+        },
+    )
+    .await
+}
+
+// ---- grant: password (resource owner password credentials) ----
+
+/// ROPC. Off unless the app is opted in: the client sees the user's password,
+/// so it cannot support MFA and should be a last resort for legacy clients.
+pub async fn password(
+    st: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    params: &Params,
+) -> Result<Response, AadError> {
+    let client = authenticate_confidential_client(st, tenant, headers, params).await?;
+    if !client.app.allow_password_grant {
+        return Err(AadError::password_grant_not_allowed(&client.app.app_id));
+    }
+
+    let username = param(params, "username").ok_or_else(|| AadError::missing_parameter("username"))?;
+    let password = param(params, "password").ok_or_else(|| AadError::missing_parameter("password"))?;
+    let scope = param(params, "scope").ok_or_else(|| AadError::missing_parameter("scope"))?;
+
+    let outcome = users::authenticate(&st.pool, tenant, username, password).await?;
+    let user = match outcome {
+        users::AuthResult::Ok(user) => user,
+        // An unknown user and a wrong password give the same answer, so the token
+        // endpoint cannot be used to discover which accounts exist.
+        users::AuthResult::InvalidCredentials => {
+            return Err(AadError::invalid_grant(
+                50126,
+                "AADSTS50126: Error validating credentials due to invalid username or password.",
+            ));
+        }
+        users::AuthResult::Locked => {
+            return Err(AadError::invalid_grant(
+                50053,
+                "AADSTS50053: The account is temporarily locked because of too many failed sign-in attempts.",
+            ));
+        }
+        users::AuthResult::Disabled => {
+            return Err(AadError::invalid_grant(50057, "AADSTS50057: The user account is disabled."));
+        }
+    };
+
+    let grant = scopes::resolve(&st.pool, tenant, scope).await?;
+    let ts = now();
+    issue(
+        st,
+        tenant,
+        headers,
+        params,
+        &client.app.app_id,
+        &user.id,
+        &grant,
+        None,
+        client.azpacr,
+        Family {
+            id: b64url(&random_bytes(16)),
+            code_hash: None,
+            platform: PLATFORM_WEB.to_string(),
+            auth_time: ts,
+            amr: vec!["pwd".to_string()],
+            spa_expires_at: None,
+            rotation: false,
+        },
+    )
+    .await
 }

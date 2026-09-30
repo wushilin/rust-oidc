@@ -17,6 +17,24 @@ async fn discovery_by_guid_and_domain_uses_guid_issuer() {
         assert_eq!(status, 200, "{key}");
         assert_eq!(doc["issuer"], s.issuer(&t.id));
         assert_eq!(doc["token_endpoint"], s.url(&format!("/{}/oauth2/v2.0/token", t.id)));
+        assert_eq!(
+            doc["device_authorization_endpoint"],
+            s.url(&format!("/{}/oauth2/v2.0/devicecode", t.id))
+        );
+        let grants: Vec<&str> = doc["grant_types_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g.as_str().unwrap())
+            .collect();
+        assert!(grants.contains(&"urn:ietf:params:oauth:grant-type:device_code"), "{grants:?}");
+        let auth_methods: Vec<&str> = doc["token_endpoint_auth_methods_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap())
+            .collect();
+        assert!(auth_methods.contains(&"private_key_jwt"), "{auth_methods:?}");
         assert_eq!(doc["jwks_uri"], s.url(&format!("/{}/discovery/v2.0/keys", t.id)));
         assert_eq!(
             doc["authorization_endpoint"],

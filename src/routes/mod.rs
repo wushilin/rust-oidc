@@ -1,4 +1,5 @@
 mod authorize;
+mod device;
 mod discovery;
 mod logout;
 mod token;
@@ -40,6 +41,11 @@ pub fn router(state: AppState) -> Router {
             get(authorize::authorize).post(authorize::authorize),
         )
         .route("/{tenant}/login", post(authorize::login))
+        .route("/{tenant}/oauth2/v2.0/devicecode", post(device::devicecode))
+        .route(
+            "/{tenant}/oauth2/deviceauth",
+            get(device::deviceauth_get).post(device::deviceauth_post),
+        )
         .route("/{tenant}/oauth2/v2.0/logout", get(logout::logout).post(logout::logout))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone());

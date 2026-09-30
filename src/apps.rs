@@ -4,7 +4,7 @@ use anyhow::{Context, bail};
 use sqlx::{FromRow, SqlitePool};
 
 use crate::tenant::Tenant;
-use crate::util::{ct_eq, generate_client_secret, is_guid, new_guid, now, sha256_hex};
+use crate::util::{b64url, ct_eq, generate_client_secret, is_guid, new_guid, now, sha256_hex};
 
 #[derive(Clone, Debug, FromRow)]
 pub struct Application {
@@ -12,6 +12,8 @@ pub struct Application {
     pub app_id: String,
     pub tenant_id: String,
     pub display_name: String,
+    /// ROPC is refused unless an administrator has turned it on for this app.
+    pub allow_password_grant: bool,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -37,6 +39,7 @@ pub async fn create(pool: &SqlitePool, tenant: &Tenant, display_name: &str) -> a
         app_id: new_guid(),
         tenant_id: tenant.id.clone(),
         display_name: display_name.to_string(),
+        allow_password_grant: false,
     };
     let sp_id = new_guid();
     let identifier_uri = format!("api://{}", application.app_id);
@@ -76,7 +79,7 @@ pub async fn find(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<Appl
         return Ok(None);
     }
     Ok(sqlx::query_as(
-        "SELECT id, app_id, tenant_id, display_name FROM applications
+        "SELECT id, app_id, tenant_id, display_name, allow_password_grant FROM applications
          WHERE app_id = ? COLLATE NOCASE AND deleted_at IS NULL",
     )
     .bind(app_id)
@@ -93,7 +96,7 @@ pub async fn find_in_tenant(pool: &SqlitePool, tenant: &Tenant, app_id: &str) ->
 
 pub async fn list(pool: &SqlitePool, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
     Ok(sqlx::query_as(
-        "SELECT id, app_id, tenant_id, display_name FROM applications
+        "SELECT id, app_id, tenant_id, display_name, allow_password_grant FROM applications
          WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
     )
     .bind(tenant_id)
@@ -148,7 +151,7 @@ pub async fn resolve_resource(
         find(pool, resource).await?
     } else {
         sqlx::query_as(
-            "SELECT a.id, a.app_id, a.tenant_id, a.display_name FROM applications a
+            "SELECT a.id, a.app_id, a.tenant_id, a.display_name, a.allow_password_grant FROM applications a
              JOIN app_identifier_uris u ON u.application_id = a.id
              WHERE u.tenant_id = ? AND u.uri = ? AND a.deleted_at IS NULL",
         )
@@ -579,4 +582,149 @@ pub async fn set_assignment_required(pool: &SqlitePool, sp_id: &str, required: b
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Compare certificate thumbprints across the spellings clients actually send.
+///
+/// We store base64url without padding. MSAL sends base64url *with* `=` padding,
+/// and some clients use standard base64 (`+`/`/`) or hex. Normalising means an
+/// `x5t` is matched on the bytes it denotes rather than on its spelling.
+pub fn normalize_thumbprint(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('=');
+    // A hex thumbprint (SHA-1 is 40 hex chars, possibly colon-separated).
+    let hex_digits: String = trimmed.chars().filter(|c| !matches!(c, ':' | ' ')).collect();
+    if hex_digits.len() == 40
+        && hex_digits.chars().all(|c| c.is_ascii_hexdigit())
+        && let Ok(bytes) = hex::decode(&hex_digits)
+    {
+        return b64url(&bytes);
+    }
+    trimmed.replace('+', "-").replace('/', "_")
+}
+
+/// Allow or forbid the resource owner password grant for this app.
+pub async fn set_password_grant_allowed(pool: &SqlitePool, app: &Application, allowed: bool) -> anyhow::Result<()> {
+    sqlx::query("UPDATE applications SET allow_password_grant = ? WHERE id = ?")
+        .bind(allowed)
+        .bind(&app.id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ---- certificate (key) credentials, for private_key_jwt ----
+
+/// A registered certificate a client may sign assertions with.
+#[derive(FromRow)]
+pub struct KeyCredential {
+    pub key_id: String,
+    pub display_name: Option<String>,
+    #[sqlx(rename = "public_n")]
+    pub n: Vec<u8>,
+    #[sqlx(rename = "public_e")]
+    pub e: Vec<u8>,
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+impl KeyCredential {
+    pub fn is_current(&self, at: i64) -> bool {
+        self.not_before <= at && at < self.not_after
+    }
+}
+
+/// A client certificate broken into the parts needed to verify assertions.
+pub struct ParsedCertificate {
+    /// Entra-style thumbprint: base64url(SHA-1(cert DER)), matching `x5t`.
+    pub key_id: String,
+    pub cert_der: Vec<u8>,
+    pub n: Vec<u8>,
+    pub e: Vec<u8>,
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+/// Parse a PEM X.509 certificate. Only RSA certificates are supported, which is
+/// what Entra accepts for client assertions.
+pub fn parse_certificate(pem: &str) -> anyhow::Result<ParsedCertificate> {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use sha1::{Digest, Sha1};
+    use x509_cert::der::{DecodePem, Encode};
+    use x509_cert::Certificate;
+
+    let cert = Certificate::from_pem(pem.as_bytes()).context("not a PEM X.509 certificate")?;
+    let cert_der = cert.to_der().context("re-encoding the certificate")?;
+    let key_id = b64url(&Sha1::digest(&cert_der));
+
+    let spki = cert.tbs_certificate().subject_public_key_info();
+    let key_bytes = spki
+        .subject_public_key
+        .as_bytes()
+        .context("the certificate's public key is not byte-aligned")?;
+    let public = rsa::RsaPublicKey::from_pkcs1_der(key_bytes)
+        .context("only RSA certificates are supported for client assertions")?;
+    let (n, e) = (
+        rsa::traits::PublicKeyParts::n(&public).to_bytes_be(),
+        rsa::traits::PublicKeyParts::e(&public).to_bytes_be(),
+    );
+
+    let validity = cert.tbs_certificate().validity();
+    Ok(ParsedCertificate {
+        key_id,
+        cert_der,
+        n,
+        e,
+        not_before: validity.not_before.to_unix_duration().as_secs() as i64,
+        not_after: validity.not_after.to_unix_duration().as_secs() as i64,
+    })
+}
+
+/// Register a certificate credential. Returns its thumbprint (`key_id`).
+pub async fn add_key_credential(
+    pool: &SqlitePool,
+    app: &Application,
+    cert_pem: &str,
+    display_name: Option<&str>,
+) -> anyhow::Result<String> {
+    let cert = parse_certificate(cert_pem)?;
+    sqlx::query(
+        "INSERT INTO app_key_credentials
+            (application_id, key_id, display_name, cert_der, public_n, public_e, created_at, not_before, not_after)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (application_id, key_id) DO UPDATE SET
+            display_name = excluded.display_name, cert_der = excluded.cert_der,
+            public_n = excluded.public_n, public_e = excluded.public_e,
+            not_before = excluded.not_before, not_after = excluded.not_after",
+    )
+    .bind(&app.id)
+    .bind(&cert.key_id)
+    .bind(display_name)
+    .bind(&cert.cert_der)
+    .bind(&cert.n)
+    .bind(&cert.e)
+    .bind(now())
+    .bind(cert.not_before)
+    .bind(cert.not_after)
+    .execute(pool)
+    .await?;
+    Ok(cert.key_id)
+}
+
+pub async fn key_credentials(pool: &SqlitePool, app: &Application) -> anyhow::Result<Vec<KeyCredential>> {
+    Ok(sqlx::query_as::<_, KeyCredential>(
+        "SELECT key_id, display_name, public_n, public_e, not_before, not_after
+         FROM app_key_credentials WHERE application_id = ? ORDER BY created_at",
+    )
+    .bind(&app.id)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn remove_key_credential(pool: &SqlitePool, app: &Application, key_id: &str) -> anyhow::Result<bool> {
+    let done = sqlx::query("DELETE FROM app_key_credentials WHERE application_id = ? AND key_id = ?")
+        .bind(&app.id)
+        .bind(key_id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
 }

@@ -271,7 +271,10 @@ async fn client_and_redirect_errors_are_not_redirected() {
         )
         .await;
     let p = page.redirect_params();
-    assert_eq!(p["error"], "unsupported_response_type");
+    // `token` is a response type Entra supports but gates per app registration, and
+    // this app has not enabled it. Entra's value for that refusal is
+    // `unsupported_response`, not the RFC's `unsupported_response_type`.
+    assert_eq!(p["error"], "unsupported_response");
     assert_eq!(p["state"], "x");
 
     let page = b

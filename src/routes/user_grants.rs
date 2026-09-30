@@ -350,7 +350,9 @@ pub(super) async fn issue(
         auth_time: family.auth_time,
         amr: family.amr.clone(),
     };
-    let issued = claims::issue(st, &sign_in, grant, nonce, azpacr).await?;
+    // Back-channel: no code or access token travels beside the ID token here, so
+    // there is nothing for it to bind.
+    let issued = claims::issue(st, &sign_in, grant, nonce, azpacr, Default::default()).await?;
 
     let mut body = Map::new();
     body.insert("token_type".into(), json!("Bearer"));

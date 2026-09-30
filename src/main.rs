@@ -202,6 +202,21 @@ enum AppCmd {
         #[arg(long, default_value = "User")]
         r#type: String,
     },
+    /// Allow front-channel tokens for this app: Entra's "ID tokens" and "access
+    /// tokens" toggles under Implicit grant and hybrid flows. Both off by default,
+    /// so response_type must be `code`.
+    Implicit {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        app: String,
+        /// Permit response_type values containing `id_token`.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+        id_tokens: bool,
+        /// Permit response_type values containing `token`.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+        access_tokens: bool,
+    },
     /// Allow the resource owner password grant (ROPC) for this app. Off by
     /// default: the client sees the user's password and MFA cannot apply.
     PasswordGrant {
@@ -744,6 +759,26 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             print_json(
                 json!({ "keyId": s.key_id, "secretText": s.secret, "hint": &s.secret[..3], "endDateTime": end }),
             );
+        }
+        AppCmd::Implicit {
+            tenant: key,
+            app,
+            id_tokens,
+            access_tokens,
+        } => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let a = apps::find_in_tenant(pool, &t, &app).await?;
+            apps::set_implicit_allowed(pool, &a, id_tokens, access_tokens).await?;
+            db::audit(
+                pool,
+                Some(&t.id),
+                "cli",
+                "app.implicit",
+                Some(&a.app_id),
+                json!({ "idTokens": id_tokens, "accessTokens": access_tokens }),
+            )
+            .await?;
+            println!("id_tokens={id_tokens} access_tokens={access_tokens} for {}", a.app_id);
         }
         AppCmd::PasswordGrant {
             tenant: key,

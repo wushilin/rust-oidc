@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use super::audit::{self, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application, PLATFORM_SPA, ServicePrincipal};
-use crate::claims::Amr;
+use crate::claims::{self, Amr, Azpacr};
 use crate::error::AadError;
 use crate::html;
 use crate::scopes;
@@ -86,6 +86,70 @@ struct Validated {
     platform: String,
     response_mode: ResponseMode,
     state: Option<String>,
+}
+
+/// The response types Entra accepts.
+///
+/// An enum of whole combinations rather than three booleans, so every decision that
+/// depends on what the response carries -- the default response mode, whether a nonce
+/// is required, which hash claims bind the ID token -- is an exhaustive match the
+/// compiler checks. Any combination not listed is refused: Entra advertises
+/// `code`, `id_token`, `code id_token` and `id_token token`, and its documentation
+/// additionally demonstrates bare `token`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseType {
+    Code,
+    IdToken,
+    Token,
+    CodeIdToken,
+    IdTokenToken,
+}
+
+impl ResponseType {
+    /// Order-insensitive: the value is a space-delimited *set*, and Entra's own docs
+    /// spell the hybrid type both ways round.
+    fn parse(raw: &str) -> Option<Self> {
+        let mut parts: Vec<&str> = raw.split_whitespace().collect();
+        parts.sort_unstable();
+        parts.dedup();
+        match parts.as_slice() {
+            ["code"] => Some(Self::Code),
+            ["id_token"] => Some(Self::IdToken),
+            ["token"] => Some(Self::Token),
+            ["code", "id_token"] => Some(Self::CodeIdToken),
+            ["id_token", "token"] => Some(Self::IdTokenToken),
+            _ => None,
+        }
+    }
+
+    fn has_code(self) -> bool {
+        matches!(self, Self::Code | Self::CodeIdToken)
+    }
+
+    fn has_id_token(self) -> bool {
+        matches!(self, Self::IdToken | Self::CodeIdToken | Self::IdTokenToken)
+    }
+
+    fn has_access_token(self) -> bool {
+        matches!(self, Self::Token | Self::IdTokenToken)
+    }
+
+    /// Whether a token travels in the response itself, rather than only a code.
+    fn is_front_channel(self) -> bool {
+        self.has_id_token() || self.has_access_token()
+    }
+}
+
+/// Entra's answer when the app registration has not enabled front-channel tokens.
+/// The error value and message are quoted from Microsoft's implicit-flow
+/// documentation; the AADSTS number is our closest match, not a verified pairing.
+fn response_type_not_allowed() -> AadError {
+    AadError::new(
+        StatusCode::BAD_REQUEST,
+        "unsupported_response",
+        700054,
+        "The provided value for the input parameter 'response_type' is not allowed for this client. Expected value is 'code'",
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,7 +263,30 @@ async fn run(
 ) -> Result<Response, Response> {
     let (tenant, client, sp, redirect_uri, platform) = validate_client(st, tenant_key, params).await?;
 
+    // Entra defaults the response mode to fragment when an ID token is involved, and
+    // a token must never travel in a query string: it would be logged by proxies and
+    // leak through Referer. Parsed leniently -- continue_authorize reports a bad value.
+    let front_channel = get(params, "response_type")
+        .and_then(ResponseType::parse)
+        .is_some_and(ResponseType::is_front_channel);
     let response_mode = match get(params, "response_mode") {
+        Some("query") if front_channel => {
+            let v = Validated {
+                tenant,
+                client,
+                sp,
+                redirect_uri,
+                platform,
+                // Report it through the mode this request should have used.
+                response_mode: ResponseMode::Fragment,
+                state: get(params, "state").map(str::to_string),
+            };
+            return Ok(v.error(AadError::invalid_request(
+                900144,
+                "The response_mode 'query' cannot be used with a response_type that returns a token.",
+            )));
+        }
+        None if front_channel => ResponseMode::Fragment,
         None | Some("query") => ResponseMode::Query,
         Some("fragment") => ResponseMode::Fragment,
         Some("form_post") => ResponseMode::FormPost,
@@ -287,21 +374,34 @@ async fn continue_authorize(
         )
         .into());
     }
-    match get(params, "response_type") {
+    let response_type = match get(params, "response_type") {
         None => return Err(AadError::missing_parameter("response_type").into()),
-        Some("code") => {}
-        Some(other) => {
-            return Err(AadError::new(
-                StatusCode::BAD_REQUEST,
-                "unsupported_response_type",
-                700054,
-                format!("response_type '{other}' is not enabled for the application."),
-            )
-            .into());
-        }
+        Some(raw) => match ResponseType::parse(raw) {
+            Some(rt) => rt,
+            None => return Err(response_type_not_allowed().into()),
+        },
+    };
+    // Entra gates front-channel tokens per app registration, both off by default.
+    if (response_type.has_id_token() && !v.client.allow_id_token_implicit)
+        || (response_type.has_access_token() && !v.client.allow_access_token_implicit)
+    {
+        return Err(response_type_not_allowed().into());
+    }
+    // Required whenever an ID token comes back through the browser: it is what binds
+    // the token to this request, and there is no code exchange to do it instead.
+    let nonce = get(params, "nonce");
+    if response_type.has_id_token() && nonce.is_none() {
+        return Err(AadError::missing_parameter("nonce").into());
     }
     let scope = get(params, "scope").ok_or_else(|| AadError::missing_parameter("scope"))?;
     let grant = scopes::resolve(&st.pool, &v.tenant, scope).await?;
+    if response_type.has_id_token() && !grant.has("openid") {
+        return Err(AadError::invalid_request(
+            900144,
+            "The scope must include 'openid' when the response_type requests an id_token.",
+        )
+        .into());
+    }
 
     let code_challenge = get(params, "code_challenge");
     let method = get(params, "code_challenge_method");
@@ -316,7 +416,7 @@ async fn continue_authorize(
         if challenge.len() < 43 || challenge.len() > 128 {
             return Err(AadError::invalid_request(501491, "Invalid size of Code_Challenge parameter.").into());
         }
-    } else if v.platform == PLATFORM_SPA {
+    } else if v.platform == PLATFORM_SPA && response_type.has_code() {
         return Err(AadError::invalid_request(
             9002325,
             "Proof Key for Code Exchange is required for cross-origin authorization code redemption.",
@@ -410,35 +510,81 @@ async fn continue_authorize(
         return Err(Step::Page(html::error(Some(&v.tenant.name), &err.description())));
     }
 
-    // ---- issue the code ----
-    let code = b64url(&random_bytes(48));
+    // ---- issue ----
     let ts = now();
-    sqlx::query(crate::db::q(
-        &st.pool,
-        "INSERT INTO auth_codes (code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce,
-                                 code_challenge, code_challenge_method, auth_time, amr, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    ))
-    .bind(sha256_hex(code.as_bytes()))
-    .bind(&v.tenant.id)
-    .bind(&v.client.app_id)
-    // Empty when the client omitted redirect_uri; then the token request may omit it too.
-    .bind(get(params, "redirect_uri").unwrap_or_default())
-    .bind(&v.platform)
-    .bind(&user.id)
-    .bind(grant.granted.join(" "))
-    .bind(get(params, "nonce"))
-    .bind(code_challenge)
-    .bind(code_challenge.map(|_| method.unwrap_or("plain")))
-    .bind(session.auth_time)
-    .bind(serde_json::to_string(&session.amr).map_err(anyhow::Error::from)?)
-    .bind(ts)
-    .bind(ts + CODE_LIFETIME)
-    .execute(&st.pool)
-    .await
-    .map_err(anyhow::Error::from)?;
+    let mut out: Vec<(&str, String)> = Vec::new();
 
-    let mut out = vec![("code", code)];
+    let code = if response_type.has_code() {
+        let code = b64url(&random_bytes(48));
+        sqlx::query(crate::db::q(
+            &st.pool,
+            "INSERT INTO auth_codes (code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce,
+                                     code_challenge, code_challenge_method, auth_time, amr, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(sha256_hex(code.as_bytes()))
+        .bind(&v.tenant.id)
+        .bind(&v.client.app_id)
+        // Empty when the client omitted redirect_uri; then the token request may omit it too.
+        .bind(get(params, "redirect_uri").unwrap_or_default())
+        .bind(&v.platform)
+        .bind(&user.id)
+        .bind(grant.granted.join(" "))
+        .bind(nonce)
+        .bind(code_challenge)
+        .bind(code_challenge.map(|_| method.unwrap_or("plain")))
+        .bind(session.auth_time)
+        .bind(serde_json::to_string(&session.amr).map_err(anyhow::Error::from)?)
+        .bind(ts)
+        .bind(ts + CODE_LIFETIME)
+        .execute(&st.pool)
+        .await
+        .map_err(anyhow::Error::from)?;
+        out.push(("code", code.clone()));
+        Some(code)
+    } else {
+        None
+    };
+
+    if response_type.is_front_channel() {
+        let sign_in = claims::SignIn {
+            tenant: v.tenant.clone(),
+            user: user.clone(),
+            client: v.client.clone(),
+            auth_time: session.auth_time,
+            amr: session.amr.clone(),
+        };
+        // A front-channel client presents no credential at all, so azpacr is "0".
+        // The implicit grant issues no refresh token, so nothing is recorded for
+        // rotation -- a hybrid response's code still redeems normally and gets one.
+        let issued = claims::issue(
+            st,
+            &sign_in,
+            &grant,
+            nonce,
+            Azpacr::None,
+            claims::FrontChannel {
+                code: code.as_deref(),
+                with_access_token: response_type.has_access_token(),
+            },
+        )
+        .await
+        .map_err(|e| Step::from(AadError::from(e)))?;
+        if response_type.has_access_token() {
+            out.push(("access_token", issued.access_token));
+            out.push(("token_type", "Bearer".to_string()));
+            out.push(("expires_in", issued.expires_in.to_string()));
+            out.push(("scope", grant.scp.join(" ")));
+        }
+        // Only when it was asked for: an `openid` scope on a bare `token` request
+        // would otherwise hand back an ID token the client never requested.
+        if response_type.has_id_token()
+            && let Some(id_token) = issued.id_token
+        {
+            out.push(("id_token", id_token));
+        }
+    }
+
     if get(params, "client_info") == Some("1") {
         out.push(("client_info", crate::claims::client_info(&user)));
     }

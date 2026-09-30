@@ -16,6 +16,14 @@ pub struct Application {
     /// ROPC is refused unless an administrator has turned it on for this app.
     #[sqlx(try_from = "crate::db::Flag")]
     pub allow_password_grant: bool,
+    /// Entra's "ID tokens" toggle: allows `response_type` values containing
+    /// `id_token`. Off by default.
+    #[sqlx(try_from = "crate::db::Flag")]
+    pub allow_id_token_implicit: bool,
+    /// Entra's "access tokens" toggle: allows `response_type` values containing
+    /// `token`. Off by default.
+    #[sqlx(try_from = "crate::db::Flag")]
+    pub allow_access_token_implicit: bool,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -44,6 +52,8 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, display_name: &str) -> anyho
         tenant_id: tenant.id.clone(),
         display_name: display_name.to_string(),
         allow_password_grant: false,
+        allow_id_token_implicit: false,
+        allow_access_token_implicit: false,
     };
     let sp_id = new_guid();
     let identifier_uri = format!("api://{}", application.app_id);
@@ -95,7 +105,8 @@ pub async fn find(pool: &DbPool, app_id: &str) -> anyhow::Result<Option<Applicat
     }
     Ok(sqlx::query_as(crate::db::q(
         pool,
-        "SELECT id, app_id, tenant_id, display_name, allow_password_grant FROM applications
+        "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
+                allow_access_token_implicit FROM applications
          WHERE app_id = ? AND deleted_at IS NULL",
     ))
     // GUIDs are stored lowercase; fold the probe so `ABC-..` still finds them.
@@ -114,7 +125,8 @@ pub async fn find_in_tenant(pool: &DbPool, tenant: &Tenant, app_id: &str) -> any
 pub async fn list(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
     Ok(sqlx::query_as(crate::db::q(
         pool,
-        "SELECT id, app_id, tenant_id, display_name, allow_password_grant FROM applications
+        "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
+                allow_access_token_implicit FROM applications
          WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
     ))
     .bind(tenant_id)
@@ -176,7 +188,8 @@ pub async fn resolve_resource(
     } else {
         sqlx::query_as(crate::db::q(
             pool,
-            "SELECT a.id, a.app_id, a.tenant_id, a.display_name, a.allow_password_grant FROM applications a
+            "SELECT a.id, a.app_id, a.tenant_id, a.display_name, a.allow_password_grant,
+                    a.allow_id_token_implicit, a.allow_access_token_implicit FROM applications a
              JOIN app_identifier_uris u ON u.application_id = a.id
              WHERE u.tenant_id = ? AND u.uri = ? AND a.deleted_at IS NULL",
         ))
@@ -670,6 +683,26 @@ pub async fn set_password_grant_allowed(pool: &DbPool, app: &Application, allowe
         "UPDATE applications SET allow_password_grant = ? WHERE id = ?",
     ))
     .bind(allowed)
+    .bind(&app.id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Allow or forbid front-channel tokens for this app: Entra's "ID tokens" and
+/// "access tokens" toggles. Both off means `response_type` must be `code`.
+pub async fn set_implicit_allowed(
+    pool: &DbPool,
+    app: &Application,
+    id_token: bool,
+    access_token: bool,
+) -> anyhow::Result<()> {
+    sqlx::query(crate::db::q(
+        pool,
+        "UPDATE applications SET allow_id_token_implicit = ?, allow_access_token_implicit = ? WHERE id = ?",
+    ))
+    .bind(id_token)
+    .bind(access_token)
     .bind(&app.id)
     .execute(pool)
     .await?;

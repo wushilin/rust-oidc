@@ -33,6 +33,13 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// The `c_hash`/`at_hash` construction for an RS256 token: the left-most half of
+/// the SHA-256 of the ASCII value, base64url (OpenID Connect Core 3.3.2.11).
+pub fn half_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    b64url(&digest[..16])
+}
+
 pub fn ct_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }

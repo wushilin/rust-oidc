@@ -7,7 +7,7 @@ use crate::apps::{self, Application};
 use crate::scopes::{Grant, Resource};
 use crate::tenant::Tenant;
 use crate::users::User;
-use crate::util::{b64url, now, random_bytes};
+use crate::util::{b64url, half_hash, now, random_bytes};
 use crate::{directory, groups};
 
 pub const ID_TOKEN_LIFETIME: i64 = 3600;
@@ -19,6 +19,19 @@ pub struct SignIn {
     pub client: Application,
     pub auth_time: i64,
     pub amr: Vec<String>,
+}
+
+/// What is delivered alongside the ID token in the same front-channel response.
+///
+/// OpenID Connect Core 3.3.2.11 requires the ID token to bind these, so that a
+/// response's ID token cannot be paired with a code or access token taken from a
+/// different response.
+#[derive(Default, Clone, Copy)]
+pub struct FrontChannel<'a> {
+    /// The authorization code in this response, hashed into `c_hash`.
+    pub code: Option<&'a str>,
+    /// Whether this response also carries the access token, hashed into `at_hash`.
+    pub with_access_token: bool,
 }
 
 pub struct Issued {
@@ -92,6 +105,7 @@ pub async fn issue(
     grant: &Grant,
     nonce: Option<&str>,
     azpacr: Azpacr,
+    front: FrontChannel<'_>,
 ) -> anyhow::Result<Issued> {
     let pool = &st.pool;
     let user = &sign_in.user;
@@ -147,6 +161,12 @@ pub async fn issue(
         id.insert("exp".into(), json!(iat + ID_TOKEN_LIFETIME));
         id.insert("amr".into(), json!(sign_in.amr));
         id.insert("auth_time".into(), json!(sign_in.auth_time));
+        if let Some(code) = front.code {
+            id.insert("c_hash".into(), json!(half_hash(code)));
+        }
+        if front.with_access_token {
+            id.insert("at_hash".into(), json!(half_hash(&access_token)));
+        }
         if grant.has("email")
             && let Some(email) = &user.email
         {

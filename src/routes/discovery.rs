@@ -34,7 +34,10 @@ pub async fn openid_configuration(
         "response_modes_supported": ["query", "fragment", "form_post"],
         "subject_types_supported": ["pairwise"],
         "id_token_signing_alg_values_supported": ["RS256"],
-        "response_types_supported": ["code"],
+        // Exactly what Entra advertises. Its documentation additionally demonstrates
+        // bare `token` (the silent-refresh iframe), which it does not advertise and
+        // neither do we -- the mismatch is reproduced deliberately.
+        "response_types_supported": ["code", "id_token", "code id_token", "id_token token"],
         "scopes_supported": ["openid", "profile", "email", "offline_access"],
         "device_authorization_endpoint": url.tenant_url(tid, "oauth2/v2.0/devicecode"),
         "grant_types_supported": [

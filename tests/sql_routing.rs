@@ -53,6 +53,22 @@ fn call_body(src: &str, open: usize) -> &str {
     &src[open..]
 }
 
+/// True if `needle` occurs in `body` not glued to a longer identifier on its left.
+fn has_token(body: &str, needle: &str, allow_path_before: bool) -> bool {
+    body.match_indices(needle).any(|(i, _)| {
+        body[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || (c == ':' && !allow_path_before)))
+    })
+}
+
+/// The call goes through `db::sql_stmt`, `db::q`, or an imported bare `q(`/`sql_stmt(`.
+/// A path ending in `::q(` from some other module does not count.
+fn routed(body: &str) -> bool {
+    has_token(body, "sql_stmt(", true) || has_token(body, "db::q(", true) || has_token(body, "q(", false)
+}
+
 /// Offending `sqlx::query*(` calls in `src`, as "line N" strings.
 fn unrouted(src: &str) -> Vec<usize> {
     let mut bad = Vec::new();
@@ -69,7 +85,7 @@ fn unrouted(src: &str) -> Vec<usize> {
             continue;
         }
         let body = call_body(src, paren);
-        if body.contains('?') && !(body.contains("sql_stmt(") || body.contains("::q(") || body.contains("(q(")) {
+        if body.contains('?') && !routed(body) {
             bad.push(src[..at].matches('\n').count() + 1);
         }
     }
@@ -106,4 +122,23 @@ fn the_scanner_flags_multiline_unwrapped_queries_and_passes_wrapped_ones() {
     assert!(unrouted(tf_ok).is_empty());
     let none = "sqlx::query(\"SELECT 1\")";
     assert!(unrouted(none).is_empty());
+}
+
+#[test]
+fn the_scanner_keeps_its_teeth_with_q_wrapping() {
+    // Unwrapped: still flagged, plain and turbofish.
+    assert_eq!(unrouted("sqlx::query(\"UPDATE t SET a = ?\")"), vec![1]);
+    assert_eq!(
+        unrouted("sqlx::query_as::<_, T>(\"SELECT a FROM t WHERE x = ?\")"),
+        vec![1]
+    );
+    // Wrapped in db::q: accepted, plain and turbofish, qualified or imported.
+    assert!(unrouted("sqlx::query(db::q(pool, \"UPDATE t SET a = ?\"))").is_empty());
+    assert!(unrouted("sqlx::query(crate::db::q(pool, \"UPDATE t SET a = ?\"))").is_empty());
+    assert!(unrouted("sqlx::query_as::<_, T>(db::q(pool, \"SELECT a FROM t WHERE x = ?\"))").is_empty());
+    assert!(unrouted("sqlx::query_as::<_, T>(q(pool, \"SELECT a FROM t WHERE x = ?\"))").is_empty());
+    // Look-alikes do not count as routing.
+    assert_eq!(unrouted("sqlx::query(other::q(\"UPDATE t SET a = ?\"))"), vec![1]);
+    assert_eq!(unrouted("sqlx::query(faq(\"UPDATE t SET a = ?\"))"), vec![1]);
+    assert_eq!(unrouted("sqlx::query(mydb::q(pool, \"UPDATE t SET a = ?\"))"), vec![1]);
 }

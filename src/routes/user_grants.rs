@@ -103,9 +103,9 @@ pub async fn authorization_code(
 ) -> Result<Response, AadError> {
     let code = param(params, "code").ok_or_else(|| AadError::missing_parameter("code"))?;
     let row: Option<CodeRow> = sqlx::query_as(
-        "SELECT code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce, code_challenge,
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "SELECT code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce, code_challenge,
                 code_challenge_method, auth_time, amr, expires_at, redeemed_at
-         FROM auth_codes WHERE code_hash = ?",
+         FROM auth_codes WHERE code_hash = ?"),
     )
     .bind(sha256_hex(code.as_bytes()))
     .fetch_optional(&st.pool)
@@ -154,7 +154,7 @@ pub async fn authorization_code(
         }
     }
     // Single use, race-safe: only one redemption can flip redeemed_at.
-    let res = sqlx::query("UPDATE auth_codes SET redeemed_at = ? WHERE code_hash = ? AND redeemed_at IS NULL")
+    let res = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE auth_codes SET redeemed_at = ? WHERE code_hash = ? AND redeemed_at IS NULL"))
         .bind(now())
         .bind(&row.code_hash)
         .execute(&st.pool)
@@ -216,9 +216,9 @@ pub async fn refresh_token(
 ) -> Result<Response, AadError> {
     let token = param(params, "refresh_token").ok_or_else(|| AadError::missing_parameter("refresh_token"))?;
     let row: Option<RefreshRow> = sqlx::query_as(
-        "SELECT token_hash, family_id, tenant_id, client_app_id, platform, user_id, scope, auth_time, amr,
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "SELECT token_hash, family_id, tenant_id, client_app_id, platform, user_id, scope, auth_time, amr,
                 expires_at, used_at, revoked_at
-         FROM refresh_tokens WHERE token_hash = ?",
+         FROM refresh_tokens WHERE token_hash = ?"),
     )
     .bind(sha256_hex(token.as_bytes()))
     .fetch_optional(&st.pool)
@@ -252,7 +252,7 @@ pub async fn refresh_token(
             AadError::invalid_grant(700082, "The refresh token has expired due to inactivity.")
         });
     }
-    let res = sqlx::query("UPDATE refresh_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL")
+    let res = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE refresh_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL"))
         .bind(now())
         .bind(&row.token_hash)
         .execute(&st.pool)
@@ -352,9 +352,9 @@ pub(super) async fn issue(
             },
         );
         sqlx::query(
-            "INSERT INTO refresh_tokens (token_hash, family_id, code_hash, tenant_id, client_app_id, platform, user_id,
+            crate::db::sql_stmt(crate::db::engine_of(&st.pool), "INSERT INTO refresh_tokens (token_hash, family_id, code_hash, tenant_id, client_app_id, platform, user_id,
                                          scope, auth_time, amr, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
         )
         .bind(sha256_hex(refresh.as_bytes()))
         .bind(&family.id)
@@ -387,7 +387,7 @@ pub(super) async fn issue(
 }
 
 async fn revoke_family(st: &AppState, family_id: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE refresh_tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL")
+    sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE refresh_tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL"))
         .bind(now())
         .bind(family_id)
         .execute(&st.pool)
@@ -398,8 +398,8 @@ async fn revoke_family(st: &AppState, family_id: &str) -> anyhow::Result<()> {
 /// A replayed authorization code revokes the refresh tokens it produced (RFC 6749 §4.1.2).
 async fn revoke_code_family(st: &AppState, code_hash: &str) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE refresh_tokens SET revoked_at = ? WHERE revoked_at IS NULL
-         AND family_id IN (SELECT family_id FROM refresh_tokens WHERE code_hash = ?)",
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE refresh_tokens SET revoked_at = ? WHERE revoked_at IS NULL
+         AND family_id IN (SELECT family_id FROM refresh_tokens WHERE code_hash = ?)"),
     )
     .bind(now())
     .bind(code_hash)

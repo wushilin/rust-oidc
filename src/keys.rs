@@ -180,8 +180,8 @@ pub async fn generate(pool: &DbPool, status: &str) -> anyhow::Result<String> {
     let kid = b64url(&Sha1::digest(&cert_der));
 
     sqlx::query(
-        "INSERT INTO signing_keys (kid, private_key_pem, cert_der, status, created_at, not_after)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO signing_keys (kid, private_key_pem, cert_der, status, created_at, not_after)
+         VALUES (?, ?, ?, ?, ?, ?)"),
     )
     .bind(&kid)
     .bind(key_pair.serialize_pem())
@@ -197,7 +197,7 @@ pub async fn generate(pool: &DbPool, status: &str) -> anyhow::Result<String> {
 /// Make sure there is an active key and a pre-published next key.
 pub async fn ensure(pool: &DbPool) -> anyhow::Result<()> {
     let count = |status: &'static str| async move {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM signing_keys WHERE status = ?")
+        let (n,): (i64,) = sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT COUNT(*) FROM signing_keys WHERE status = ?"))
             .bind(status)
             .fetch_one(pool)
             .await?;
@@ -216,8 +216,9 @@ pub async fn ensure(pool: &DbPool) -> anyhow::Result<()> {
 /// published as `next`, so clients that cache JWKS have had time to see it.
 pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
     ensure(pool).await?;
+    let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'")
+    sqlx::query(crate::db::sql_stmt(engine, "UPDATE signing_keys SET status = 'retired', retired_at = ? WHERE status = 'active'"))
         .bind(now())
         .execute(&mut *tx)
         .await?;
@@ -234,7 +235,7 @@ pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
 
 /// Delete keys retired more than `older_than_secs` ago (must exceed token lifetimes).
 pub async fn prune(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
-    let res = sqlx::query("DELETE FROM signing_keys WHERE status = 'retired' AND retired_at < ?")
+    let res = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(pool), "DELETE FROM signing_keys WHERE status = 'retired' AND retired_at < ?"))
         .bind(now() - older_than_secs)
         .execute(pool)
         .await?;

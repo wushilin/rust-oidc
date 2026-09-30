@@ -36,13 +36,13 @@ impl Secrets {
 }
 
 async fn load_or_create(pool: &DbPool, name: &str) -> anyhow::Result<Vec<u8>> {
-    sqlx::query("INSERT OR IGNORE INTO server_secrets (name, value, created_at) VALUES (?, ?, ?)")
+    sqlx::query(crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT OR IGNORE INTO server_secrets (name, value, created_at) VALUES (?, ?, ?)"))
         .bind(name)
         .bind(random_bytes(32))
         .bind(now())
         .execute(pool)
         .await?;
-    let (value,): (Vec<u8>,) = sqlx::query_as("SELECT value FROM server_secrets WHERE name = ?")
+    let (value,): (Vec<u8>,) = sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT value FROM server_secrets WHERE name = ?"))
         .bind(name)
         .fetch_one(pool)
         .await?;

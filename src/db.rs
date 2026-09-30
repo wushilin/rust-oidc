@@ -165,6 +165,45 @@ pub fn engine_of(pool: &DbPool) -> Engine {
     Engine::from_url(opts.database_url.as_str()).expect("connect() only opens URLs with a supported scheme")
 }
 
+/// Rewrite placeholders for the target engine. SQLite and MySQL use `?`;
+/// Postgres needs `$1`, `$2`, ... in order. A `?` inside a single-quoted literal
+/// is data and must be left alone; `''` is an escaped quote, not a terminator.
+pub fn sql(engine: Engine, sql: &str) -> std::borrow::Cow<'_, str> {
+    if engine != Engine::Postgres || !sql.contains('?') {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0usize;
+    let mut in_literal = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                out.push(c);
+                if in_literal && chars.peek() == Some(&'\'') {
+                    out.push(chars.next().expect("peeked"));
+                } else {
+                    in_literal = !in_literal;
+                }
+            }
+            '?' if !in_literal => {
+                n += 1;
+                out.push('$');
+                out.push_str(&n.to_string());
+            }
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// [`sql`] for a statement handed to `sqlx::query*`. sqlx 0.9 refuses non-static
+/// SQL unless it is wrapped in `AssertSqlSafe`. Requiring `&'static str` makes
+/// that assertion sound: only source-code literals get in, never runtime data.
+pub fn sql_stmt(engine: Engine, statement: &'static str) -> sqlx::AssertSqlSafe<std::borrow::Cow<'static, str>> {
+    sqlx::AssertSqlSafe(sql(engine, statement))
+}
+
 pub async fn audit(
     pool: &DbPool,
     tenant_id: Option<&str>,
@@ -173,10 +212,11 @@ pub async fn audit(
     target: Option<&str>,
     details: serde_json::Value,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    sqlx::query(sql_stmt(
+        engine_of(pool),
         "INSERT INTO audit_log (tenant_id, actor, action, target, details, created_at)
          VALUES (?, ?, ?, ?, ?, ?)",
-    )
+    ))
     .bind(tenant_id)
     .bind(actor)
     .bind(action)
@@ -225,5 +265,55 @@ mod tests {
         assert!(decode(Raw::Other(AnyTypeInfoKind::Text)).is_err());
         assert!(decode(Raw::Other(AnyTypeInfoKind::Double)).is_err());
         assert!(decode(Raw::Other(AnyTypeInfoKind::Null)).is_err());
+    }
+
+    #[test]
+    fn sqlite_and_mysql_keep_question_marks() {
+        let q = "SELECT a FROM t WHERE b = ? AND c = ?";
+        assert_eq!(sql(Engine::Sqlite, q), q);
+        assert_eq!(sql(Engine::MySql, q), q);
+    }
+
+    #[test]
+    fn postgres_gets_numbered_parameters() {
+        assert_eq!(
+            sql(Engine::Postgres, "SELECT a FROM t WHERE b = ? AND c = ?"),
+            "SELECT a FROM t WHERE b = $1 AND c = $2"
+        );
+    }
+
+    #[test]
+    fn postgres_numbering_counts_every_placeholder_in_order() {
+        assert_eq!(
+            sql(Engine::Postgres, "INSERT INTO t (a,b,c) VALUES (?, ?, ?)"),
+            "INSERT INTO t (a,b,c) VALUES ($1, $2, $3)"
+        );
+    }
+
+    /// A `?` inside a quoted literal is data, not a placeholder.
+    #[test]
+    fn a_question_mark_inside_a_string_literal_is_left_alone() {
+        assert_eq!(
+            sql(Engine::Postgres, "SELECT a FROM t WHERE b = ? AND c = 'why?'"),
+            "SELECT a FROM t WHERE b = $1 AND c = 'why?'"
+        );
+        assert_eq!(
+            sql(Engine::Postgres, "SELECT 'a?b' AS x WHERE y = ?"),
+            "SELECT 'a?b' AS x WHERE y = $1"
+        );
+    }
+
+    #[test]
+    fn a_doubled_quote_inside_a_literal_does_not_end_it() {
+        assert_eq!(
+            sql(Engine::Postgres, "SELECT 'it''s ?' WHERE y = ?"),
+            "SELECT 'it''s ?' WHERE y = $1"
+        );
+    }
+
+    #[test]
+    fn sql_without_placeholders_is_unchanged_and_not_reallocated() {
+        let q = "SELECT 1";
+        assert!(matches!(sql(Engine::Postgres, q), std::borrow::Cow::Borrowed(_)));
     }
 }

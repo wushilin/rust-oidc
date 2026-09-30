@@ -47,10 +47,11 @@ pub async fn create(
     created_by: &str,
 ) -> anyhow::Result<String> {
     let id = new_guid();
+    let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
     sqlx::query(
-        "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        crate::db::sql_stmt(engine, "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)"),
     )
     .bind(&id)
     .bind(principal_type.as_str())
@@ -63,7 +64,7 @@ pub async fn create(
     .await?;
     if let Scope::Tenants(ids) = scope {
         for tenant_id in ids {
-            sqlx::query("INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES (?, ?)")
+            sqlx::query(crate::db::sql_stmt(engine, "INSERT INTO role_binding_tenants (binding_id, tenant_id) VALUES (?, ?)"))
                 .bind(&id)
                 .bind(tenant_id)
                 .execute(&mut *tx)
@@ -75,7 +76,7 @@ pub async fn create(
 }
 
 pub async fn delete(pool: &DbPool, binding_id: &str) -> anyhow::Result<bool> {
-    let done = sqlx::query("DELETE FROM role_bindings WHERE id = ?")
+    let done = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(pool), "DELETE FROM role_bindings WHERE id = ?"))
         .bind(binding_id)
         .execute(pool)
         .await?;
@@ -89,9 +90,9 @@ async fn scope_of(pool: &DbPool, binding_id: &str, kind: ScopeKind) -> anyhow::R
         ScopeKind::All => Ok(Scope::All),
         ScopeKind::Tenants => {
             let rows = sqlx::query(
-                "SELECT rbt.tenant_id FROM role_binding_tenants rbt
+                crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT rbt.tenant_id FROM role_binding_tenants rbt
                  JOIN tenants t ON t.id = rbt.tenant_id
-                 WHERE rbt.binding_id = ?",
+                 WHERE rbt.binding_id = ?"),
             )
             .bind(binding_id)
             .fetch_all(pool)
@@ -105,14 +106,15 @@ async fn scope_of(pool: &DbPool, binding_id: &str, kind: ScopeKind) -> anyhow::R
 /// Recomputed on each call: never cache this in a session.
 pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<EffectiveBinding>> {
     let rows = sqlx::query(
-        "SELECT id, role_id, scope_kind FROM role_bindings
-         WHERE (principal_type = ?2 AND principal_id = ?1)
-            OR (principal_type = ?3 AND principal_id IN
-                (SELECT group_id FROM group_members WHERE user_id = ?1))",
+        crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id, role_id, scope_kind FROM role_bindings
+         WHERE (principal_type = ? AND principal_id = ?)
+            OR (principal_type = ? AND principal_id IN
+                (SELECT group_id FROM group_members WHERE user_id = ?))"),
     )
-    .bind(user_id)
     .bind(PrincipalType::User.as_str())
+    .bind(user_id)
     .bind(PrincipalType::Group.as_str())
+    .bind(user_id)
     .fetch_all(pool)
     .await?;
 
@@ -144,11 +146,11 @@ pub async fn list_all(pool: &DbPool) -> anyhow::Result<Vec<StoredBinding>> {
 
 pub async fn list_for_tenant(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<StoredBinding>> {
     let rows = sqlx::query(
-        "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
+        crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
          FROM role_bindings b
          LEFT JOIN role_binding_tenants rbt ON rbt.binding_id = b.id
          WHERE b.scope_kind = ? OR rbt.tenant_id = ?
-         GROUP BY b.id ORDER BY b.created_at",
+         GROUP BY b.id ORDER BY b.created_at"),
     )
     .bind(ScopeKind::All.as_str())
     .bind(tenant_id)

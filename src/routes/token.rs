@@ -349,13 +349,13 @@ async fn authenticate_with_assertion(
     if exp > ts + MAX_ASSERTION_LIFETIME {
         return Err(AadError::invalid_client_assertion());
     }
-    let _ = sqlx::query("DELETE FROM client_assertion_jti WHERE expires_at <= ?")
+    let _ = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "DELETE FROM client_assertion_jti WHERE expires_at <= ?"))
         .bind(ts)
         .execute(&st.pool)
         .await;
     let first_use = sqlx::query(
-        "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)
-         ON CONFLICT (jti, client_app_id) DO NOTHING",
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)
+         ON CONFLICT (jti, client_app_id) DO NOTHING"),
     )
     .bind(jti)
     .bind(&app.app_id)

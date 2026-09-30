@@ -161,9 +161,9 @@ async fn issue_device_code(st: &AppState, tenant_key: &str, params: &Params) -> 
     let ts = now();
     let expires_at = ts + DEVICE_CODE_LIFETIME;
     sqlx::query(
-        "INSERT INTO device_codes (device_code_hash, user_code, tenant_id, client_app_id, scope, status,
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "INSERT INTO device_codes (device_code_hash, user_code, tenant_id, client_app_id, scope, status,
                                    interval_secs, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
     )
     .bind(sha256_hex(device_code.as_bytes()))
     .bind(&user_code)
@@ -205,8 +205,8 @@ struct Pending {
 
 async fn load_pending(st: &AppState, tenant: &Tenant, user_code: &str) -> anyhow::Result<Option<Pending>> {
     let row = sqlx::query(
-        "SELECT user_code, client_app_id, scope FROM device_codes
-         WHERE user_code = ? AND tenant_id = ? AND status = ? AND expires_at > ? AND redeemed_at IS NULL",
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "SELECT user_code, client_app_id, scope FROM device_codes
+         WHERE user_code = ? AND tenant_id = ? AND status = ? AND expires_at > ? AND redeemed_at IS NULL"),
     )
     .bind(user_code)
     .bind(&tenant.id)
@@ -432,7 +432,7 @@ async fn decide(
         return login_page(st, tenant, &pending, "", None);
     };
     if status == DeviceStatus::Denied {
-        let _ = sqlx::query("UPDATE device_codes SET status = ? WHERE user_code = ? AND tenant_id = ?")
+        let _ = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE device_codes SET status = ? WHERE user_code = ? AND tenant_id = ?"))
             .bind(DeviceStatus::Denied.as_str())
             .bind(&pending.user_code)
             .bind(&tenant.id)
@@ -446,8 +446,8 @@ async fn decide(
     }
     let amr = serde_json::to_string(&s.amr).unwrap_or_else(|_| "[]".into());
     let updated = sqlx::query(
-        "UPDATE device_codes SET status = ?, user_id = ?, auth_time = ?, amr = ?
-         WHERE user_code = ? AND tenant_id = ? AND status = ?",
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE device_codes SET status = ?, user_id = ?, auth_time = ?, amr = ?
+         WHERE user_code = ? AND tenant_id = ? AND status = ?"),
     )
     .bind(DeviceStatus::Approved.as_str())
     .bind(&s.user_id)
@@ -490,9 +490,9 @@ pub(super) async fn device_code_grant(
     };
 
     let row = sqlx::query(
-        "SELECT user_code, client_app_id, scope, status, user_id, auth_time, amr,
+        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "SELECT user_code, client_app_id, scope, status, user_id, auth_time, amr,
                 interval_secs, expires_at, last_polled_at, redeemed_at
-         FROM device_codes WHERE device_code_hash = ? AND tenant_id = ?",
+         FROM device_codes WHERE device_code_hash = ? AND tenant_id = ?"),
     )
     .bind(&hash)
     .bind(&tenant.id)
@@ -517,7 +517,7 @@ pub(super) async fn device_code_grant(
     let too_fast = row
         .get::<Option<i64>, _>("last_polled_at")
         .is_some_and(|last| ts - last < interval);
-    sqlx::query("UPDATE device_codes SET last_polled_at = ? WHERE device_code_hash = ?")
+    sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE device_codes SET last_polled_at = ? WHERE device_code_hash = ?"))
         .bind(ts)
         .bind(&hash)
         .execute(&st.pool)
@@ -537,7 +537,7 @@ pub(super) async fn device_code_grant(
     }
 
     // Approved: claim the code before issuing, so a racing poll cannot reuse it.
-    let claimed = sqlx::query("UPDATE device_codes SET redeemed_at = ? WHERE device_code_hash = ? AND redeemed_at IS NULL")
+    let claimed = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "UPDATE device_codes SET redeemed_at = ? WHERE device_code_hash = ? AND redeemed_at IS NULL"))
         .bind(ts)
         .bind(&hash)
         .execute(&st.pool)

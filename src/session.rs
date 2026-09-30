@@ -57,8 +57,8 @@ pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow
         return Ok(None);
     };
     let row: Option<(String, i64, String)> = sqlx::query_as(
-        "SELECT s.user_id, s.auth_time, s.amr FROM sessions s JOIN users u ON u.id = s.user_id
-         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = 1",
+        crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT s.user_id, s.auth_time, s.amr FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = 1"),
     )
     .bind(sha256_hex(cookie.as_bytes()))
     .bind(tenant_id)
@@ -86,11 +86,11 @@ pub async fn create(
     let cookie = cookie(headers, SESSION_COOKIE).unwrap_or_else(new_token);
     let ts = now();
     sqlx::query(
-        "INSERT INTO sessions (cookie_hash, tenant_id, user_id, auth_time, amr, created_at, expires_at)
+        crate::db::sql_stmt(crate::db::engine_of(pool), "INSERT INTO sessions (cookie_hash, tenant_id, user_id, auth_time, amr, created_at, expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (cookie_hash, tenant_id) DO UPDATE SET
             user_id = excluded.user_id, auth_time = excluded.auth_time, amr = excluded.amr,
-            created_at = excluded.created_at, expires_at = excluded.expires_at",
+            created_at = excluded.created_at, expires_at = excluded.expires_at"),
     )
     .bind(sha256_hex(cookie.as_bytes()))
     .bind(tenant_id)
@@ -106,7 +106,7 @@ pub async fn create(
 
 pub async fn end(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {
     if let Some(cookie) = cookie(headers, SESSION_COOKIE) {
-        sqlx::query("DELETE FROM sessions WHERE cookie_hash = ? AND tenant_id = ?")
+        sqlx::query(crate::db::sql_stmt(crate::db::engine_of(pool), "DELETE FROM sessions WHERE cookie_hash = ? AND tenant_id = ?"))
             .bind(sha256_hex(cookie.as_bytes()))
             .bind(tenant_id)
             .execute(pool)
@@ -120,7 +120,7 @@ pub async fn has_any(pool: &DbPool, headers: &HeaderMap) -> anyhow::Result<bool>
     let Some(cookie) = cookie(headers, SESSION_COOKIE) else {
         return Ok(false);
     };
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE cookie_hash = ? AND expires_at > ?")
+    let (n,): (i64,) = sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT COUNT(*) FROM sessions WHERE cookie_hash = ? AND expires_at > ?"))
         .bind(sha256_hex(cookie.as_bytes()))
         .bind(now())
         .fetch_one(pool)

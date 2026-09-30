@@ -219,21 +219,28 @@ const ROTATE_ATTEMPTS: usize = 5;
 /// active -> retired, next -> active, new next. The new active key was already
 /// published as `next`, so clients that cache JWKS have had time to see it.
 ///
-/// Safe under concurrent rotations. The transaction opens with a no-op write to
-/// the active row, which takes that row's lock (Postgres/MySQL: a row lock, so a
-/// second rotation waits and then reads the winner's committed state; SQLite:
-/// the single write lock, taken before any read so the snapshot is fresh). No
-/// `SELECT ... FOR UPDATE`, which SQLite lacks. Each racer then performs its own
-/// rotation in turn. If the winner consumed the last `next` key and has not yet
-/// published a new one, the loser publishes one and retries rather than retiring
-/// the active key with nothing to promote. The unique index on the active key
-/// stays as a backstop, and a violation is retried too.
+/// Safe under concurrent rotations. The transaction opens with a write to the
+/// single `key_rotation_lock` row (migration 0008), which always exists and so
+/// always takes a lock on every engine: a row lock on Postgres/MySQL, the
+/// database write lock on SQLite (taken before any read, so the snapshot is
+/// fresh). A waiting rotation therefore resumes only after the winner commits and
+/// sees its state. Locking the active key instead would not work: after the
+/// winner commits that row is no longer active, so a waiter's UPDATE would match
+/// nothing and hold no lock. No `SELECT ... FOR UPDATE`, which SQLite lacks.
+///
+/// Each racer performs its own rotation in turn. The replacement `next` key is
+/// published after commit, not under the lock (RSA generation is slow, and on
+/// SQLite `generate` would block on the write lock we hold), and only if none
+/// exists, so racers do not pile up spare keys. With the lock the retry paths
+/// below are defence in depth: if a rotation still finds no `next` to promote it
+/// publishes one and retries, and a unique violation on the single-active index
+/// is retried too.
 pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
     for _ in 0..ROTATE_ATTEMPTS {
         ensure(pool).await?;
         match try_rotate(pool).await {
             Ok(true) => {
-                generate(pool, "next").await?;
+                ensure(pool).await?;
                 return Ok(());
             }
             // Nothing to promote yet: a concurrent rotation used the last `next` key.
@@ -254,11 +261,12 @@ pub async fn rotate(pool: &DbPool) -> anyhow::Result<()> {
 async fn try_rotate(pool: &DbPool) -> anyhow::Result<bool> {
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
-    // Mutex on the active row; see `rotate`.
+    // Mutex on the sentinel row; see `rotate`.
     sqlx::query(crate::db::sql_stmt(
         engine,
-        "UPDATE signing_keys SET status = status WHERE status = 'active'",
+        "UPDATE key_rotation_lock SET held_at = ? WHERE id = 1",
     ))
+    .bind(now())
     .execute(&mut *tx)
     .await?;
     // Two statements, not `UPDATE ... WHERE kid = (SELECT ... FROM signing_keys)`:

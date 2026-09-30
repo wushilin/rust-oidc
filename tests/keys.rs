@@ -42,6 +42,8 @@ async fn rotation_promotes_prepublished_key_and_keeps_old_one() {
     assert_eq!(keys::prune(&s.pool, -1).await.unwrap(), 1);
 }
 
+/// The exact `retired == 4` count is only meaningful on Postgres and MySQL, where
+/// a broken lock lets rotations merge; SQLite serializes writers anyway.
 #[tokio::test]
 async fn concurrent_rotations_leave_exactly_one_active_key_and_do_not_error() {
     let s = TestServer::start().await;

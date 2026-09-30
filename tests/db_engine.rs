@@ -9,6 +9,10 @@ fn the_engine_is_recognised_from_the_url() {
     assert_eq!(Engine::from_url("mysql://u@h/db"), Some(Engine::MySql));
     assert_eq!(Engine::from_url("mariadb://u@h/db"), Some(Engine::MySql));
     assert_eq!(Engine::from_url("oracle://nope"), None);
+    assert_eq!(Engine::from_url("sqlite:x.db"), Some(Engine::Sqlite));
+    assert_eq!(Engine::from_url("sqlite:/abs/path.db"), Some(Engine::Sqlite));
+    assert_eq!(Engine::from_url("sqlite://rel/path.db"), Some(Engine::Sqlite));
+    assert_eq!(Engine::from_url("just-a-path.db"), None);
 }
 
 #[test]
@@ -55,4 +59,14 @@ async fn foreign_key_cascades_fire_on_sqlite() {
         .await
         .unwrap();
     assert_eq!(left.0, 0, "cascade did not fire: foreign_keys pragma is off");
+}
+
+#[tokio::test]
+async fn a_directory_named_mode_does_not_suppress_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("mode=foo");
+    std::fs::create_dir(&sub).unwrap();
+    let url = format!("sqlite:{}", sub.join("t.db").display());
+    let pool = rust_oidc::db::connect(&url).await.unwrap();
+    assert_eq!(rust_oidc::db::engine_of(&pool), Engine::Sqlite);
 }

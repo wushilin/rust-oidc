@@ -903,12 +903,8 @@ fn password_or_stdin(password: Option<String>) -> anyhow::Result<String> {
 }
 
 fn ensure_db_dir(url: &str) -> anyhow::Result<()> {
-    let path = url.trim_start_matches("sqlite://").trim_start_matches("sqlite:");
-    let path = path.split('?').next().unwrap_or_default();
-    if path.is_empty() || path == ":memory:" {
-        return Ok(());
-    }
-    if let Some(parent) = std::path::Path::new(path).parent()
+    if let Some(path) = db::database_file_path(url)
+        && let Some(parent) = std::path::Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;

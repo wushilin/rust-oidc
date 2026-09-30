@@ -33,8 +33,9 @@ impl Engine {
 
     /// Which engine a connection URL selects. Accepts the aliases sqlx accepts.
     pub fn from_url(url: &str) -> Option<Self> {
-        let scheme = url.split("://").next()?.to_ascii_lowercase();
-        match scheme.as_str() {
+        // Scheme is everything before the first ':' so `sqlite:x.db` (no "//") resolves too.
+        let (scheme, _) = url.split_once(':')?;
+        match scheme.to_ascii_lowercase().as_str() {
             "sqlite" => Some(Self::Sqlite),
             "postgres" | "postgresql" => Some(Self::Postgres),
             "mysql" | "mariadb" => Some(Self::MySql),
@@ -106,6 +107,7 @@ static INSTALL_DRIVERS: Once = Once::new();
 
 /// Query parameter that lets SQLite create a missing database file.
 const SQLITE_MODE_PARAM: &str = "mode=";
+const SQLITE_MEMORY_PATH: &str = ":memory:";
 const SQLITE_CREATE_MODE: &str = "mode=rwc";
 
 pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
@@ -115,7 +117,11 @@ pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
     INSTALL_DRIVERS.call_once(sqlx::any::install_default_drivers);
 
     let mut url = url.to_string();
-    if engine == Engine::Sqlite && !url.contains(SQLITE_MODE_PARAM) {
+    // Only the query string counts: a directory named `mode=x` must not suppress it.
+    let query_has_mode = url
+        .split_once('?')
+        .is_some_and(|(_, q)| q.split('&').any(|p| p.starts_with(SQLITE_MODE_PARAM)));
+    if engine == Engine::Sqlite && !query_has_mode {
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str(SQLITE_CREATE_MODE);
     }
@@ -139,9 +145,23 @@ pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
     Ok(pool)
 }
 
+/// The filesystem path of a file-backed database, if the URL names one, so the
+/// caller can create its parent directory. `None` for server engines and for
+/// in-memory or empty SQLite paths. Handles `sqlite:path` and `sqlite://path`.
+pub fn database_file_path(url: &str) -> Option<&str> {
+    if Engine::from_url(url)? != Engine::Sqlite {
+        return None;
+    }
+    let (_, rest) = url.split_once(':')?;
+    let path = rest.strip_prefix("//").unwrap_or(rest);
+    let path = path.split('?').next().unwrap_or_default();
+    (!path.is_empty() && path != SQLITE_MEMORY_PATH).then_some(path)
+}
+
 /// The engine behind a pool, derived from the URL it was opened with.
 pub fn engine_of(pool: &DbPool) -> Engine {
     let opts = pool.connect_options();
+    // Unreachable today: connect() is the only constructor of a DbPool and it rejects unknown schemes.
     Engine::from_url(opts.database_url.as_str()).expect("connect() only opens URLs with a supported scheme")
 }
 
@@ -171,6 +191,17 @@ pub async fn audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_file_path_handles_both_sqlite_forms() {
+        assert_eq!(database_file_path("sqlite:x.db"), Some("x.db"));
+        assert_eq!(database_file_path("sqlite:/abs/p.db?mode=rwc"), Some("/abs/p.db"));
+        assert_eq!(database_file_path("sqlite:///abs/p.db"), Some("/abs/p.db"));
+        assert_eq!(database_file_path("sqlite://rel/p.db"), Some("rel/p.db"));
+        assert_eq!(database_file_path("sqlite::memory:"), None);
+        assert_eq!(database_file_path("sqlite://"), None);
+        assert_eq!(database_file_path("postgres://u@h/db"), None);
+    }
 
     fn decode(raw: Raw) -> Result<bool, sqlx::error::BoxDynError> {
         Flag::from_raw(raw).map(bool::from)

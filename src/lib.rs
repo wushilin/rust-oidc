@@ -7,6 +7,7 @@ pub mod error;
 pub mod groups;
 pub mod html;
 pub mod keys;
+pub mod rbac;
 pub mod routes;
 pub mod scopes;
 pub mod secrets;

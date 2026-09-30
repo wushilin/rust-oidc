@@ -27,10 +27,18 @@ before certification is claimed publicly.
 |---|---|---|
 | `EnsureIdTokenDoesNotContainNonRequestedClaims` | id_token contains non-requested claims `oid`, `tid`, `uti`, `ver` | These are core Entra v2.0 claims, present in every Entra id_token. Removing them would break every client that reads `tid`/`oid`. Emitted at `src/routes/token.rs:547-554`. |
 | `EnsureIdTokenDoesNotContainEmailForScopeEmail` | `email` appears in the id_token although the suite did not request it via `claims` | Entra puts `email` in the id_token when the `email` scope is granted, without needing a `claims` request. |
-| `ValidateIdTokenACRClaimAgainstAcrValuesRequest` | `acr_values` was requested so the server SHOULD return `acr`, but did not | `acr` is an Entra **v1.0** claim; v2.0 tokens do not carry it. rust-oidc emits no `acr` anywhere, deliberately. (*unverified against a live tenant*) |
+| `ValidateIdTokenACRClaimAgainstAcrValuesRequest` | `acr_values` was requested so the server SHOULD return `acr`, but did not | **Unresolved — see below.** rust-oidc emits no `acr` anywhere. |
 
 Note the spec language: `acr` is a SHOULD, and the suite raises these three as WARNING,
 not FAILURE. They do not block certification on their own.
+
+**`acr` is not settled.** This was recorded here as an accepted deviation because `acr`
+is a v1.0 claim that v2.0 tokens do not carry. Entra's live v2.0 discovery document
+contradicts that: `acr` *is* listed in its `claims_supported`. It also omits
+`acr_values_supported`, and its `claims_supported` is demonstrably unreliable in both
+directions — it omits `oid` and `uti`, which Entra certainly does emit. So the metadata
+cannot settle what Entra actually puts in a v2.0 token. Deciding this needs a capture
+from a real tenant; until then it is an open question, not a justified omission.
 
 ## Accepted: minimal userinfo response
 
@@ -83,7 +91,7 @@ step, not something the automated run can clear.
 
 ## Real gaps
 
-### Request objects are not supported (2 failing modules)
+### Request objects are not supported (2 failing modules) — accepted, not a gap
 
 `oidcc-ensure-request-object-with-redirect-uri` and
 `oidcc-unsigned-request-object-supported-correctly-or-rejected-as-unsupported` fail.
@@ -91,20 +99,25 @@ step, not something the automated run can clear.
 rust-oidc rejects both parameters explicitly — `request_not_supported` and
 `request_uri_not_supported` at `src/routes/authorize.rs:271-287` — and advertises
 `request_parameter_supported: false` / `request_uri_parameter_supported: false` in
-discovery (`src/routes/discovery.rs:51-53`). That is honest, but the basic certification
-profile requires support, so the suite reports `request_parameter_supported must be: true`.
+discovery (`src/routes/discovery.rs:51-53`). The basic certification profile requires
+support, so the suite reports `request_parameter_supported must be: true`.
+
+**This was previously recorded here as the one real remaining gap, on the grounds that
+Entra supports request objects. That was wrong.** Entra's own v2.0 discovery document
+says `"request_uri_parameter_supported": false` and omits `request_parameter_supported`
+entirely, which OpenID Connect Discovery §3 defines as defaulting to `false`. Entra does
+not accept JWT request objects on the v2.0 authorize endpoint, so our behaviour is
+already the faithful one and implementing request objects would move us *away* from
+Entra. Accepted, and closed.
 
 The follow-on failures in the unsigned-request-object module
 (`CheckCallbackHttpMethodIsPost`, `CheckCallbackContentTypeIsFormUrlEncoded`,
-`RejectErrorInUrlQuery`) are **consequences of the same gap, not a separate form_post
-bug**: that module carries `response_mode=form_post` *inside* the request JWT. Since we
+`RejectErrorInUrlQuery`) are consequences of the same choice, not a separate form_post
+bug: that module carries `response_mode=form_post` *inside* the request JWT. Since we
 never parse the JWT we never see the parameter, so the error is delivered as a query
-redirect. Error delivery does honour `response_mode` for every parameter we can
-actually see — `Validated::error` routes through `Validated::respond`
+redirect. Error delivery does honour `response_mode` for every parameter we can actually
+see — `Validated::error` routes through `Validated::respond`
 (`src/routes/authorize.rs:99-126`), which handles `form_post`.
-
-Closing this means parsing the `request` JWT and merging its claims over the query
-parameters. Entra supports request objects, so this is a genuine fidelity gap.
 
 ### Latent trap: the login POST handler discards response_mode and state
 
@@ -117,6 +130,43 @@ and `state` from the original request carried in the hidden `request` field.
 But any future `v.error(...)` or `v.respond(...)` added to that handler would silently
 force a query redirect and drop `state`, breaking form_post clients in a way no current
 test would catch.
+
+## Our discovery document vs. Entra's
+
+Compared field by field against the live document at
+`https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration`
+(fetched 2026-09-30). This is ground truth for metadata, though **not** for token
+contents: Entra's `claims_supported` omits `oid` and `uti`, which it certainly emits,
+so the list understates reality.
+
+Exact matches: `scopes_supported` (`openid profile email offline_access`, so the
+conformance SKIPs for the `address` and `phone` scopes are faithful, not an omission),
+`response_modes_supported`, `subject_types_supported` (`pairwise`),
+`id_token_signing_alg_values_supported` (`RS256`), `request_uri_parameter_supported`
+(`false`), and the shape of `userinfo_endpoint`.
+
+Equivalent: Entra omits `request_parameter_supported`, `claims_parameter_supported`,
+`code_challenge_methods_supported` and `prompt_values_supported`; we state the first two
+as `false` (the spec default, so identical in meaning) and advertise the latter two,
+which Entra supports without announcing. Advertising a capability we really have is the
+better behaviour.
+
+Two real divergences, both found by this comparison rather than by the suite:
+
+| Field | Entra | rust-oidc |
+|---|---|---|
+| `response_types_supported` | `code`, `id_token`, `code id_token`, `id_token token` | `code` only |
+| `token_endpoint_auth_methods_supported` | adds `self_signed_tls_client_auth` | omits it |
+
+**The implicit and hybrid response types are a genuine gap.** Entra supports them, and
+the project's goal is that an app written for Entra works here with configuration changes
+only — which includes clients configured for `code id_token`. Note how Entra gates them:
+they are **opt-in per app registration** (the "ID tokens" / "Access tokens" checkboxes),
+off by default. That is the faithful design and it is also the safe one, matching the
+precedent already set for ROPC by `applications.allow_password_grant`.
+
+`self_signed_tls_client_auth` (mTLS client authentication) is niche and needs TLS client
+certificates plumbed through the listener; recorded, not planned.
 
 ## Fixed: harness config gap for client_secret_post
 

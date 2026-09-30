@@ -62,7 +62,8 @@ Per the standing rule, this feature introduces enums and no bare literals:
 
 ## Data model
 
-One migration (`0009_mfa`) in all three of `migrations/{sqlite,postgres,mysql}/`.
+One migration (`0010_mfa`) in all three of `migrations/{sqlite,postgres,mysql}/`
+(`0009` is taken by the audit-log indexes).
 
 ```
 user_mfa_credentials

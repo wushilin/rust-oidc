@@ -335,6 +335,45 @@ like any other unknown prompt, which is what Entra's documented list implies.
 
 ---
 
+## Admin console: the authorization rules (plan tasks 3 and 5)
+
+**49. Task 3 is tests only.** Its module arrived early with the `wids` work (ruling
+R6 in the console ledger), so `tests/rbac_bindings.rs` is the coverage that task never
+got. It pins the properties the design leans on rather than the happy path: an orphaned
+`role_binding_tenants` row grants nothing, a tenant *alias* does not match a scope (so a
+check that compared the raw URL segment could not be bypassed), and a role or scope kind
+this build does not know is skipped instead of failing the request.
+
+**50. `authz::delete` is the single entry point for removing a binding**, applying both
+the no-widening rule and the lock-out rule, rather than leaving a handler to remember to
+call two functions. *To reverse:* call `may_write_binding`, `check_delete` and
+`bindings::delete` separately, and accept that a new handler can forget one.
+
+**51. The lock-out rule counts bindings, not reachable people.** A binding to a group
+with no members, or to a disabled or soft-deleted user, counts as one platform
+administrator. So the rule prevents the obvious lock-out (deleting the only one) and not
+every lock-out. Making it exact means joining `users` and `group_members` and deciding
+what "reachable" means -- whether a disabled user counts, whether an empty group does --
+which is a product question, not an implementation detail. Written into the function's
+doc comment so nobody reads more into it than it does. *To reverse:* add the joins and
+pick an answer.
+
+**52. A teeth check found a coverage gap, not a bug, and the gap is now closed.**
+Removing `scope_kind = 'all'` from the lock-out count left every test in
+`tests/rbac_no_widening.rs` passing -- because none of them held a *tenant-scoped*
+platform binding alongside the last all-scope one. With the bug, that scoped binding
+would have been counted as a substitute, the all-scope one would have been deletable,
+and the platform would have been locked out anyway, since a scoped platform binding
+cannot create or assume a tenant.
+`a_tenant_scoped_platform_binding_does_not_keep_the_platform_alive` now covers it and
+was confirmed to fail against the seeded bug before the fix was restored.
+
+**53. `authz::delete` treats "already gone" as success.** If a binding disappears between
+the check and the delete, the end state is the one the caller asked for. *To reverse:*
+return `NotPermitted` and make every caller handle a race it cannot do anything about.
+
+---
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

@@ -18,7 +18,7 @@ use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application, RedirectPlatform, ServicePrincipal};
 use crate::claims::{self, Amr, Azpacr};
-use crate::error::AadError;
+use crate::error::{AadError, Aadsts, OAuthError};
 use crate::html;
 use crate::scopes;
 use crate::session::{self, CSRF_COOKIE, SESSION_COOKIE};
@@ -146,8 +146,8 @@ impl ResponseType {
 fn response_type_not_allowed() -> AadError {
     AadError::new(
         StatusCode::BAD_REQUEST,
-        "unsupported_response",
-        700054,
+        OAuthError::UnsupportedResponse,
+        Aadsts::ResponseTypeNotAllowed,
         "The provided value for the input parameter 'response_type' is not allowed for this client. Expected value is 'code'",
     )
 }
@@ -184,7 +184,7 @@ impl Validated {
     }
 
     fn error(&self, err: AadError) -> Response {
-        let error = err.error.to_string();
+        let error = err.error.as_str().to_string();
         self.respond(vec![("error", error), ("error_description", err.description())])
     }
 }
@@ -242,7 +242,7 @@ async fn validate_client(
         return Err(page_error(
             tn,
             AadError::invalid_request(
-                50011,
+                Aadsts::RedirectUriMismatch,
                 format!(
                     "The redirect URI '{requested}' specified in the request does not match the redirect URIs configured for the application '{}'. Make sure the redirect URI sent in the request matches one added to your application in the Azure portal.",
                     app.app_id
@@ -282,7 +282,7 @@ async fn run(
                 state: get(params, "state").map(str::to_string),
             };
             return Ok(v.error(AadError::invalid_request(
-                900144,
+                Aadsts::MissingOrInvalidParameter,
                 "The response_mode 'query' cannot be used with a response_type that returns a token.",
             )));
         }
@@ -301,7 +301,7 @@ async fn run(
                 state: get(params, "state").map(str::to_string),
             };
             return Ok(v.error(AadError::invalid_request(
-                900144,
+                Aadsts::MissingOrInvalidParameter,
                 format!("The response_mode '{other}' is not supported."),
             )));
         }
@@ -342,10 +342,97 @@ impl From<anyhow::Error> for Step {
     }
 }
 
-struct Prompt {
-    none: bool,
-    login: bool,
-    select_account: bool,
+/// A `prompt` value on the authorize endpoint.
+///
+/// Entra documents exactly four: *"Valid values are `login`, `none`, `consent`,
+/// and `select_account`"* (v2-oauth2-auth-code-flow, fetched 30 Sep 2026). Those
+/// four are what [`Prompt::SUPPORTED`] advertises in discovery.
+///
+/// [`Prompt::Create`] is a fifth we accept and ignore. It is real in Entra, but on
+/// **External ID** tenants (`*.ciamlogin.com`) with a self-service sign-up user
+/// flow, not on the workforce v2 endpoint this server clones; what a workforce
+/// tenant does with it is not documented and we have not captured it. Since this
+/// server has no sign-up at all, accepting and ignoring it sends the caller to the
+/// sign-in page, which is the least surprising of the options available. It is
+/// deliberately not advertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prompt {
+    None,
+    Login,
+    Consent,
+    SelectAccount,
+    Create,
+}
+
+impl Prompt {
+    pub const ALL: &'static [Prompt] = &[
+        Self::None,
+        Self::Login,
+        Self::Consent,
+        Self::SelectAccount,
+        Self::Create,
+    ];
+
+    /// What `prompt_values_supported` advertises: Entra's documented four.
+    pub const SUPPORTED: &'static [Prompt] = &[Self::None, Self::Login, Self::Consent, Self::SelectAccount];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Login => "login",
+            Self::Consent => "consent",
+            Self::SelectAccount => "select_account",
+            Self::Create => "create",
+        }
+    }
+
+    /// A value from the query string. `None` is a caller error, not something to
+    /// tolerate: an unrecognised `prompt` is rejected with AADSTS90023, as Entra
+    /// rejects one.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.as_str() == raw)
+    }
+}
+
+/// The prompts one request asked for.
+///
+/// `consent` and `create` are accepted and have no effect here -- apps are
+/// admin-consented and there is no sign-up -- so they are absorbed at parse time
+/// and never reach a decision.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PromptSet {
+    pub none: bool,
+    pub login: bool,
+    pub select_account: bool,
+}
+
+impl PromptSet {
+    /// Parse the space-delimited `prompt` parameter.
+    pub fn parse(raw: &str) -> Result<Self, AadError> {
+        let mut set = Self::default();
+        for word in raw.split_whitespace() {
+            match Prompt::parse(word) {
+                Some(Prompt::None) => set.none = true,
+                Some(Prompt::Login) => set.login = true,
+                Some(Prompt::SelectAccount) => set.select_account = true,
+                // Accepted, no effect: apps are admin-consented and there is no sign-up.
+                Some(Prompt::Consent) | Some(Prompt::Create) => {}
+                None => {
+                    return Err(AadError::invalid_request(
+                        Aadsts::UnsupportedParameter,
+                        format!("Invalid prompt value '{word}'."),
+                    ));
+                }
+            }
+        }
+        if set.none && (set.login || set.select_account) {
+            return Err(AadError::invalid_request(
+                Aadsts::UnsupportedParameter,
+                "prompt=none cannot be combined with other values.",
+            ));
+        }
+        Ok(set)
+    }
 }
 
 async fn continue_authorize(
@@ -359,8 +446,8 @@ async fn continue_authorize(
     if get(params, "request").is_some() {
         return Err(AadError::new(
             StatusCode::BAD_REQUEST,
-            "request_not_supported",
-            90023,
+            OAuthError::RequestNotSupported,
+            Aadsts::UnsupportedParameter,
             "The 'request' parameter is not supported.",
         )
         .into());
@@ -368,8 +455,8 @@ async fn continue_authorize(
     if get(params, "request_uri").is_some() {
         return Err(AadError::new(
             StatusCode::BAD_REQUEST,
-            "request_uri_not_supported",
-            90023,
+            OAuthError::RequestUriNotSupported,
+            Aadsts::UnsupportedParameter,
             "The 'request_uri' parameter is not supported.",
         )
         .into());
@@ -397,7 +484,7 @@ async fn continue_authorize(
     let grant = scopes::resolve(&st.pool, &v.tenant, scope).await?;
     if response_type.has_id_token() && !grant.has("openid") {
         return Err(AadError::invalid_request(
-            900144,
+            Aadsts::MissingOrInvalidParameter,
             "The scope must include 'openid' when the response_type requests an id_token.",
         )
         .into());
@@ -407,46 +494,32 @@ async fn continue_authorize(
     let method = get(params, "code_challenge_method");
     if let Some(challenge) = code_challenge {
         if !matches!(method, None | Some("S256") | Some("plain")) {
-            return Err(AadError::invalid_request(
-                501491,
+            return Err(AadError::invalid_request(Aadsts::InvalidCodeChallenge,
                 "Invalid size of Code_Challenge parameter. Only 'S256' and 'plain' are supported code_challenge_method values.",
             )
             .into());
         }
         if challenge.len() < 43 || challenge.len() > 128 {
-            return Err(AadError::invalid_request(501491, "Invalid size of Code_Challenge parameter.").into());
+            return Err(AadError::invalid_request(
+                Aadsts::InvalidCodeChallenge,
+                "Invalid size of Code_Challenge parameter.",
+            )
+            .into());
         }
     } else if v.platform == RedirectPlatform::Spa && response_type.has_code() {
         return Err(AadError::invalid_request(
-            9002325,
+            Aadsts::PkceRequired,
             "Proof Key for Code Exchange is required for cross-origin authorization code redemption.",
         )
         .into());
     }
 
-    let mut prompt = Prompt {
-        none: false,
-        login: false,
-        select_account: false,
-    };
-    for p in get(params, "prompt").unwrap_or_default().split_whitespace() {
-        match p {
-            "none" => prompt.none = true,
-            "login" => prompt.login = true,
-            "select_account" => prompt.select_account = true,
-            "consent" | "create" => {} // apps are admin-consented; no sign-up here
-            other => {
-                return Err(AadError::invalid_request(90023, format!("Invalid prompt value '{other}'.")).into());
-            }
-        }
-    }
-    if prompt.none && (prompt.login || prompt.select_account) {
-        return Err(AadError::invalid_request(90023, "prompt=none cannot be combined with other values.").into());
-    }
+    let prompt = PromptSet::parse(get(params, "prompt").unwrap_or_default())?;
+
     let max_age = match get(params, "max_age") {
         Some(s) => Some(
             s.parse::<i64>()
-                .map_err(|_| AadError::invalid_request(90023, "Invalid max_age value."))?,
+                .map_err(|_| AadError::invalid_request(Aadsts::UnsupportedParameter, "Invalid max_age value."))?,
         ),
         None => None,
     };
@@ -477,8 +550,8 @@ async fn continue_authorize(
         if prompt.none {
             return Err(AadError::new(
                 StatusCode::BAD_REQUEST,
-                "login_required",
-                50058,
+                OAuthError::LoginRequired,
+                Aadsts::SilentSignInFailed,
                 "A silent sign-in request was sent but no user is signed in.",
             )
             .into());
@@ -500,8 +573,8 @@ async fn continue_authorize(
     if v.sp.app_role_assignment_required && !apps::user_is_assigned(&st.pool, &v.sp.id, &user.id).await? {
         let err = AadError::new(
             StatusCode::FORBIDDEN,
-            "access_denied",
-            50105,
+            OAuthError::AccessDenied,
+            Aadsts::NotAssigned,
             format!(
                 "Your administrator has configured the application {} ('{}') to block users unless they are specifically granted ('assigned') access to the application.",
                 v.client.display_name, v.client.app_id

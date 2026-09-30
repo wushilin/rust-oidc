@@ -225,7 +225,13 @@ into a shared store.
 
 ---
 
-## No magic values: the remaining closed sets
+## No magic values: the list is now finished
+
+Every item on the user's remaining list is done: the scope type, the principal and
+member types, the redirect platforms, the OAuth `error` strings, the AADSTS codes, the
+`prompt` values, and the 19 `db::audit` call sites that passed raw action strings.
+
+### The decisions
 
 **39. The audit vocabulary moved into `src/db.rs`, beside the function that writes
 it.** `audit_log.action` had two sources of truth: `routes::audit::Event` for the HTTP
@@ -295,6 +301,37 @@ with explicit `value(name = ...)`.** The accepted spellings are unchanged
 command changes; clap now rejects a bad value with a list of the good ones instead of
 the server doing it in a `bail!`.
 
+
+**46. The OAuth `error` value and the AADSTS number are enums.** `AadError.error` was
+a `&'static str` and `.code` a bare `u32`, written out at 64 call sites.
+`error::OAuthError` (19 values) and `error::Aadsts` (47 numbers) are now the only lists.
+**All 64 (error, number) pairs are unchanged, verified by extracting them from git
+before and after and comparing** -- these are a client-facing contract, not internal
+naming.
+
+The win beyond the rule: the set is now enumerable, so a test can assert things that
+were previously unassertable. `no_two_conditions_quietly_claim_the_same_number` found
+that 70016 is shared by `authorization_pending` and `slow_down` -- which is correct,
+because Entra's 70016 *is* the device-flow error family, so it is one variant used at
+two call sites rather than two variants with the same number. And the two numbers that
+are **our guess** rather than an observed Entra pairing (700054 for
+`unsupported_response`, decision 16; 90055 for the 429, decision 31) are now named as
+such in the enum and pinned by a test, so "which of these did we invent?" has an
+answer in code rather than only here.
+
+**47. `prompt` is an enum, and discovery advertises `Prompt::SUPPORTED` rather than a
+second copy of the list.** The four values were written once in the parser and again in
+the discovery document. `tests/discovery.rs` pins the advertised four by hand.
+
+**48. `prompt=create` stays accepted-and-ignored, and stays unadvertised.** It is real
+in Entra -- but on **External ID** tenants (`*.ciamlogin.com`) with a self-service
+sign-up user flow, not the workforce v2 endpoint this server clones. Entra's v2
+authorize reference lists only `login`, `none`, `consent`, `select_account`. What a
+workforce tenant does with `create` is undocumented and we have not captured it, so:
+behaviour unchanged (this server has no sign-up, so it falls back to the sign-in page,
+the least surprising option), not advertised, and the uncertainty is written into the
+enum's doc comment rather than smoothed over. *To reverse:* reject it with AADSTS90023
+like any other unknown prompt, which is what Entra's documented list implies.
 
 ---
 

@@ -13,6 +13,8 @@ use axum::routing::{get, post};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
+pub use authorize::Prompt;
+
 use crate::AppState;
 
 /// All routes, nested under the public URL's path (e.g. `/rust-oidc`).

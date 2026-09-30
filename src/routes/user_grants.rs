@@ -22,7 +22,7 @@ use super::token::{GrantType, authenticate_confidential_client, param};
 use crate::AppState;
 use crate::apps::{self, Application, RedirectPlatform};
 use crate::claims::{self, Amr, Azpacr, IdType, SignIn};
-use crate::error::{AadError, no_store};
+use crate::error::{AadError, Aadsts, no_store};
 use crate::scopes::{self, Grant};
 use crate::tenant::Tenant;
 use crate::users;
@@ -63,17 +63,22 @@ async fn authenticate_for_platform(
     if platform == RedirectPlatform::Spa {
         if !has_origin {
             return Err(AadError::invalid_request(
-                9002327,
+                Aadsts::SpaRequiresCrossOrigin,
                 "Tokens issued for the 'Single-Page Application' client-type may only be redeemed via cross-origin requests.",
             ));
         }
     } else if has_origin {
         return Err(AadError::invalid_request(
-            9002326,
+            Aadsts::CrossOriginNotPermitted,
             "Cross-origin token redemption is permitted only for the 'Single-Page Application' client-type.",
         ));
     }
-    let wrong_client = || AadError::invalid_grant(70000, "The provided grant was issued to a different client.");
+    let wrong_client = || {
+        AadError::invalid_grant(
+            Aadsts::GrantIssuedToDifferentClient,
+            "The provided grant was issued to a different client.",
+        )
+    };
     // Exhaustive on purpose. This used to compare strings and fall through to the
     // public-client branch for anything it did not recognise, which is the weakest
     // of the three rule sets -- an unreadable platform meant "no authentication".
@@ -130,11 +135,15 @@ pub async fn authorization_code(
     .bind(sha256_hex(code.as_bytes()))
     .fetch_optional(&st.pool)
     .await?;
-    let row =
-        row.ok_or_else(|| AadError::invalid_grant(70000, "The provided value for the 'code' parameter is not valid."))?;
+    let row = row.ok_or_else(|| {
+        AadError::invalid_grant(
+            Aadsts::GrantIssuedToDifferentClient,
+            "The provided value for the 'code' parameter is not valid.",
+        )
+    })?;
     if row.tenant_id != tenant.id {
         return Err(AadError::invalid_grant(
-            700005,
+            Aadsts::WrongTenantForGrant,
             "Provided Authorization Code is intended to use against other tenant, thus rejected.",
         ));
     }
@@ -155,20 +164,20 @@ pub async fn authorization_code(
         .await;
         revoke_code_family(st, tenant, &row.user_id, &row.code_hash).await?;
         return Err(AadError::invalid_grant(
-            54005,
+            Aadsts::AuthorizationCodeAlreadyRedeemed,
             "OAuth2 Authorization code was already redeemed, please retry with a new valid code or use an existing refresh token.",
         ));
     }
     if row.expires_at <= now() {
         return Err(AadError::invalid_grant(
-            70008,
+            Aadsts::GrantExpiredThroughInactivity,
             "The provided authorization code or refresh token has expired due to inactivity. Send a new interactive authorization request for this user and resource.",
         ));
     }
     let redirect_uri = param(params, "redirect_uri").unwrap_or_default();
     if redirect_uri != row.redirect_uri {
         return Err(AadError::invalid_grant(
-            50011,
+            Aadsts::RedirectUriMismatch,
             "The redirect URI in the token request does not match the one used in the authorization request.",
         ));
     }
@@ -180,7 +189,7 @@ pub async fn authorization_code(
         };
         if verifier.is_empty() || !ct_eq(&expected, challenge) {
             return Err(AadError::invalid_grant(
-                501481,
+                Aadsts::CodeVerifierMismatch,
                 "The Code_Verifier does not match the code_challenge supplied in the authorization request.",
             ));
         }
@@ -196,7 +205,7 @@ pub async fn authorization_code(
     .await?;
     if res.rows_affected() != 1 {
         return Err(AadError::invalid_grant(
-            54005,
+            Aadsts::AuthorizationCodeAlreadyRedeemed,
             "OAuth2 Authorization code was already redeemed.",
         ));
     }
@@ -259,18 +268,27 @@ pub async fn refresh_token(
     .bind(sha256_hex(token.as_bytes()))
     .fetch_optional(&st.pool)
     .await?;
-    let row =
-        row.ok_or_else(|| AadError::invalid_grant(9002313, "Invalid request. Request is malformed or invalid."))?;
+    let row = row.ok_or_else(|| {
+        AadError::invalid_grant(
+            Aadsts::MalformedRequest,
+            "Invalid request. Request is malformed or invalid.",
+        )
+    })?;
     if row.tenant_id != tenant.id {
         return Err(AadError::invalid_grant(
-            700005,
+            Aadsts::WrongTenantForGrant,
             "Provided refresh token is intended to use against other tenant, thus rejected.",
         ));
     }
     let platform = stored_platform(&row.platform, "refresh_token")?;
     let azpacr = authenticate_for_platform(st, tenant, headers, params, platform, &row.client_app_id).await?;
 
-    let revoked = || AadError::invalid_grant(50173, "The provided grant has expired due to it being revoked.");
+    let revoked = || {
+        AadError::invalid_grant(
+            Aadsts::GrantRevoked,
+            "The provided grant has expired due to it being revoked.",
+        )
+    };
     if row.revoked_at.is_some() {
         return Err(revoked());
     }
@@ -282,11 +300,14 @@ pub async fn refresh_token(
     if row.expires_at <= now() {
         return Err(if platform == RedirectPlatform::Spa {
             AadError::invalid_grant(
-                700084,
+                Aadsts::SpaRefreshTokenExpired,
                 "The refresh token was issued to a single page app (SPA), and therefore has a fixed, limited lifetime of 1.00:00:00, which cannot be extended. It is now expired and a new sign in request must be sent by the SPA to the sign in page.",
             )
         } else {
-            AadError::invalid_grant(700082, "The refresh token has expired due to inactivity.")
+            AadError::invalid_grant(
+                Aadsts::RefreshTokenExpired,
+                "The refresh token has expired due to inactivity.",
+            )
         });
     }
     let res = sqlx::query(crate::db::q(
@@ -359,7 +380,7 @@ pub(super) async fn issue(
     let user = users::find(&st.pool, &tenant.id, user_id)
         .await?
         .filter(|u| u.enabled)
-        .ok_or_else(|| AadError::invalid_grant(50057, "The user account is disabled."))?;
+        .ok_or_else(|| AadError::invalid_grant(Aadsts::AccountDisabled, "The user account is disabled."))?;
     let client: Application = apps::find(&st.pool, client_app_id)
         .await?
         .ok_or_else(|| AadError::app_not_found(client_app_id, &tenant.id))?;
@@ -535,7 +556,7 @@ pub async fn on_behalf_of(
         param(params, "requested_token_use").ok_or_else(|| AadError::missing_parameter("requested_token_use"))?;
     if requested != REQUESTED_TOKEN_USE_OBO {
         return Err(AadError::invalid_request(
-            500131,
+            Aadsts::InvalidRequestedTokenUse,
             format!(
                 "The value '{requested}' for 'requested_token_use' is not valid. Expected '{REQUESTED_TOKEN_USE_OBO}'."
             ),
@@ -673,19 +694,19 @@ pub async fn password(
         // endpoint cannot be used to discover which accounts exist.
         users::AuthResult::InvalidCredentials => {
             return Err(AadError::invalid_grant(
-                50126,
+                Aadsts::InvalidUsernameOrPassword,
                 "AADSTS50126: Error validating credentials due to invalid username or password.",
             ));
         }
         users::AuthResult::Locked => {
             return Err(AadError::invalid_grant(
-                50053,
+                Aadsts::AccountLocked,
                 "AADSTS50053: The account is temporarily locked because of too many failed sign-in attempts.",
             ));
         }
         users::AuthResult::Disabled => {
             return Err(AadError::invalid_grant(
-                50057,
+                Aadsts::AccountDisabled,
                 "AADSTS50057: The user account is disabled.",
             ));
         }

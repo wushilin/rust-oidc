@@ -12,7 +12,7 @@
 use crate::db::DbPool;
 
 use crate::apps::{self, Application, ServicePrincipal};
-use crate::error::AadError;
+use crate::error::{AadError, Aadsts};
 use crate::tenant::Tenant;
 
 pub const OIDC_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
@@ -54,7 +54,7 @@ impl Grant {
 
 fn invalid_scope(scope: &str) -> AadError {
     AadError::invalid_scope(
-        70011,
+        Aadsts::InvalidScope,
         format!("The provided value for the input parameter 'scope' is not valid. The scope '{scope}' is not valid."),
     )
 }
@@ -154,7 +154,7 @@ pub async fn resolve(pool: &DbPool, tenant: &Tenant, scope: &str) -> Result<Gran
 
 fn more_than_one_resource() -> AadError {
     AadError::invalid_scope(
-        28000,
+        Aadsts::MultipleResourcesInScope,
         "Provided value for the input parameter scope is not valid because it contains more than one resource.",
     )
 }

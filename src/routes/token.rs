@@ -15,7 +15,7 @@ use super::audit::{self, Actor, ClientFailures, Event, Reason};
 use crate::AppState;
 use crate::apps::{self, Application, SecretCheck, ServicePrincipal};
 use crate::claims::Azpacr;
-use crate::error::{AadError, no_store};
+use crate::error::{AadError, Aadsts, no_store};
 use crate::ratelimit::{Limit, app_key};
 use crate::tenant::{self, Tenant};
 use crate::util::{b64url, ct_eq, now, random_bytes};
@@ -189,14 +189,19 @@ fn client_credentials_from_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or_else(|| v.strip_prefix("basic ")));
     if let Some(encoded) = basic {
-        let invalid = || AadError::invalid_request(900144, "The Authorization header is not a valid Basic credential.");
+        let invalid = || {
+            AadError::invalid_request(
+                Aadsts::MissingOrInvalidParameter,
+                "The Authorization header is not a valid Basic credential.",
+            )
+        };
         let decoded = STANDARD.decode(encoded.trim()).map_err(|_| invalid())?;
         let decoded = String::from_utf8(decoded).map_err(|_| invalid())?;
         let (id, secret) = decoded.split_once(':').ok_or_else(invalid)?;
         let (id, secret) = (form_decode(id), form_decode(secret));
         if param(params, "client_secret").is_some() {
             return Err(AadError::invalid_request(
-                50148,
+                Aadsts::MultipleClientAuthMethods,
                 "The client must use only one method to authenticate (client_secret_basic or client_secret_post).",
             ));
         }
@@ -204,7 +209,7 @@ fn client_credentials_from_request(
             && !body_id.eq_ignore_ascii_case(&id)
         {
             return Err(AadError::invalid_request(
-                900144,
+                Aadsts::MissingOrInvalidParameter,
                 "The client_id in the body does not match the Authorization header.",
             ));
         }
@@ -331,7 +336,7 @@ async fn authenticate_with_assertion(
         param(params, "client_assertion_type").ok_or_else(|| AadError::missing_parameter("client_assertion_type"))?;
     if assertion_type != ClientAuthMethod::ASSERTION_TYPE {
         return Err(AadError::invalid_request(
-            700021,
+            Aadsts::UnsupportedAssertionType,
             format!(
                 "Client assertion type '{assertion_type}' is not supported. Expected '{}'.",
                 ClientAuthMethod::ASSERTION_TYPE
@@ -542,13 +547,13 @@ async fn client_credentials(
     let scopes: Vec<&str> = scope.split_whitespace().collect();
     if scopes.len() != 1 {
         return Err(AadError::invalid_scope(
-            70011,
+            Aadsts::InvalidScope,
             format!("The provided value for the input parameter 'scope' is not valid. The scope {scope} is not valid."),
         ));
     }
     let Some(resource) = scopes[0].strip_suffix("/.default") else {
         return Err(AadError::invalid_scope(
-            1002012,
+            Aadsts::DefaultScopeRequired,
             format!(
                 "The provided value for scope {scope} is not valid. Client credential flows must have a scope value with /.default suffixed to the resource identifier (application ID URI)."
             ),

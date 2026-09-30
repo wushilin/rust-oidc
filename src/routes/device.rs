@@ -18,7 +18,7 @@ use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application};
 use crate::claims::Amr;
-use crate::error::{AadError, no_store};
+use crate::error::{AadError, Aadsts, no_store};
 use crate::ratelimit::{Hit, Limit};
 use crate::session::{self, CSRF_COOKIE};
 use crate::tenant::{self, Tenant};
@@ -610,7 +610,7 @@ pub(super) async fn device_code_grant(
 
     let bad_code = || {
         AadError::invalid_grant(
-            70018,
+            Aadsts::DeviceCodeInvalidOrRedeemed,
             "AADSTS70018: Invalid verification code due to an invalid or already redeemed device code.",
         )
     };

@@ -3,6 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
 
+use super::authorize::Prompt;
 use super::token::{ClientAuthMethod, GrantType};
 use crate::AppState;
 use crate::error::AadError;
@@ -49,7 +50,7 @@ pub async fn openid_configuration(
             GrantType::Password.as_str(),
         ],
         "code_challenge_methods_supported": ["S256", "plain"],
-        "prompt_values_supported": ["none", "login", "consent", "select_account"],
+        "prompt_values_supported": Prompt::SUPPORTED.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
         "claims_parameter_supported": false,
         "request_parameter_supported": false,
         "issuer": url.issuer(tid),

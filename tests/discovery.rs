@@ -48,6 +48,13 @@ async fn discovery_by_guid_and_domain_uses_guid_issuer() {
             serde_json::json!(["RS256"])
         );
         assert_eq!(doc["subject_types_supported"], serde_json::json!(["pairwise"]));
+        // Advertised straight from `Prompt::SUPPORTED`, so this pins the wire
+        // value rather than a second copy of the list. Entra documents exactly
+        // these four; `create` is accepted but deliberately not advertised.
+        assert_eq!(
+            doc["prompt_values_supported"],
+            serde_json::json!(["none", "login", "consent", "select_account"])
+        );
     }
 }
 

@@ -76,3 +76,31 @@ fn every_guid_in_0006_is_a_known_role_template() {
         assert!(unknown.is_empty(), "{engine}: unknown GUIDs {unknown:?}");
     }
 }
+
+/// Collapse every run of whitespace to one space and drop `--` comments.
+fn squash(sql: &str) -> String {
+    sql.lines()
+        .map(|l| l.split("--").next().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Losing `role_id` from the GROUP BY would fold every role of a principal into
+/// one binding; losing it from the join would attach a tenant to the wrong role.
+#[test]
+fn every_dialect_groups_by_role_and_joins_tenants_on_role() {
+    for (engine, sql) in FILES {
+        let flat = squash(sql);
+        assert!(
+            flat.contains("GROUP BY principal_type, principal_id, role_id;"),
+            "{engine}: the binding backfill must GROUP BY role_id"
+        );
+        assert!(
+            flat.contains("AND b.role_id = CASE d.role_template_id"),
+            "{engine}: the tenant join must match b.role_id against the CASE"
+        );
+    }
+}

@@ -75,9 +75,9 @@ async fn a_directory_named_mode_does_not_suppress_create() {
     assert_eq!(rust_oidc::db::engine_of(&pool), Engine::Sqlite);
 }
 
-/// Review Focus 5: booleans and epoch columns must read back identically.
+/// Review Focus 5: boolean columns must read back identically.
 #[tokio::test]
-async fn booleans_and_timestamps_round_trip_on_every_available_engine() {
+async fn booleans_round_trip_on_every_available_engine() {
     for pool in common::all_engine_pools().await {
         let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.test", false).await.unwrap();
         let id = rust_oidc::users::create(&pool, &t, rust_oidc::users::NewUser {

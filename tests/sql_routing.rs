@@ -67,7 +67,7 @@ fn unrouted(src: &str) -> Vec<usize> {
             continue;
         }
         let body = call_body(src, paren);
-        if body.contains('?') && !body.contains("sql_stmt(") {
+        if body.contains('?') && !(body.contains("sql_stmt(") || body.contains("::q(") || body.contains("(q(")) {
             bad.push(src[..at].matches('\n').count() + 1);
         }
     }
@@ -75,7 +75,7 @@ fn unrouted(src: &str) -> Vec<usize> {
 }
 
 #[test]
-fn every_sqlx_query_with_a_placeholder_goes_through_sql_stmt() {
+fn every_sqlx_query_with_a_placeholder_goes_through_sql_stmt_or_q() {
     let mut files = Vec::new();
     rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
     let mut offenders = Vec::new();
@@ -87,7 +87,7 @@ fn every_sqlx_query_with_a_placeholder_goes_through_sql_stmt() {
     }
     assert!(
         offenders.is_empty(),
-        "sqlx query with `?` not wrapped in db::sql_stmt (breaks on Postgres):\n{}",
+        "sqlx query with `?` not wrapped in db::sql_stmt or db::q (breaks on Postgres):\n{}",
         offenders.join("\n")
     );
 }

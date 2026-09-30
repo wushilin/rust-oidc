@@ -76,7 +76,7 @@ pub async fn create(
 }
 
 pub async fn delete(pool: &DbPool, binding_id: &str) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(pool), "DELETE FROM role_bindings WHERE id = ?"))
+    let done = sqlx::query(crate::db::q(pool, "DELETE FROM role_bindings WHERE id = ?"))
         .bind(binding_id)
         .execute(pool)
         .await?;
@@ -90,7 +90,7 @@ async fn scope_of(pool: &DbPool, binding_id: &str, kind: ScopeKind) -> anyhow::R
         ScopeKind::All => Ok(Scope::All),
         ScopeKind::Tenants => {
             let rows = sqlx::query(
-                crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT rbt.tenant_id FROM role_binding_tenants rbt
+                crate::db::q(pool, "SELECT rbt.tenant_id FROM role_binding_tenants rbt
                  JOIN tenants t ON t.id = rbt.tenant_id
                  WHERE rbt.binding_id = ?"),
             )
@@ -106,7 +106,7 @@ async fn scope_of(pool: &DbPool, binding_id: &str, kind: ScopeKind) -> anyhow::R
 /// Recomputed on each call: never cache this in a session.
 pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<EffectiveBinding>> {
     let rows = sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id, role_id, scope_kind FROM role_bindings
+        crate::db::q(pool, "SELECT id, role_id, scope_kind FROM role_bindings
          WHERE (principal_type = ? AND principal_id = ?)
             OR (principal_type = ? AND principal_id IN
                 (SELECT group_id FROM group_members WHERE user_id = ?))"),
@@ -146,7 +146,7 @@ pub async fn list_all(pool: &DbPool) -> anyhow::Result<Vec<StoredBinding>> {
 
 pub async fn list_for_tenant(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<StoredBinding>> {
     let rows = sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
+        crate::db::q(pool, "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
          FROM role_bindings b
          LEFT JOIN role_binding_tenants rbt ON rbt.binding_id = b.id
          WHERE b.scope_kind = ? OR rbt.tenant_id = ?

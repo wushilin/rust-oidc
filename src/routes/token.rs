@@ -349,16 +349,14 @@ async fn authenticate_with_assertion(
     if exp > ts + MAX_ASSERTION_LIFETIME {
         return Err(AadError::invalid_client_assertion());
     }
-    let _ = sqlx::query(crate::db::sql_stmt(crate::db::engine_of(&st.pool), "DELETE FROM client_assertion_jti WHERE expires_at <= ?"))
+    let _ = sqlx::query(crate::db::q(&st.pool, "DELETE FROM client_assertion_jti WHERE expires_at <= ?"))
         .bind(ts)
         .execute(&st.pool)
         .await;
     // The primary key makes the insert the atomic "first use" test: a unique
     // violation is a replay, any other error is a real failure.
     let first_use = crate::db::inserted(
-        sqlx::query(crate::db::sql_stmt(
-            crate::db::engine_of(&st.pool),
-            "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)",
+        sqlx::query(crate::db::q(&st.pool, "INSERT INTO client_assertion_jti (jti, client_app_id, expires_at) VALUES (?, ?, ?)",
         ))
         .bind(jti)
         .bind(&app.app_id)

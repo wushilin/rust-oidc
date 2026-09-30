@@ -46,11 +46,23 @@ there is a privilege-escalation bug, not a cosmetic one.
 This is done in Rust, not by collation: `util::fold` plus `*_folded` columns with unique
 indexes, reconciled at startup by `db::reconcile_folded`. A folding collision **refuses to
 start**, deliberately, with a full diagnostic. The operator must rename or remove one of the
-conflicting rows and restart.
+conflicting rows and restart. No CLI command can do that; use the engine's own client
+(`sqlite3`, `psql`, `mysql`). Only `serve` fails closed: other subcommands log the collision
+and continue.
 
 ## MySQL specifics
 
-- Requires **MySQL 8.0.13+** (for `DEFAULT ('{}')`).
+- Requires **MySQL 8.0.16+**. `DEFAULT ('{}')` needs 8.0.13, but before 8.0.16 MySQL parsed
+  and silently ignored `CHECK` clauses, and this schema relies on its table-level checks
+  (`0001_init.sql`, `0003`).
+- The schema assumes a **strict** `sql_mode` (the 8.0 default). A non-strict server truncates
+  over-long values instead of erroring.
+- Key columns are `VARCHAR`-capped: a `jti` over 255 characters or a UPN over 320 fails on
+  MySQL (error 1406), where SQLite and Postgres accept it.
+- `utf8mb4_unicode_ci` is PAD SPACE: trailing spaces are insignificant on the non-`_bin`
+  columns, which are display names only.
+- The MySQL migrations were amended in place before the first release. Do **not** edit
+  migrations after release by analogy; add a new one, since sqlx checksums applied files.
 - Exact-match columns carry `COLLATE utf8mb4_bin`. The default collation is case- and
   accent-insensitive, which would otherwise loosen OAuth redirect-URI matching.
 - `GROUPS` is a reserved word, so the table is `user_groups`.

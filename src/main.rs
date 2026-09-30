@@ -21,13 +21,8 @@ use rust_oidc::{AppState, db, directory, groups, keys, routes, tenant, users};
     about = "OIDC / OAuth 2.0 provider compatible with Microsoft Entra ID v2.0"
 )]
 struct Cli {
-    /// SQLite database URL.
-    #[arg(
-        long,
-        global = true,
-        env = "RUST_OIDC_DATABASE",
-        default_value = "sqlite://data/rust-oidc.db"
-    )]
+    /// Database URL (SQLite, PostgreSQL or MySQL).
+    #[arg(long, global = true, env = "RUST_OIDC_DATABASE", default_value = db::DEFAULT_DATABASE_URL)]
     database: String,
     #[command(subcommand)]
     command: Command,
@@ -356,7 +351,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     ensure_db_dir(&cli.database)?;
-    let pool = db::connect(&cli.database).await?;
+    let policy = if matches!(cli.command, Command::Serve { .. }) {
+        db::FoldPolicy::FailClosed
+    } else {
+        db::FoldPolicy::ReportOnly
+    };
+    let pool = db::connect_with(&cli.database, policy).await?;
 
     match cli.command {
         Command::Serve { bind, public_url, tls } => {

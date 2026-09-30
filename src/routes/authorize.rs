@@ -412,7 +412,7 @@ async fn continue_authorize(
     let code = b64url(&random_bytes(48));
     let ts = now();
     sqlx::query(
-        crate::db::sql_stmt(crate::db::engine_of(&st.pool), "INSERT INTO auth_codes (code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce,
+        crate::db::q(&st.pool, "INSERT INTO auth_codes (code_hash, tenant_id, client_app_id, redirect_uri, platform, user_id, scope, nonce,
                                  code_challenge, code_challenge_method, auth_time, amr, created_at, expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
     )

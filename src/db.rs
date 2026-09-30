@@ -116,7 +116,24 @@ const SQLITE_MODE_PARAM: &str = "mode=";
 const SQLITE_MEMORY_PATH: &str = ":memory:";
 const SQLITE_CREATE_MODE: &str = "mode=rwc";
 
+/// Database used when none is configured.
+pub const DEFAULT_DATABASE_URL: &str = "sqlite://data/rust-oidc.db";
+
 pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
+    connect_with(url, FoldPolicy::FailClosed).await
+}
+
+/// What `connect` does when identifier folding finds colliding rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldPolicy {
+    /// Refuse to open the database (the server).
+    FailClosed,
+    /// Log the collisions and carry on (CLI subcommands, so they stay usable during an upgrade).
+    ReportOnly,
+}
+
+/// `connect` with an explicit collision policy.
+pub async fn connect_with(url: &str, policy: FoldPolicy) -> anyhow::Result<DbPool> {
     let engine = Engine::from_url(url)
         .ok_or_else(|| anyhow::anyhow!("unsupported database URL scheme; use sqlite://, postgres:// or mysql://"))?;
     // Installing the drivers twice panics; tests create many pools per process.
@@ -155,7 +172,16 @@ pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
         Engine::MySql => sqlx::migrate!("./migrations/mysql"),
     };
     migrator.run(&pool).await?;
-    reconcile_folded(&pool).await?;
+    match policy {
+        FoldPolicy::FailClosed => {
+            reconcile_folded(&pool).await?;
+        }
+        FoldPolicy::ReportOnly => {
+            if let Err(e) = reconcile_folded(&pool).await {
+                tracing::error!("identifier folding skipped, data untouched: {e}");
+            }
+        }
+    }
     Ok(pool)
 }
 
@@ -237,16 +263,25 @@ pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
             "refusing to start: {} case-insensitive identity conflict(s) found while normalising \
              identifiers; rows that differ only by case are the same identity.\n{}\n\
              Rename or remove one of the conflicting rows in each group, then restart. \
-             No data was modified.",
+             No command of this product can do that; use the database's own client \
+             (`sqlite3`, `psql` or `mysql`). No data was modified.",
             conflicts.len(),
             conflicts.join("\n"),
         );
     }
 
+    // One transaction so a failure part-way leaves nothing half-rewritten.
+    // Safety argument: a stale value always retains an uppercase non-ASCII char or
+    // untrimmed whitespace, so it can never equal a `fold()` output and the writes
+    // cannot collide with rows that are already correct. That holds only while
+    // `fold` merely lowercases and trims; revisit if it ever normalises further
+    // (e.g. NFKC), since two different stale values could then map to one result.
     let fixed = writes.len();
+    let mut tx = pool.begin().await?;
     for (update, key, want) in writes {
-        sqlx::query(sql_stmt(engine, update)).bind(want).bind(key).execute(pool).await?;
+        sqlx::query(sql_stmt(engine, update)).bind(want).bind(key).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     Ok(fixed)
 }
 
@@ -327,6 +362,11 @@ pub fn sql(engine: Engine, sql: &str) -> std::borrow::Cow<'_, str> {
 /// that assertion sound: only source-code literals get in, never runtime data.
 pub fn sql_stmt(engine: Engine, statement: &'static str) -> sqlx::AssertSqlSafe<std::borrow::Cow<'static, str>> {
     sqlx::AssertSqlSafe(sql(engine, statement))
+}
+
+/// `sql_stmt` for the common case: derive the engine from the pool.
+pub fn q(pool: &DbPool, statement: &'static str) -> sqlx::AssertSqlSafe<std::borrow::Cow<'static, str>> {
+    sql_stmt(engine_of(pool), statement)
 }
 
 pub async fn audit(

@@ -117,6 +117,10 @@ async fn concurrent_certificate_registrations_leave_one_row_with_last_writer_fie
         let creds = apps::key_credentials(&pool, &app).await.unwrap();
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].display_name.as_deref(), Some("renamed"));
+        // Re-registering with identical arguments changes nothing. MySQL reports 0 affected
+        // rows for that unless sqlx sets CLIENT_FOUND_ROWS, which the upsert relies on.
+        apps::add_key_credential(&pool, &app, &pem, Some("renamed")).await.expect("no-change re-registration");
+        assert_eq!(apps::key_credentials(&pool, &app).await.unwrap().len(), 1);
     }
 }
 

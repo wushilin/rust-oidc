@@ -63,7 +63,7 @@ impl From<TenantRow> for Tenant {
 pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> = if is_guid(key) {
         sqlx::query_as(
-            crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT id, name, is_root, enabled, settings FROM tenants
+            crate::db::q(pool, "SELECT id, name, is_root, enabled, settings FROM tenants
              WHERE id = ? AND deleted_at IS NULL AND enabled = ?"),
         )
         .bind(fold(key))
@@ -72,7 +72,7 @@ pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>>
         .await?
     } else {
         sqlx::query_as(
-            crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
+            crate::db::q(pool, "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
              JOIN tenant_domains d ON d.tenant_id = t.id
              WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = ?"),
         )
@@ -86,9 +86,7 @@ pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>>
 
 pub async fn root(pool: &DbPool) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> =
-        sqlx::query_as(crate::db::sql_stmt(
-            crate::db::engine_of(pool),
-            "SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = ?",
+        sqlx::query_as(crate::db::q(pool, "SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = ?",
         ))
             .bind(true)
             .fetch_optional(pool)
@@ -114,7 +112,7 @@ pub async fn list(pool: &DbPool) -> anyhow::Result<Vec<(Tenant, Vec<String>)>> {
 
 pub async fn domains(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> =
-        sqlx::query_as(crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain"))
+        sqlx::query_as(crate::db::q(pool, "SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain"))
             .bind(tenant_id)
             .fetch_all(pool)
             .await?;
@@ -202,7 +200,7 @@ async fn insert_domain(
 /// Resolve a tenant for CLI use; unlike [`resolve`] this also finds disabled tenants.
 pub async fn find_for_admin(pool: &DbPool, key: &str) -> anyhow::Result<Tenant> {
     let row: Option<TenantRow> = sqlx::query_as(
-        crate::db::sql_stmt(crate::db::engine_of(pool), "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
+        crate::db::q(pool, "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
          WHERE t.deleted_at IS NULL AND (t.id = ?
                OR t.id IN (SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?))"),
     )

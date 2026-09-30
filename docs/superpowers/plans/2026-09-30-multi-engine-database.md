@@ -499,6 +499,11 @@ git commit -m "feat(db): engine-neutral upserts with unique-violation fallback"
 
 ### Task 6: Run the suite against all three engines
 
+> **Controller amendment (Ruling M10): run Task 7 BEFORE this task.** Task 6's bar
+> is a green suite on all three engines, which is unreachable while the
+> boolean-vs-integer comparisons and the reserved-word `groups` table still fail
+> on Postgres and MySQL. Order is T4, T5, T7, T6, T8.
+
 This is the task that turns the abstraction from indirection into something proven.
 
 **Files:**

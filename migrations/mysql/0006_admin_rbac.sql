@@ -2,23 +2,23 @@
 -- Admin console RBAC: a role carries actions, a binding carries the scope.
 
 CREATE TABLE role_bindings (
-    id             VARCHAR(64) PRIMARY KEY,
-    principal_type VARCHAR(32) NOT NULL,       -- PrincipalType: User | Group
-    principal_id   VARCHAR(64) NOT NULL,
-    role_id        VARCHAR(64) NOT NULL,       -- RoleId::as_str
-    scope_kind     VARCHAR(32) NOT NULL,       -- ScopeKind: all | tenants
+    id             VARCHAR(64) COLLATE utf8mb4_bin PRIMARY KEY,
+    principal_type VARCHAR(32) COLLATE utf8mb4_bin NOT NULL,       -- PrincipalType: User | Group
+    principal_id   VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+    role_id        VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,       -- RoleId::as_str
+    scope_kind     VARCHAR(32) COLLATE utf8mb4_bin NOT NULL,       -- ScopeKind: all | tenants
     created_at     BIGINT NOT NULL,
     created_by     TEXT
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 CREATE INDEX role_bindings_principal ON role_bindings(principal_type, principal_id);
 
 CREATE TABLE role_binding_tenants (
-    binding_id VARCHAR(64) NOT NULL,
-    tenant_id  VARCHAR(64) NOT NULL,
+    binding_id VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+    tenant_id  VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
     PRIMARY KEY (binding_id, tenant_id),
     FOREIGN KEY (binding_id) REFERENCES role_bindings(id) ON DELETE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- Carry existing directory role assignments across as tenant-scoped bindings.
 -- Only User and Group principals: a service principal cannot use the console.
@@ -83,16 +83,16 @@ DROP TABLE directory_role_assignments;
 
 -- The console's own session: not tenant-scoped, and records any assumed tenant.
 CREATE TABLE admin_sessions (
-    cookie_hash   VARCHAR(128) PRIMARY KEY,
-    user_id       VARCHAR(64) NOT NULL,
-    home_tenant   VARCHAR(64) NOT NULL,
-    acting_tenant VARCHAR(64),
+    cookie_hash   VARCHAR(128) COLLATE utf8mb4_bin PRIMARY KEY,
+    user_id       VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+    home_tenant   VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+    acting_tenant VARCHAR(64) COLLATE utf8mb4_bin,
     created_at    BIGINT NOT NULL,
     expires_at    BIGINT NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (home_tenant) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (acting_tenant) REFERENCES tenants(id) ON DELETE SET NULL
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 CREATE INDEX admin_sessions_expires ON admin_sessions(expires_at);
 
 -- Soft delete for users, mirroring applications.deleted_at.

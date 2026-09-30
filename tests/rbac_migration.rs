@@ -94,11 +94,11 @@ async fn migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_root_ad
     let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
 
     for sql in [
-        include_str!("../migrations/0001_init.sql"),
-        include_str!("../migrations/0002_user_signin.sql"),
-        include_str!("../migrations/0003_device_code.sql"),
-        include_str!("../migrations/0004_app_key_credentials.sql"),
-        include_str!("../migrations/0005_password_grant.sql"),
+        include_str!("../migrations/sqlite/0001_init.sql"),
+        include_str!("../migrations/sqlite/0002_user_signin.sql"),
+        include_str!("../migrations/sqlite/0003_device_code.sql"),
+        include_str!("../migrations/sqlite/0004_app_key_credentials.sql"),
+        include_str!("../migrations/sqlite/0005_password_grant.sql"),
     ] {
         sqlx::raw_sql(sql).execute(&pool).await.unwrap();
     }
@@ -137,7 +137,7 @@ async fn migration_keeps_each_role_scoped_to_its_own_tenant_and_promotes_root_ad
         .unwrap();
     }
 
-    sqlx::raw_sql(include_str!("../migrations/0006_admin_rbac.sql"))
+    sqlx::raw_sql(include_str!("../migrations/sqlite/0006_admin_rbac.sql"))
         .execute(&pool)
         .await
         .unwrap();

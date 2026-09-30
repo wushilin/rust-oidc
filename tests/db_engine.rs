@@ -70,3 +70,19 @@ async fn a_directory_named_mode_does_not_suppress_create() {
     let pool = rust_oidc::db::connect(&url).await.unwrap();
     assert_eq!(rust_oidc::db::engine_of(&pool), Engine::Sqlite);
 }
+
+/// Review Focus 5: booleans and epoch columns must read back identically.
+#[tokio::test]
+async fn booleans_and_timestamps_round_trip_on_every_available_engine() {
+    for pool in common::all_engine_pools().await {
+        let t = rust_oidc::tenant::create(&pool, "Contoso", "contoso.test", false).await.unwrap();
+        let id = rust_oidc::users::create(&pool, &t, rust_oidc::users::NewUser {
+            upn: "alice@contoso.test", password: "Correct-Horse-9",
+            display_name: None, given_name: None, family_name: None,
+            email: Some("a@example.org"),
+        }).await.unwrap();
+        let u = rust_oidc::users::find(&pool, &t.id, &id).await.unwrap().unwrap();
+        assert!(u.enabled, "enabled must read back true");
+        assert!(!u.email_verified, "email_verified must read back false");
+    }
+}

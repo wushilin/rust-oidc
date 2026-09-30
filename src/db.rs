@@ -141,7 +141,14 @@ pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
         .acquire_timeout(Duration::from_secs(30))
         .connect(&url)
         .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    // `migrate!` embeds one literal directory at compile time, so each engine
+    // gets its own Migrator.
+    let migrator = match engine {
+        Engine::Sqlite => sqlx::migrate!("./migrations/sqlite"),
+        Engine::Postgres => sqlx::migrate!("./migrations/postgres"),
+        Engine::MySql => sqlx::migrate!("./migrations/mysql"),
+    };
+    migrator.run(&pool).await?;
     Ok(pool)
 }
 

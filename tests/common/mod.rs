@@ -341,3 +341,12 @@ pub fn decode_unverified(token: &str) -> Value {
     )
     .unwrap()
 }
+
+/// One migrated pool per engine available to this run. Task 6 adds Postgres and
+/// MySQL when their URLs are configured; until then SQLite only.
+pub async fn all_engine_pools() -> Vec<DbPool> {
+    // Kept (not deleted on drop): the pool outlives this function.
+    let dir = tempfile::tempdir().unwrap().keep();
+    let url = format!("sqlite://{}", dir.join("engine.db").display());
+    vec![db::connect(&url).await.unwrap()]
+}

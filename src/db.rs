@@ -149,7 +149,49 @@ pub async fn connect(url: &str) -> anyhow::Result<DbPool> {
         Engine::MySql => sqlx::migrate!("./migrations/mysql"),
     };
     migrator.run(&pool).await?;
+    reconcile_folded(&pool).await?;
     Ok(pool)
+}
+
+/// Recompute every folded identity column in Rust and rewrite the rows that
+/// disagree. The `0007` migration fills them with SQL `lower()`, which is
+/// ASCII-only on SQLite and locale-dependent on Postgres, so rows with non-ASCII
+/// identifiers would otherwise never match `util::fold` and their owners could
+/// not sign in. Idempotent: a no-op once every row agrees. Returns rows rewritten.
+pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
+    let engine = engine_of(pool);
+    let mut fixed = 0;
+    // (select, update) per table: rows are (key, display value, stored fold).
+    let plans: [(&'static str, &'static str); 3] = [
+        (
+            "SELECT id, upn, upn_folded FROM users",
+            "UPDATE users SET upn_folded = ? WHERE id = ?",
+        ),
+        (
+            "SELECT domain, domain, domain_folded FROM tenant_domains",
+            "UPDATE tenant_domains SET domain_folded = ? WHERE domain = ?",
+        ),
+        (
+            "SELECT id, name, name_folded FROM user_groups",
+            "UPDATE user_groups SET name_folded = ? WHERE id = ?",
+        ),
+    ];
+    for (select, update) in plans {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(sql_stmt(engine, select)).fetch_all(pool).await?;
+        for (key, display, stored) in rows {
+            let want = crate::util::fold(&display);
+            if stored.as_deref() != Some(want.as_str()) {
+                sqlx::query(sql_stmt(engine, update))
+                    .bind(want)
+                    .bind(key)
+                    .execute(pool)
+                    .await?;
+                fixed += 1;
+            }
+        }
+    }
+    Ok(fixed)
 }
 
 /// The filesystem path of a file-backed database, if the URL names one, so the

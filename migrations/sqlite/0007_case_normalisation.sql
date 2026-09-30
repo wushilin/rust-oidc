@@ -8,6 +8,11 @@
 -- The columns stay nullable because SQLite cannot add NOT NULL without a
 -- default; the application always writes them.
 
+-- NOTE: the lower() backfill below is only the cheap initial fill. It is exact
+-- for ASCII, but not for non-ASCII. db::reconcile_folded recomputes every
+-- folded column with util::fold at startup and is what makes the data exact.
+-- Keep both: dropping the Rust pass locks out users with non-ASCII identifiers.
+
 -- GROUPS is a reserved word in MySQL 8.0.2+; rename so no engine needs quoting.
 ALTER TABLE groups RENAME TO user_groups;
 

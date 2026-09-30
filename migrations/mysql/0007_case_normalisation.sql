@@ -7,6 +7,11 @@
 -- length) and utf8mb4_bin: under the table's _ai_ci default, `e` and `é` would
 -- compare equal and two different accounts would collide.
 
+-- NOTE: the lower() backfill below is only the cheap initial fill. It is exact
+-- for ASCII, but not for non-ASCII. db::reconcile_folded recomputes every
+-- folded column with util::fold at startup and is what makes the data exact.
+-- Keep both: dropping the Rust pass locks out users with non-ASCII identifiers.
+
 -- GROUPS is a reserved word in MySQL 8.0.2+; rename so no statement needs backticks.
 RENAME TABLE `groups` TO user_groups;
 

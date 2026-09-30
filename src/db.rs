@@ -387,11 +387,201 @@ pub fn q(pool: &DbPool, statement: &'static str) -> sqlx::AssertSqlSafe<std::bor
     sql_stmt(engine_of(pool), statement)
 }
 
+// ---- audit trail vocabulary ----
+
+/// Who performed an audited action: the `actor` column.
+///
+/// `Id` carries an identifier this server owns -- a user id, an application id
+/// or a service principal id -- and never caller-supplied text. An identifier
+/// that did not resolve is not an identifier, so it is [`Actor::Anonymous`] and
+/// the submitted value is not recorded at all; see [`crate::routes::audit`] for
+/// why (a client transposing `client_id` and `client_secret` would otherwise
+/// write its secret into the table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Actor<'a> {
+    /// The command line, run by an operator who already has database access.
+    Cli,
+    /// No user or client was identified.
+    Anonymous,
+    /// A user, application or service principal, by id.
+    Id(&'a str),
+}
+
+impl<'a> Actor<'a> {
+    pub fn as_str(self) -> &'a str {
+        match self {
+            Self::Cli => "cli",
+            Self::Anonymous => "anonymous",
+            Self::Id(id) => id,
+        }
+    }
+}
+
+impl<'a> From<Option<&'a str>> for Actor<'a> {
+    /// `Some(id)` is that principal, `None` is [`Actor::Anonymous`]. Lets a call
+    /// site pass an `Option<&str>` straight through without restating the rule.
+    fn from(id: Option<&'a str>) -> Self {
+        match id {
+            Some(id) => Self::Id(id),
+            None => Self::Anonymous,
+        }
+    }
+}
+
+/// Every value the `audit_log.action` column can hold, `area.event`.
+///
+/// This lives beside [`audit`] deliberately. The names used to exist in two
+/// places -- an enum for the HTTP layer and nineteen bare strings in the CLI --
+/// which gave one column two sources of truth, so a typo in either half was
+/// invisible and no single list said what the column could contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    // -- browser and API sign-in --
+    SignIn,
+    SignInFailed,
+    Lockout,
+    SessionCreate,
+    SessionEnd,
+    // -- token endpoint --
+    TokenIssued,
+    TokenClientAuthFailed,
+    TokenAssertionRejected,
+    TokenAssertionReplayed,
+    TokenCodeReplayed,
+    RefreshFamilyRevoked,
+    // -- device authorization grant --
+    DeviceCodeIssued,
+    DeviceApproved,
+    DeviceDenied,
+    DeviceRedeemed,
+    // -- protection --
+    /// A rate-limit bucket reached its allowance. Written once per bucket per
+    /// window, by the event that trips it, so the flood it reports cannot itself
+    /// flood the table. See [`crate::ratelimit`].
+    Throttled,
+    // -- command line --
+    Bootstrap,
+    TenantCreate,
+    TenantAddDomain,
+    UserCreate,
+    UserSetPassword,
+    GroupCreate,
+    GroupAddMember,
+    AppCreate,
+    AppRedirectUriAdd,
+    AppScopeAdd,
+    AppSecretAdd,
+    AppSecretRemove,
+    AppImplicit,
+    AppPasswordGrant,
+    AppKeyAdd,
+    AppKeyRemove,
+    AppRoleAdd,
+    AppRoleAssign,
+    KeyRotate,
+}
+
+impl Event {
+    pub const ALL: &'static [Event] = &[
+        Self::SignIn,
+        Self::SignInFailed,
+        Self::Lockout,
+        Self::SessionCreate,
+        Self::SessionEnd,
+        Self::TokenIssued,
+        Self::TokenClientAuthFailed,
+        Self::TokenAssertionRejected,
+        Self::TokenAssertionReplayed,
+        Self::TokenCodeReplayed,
+        Self::RefreshFamilyRevoked,
+        Self::DeviceCodeIssued,
+        Self::DeviceApproved,
+        Self::DeviceDenied,
+        Self::DeviceRedeemed,
+        Self::Throttled,
+        Self::Bootstrap,
+        Self::TenantCreate,
+        Self::TenantAddDomain,
+        Self::UserCreate,
+        Self::UserSetPassword,
+        Self::GroupCreate,
+        Self::GroupAddMember,
+        Self::AppCreate,
+        Self::AppRedirectUriAdd,
+        Self::AppScopeAdd,
+        Self::AppSecretAdd,
+        Self::AppSecretRemove,
+        Self::AppImplicit,
+        Self::AppPasswordGrant,
+        Self::AppKeyAdd,
+        Self::AppKeyRemove,
+        Self::AppRoleAdd,
+        Self::AppRoleAssign,
+        Self::KeyRotate,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SignIn => "auth.sign_in",
+            Self::SignInFailed => "auth.sign_in_failed",
+            Self::Lockout => "auth.lockout",
+            Self::SessionCreate => "session.create",
+            Self::SessionEnd => "session.end",
+            Self::TokenIssued => "token.issued",
+            Self::TokenClientAuthFailed => "token.client_auth_failed",
+            Self::TokenAssertionRejected => "token.assertion_rejected",
+            Self::TokenAssertionReplayed => "token.assertion_replayed",
+            Self::TokenCodeReplayed => "token.code_replayed",
+            Self::RefreshFamilyRevoked => "token.refresh_family_revoked",
+            Self::DeviceCodeIssued => "device.code_issued",
+            Self::DeviceApproved => "device.approved",
+            Self::DeviceDenied => "device.denied",
+            Self::DeviceRedeemed => "device.redeemed",
+            Self::Throttled => "security.throttled",
+            // The one action with no `area.` prefix. It predates the convention
+            // and rows carrying it already exist, so renaming it would split
+            // "when was this server bootstrapped" across two spellings.
+            Self::Bootstrap => "bootstrap",
+            Self::TenantCreate => "tenant.create",
+            Self::TenantAddDomain => "tenant.add_domain",
+            Self::UserCreate => "user.create",
+            Self::UserSetPassword => "user.set_password",
+            Self::GroupCreate => "group.create",
+            Self::GroupAddMember => "group.add_member",
+            Self::AppCreate => "app.create",
+            Self::AppRedirectUriAdd => "app.redirect_uri.add",
+            Self::AppScopeAdd => "app.scope.add",
+            Self::AppSecretAdd => "app.secret.add",
+            Self::AppSecretRemove => "app.secret.remove",
+            Self::AppImplicit => "app.implicit",
+            Self::AppPasswordGrant => "app.password_grant",
+            Self::AppKeyAdd => "app.key.add",
+            Self::AppKeyRemove => "app.key.remove",
+            Self::AppRoleAdd => "app.role.add",
+            Self::AppRoleAssign => "app.role.assign",
+            Self::KeyRotate => "key.rotate",
+        }
+    }
+
+    /// An action read back from a stored row. `None` for anything this build does
+    /// not know, because a row written by a newer build must not stop an older
+    /// one reading the table.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|e| e.as_str() == raw)
+    }
+}
+
+/// Append one row to `audit_log`.
+///
+/// `actor` and `event` are enums rather than strings so that the `actor` and
+/// `action` columns have exactly one source of truth each: the CLI used to pass
+/// nineteen bare action strings past an enum that the HTTP layer was already
+/// using for the same column.
 pub async fn audit(
     pool: &DbPool,
     tenant_id: Option<&str>,
-    actor: &str,
-    action: &str,
+    actor: Actor<'_>,
+    event: Event,
     target: Option<&str>,
     details: serde_json::Value,
 ) -> anyhow::Result<()> {
@@ -401,8 +591,8 @@ pub async fn audit(
          VALUES (?, ?, ?, ?, ?, ?)",
     ))
     .bind(tenant_id)
-    .bind(actor)
-    .bind(action)
+    .bind(actor.as_str())
+    .bind(event.as_str())
     .bind(target)
     .bind(details.to_string())
     .bind(crate::util::now())

@@ -14,7 +14,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use super::audit::{self, Channel, Event};
+use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application, PLATFORM_SPA, ServicePrincipal};
 use crate::claims::{self, Amr, Azpacr};
@@ -730,11 +730,19 @@ async fn signed_in(
         .await
         .map_err(|e| html::error(Some(&v.tenant.name), &AadError::from(e).description()))?;
     let details = serde_json::json!({ "via": Channel::Authorize.as_str(), "clientId": v.client.app_id });
-    audit::record(st, &v.tenant.id, &user.id, Event::SignIn, Some(&user.id), details).await;
     audit::record(
         st,
         &v.tenant.id,
-        &user.id,
+        Actor::Id(&user.id),
+        Event::SignIn,
+        Some(&user.id),
+        details,
+    )
+    .await;
+    audit::record(
+        st,
+        &v.tenant.id,
+        Actor::Id(&user.id),
         Event::SessionCreate,
         Some(&user.id),
         serde_json::json!({}),

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use rust_oidc::db::DbPool;
+use rust_oidc::db::{Actor, DbPool, Event};
 use serde_json::json;
 
 use rust_oidc::admin::bindings::{self as role_bindings, PrincipalType};
@@ -445,8 +445,8 @@ async fn main() -> anyhow::Result<()> {
             db::audit(
                 &pool,
                 Some(&t.id),
-                "cli",
-                "bootstrap",
+                Actor::Cli,
+                Event::Bootstrap,
                 Some(&user_id),
                 json!({ "upn": admin_upn }),
             )
@@ -474,8 +474,8 @@ async fn tenant_cmd(pool: &DbPool, cmd: TenantCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "tenant.create",
+                Actor::Cli,
+                Event::TenantCreate,
                 Some(&t.id),
                 json!({ "name": name, "domain": domain }),
             )
@@ -498,8 +498,8 @@ async fn tenant_cmd(pool: &DbPool, cmd: TenantCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "tenant.add_domain",
+                Actor::Cli,
+                Event::TenantAddDomain,
                 Some(&t.id),
                 json!({ "domain": domain }),
             )
@@ -561,8 +561,8 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "user.create",
+                Actor::Cli,
+                Event::UserCreate,
                 Some(&id),
                 json!({ "upn": upn }),
             )
@@ -577,7 +577,15 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
             let t = tenant::find_for_admin(pool, &key).await?;
             let password = password_or_stdin(password)?;
             users::set_password(pool, &t, &upn, &password).await?;
-            db::audit(pool, Some(&t.id), "cli", "user.set_password", Some(&upn), json!({})).await?;
+            db::audit(
+                pool,
+                Some(&t.id),
+                Actor::Cli,
+                Event::UserSetPassword,
+                Some(&upn),
+                json!({}),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -595,8 +603,8 @@ async fn group_cmd(pool: &DbPool, cmd: GroupCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "group.create",
+                Actor::Cli,
+                Event::GroupCreate,
                 Some(&id),
                 json!({ "name": name }),
             )
@@ -613,8 +621,8 @@ async fn group_cmd(pool: &DbPool, cmd: GroupCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "group.add_member",
+                Actor::Cli,
+                Event::GroupAddMember,
                 Some(&group),
                 json!({ "upn": user }),
             )
@@ -632,8 +640,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.create",
+                Actor::Cli,
+                Event::AppCreate,
                 Some(&created.application.app_id),
                 json!({ "name": name }),
             )
@@ -695,8 +703,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.redirect_uri.add",
+                Actor::Cli,
+                Event::AppRedirectUriAdd,
                 Some(&a.app_id),
                 json!({ "platform": platform, "uri": uri }),
             )
@@ -716,8 +724,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.scope.add",
+                Actor::Cli,
+                Event::AppScopeAdd,
                 Some(&a.app_id),
                 json!({ "value": value }),
             )
@@ -748,8 +756,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.secret.add",
+                Actor::Cli,
+                Event::AppSecretAdd,
                 Some(&a.app_id),
                 json!({ "keyId": s.key_id }),
             )
@@ -772,8 +780,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.implicit",
+                Actor::Cli,
+                Event::AppImplicit,
                 Some(&a.app_id),
                 json!({ "idTokens": id_tokens, "accessTokens": access_tokens }),
             )
@@ -791,8 +799,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.password_grant",
+                Actor::Cli,
+                Event::AppPasswordGrant,
                 Some(&a.app_id),
                 json!({ "allowed": allowed }),
             )
@@ -822,8 +830,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.key.add",
+                Actor::Cli,
+                Event::AppKeyAdd,
                 Some(&a.app_id),
                 json!({ "keyId": key_id }),
             )
@@ -861,8 +869,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.key.remove",
+                Actor::Cli,
+                Event::AppKeyRemove,
                 Some(&a.app_id),
                 json!({ "keyId": key_id }),
             )
@@ -880,8 +888,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.secret.remove",
+                Actor::Cli,
+                Event::AppSecretRemove,
                 Some(&a.app_id),
                 json!({ "keyId": key_id }),
             )
@@ -903,8 +911,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.role.add",
+                Actor::Cli,
+                Event::AppRoleAdd,
                 Some(&a.app_id),
                 json!({ "value": value }),
             )
@@ -931,8 +939,8 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             db::audit(
                 pool,
                 Some(&t.id),
-                "cli",
-                "app.role.assign",
+                Actor::Cli,
+                Event::AppRoleAssign,
                 Some(&resource_app.app_id),
                 json!({ "role": role }),
             )
@@ -960,7 +968,7 @@ async fn key_cmd(pool: &DbPool, cmd: KeyCmd) -> anyhow::Result<()> {
         }
         KeyCmd::Rotate => {
             keys::rotate(pool).await?;
-            db::audit(pool, None, "cli", "key.rotate", None, json!({})).await?;
+            db::audit(pool, None, Actor::Cli, Event::KeyRotate, None, json!({})).await?;
             println!("rotated; running servers pick up the change within 30 seconds");
         }
         KeyCmd::Prune { older_than_days } => {

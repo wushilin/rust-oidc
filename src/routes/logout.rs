@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use super::audit::{self, Channel, Event};
+use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
 use crate::apps;
 use crate::html;
@@ -87,7 +87,7 @@ pub async fn logout(
         audit::record(
             &st,
             &tenant.id,
-            &s.user_id,
+            Actor::Id(&s.user_id),
             Event::SessionEnd,
             Some(&s.user_id),
             details,

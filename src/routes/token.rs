@@ -11,7 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value, json};
 
-use super::audit::{self, ClientFailures, Event, Reason};
+use super::audit::{self, Actor, ClientFailures, Event, Reason};
 use crate::AppState;
 use crate::apps::{self, Application, SecretCheck, ServicePrincipal};
 use crate::claims::Azpacr;
@@ -508,7 +508,7 @@ async fn authenticate_with_assertion(
         audit::record(
             st,
             &tenant.id,
-            &app.app_id,
+            Actor::Id(&app.app_id),
             Event::TokenAssertionReplayed,
             Some(&app.app_id),
             details,
@@ -590,7 +590,7 @@ async fn client_credentials(
     audit::record(
         st,
         &tenant.id,
-        &client.app.app_id,
+        Actor::Id(&client.app.app_id),
         Event::TokenIssued,
         Some(&resource_app.app_id),
         details,

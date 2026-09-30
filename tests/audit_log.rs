@@ -286,7 +286,7 @@ async fn transposed_client_credentials_do_not_leak_the_secret() {
     let failed = rows(&s, &f.tenant.id, "token.client_auth_failed").await;
     assert_eq!(failed.len(), 2);
     for row in &failed {
-        assert_eq!(row.actor, rust_oidc::routes::audit::ANONYMOUS);
+        assert_eq!(row.actor, rust_oidc::db::Actor::Anonymous.as_str());
         assert_eq!(row.target, None);
         assert_eq!(row.details["reason"], "unknown_client");
         // Recorded instead of the value: a secret is not GUID-shaped, so this

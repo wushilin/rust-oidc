@@ -225,6 +225,37 @@ into a shared store.
 
 ---
 
+## No magic values: the remaining closed sets
+
+**39. The audit vocabulary moved into `src/db.rs`, beside the function that writes
+it.** `audit_log.action` had two sources of truth: `routes::audit::Event` for the HTTP
+layer and nineteen bare strings in `src/main.rs` for the CLI. One column, two lists,
+neither of which said what the column could contain. `db::Event` is now the only list
+(35 variants), `db::audit` takes it, and `routes::audit` re-exports it so the HTTP
+layer's call sites are unchanged. `db::Actor` does the same for the `actor` column,
+which had `"cli"` inline nineteen times and a separate `ANONYMOUS` constant.
+
+**Every wire value is unchanged, verified rather than asserted:** the old and new
+spellings were extracted from git and compared, and all 19 CLI actions match in the
+same order, all 16 HTTP actions match, and the actor is still `cli`. That mattered
+because renaming an action would split a deployment's history across two spellings in
+a column that is already indexed and already has rows on the deployed service.
+`tests/audit_vocabulary.rs` pins all 35 values by hand -- deriving the expected list
+from `as_str` would have made the test agree with any rename.
+
+**40. `bootstrap` keeps its missing `area.` prefix.** It is the one action that does
+not follow `area.event`. Renaming it to `server.bootstrap` would be tidier and would
+also mean "when was this server bootstrapped" no longer has a single answer on the
+deployed database. The shape test skips it by name, with the reason in the code.
+*To reverse:* rename the variant's string and accept the split, or migrate the rows.
+
+**41. `Event::parse` exists although nothing reads the column back yet.** It tolerates
+unknown values (returns `None`), so a row written by a newer build cannot stop an older
+one reading the table -- the same rule as `Amr` (decision 22). The console's audit view
+will need it.
+
+---
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

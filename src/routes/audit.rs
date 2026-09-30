@@ -17,62 +17,13 @@ use crate::AppState;
 use crate::ratelimit::{Hit, Limit, app_key};
 use crate::users::{AuthResult, AuthTrace};
 
-/// Actor for events where no user or client has been identified, such as a
-/// failed sign-in for an unknown account. The submitted name is deliberately
-/// *not* recorded: an identifier that did not resolve is not an identifier, so
-/// it may hold anything the caller typed. See [`sign_in_failure`] and
-/// [`ClientFailures::fail`].
-pub const ANONYMOUS: &str = "anonymous";
-
 /// Longest attacker-supplied string kept in `details`.
 const MAX_FIELD_LEN: usize = 128;
 
-/// Audit event names, `area.event`, matching the CLI's `user.create` style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Event {
-    SignIn,
-    SignInFailed,
-    Lockout,
-    SessionCreate,
-    SessionEnd,
-    TokenIssued,
-    TokenClientAuthFailed,
-    TokenAssertionRejected,
-    TokenAssertionReplayed,
-    TokenCodeReplayed,
-    RefreshFamilyRevoked,
-    DeviceCodeIssued,
-    DeviceApproved,
-    DeviceDenied,
-    DeviceRedeemed,
-    /// A rate-limit bucket reached its allowance. Written once per window, by
-    /// the event that trips it, so the flood it reports cannot itself flood the
-    /// table. See [`crate::ratelimit`].
-    Throttled,
-}
-
-impl Event {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SignIn => "auth.sign_in",
-            Self::SignInFailed => "auth.sign_in_failed",
-            Self::Lockout => "auth.lockout",
-            Self::SessionCreate => "session.create",
-            Self::SessionEnd => "session.end",
-            Self::TokenIssued => "token.issued",
-            Self::TokenClientAuthFailed => "token.client_auth_failed",
-            Self::TokenAssertionRejected => "token.assertion_rejected",
-            Self::TokenAssertionReplayed => "token.assertion_replayed",
-            Self::TokenCodeReplayed => "token.code_replayed",
-            Self::RefreshFamilyRevoked => "token.refresh_family_revoked",
-            Self::DeviceCodeIssued => "device.code_issued",
-            Self::DeviceApproved => "device.approved",
-            Self::DeviceDenied => "device.denied",
-            Self::DeviceRedeemed => "device.redeemed",
-            Self::Throttled => "security.throttled",
-        }
-    }
-}
+/// The audit vocabulary lives in [`crate::db`], beside the `audit` function that
+/// writes it, so the CLI and the HTTP layer cannot drift apart. Re-exported here
+/// because this is where the HTTP layer reaches for it.
+pub use crate::db::{Actor, Event};
 
 /// Where a password was checked, recorded as `via`.
 #[derive(Debug, Clone, Copy)]
@@ -205,7 +156,7 @@ pub struct ClientFailures<'a> {
 
 impl ClientFailures<'_> {
     /// `app_id` is the client once it is known to exist and is then the actor;
-    /// before that the actor is [`ANONYMOUS`] and the claimed id is only data.
+    /// before that the actor is [`Actor::Anonymous`] and the claimed id is only data.
     pub async fn fail(
         &self,
         app_id: Option<&str>,
@@ -241,7 +192,7 @@ impl ClientFailures<'_> {
         record(
             self.st,
             self.tenant_id,
-            app_id.unwrap_or(ANONYMOUS),
+            Actor::from(app_id),
             self.event,
             app_id,
             details,
@@ -268,15 +219,7 @@ pub async fn throttled(st: &AppState, tenant_id: &str, app_id: Option<&str>, lim
     if let Some(id) = app_id {
         details["clientId"] = id.into();
     }
-    record(
-        st,
-        tenant_id,
-        app_id.unwrap_or(ANONYMOUS),
-        Event::Throttled,
-        app_id,
-        details,
-    )
-    .await;
+    record(st, tenant_id, Actor::from(app_id), Event::Throttled, app_id, details).await;
 }
 
 /// The tenant's own verified domain that `value` names after its last `@`, as
@@ -297,8 +240,15 @@ pub fn clip(s: &str) -> String {
 /// audit outage into an authentication outage (and a lever for denial of
 /// service). The failure is logged at error level so monitoring can alert on
 /// it; the request proceeds.
-pub async fn record(st: &AppState, tenant_id: &str, actor: &str, event: Event, target: Option<&str>, details: Value) {
-    if let Err(e) = crate::db::audit(&st.pool, Some(tenant_id), actor, event.as_str(), target, details).await {
+pub async fn record(
+    st: &AppState,
+    tenant_id: &str,
+    actor: Actor<'_>,
+    event: Event,
+    target: Option<&str>,
+    details: Value,
+) {
+    if let Err(e) = crate::db::audit(&st.pool, Some(tenant_id), actor, event, target, details).await {
         tracing::error!(error = ?e, event = event.as_str(), "audit write failed");
     }
 }
@@ -342,10 +292,15 @@ pub async fn sign_in_failure(
     }
     // A known account is the actor; otherwise the submitted name is only data.
     // For the password grant the authenticated client stands in.
-    let actor = trace.user_id.as_deref().unwrap_or(match channel {
-        Channel::Ropc => client_id,
-        _ => ANONYMOUS,
-    });
+    let actor = match trace.user_id.as_deref() {
+        Some(id) => Actor::Id(id),
+        // For the password grant the authenticated client stands in; elsewhere
+        // there is nobody to name.
+        None => match channel {
+            Channel::Ropc => Actor::Id(client_id),
+            _ => Actor::Anonymous,
+        },
+    };
     // The submitted name is only safe to log when it resolved to an account,
     // because then it is a real UPN. Otherwise it may be anything, including a
     // password typed into the wrong box. The one thing still worth keeping is

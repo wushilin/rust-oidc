@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use sqlx::Row;
 
-use super::audit::{self, Channel, Event};
+use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application};
 use crate::claims::Amr;
@@ -205,7 +205,15 @@ async fn issue_device_code(st: &AppState, tenant_key: &str, params: &Params) -> 
 
     // The user code is what approves this request, so it stays out of the log.
     let details = json!({ "clientId": app.app_id, "scope": audit::clip(scope) });
-    audit::record(st, &tenant.id, &app.app_id, Event::DeviceCodeIssued, None, details).await;
+    audit::record(
+        st,
+        &tenant.id,
+        Actor::Id(&app.app_id),
+        Event::DeviceCodeIssued,
+        None,
+        details,
+    )
+    .await;
 
     let verification_uri = deviceauth_url(st, &tenant.id);
     let mut resp = (
@@ -470,11 +478,19 @@ async fn sign_in(
         .await
         .map_err(|e| html::error(Some(&tenant.name), &AadError::from(e).description()))?;
     let details = json!({ "via": Channel::Device.as_str(), "clientId": pending.client.app_id });
-    audit::record(st, &tenant.id, &user.id, Event::SignIn, Some(&user.id), details).await;
     audit::record(
         st,
         &tenant.id,
-        &user.id,
+        Actor::Id(&user.id),
+        Event::SignIn,
+        Some(&user.id),
+        details,
+    )
+    .await;
+    audit::record(
+        st,
+        &tenant.id,
+        Actor::Id(&user.id),
         Event::SessionCreate,
         Some(&user.id),
         json!({}),
@@ -525,7 +541,15 @@ async fn decide(
         .await;
         if denied.is_ok_and(|r| r.rows_affected() > 0) {
             let details = json!({ "clientId": client_id });
-            audit::record(st, &tenant.id, &s.user_id, Event::DeviceDenied, None, details).await;
+            audit::record(
+                st,
+                &tenant.id,
+                Actor::Id(&s.user_id),
+                Event::DeviceDenied,
+                None,
+                details,
+            )
+            .await;
         }
         return html::device_result(
             Some(&tenant.name),
@@ -551,7 +575,15 @@ async fn decide(
     match updated {
         Ok(r) if r.rows_affected() == 1 => {
             let details = json!({ "clientId": client_id });
-            audit::record(st, &tenant.id, &s.user_id, Event::DeviceApproved, None, details).await;
+            audit::record(
+                st,
+                &tenant.id,
+                Actor::Id(&s.user_id),
+                Event::DeviceApproved,
+                None,
+                details,
+            )
+            .await;
             html::device_result(
                 Some(&tenant.name),
                 "You're all set",
@@ -649,7 +681,15 @@ pub(super) async fn device_code_grant(
 
     let user_id: String = row.get::<Option<String>, _>("user_id").ok_or_else(bad_code)?;
     let details = json!({ "clientId": client_app_id });
-    audit::record(st, &tenant.id, &user_id, Event::DeviceRedeemed, None, details).await;
+    audit::record(
+        st,
+        &tenant.id,
+        Actor::Id(&user_id),
+        Event::DeviceRedeemed,
+        None,
+        details,
+    )
+    .await;
     let scope: String = row.get("scope");
     let auth_time: i64 = row.get::<Option<i64>, _>("auth_time").unwrap_or(ts);
     let amr: Vec<String> = row

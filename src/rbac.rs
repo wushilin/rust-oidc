@@ -332,4 +332,162 @@ mod tests {
             assert_eq!(RoleId::parse(role.as_str()), Some(*role));
         }
     }
+
+    fn keys(actions: &[Action]) -> Vec<String> {
+        let mut v: Vec<String> = actions
+            .iter()
+            .map(|a| format!("{:?}:{:?}", a.resource, a.verb))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn expected(list: &[(Resource, Verb)]) -> Vec<String> {
+        let acts: Vec<Action> = list.iter().map(|(r, v)| Action::new(*r, *v)).collect();
+        keys(&acts)
+    }
+
+    const READ_EVERYTHING: [(Resource, Verb); 8] = [
+        (Resource::Tenant, Verb::Read),
+        (Resource::User, Verb::Read),
+        (Resource::Group, Verb::Read),
+        (Resource::App, Verb::Read),
+        (Resource::Assignment, Verb::Read),
+        (Resource::RoleBinding, Verb::Read),
+        (Resource::Key, Verb::Read),
+        (Resource::Audit, Verb::Read),
+    ];
+
+    #[test]
+    fn every_role_grants_exactly_its_expected_actions() {
+        use Resource::*;
+        use Verb::*;
+        for role in RoleId::ALL {
+            let want: Vec<(Resource, Verb)> = match role {
+                RoleId::GlobalAdministrator => {
+                    let mut w = READ_EVERYTHING.to_vec();
+                    w.extend([
+                        (Tenant, Write),
+                        (User, Write),
+                        (User, Reset),
+                        (Group, Write),
+                        (App, Write),
+                        (App, Rotate),
+                        (Assignment, Write),
+                        (RoleBinding, Write),
+                    ]);
+                    w
+                }
+                RoleId::GlobalReader => READ_EVERYTHING.to_vec(),
+                RoleId::UserAdministrator => vec![
+                    (User, Read),
+                    (User, Write),
+                    (User, Reset),
+                    (Group, Read),
+                    (Audit, Read),
+                ],
+                RoleId::GroupsAdministrator => {
+                    vec![(Group, Read), (Group, Write), (User, Read), (Audit, Read)]
+                }
+                RoleId::ApplicationAdministrator => vec![
+                    (App, Read),
+                    (App, Write),
+                    (App, Rotate),
+                    (Assignment, Read),
+                    (Assignment, Write),
+                    (Audit, Read),
+                ],
+                RoleId::CloudApplicationAdministrator => vec![
+                    (App, Read),
+                    (App, Write),
+                    (Assignment, Read),
+                    (Assignment, Write),
+                    (Audit, Read),
+                ],
+                RoleId::PrivilegedRoleAdministrator => vec![
+                    (RoleBinding, Read),
+                    (RoleBinding, Write),
+                    (Assignment, Read),
+                    (Assignment, Write),
+                    (Audit, Read),
+                ],
+                RoleId::PlatformAdministrator => vec![
+                    (Tenant, Read),
+                    (Tenant, Create),
+                    (Tenant, Write),
+                    (Tenant, Assume),
+                    (Key, Read),
+                    (Key, Rotate),
+                    (Audit, Read),
+                ],
+            };
+            assert_eq!(keys(&role.actions()), expected(&want), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn platform_only_actions_are_held_by_no_other_role() {
+        let platform_only = [
+            Action::new(Resource::Tenant, Verb::Create),
+            Action::new(Resource::Tenant, Verb::Assume),
+            Action::new(Resource::Key, Verb::Rotate),
+        ];
+        for role in RoleId::ALL {
+            for action in platform_only {
+                assert_eq!(
+                    role.actions().contains(&action),
+                    *role == RoleId::PlatformAdministrator,
+                    "{role:?} {action:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_platform_administrator_lacks_a_template_id() {
+        for role in RoleId::ALL {
+            assert_eq!(
+                role.template_id().is_none(),
+                *role == RoleId::PlatformAdministrator,
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_ids_and_names_match_the_directory() {
+        for role in RoleId::ALL {
+            let Some(id) = role.template_id() else { continue };
+            let dir = crate::directory::ROLES
+                .iter()
+                .find(|r| r.template_id == id)
+                .unwrap_or_else(|| panic!("{role:?} GUID {id} missing from directory::ROLES"));
+            assert_eq!(dir.name, role.display_name(), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn scope_kinds_round_trip() {
+        for kind in [ScopeKind::All, ScopeKind::Tenants] {
+            assert_eq!(ScopeKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ScopeKind::parse("bogus"), None);
+        assert_eq!(Scope::All.kind(), ScopeKind::All);
+        assert_eq!(Scope::Tenants(vec![]).kind(), ScopeKind::Tenants);
+    }
+
+    #[test]
+    fn allowed_at_all_scope_requires_an_all_binding() {
+        let action = Action::new(Resource::User, Verb::Write);
+        let all = [binding(RoleId::UserAdministrator, Scope::All)];
+        let some = [binding(
+            RoleId::UserAdministrator,
+            Scope::Tenants(vec!["t1".into()]),
+        )];
+        assert!(allowed_at_all_scope(&all, action));
+        assert!(!allowed_at_all_scope(&some, action));
+        // Right scope, wrong role.
+        let wrong = [binding(RoleId::GlobalReader, Scope::All)];
+        assert!(!allowed_at_all_scope(&wrong, action));
+    }
 }

@@ -14,6 +14,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use super::audit::{self, Channel, Event};
 use crate::AppState;
 use crate::apps::{self, Application, PLATFORM_SPA, ServicePrincipal};
 use crate::error::AadError;
@@ -531,10 +532,20 @@ pub async fn login(
         _ => {
             let upn = form.get("upn").map(|s| s.trim().to_string()).unwrap_or_default();
             let password = form.get("password").cloned().unwrap_or_default();
-            let outcome = match users::authenticate(&st.pool, &v.tenant, &upn, &password).await {
+            let (outcome, trace) = match users::authenticate_traced(&st.pool, &v.tenant, &upn, &password).await {
                 Ok(o) => o,
                 Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
             };
+            audit::sign_in_failure(
+                &st,
+                &v.tenant.id,
+                &upn,
+                &outcome,
+                &trace,
+                Channel::Authorize,
+                &v.client.app_id,
+            )
+            .await;
             let message = match outcome {
                 AuthResult::Ok(user) => {
                     return match signed_in(&st, &tenant_key, &headers, &params, &request, &v, &user).await {
@@ -571,6 +582,17 @@ async fn signed_in(
     let cookie = session::create(&st.pool, headers, &v.tenant.id, &user.id, &amr, lifetime)
         .await
         .map_err(|e| html::error(Some(&v.tenant.name), &AadError::from(e).description()))?;
+    let details = serde_json::json!({ "via": Channel::Authorize.as_str(), "clientId": v.client.app_id });
+    audit::record(st, &v.tenant.id, &user.id, Event::SignIn, Some(&user.id), details).await;
+    audit::record(
+        st,
+        &v.tenant.id,
+        &user.id,
+        Event::SessionCreate,
+        Some(&user.id),
+        serde_json::json!({}),
+    )
+    .await;
 
     // Continue the original request as the newly signed-in user.
     let mut headers = headers.clone();

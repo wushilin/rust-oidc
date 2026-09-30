@@ -117,7 +117,28 @@ fn lockout_secs(failures: i64) -> i64 {
 static DUMMY_HASH: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| hash_password("not-a-real-password").expect("argon2"));
 
+/// What an authentication attempt learned beyond the caller-visible
+/// [`AuthResult`], for the audit log only. It must never reach an HTTP
+/// response: it tells an unknown account from a wrong password.
+#[derive(Debug, Default)]
+pub struct AuthTrace {
+    /// The account the name resolved to, if any.
+    pub user_id: Option<String>,
+    /// This very attempt pushed the account over the lockout threshold.
+    pub lockout_triggered: bool,
+}
+
 pub async fn authenticate(pool: &DbPool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<AuthResult> {
+    Ok(authenticate_traced(pool, tenant, upn, password).await?.0)
+}
+
+/// [`authenticate`], plus the [`AuthTrace`] the audit log needs.
+pub async fn authenticate_traced(
+    pool: &DbPool,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
     #[derive(sqlx::FromRow)]
     struct Row {
         id: String,
@@ -137,11 +158,15 @@ pub async fn authenticate(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
 
     let Some(row) = row else {
         let _ = verify_password(password, &DUMMY_HASH);
-        return Ok(AuthResult::InvalidCredentials);
+        return Ok((AuthResult::InvalidCredentials, AuthTrace::default()));
     };
     let ts = now();
+    let mut trace = AuthTrace {
+        user_id: Some(row.id.clone()),
+        lockout_triggered: false,
+    };
     if row.locked_until.is_some_and(|until| until > ts) {
-        return Ok(AuthResult::Locked);
+        return Ok((AuthResult::Locked, trace));
     }
     let ok = row
         .password_hash
@@ -159,10 +184,11 @@ pub async fn authenticate(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
         .bind(&row.id)
         .execute(pool)
         .await?;
-        return Ok(AuthResult::InvalidCredentials);
+        trace.lockout_triggered = locked_until.is_some();
+        return Ok((AuthResult::InvalidCredentials, trace));
     }
     if !row.enabled {
-        return Ok(AuthResult::Disabled);
+        return Ok((AuthResult::Disabled, trace));
     }
     sqlx::query(crate::db::q(
         pool,
@@ -172,7 +198,7 @@ pub async fn authenticate(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
     .execute(pool)
     .await?;
     let user = find(pool, &tenant.id, &row.id).await?.context("user vanished")?;
-    Ok(AuthResult::Ok(user))
+    Ok((AuthResult::Ok(user), trace))
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {

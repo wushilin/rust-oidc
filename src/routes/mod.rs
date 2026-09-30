@@ -1,3 +1,4 @@
+pub mod audit;
 mod authorize;
 mod device;
 mod discovery;

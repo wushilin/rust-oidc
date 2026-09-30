@@ -134,7 +134,7 @@ async fn ropc_rejects_an_unknown_user() {
     // The audit log does tell them apart. The authenticated client is the actor.
     let (actor, details) = audit_row(&s, &f, "auth.sign_in_failed").await;
     assert_eq!(actor, f.web.app_id);
-    assert!(details.contains("unknown_user") && details.contains("nobody@contoso.com"));
+    assert!(details.contains("unknown_user") && !details.contains("nobody"));
 }
 
 #[tokio::test]
@@ -158,4 +158,53 @@ async fn ropc_still_requires_client_authentication() {
         .await;
     assert_eq!(status, 401, "{err}");
     assert_eq!(err["error"], "invalid_client");
+}
+
+/// Description with the per-request Trace ID / Correlation ID / Timestamp removed.
+fn stable_description(err: &Value) -> &str {
+    let d = err["error_description"].as_str().unwrap();
+    d.split(" Trace ID:").next().unwrap()
+}
+
+#[tokio::test]
+async fn ropc_unknown_user_and_wrong_password_are_indistinguishable() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    allow_ropc(&s, &f, true).await;
+    let scope = format!("openid api://{}/Orders.Read", f.api.app_id);
+    let (s1, wrong) = ropc(&s, &f, &f.upn, "not-the-password", &scope).await;
+    let (s2, unknown) = ropc(&s, &f, "nobody@contoso.com", "not-the-password", &scope).await;
+    assert_eq!(s1, s2);
+    assert_eq!(wrong["error"], unknown["error"]);
+    assert_eq!(wrong["error_codes"], unknown["error_codes"]);
+    assert_eq!(stable_description(&wrong), stable_description(&unknown));
+    // Same set of keys too: no extra field on either side.
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&wrong), keys(&unknown));
+}
+
+#[tokio::test]
+async fn ropc_unknown_user_audit_row_keeps_no_local_part() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    allow_ropc(&s, &f, true).await;
+    let scope = format!("openid api://{}/Orders.Read", f.api.app_id);
+    ropc(&s, &f, "CorrectHorse-Battery9!", "x", &scope).await;
+    ropc(&s, &f, "nobody@contoso.com", "x", &scope).await;
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT actor, details FROM audit_log WHERE tenant_id = ? AND action = ? ORDER BY id",
+    ))
+    .bind(&f.tenant.id)
+    .bind("auth.sign_in_failed")
+    .fetch_all(&s.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    let (first, second) = (rows[0].1.as_deref().unwrap(), rows[1].1.as_deref().unwrap());
+    assert!(!first.contains("CorrectHorse") && !first.contains("domain"), "{first}");
+    assert!(
+        second.contains(r#""domain":"contoso.com""#) && !second.contains("nobody"),
+        "{second}"
+    );
 }

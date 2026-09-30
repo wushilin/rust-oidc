@@ -130,7 +130,15 @@ async fn failed_sign_ins_and_lockout_are_audited_without_the_password() {
     assert_eq!(failed[0].details["reason"], "bad_password");
     assert_eq!(failed[1].actor, "anonymous");
     assert_eq!(failed[1].details["reason"], "unknown_user");
-    assert_eq!(failed[1].details["upn"], "nobody@contoso.com");
+    // Unknown account: only the domain is kept, never the local part.
+    assert_eq!(failed[1].details["domain"], "contoso.com");
+    assert!(failed[1].details.get("upn").is_none());
+    assert_eq!(
+        failed[0].details["upn"],
+        f.upn.as_str(),
+        "a real account's UPN is safe to log"
+    );
+    assert!(!everything(&s, &f.tenant.id).await.contains("nobody"));
 
     // Push the real account over the lockout threshold, then hit the lock.
     let mut current = unknown;
@@ -319,4 +327,71 @@ async fn device_flow_is_audited_without_the_codes() {
         !log.contains(&device_code) && !log.contains(&user_code),
         "device code leaked"
     );
+}
+
+#[tokio::test]
+async fn unknown_user_value_without_a_domain_is_not_logged() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let b = Browser::new();
+    let (_, challenge) = pkce();
+    let page = b
+        .authorize(&s, &f.tenant.id, &authorize_params(&f, "openid", &challenge))
+        .await;
+    // What a user types when they paste their password into the username box.
+    let typed = "CorrectHorse-Battery9!";
+    let resp = b.login(&page, typed, "whatever").await;
+    assert_eq!(resp.status, 401);
+    let with_junk_at = b.login(&resp, "p@ss word!", "whatever").await;
+    assert_eq!(with_junk_at.status, 401);
+
+    let failed = rows(&s, &f.tenant.id, "auth.sign_in_failed").await;
+    assert_eq!(failed.len(), 2);
+    for row in &failed {
+        assert_eq!(row.actor, "anonymous");
+        assert_eq!(row.details["reason"], "unknown_user");
+        assert!(row.details.get("upn").is_none() && row.details.get("domain").is_none());
+    }
+    let log = everything(&s, &f.tenant.id).await;
+    assert!(
+        !log.contains(typed) && !log.contains("p@ss"),
+        "unknown-user input leaked: {log}"
+    );
+}
+
+/// Strip what legitimately differs between two responses: random tokens and
+/// the echoed username.
+fn normalized(page: &common::Page, csrf: &str, upns: &[&str]) -> String {
+    let mut body = page.body.replace(csrf, "CSRF");
+    for upn in upns {
+        body = body.replace(*upn, "UPN");
+    }
+    body
+}
+
+#[tokio::test]
+async fn unknown_user_and_wrong_password_look_identical_on_the_login_page() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let (_, challenge) = pkce();
+    let start = || async {
+        let b = Browser::new();
+        let page = b
+            .authorize(&s, &f.tenant.id, &authorize_params(&f, "openid", &challenge))
+            .await;
+        (b, page)
+    };
+    let (b1, p1) = start().await;
+    let (b2, p2) = start().await;
+    let wrong = b1.login(&p1, &f.upn, "wrong-password").await;
+    let unknown = b2.login(&p2, "nobody@contoso.com", "wrong-password").await;
+    let upns = [f.upn.as_str(), "nobody@contoso.com"];
+    assert_eq!(wrong.status, unknown.status);
+    let (w, u) = (
+        normalized(&wrong, &wrong.field("csrf").unwrap(), &upns),
+        normalized(&unknown, &unknown.field("csrf").unwrap(), &upns),
+    );
+    assert_eq!(w, u);
+    // The auditing itself must not add anything to the page.
+    assert!(!w.contains("unknown_user") && !w.contains("bad_password"));
 }

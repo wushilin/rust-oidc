@@ -132,6 +132,24 @@ pub enum FoldPolicy {
     ReportOnly,
 }
 
+/// Two rows in one uniqueness scope fold to the same identifier. Typed so the
+/// policy can tell it from a real database failure.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct FoldConflict(pub String);
+
+/// Apply `policy` to the outcome of [`reconcile_folded`]. A [`FoldConflict`] is
+/// tolerated (logged) under `ReportOnly`; every other error propagates under both.
+pub fn apply_fold_policy(policy: FoldPolicy, outcome: anyhow::Result<()>) -> anyhow::Result<()> {
+    match outcome {
+        Err(e) if policy == FoldPolicy::ReportOnly && e.is::<FoldConflict>() => {
+            tracing::error!("identifier folding skipped, data untouched: {e}");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// `connect` with an explicit collision policy.
 pub async fn connect_with(url: &str, policy: FoldPolicy) -> anyhow::Result<DbPool> {
     let engine = Engine::from_url(url)
@@ -172,16 +190,7 @@ pub async fn connect_with(url: &str, policy: FoldPolicy) -> anyhow::Result<DbPoo
         Engine::MySql => sqlx::migrate!("./migrations/mysql"),
     };
     migrator.run(&pool).await?;
-    match policy {
-        FoldPolicy::FailClosed => {
-            reconcile_folded(&pool).await?;
-        }
-        FoldPolicy::ReportOnly => {
-            if let Err(e) = reconcile_folded(&pool).await {
-                tracing::error!("identifier folding skipped, data untouched: {e}");
-            }
-        }
-    }
+    apply_fold_policy(policy, reconcile_folded(&pool).await.map(|_| ()))?;
     Ok(pool)
 }
 
@@ -263,7 +272,7 @@ pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
         }
     }
     if !conflicts.is_empty() {
-        anyhow::bail!(
+        return Err(FoldConflict(format!(
             "refusing to start: {} case-insensitive identity conflict(s) found while normalising \
              identifiers; rows that differ only by case are the same identity.\n{}\n\
              Rename or remove one of the conflicting rows in each group, then restart. \
@@ -271,7 +280,8 @@ pub async fn reconcile_folded(pool: &DbPool) -> anyhow::Result<usize> {
              (`sqlite3`, `psql` or `mysql`). No data was modified.",
             conflicts.len(),
             conflicts.join("\n"),
-        );
+        ))
+        .into());
     }
 
     // One transaction so a failure part-way leaves nothing half-rewritten.

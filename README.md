@@ -5,17 +5,18 @@ the same endpoint layout, token claims, error format and client-secret semantics
 written for Entra should work with configuration changes only. Storage is SQLite by default (PostgreSQL and MySQL are also supported, see [docs/databases.md](docs/databases.md)), and
 tenants (realms) are built in.
 
-**Status: phase 2.** Done:
+**Status: phase 5.** Done:
 - Tenants, app registrations, service principals, app roles and signing keys.
 - Service-account tokens (`client_credentials`).
 - Interactive sign-in: authorize and login page, auth code + PKCE, ID tokens, refresh
   tokens, UserInfo and logout.
+- Implicit and hybrid response types, the device authorization grant, on-behalf-of,
+  certificate client authentication (`private_key_jwt`), rate limiting and an audit trail.
+- The **admin console** (web UI at `/rust-oidc/admin`), covering tenants, users, groups,
+  applications, assignments, console roles, tenant settings, signing keys and the audit
+  log.
 
-The **admin console** (web UI at `/rust-oidc/admin`) has its first pass: sign-in, the
-tenant list, assume-tenant for a platform administrator, a read-only view of who holds
-which role, and the users section (list, search, create, edit, enable/disable, reset
-password, delete), plus granting and revoking console roles per tenant. Groups,
-applications and assignments are still command-line only. TOTP MFA does not exist.
+TOTP MFA does not exist, and is the one administrative area with no page.
 
 ## Quick start
 
@@ -142,7 +143,9 @@ compat/run.sh       # MSAL Python (app + user), MSAL Node, openid-client (certif
 ## Admin console
 
 `/rust-oidc/admin`, server-rendered, no JavaScript. Sign in with an account that holds a
-console role; a user with none is told so rather than shown an error.
+console role; a user with none is told so rather than shown an error. Everything below is
+web-only: there is no CLI equivalent for the pages marked *new*, and several have none at
+all (tenant settings, group membership, audit).
 
 - **Who can do what** is a role (which carries actions) granted at a scope (`all`, or a
   list of tenants). A tenant administrator sees only the tenants they are bound to, and
@@ -150,11 +153,33 @@ console role; a user with none is told so rather than shown an error.
 - **A platform administrator can assume a tenant** and act as its administrator. Every
   action stays attributable to them personally in `audit_log`; the assume itself is
   recorded.
-- **Granting a role**: `/rust-oidc/admin/tenants/{tenant}/roles` grants a role to a user
-  or a group of that tenant, scoped to the tenant or -- only for someone who already holds
-  the action everywhere -- to every tenant. Revoking is refused if it would leave the
-  platform with no administrator. `/rust-oidc/admin/bindings` lists every binding on the
-  deployment, read-only, for a platform administrator.
+
+| Page | What it does | Action required |
+|---|---|---|
+| `/admin/tenants` | List; create, rename, enable/disable, add and withdraw verified domains | `Tenant:Read`; writes need `Tenant:Create`/`Tenant:Write` **at `all` scope** |
+| `/admin/tenants/{tenant}/users` | List, search, create, edit, enable/disable, reset password, delete | `User:Read`, `User:Write`, `User:Reset` |
+| `/admin/tenants/{tenant}/groups` | List, create, add and remove members | `Group:Read`, `Group:Write` |
+| `/admin/tenants/{tenant}/apps` | Register; secrets, certificates, redirect URIs per platform, Application ID URIs, exposed scopes, app roles, role assignments, and the password-grant and implicit toggles | `App:Read`, `App:Write`; credentials need `App:Rotate`; assignments need `Assignment:Write` |
+| `/admin/tenants/{tenant}/roles` | Grant and revoke console roles | `RoleBinding:Read`, `RoleBinding:Write` |
+| `/admin/tenants/{tenant}/settings` | Token, session and refresh-token lifetimes | `Tenant:Write` |
+| `/admin/tenants/{tenant}/audit` | The tenant's audit log, filtered by action and target | `Audit:Read` |
+| `/admin/keys` | Signing keys, rotate and prune | `Key:Read`, `Key:Rotate`, **at `all` scope** |
+| `/admin/bindings` | Every role binding on the deployment, read-only | `RoleBinding:Read` at `all` scope |
+
+Things worth knowing before using it:
+
+- **A client secret is shown exactly once**, on the page that creates it, because only a
+  SHA-256 hash is stored. It is never put in the audit log. Certificates are uploaded as
+  PEM; a file containing a private key is refused.
+- **Rotating a signing key affects every tenant** — the keys are shared, as in Entra — and
+  the page says so before offering the button.
+- **Granting a role revoke is refused if it would leave the platform with no
+  administrator**, and the root tenant cannot be disabled, for the same reason: there is no
+  CLI to repair either.
+- **Adding somebody to a group can grant them administrative rights**, because a console
+  role binding may name a group.
+- No MFA page (TOTP does not exist), no paging on any list, and app roles and exposed
+  scopes can be added but not removed. See `docs/decisions-log.md`.
 
 ## Deliberate differences from Entra
 

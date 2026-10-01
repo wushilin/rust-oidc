@@ -26,6 +26,63 @@ impl Default for TenantSettings {
     }
 }
 
+impl TenantSettings {
+    /// The bounds the console accepts. **Every one of these is invented**: Entra
+    /// publishes no equivalent range for v2.0 (its configurable token lifetimes
+    /// were retired), so these are chosen to exclude the values that would be
+    /// obviously wrong rather than to match a documented limit. They are recorded
+    /// in `docs/decisions-log.md`.
+    ///
+    /// Five minutes is the shortest access token a client can plausibly use
+    /// across a clock skew allowance; a day is the longest that is still a
+    /// short-lived credential.
+    pub const MIN_ACCESS_TOKEN_SECS: i64 = 300;
+    pub const MAX_ACCESS_TOKEN_SECS: i64 = 86_400;
+    /// A browser session: five minutes to thirty days.
+    pub const MIN_SESSION_SECS: i64 = 300;
+    pub const MAX_SESSION_SECS: i64 = 30 * 86_400;
+    /// A refresh token's inactivity window: an hour to a year. Entra's default is
+    /// ninety days, which is this type's default.
+    pub const MIN_REFRESH_SECS: i64 = 3_600;
+    pub const MAX_REFRESH_SECS: i64 = 365 * 86_400;
+
+    /// Refuse a combination that cannot work, rather than storing it and issuing
+    /// tokens nobody can use.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let range = |what: &str, value: i64, lo: i64, hi: i64| -> anyhow::Result<()> {
+            if (lo..=hi).contains(&value) {
+                Ok(())
+            } else {
+                bail!("{what} must be between {lo} and {hi} seconds")
+            }
+        };
+        range(
+            "the access token lifetime",
+            self.access_token_lifetime_secs,
+            Self::MIN_ACCESS_TOKEN_SECS,
+            Self::MAX_ACCESS_TOKEN_SECS,
+        )?;
+        range(
+            "the session lifetime",
+            self.session_lifetime_secs,
+            Self::MIN_SESSION_SECS,
+            Self::MAX_SESSION_SECS,
+        )?;
+        range(
+            "the refresh token lifetime",
+            self.refresh_token_lifetime_secs,
+            Self::MIN_REFRESH_SECS,
+            Self::MAX_REFRESH_SECS,
+        )?;
+        // A refresh token that expires before the access token it mints is a
+        // credential with nothing to refresh.
+        if self.refresh_token_lifetime_secs < self.access_token_lifetime_secs {
+            bail!("the refresh token lifetime must not be shorter than the access token lifetime");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Tenant {
     pub id: String,
@@ -226,5 +283,156 @@ pub async fn find_for_admin(pool: &DbPool, key: &str) -> anyhow::Result<Tenant> 
     match row {
         Some(r) => Ok(r.into()),
         None => bail!("tenant '{key}' not found"),
+    }
+}
+
+/// Replace a tenant's settings. The first write path for [`TenantSettings`],
+/// which until now was only ever read: a tenant has carried whatever
+/// [`TenantSettings::default`] produced at `create`.
+///
+/// Validated before it is stored, so a tenant cannot hold a combination the
+/// console would refuse to show.
+pub async fn save_settings(pool: &DbPool, tenant_id: &str, settings: &TenantSettings) -> anyhow::Result<()> {
+    settings.validate()?;
+    sqlx::query(crate::db::q(pool, "UPDATE tenants SET settings = ? WHERE id = ?"))
+        .bind(serde_json::to_string(settings)?)
+        .bind(tenant_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Rename a tenant. The display name only: the id and the verified domains are
+/// what anything else refers to, so a rename breaks nothing.
+pub async fn set_name(pool: &DbPool, tenant_id: &str, name: &str) -> anyhow::Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("a tenant needs a name");
+    }
+    sqlx::query(crate::db::q(pool, "UPDATE tenants SET name = ? WHERE id = ?"))
+        .bind(name)
+        .bind(tenant_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Enable or disable a tenant. A disabled tenant does not [`resolve`], so every
+/// OIDC endpoint and every console page addressed by it stops answering.
+///
+/// **The root tenant cannot be disabled.** Its administrators are the ones who
+/// could re-enable anything, their console session is dropped the moment their
+/// home tenant stops resolving, and there is no CLI command to undo it -- the
+/// admin surface is deliberately web-only. So disabling it would lock every
+/// administrator out of the deployment with no path back short of editing the
+/// database by hand. The same shape of rule as `admin::authz::check_delete`.
+pub async fn set_enabled(pool: &DbPool, tenant_id: &str, enabled: bool) -> anyhow::Result<()> {
+    let tenant = find_for_admin(pool, tenant_id).await?;
+    if !enabled && tenant.is_root {
+        bail!(
+            "the root tenant cannot be disabled: it holds the administrators who would \
+             have to re-enable it, and nothing outside the database could undo it"
+        );
+    }
+    sqlx::query(crate::db::q(pool, "UPDATE tenants SET enabled = ? WHERE id = ?"))
+        .bind(enabled)
+        .bind(&tenant.id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Withdraw a verified domain.
+///
+/// Three refusals, each because the alternative is an identity that silently
+/// stops working:
+/// - a domain this tenant does not hold (it may be another tenant's);
+/// - the tenant's last domain, which would leave it with no UPN suffix at all;
+/// - a domain still used by a live account's UPN. Such an account could still be
+///   authenticated through its own tenant, but the console's sign-in resolves the
+///   tenant *from the UPN's domain*, so it could no longer sign in there.
+pub async fn remove_domain(pool: &DbPool, tenant_id: &str, domain: &str) -> anyhow::Result<()> {
+    let domain = normalize_domain(domain)?;
+    let held = domains(pool, tenant_id).await?;
+    let Some(stored) = held.iter().find(|d| fold(d) == domain) else {
+        bail!("'{domain}' is not a verified domain of this tenant");
+    };
+    if held.len() <= 1 {
+        bail!("a tenant must keep at least one verified domain");
+    }
+    // `normalize_domain` admits only letters, digits, '-' and '.', so the pattern
+    // can hold no LIKE wildcard.
+    let (in_use,): (i64,) = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT COUNT(*) FROM users WHERE tenant_id = ? AND deleted_at IS NULL AND upn_folded LIKE ?",
+    ))
+    .bind(tenant_id)
+    .bind(format!("%@{domain}"))
+    .fetch_one(pool)
+    .await?;
+    if in_use > 0 {
+        bail!("{in_use} account(s) still use '{domain}' in their user name");
+    }
+    sqlx::query(crate::db::q(
+        pool,
+        "DELETE FROM tenant_domains WHERE tenant_id = ? AND domain_folded = ?",
+    ))
+    .bind(tenant_id)
+    .bind(fold(stored))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_settings_are_within_their_own_bounds() {
+        TenantSettings::default().validate().unwrap();
+    }
+
+    #[test]
+    fn a_lifetime_outside_its_bounds_is_refused() {
+        let refused = [
+            TenantSettings {
+                access_token_lifetime_secs: TenantSettings::MIN_ACCESS_TOKEN_SECS - 1,
+                ..Default::default()
+            },
+            TenantSettings {
+                access_token_lifetime_secs: TenantSettings::MAX_ACCESS_TOKEN_SECS + 1,
+                ..Default::default()
+            },
+            TenantSettings {
+                session_lifetime_secs: 0,
+                ..Default::default()
+            },
+            TenantSettings {
+                session_lifetime_secs: TenantSettings::MAX_SESSION_SECS + 1,
+                ..Default::default()
+            },
+            TenantSettings {
+                refresh_token_lifetime_secs: TenantSettings::MIN_REFRESH_SECS - 1,
+                ..Default::default()
+            },
+            TenantSettings {
+                refresh_token_lifetime_secs: TenantSettings::MAX_REFRESH_SECS + 1,
+                ..Default::default()
+            },
+        ];
+        for s in refused {
+            assert!(s.validate().is_err(), "{s:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_refresh_token_shorter_than_the_access_token_it_mints_is_refused() {
+        let s = TenantSettings {
+            access_token_lifetime_secs: 7_200,
+            session_lifetime_secs: 86_400,
+            refresh_token_lifetime_secs: 3_600,
+        };
+        assert!(s.validate().is_err());
     }
 }

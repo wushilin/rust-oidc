@@ -350,3 +350,46 @@ pub async fn prune(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
     .await?;
     Ok(res.rows_affected())
 }
+
+/// A signing key as the console lists it: no key material, only the lifecycle.
+pub struct StoredKey {
+    pub kid: String,
+    pub status: KeyStatus,
+    pub created_at: i64,
+    /// When `active` became `retired`; `None` for a key that never has.
+    pub retired_at: Option<i64>,
+    /// Expiry of the self-signed certificate wrapping the key.
+    pub not_after: i64,
+}
+
+/// Every signing key, active first, as `rust-oidc key list` prints them.
+///
+/// An unknown status is an error rather than a skipped row, exactly as in
+/// [`load_keys`]: such a key is published in JWKS but cannot be classified, and
+/// hiding it from the page that decides whether to rotate would be the wrong
+/// direction. In practice it cannot happen -- the schema has a CHECK constraint
+/// and `load_keys` would already have stopped the server from signing.
+pub async fn list(pool: &DbPool) -> anyhow::Result<Vec<StoredKey>> {
+    let rows: Vec<(String, String, i64, Option<i64>, i64)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT kid, status, created_at, retired_at, not_after FROM signing_keys
+         ORDER BY CASE status WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END, created_at DESC",
+    ))
+    .bind(KeyStatus::Active.as_str())
+    .bind(KeyStatus::Next.as_str())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(kid, status, created_at, retired_at, not_after)| {
+            let parsed = KeyStatus::parse(&status)
+                .ok_or_else(|| anyhow!("signing key {kid} has an unknown status {status:?}"))?;
+            Ok(StoredKey {
+                kid,
+                status: parsed,
+                created_at,
+                retired_at,
+                not_after,
+            })
+        })
+        .collect()
+}

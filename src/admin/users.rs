@@ -368,14 +368,30 @@ async fn detail(
                 .map(|n| format!(r#"<span class="pill">{}</span>"#, e(n)))
                 .collect()
         };
-        format!(r#"<h2>Groups</h2><p>{pills}</p><p class="muted">Editing group membership is not built yet.</p>"#)
+        format!(
+            r#"<h2>Groups</h2><p>{pills}</p>
+<p class="muted">Membership is edited on the group's own page, under Groups.</p>"#
+        )
+    } else {
+        String::new()
+    };
+
+    // The `(target)` index on `audit_log` exists for exactly this question, so
+    // the page that can answer it is linked from the person it is about.
+    let history = if ctx.can_in(crate::admin::AUDIT_READ, tenant) {
+        format!(
+            r#"<h2>History</h2><p><a href="{base}/admin/tenants/{tid}/audit?target={id}">Audit entries about this account</a></p>"#,
+            base = e(base),
+            tid = e(&tenant.id),
+            id = e(&user.id),
+        )
     } else {
         String::new()
     };
 
     let body = format!(
         r#"<h1>{upn}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
-<h2>Attributes</h2>{attributes}{state}{reset}{groups}"#,
+<h2>Attributes</h2>{attributes}{state}{reset}{groups}{history}"#,
         upn = e(&user.upn),
         tenant_name = e(&tenant.name),
         id = e(&user.id),

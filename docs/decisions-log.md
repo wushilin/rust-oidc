@@ -499,11 +499,172 @@ administrator" means and is yours to decide, not mine. See open question E.
 *To work around it today:* grant that account `GlobalAdministrator` at `all` scope the
 way `bootstrap` does.
 
-**67. What the console does not have yet**, so nobody reads the branch as finished:
-no MFA section (deliberately skipped -- TOTP does not exist and is blocked on question
-B), no groups, applications, assignments, domains, tenant-settings or signing-key pages,
-no role-binding writes, no paging, and no tenant create or disable. The authorization
-layer underneath all of them is built and tested; these are pages.
+**67. What the console did not have yet** when the first pass landed: no MFA section
+(deliberately skipped -- TOTP does not exist and is blocked on question B), no groups,
+applications, assignments, domains, tenant-settings or signing-key pages, no role-binding
+writes, no paging, and no tenant create or disable. **Superseded by decision 88**: all of
+those except MFA, assignment-required and paging are now built. Kept for the record
+because it is what the branch claimed at that commit.
+
+---
+
+## Admin console: the remaining sections (applications, tenants, settings, keys, groups, audit)
+
+**71. Every console write gets its own `admin.*` audit action, 26 of them**, rather than
+reusing the CLI's `app.secret.add`, `tenant.create` and so on. The precedent was already
+set by `admin.sign_in` against `auth.sign_in` (decision 59's neighbourhood): the actor of
+a console action is a named person acting through a browser, and the actor of a CLI action
+is an operator who already has database access. Keeping them apart means "what did people
+do in the console" is one query. *The cost:* `Event` now has 74 variants and
+`tests/audit_vocabulary.rs` pins every one by hand, so adding a page means adding a line
+there too -- which is the point.
+*To reverse:* collapse the `Admin*` variants onto the CLI ones; the actor column still
+distinguishes them, less legibly.
+
+**72. The tenants section is authorized at platform scope, which is stricter than the
+spec.** The design spec's action table has `Tenant:Write` cover "settings and domains"
+wherever the binding reaches, so a tenant's own Global Administrator would qualify. The
+console instead requires an `all`-scope binding for create, rename, enable, disable and
+both domain operations. Three reasons, in order of weight: disabling a tenant is
+**unrecoverable from the console** by the person who did it (their own session dies with
+their home tenant, and there is no CLI); the tenant list is a platform page by shape, not
+a page inside one tenant; and a route with no `{tenant}` segment has no scope comparison
+for a URL alias to reach at all. Being stricter than the agreed model is the safe
+direction, but it *is* a divergence and it is yours to confirm.
+*To reverse:* change `On::Platform` to `On::Tenant` in `src/admin/tenants.rs` -- but the
+route then needs a `{tenant}` segment, and a disabled tenant cannot be addressed by one
+(`tenant::resolve` refuses it), so re-enabling would become impossible from the web.
+
+**73. Tenant *settings* are the exception: they are authorized per tenant.**
+`Tenant:Write` against the tenant in the URL, which is the spec's own wording for that
+action. So a tenant's Global Administrator can tune their own lifetimes and a platform
+administrator can tune anyone's, because an `all`-scope binding covers every tenant. The
+line between this and decision 72 is that lifetimes are configuration *inside* a tenant,
+while existence, name and domains are facts *about* one.
+
+**74. The lifetime bounds are invented.** Entra retired configurable token lifetimes for
+v2.0, so there is no published range to copy. Access token 300..86 400 s, browser session
+300..2 592 000 s, refresh token 3 600..31 536 000 s, plus a cross-field rule: a refresh
+token must not be shorter than the access token it mints. They are chosen to exclude what
+is obviously wrong rather than to match a documented limit, and they live on
+`TenantSettings` next to the values. This is the **first write path those settings have
+ever had** -- until now every tenant carried whatever `TenantSettings::default` produced
+at `create`, and there was no CLI command either.
+*To reverse:* widen the constants in `src/tenant.rs`; `save_settings` validates in one
+place, so nothing else changes.
+
+**75. The root tenant cannot be disabled.** Same shape of rule as
+`authz::check_delete`'s no-lock-out: the root tenant holds the administrators who would
+have to re-enable it, an administrator's console session is dropped the moment their home
+tenant stops resolving, and the admin surface is deliberately web-only. Disabling it would
+lock every administrator out of the deployment with no path back short of editing the
+database by hand. The button is not offered for it either, not only refused.
+
+**76. A verified domain cannot be withdrawn if it is the tenant's last, or if a live
+account's user name still uses it.** The second refusal is the less obvious one: such an
+account could still be authenticated through its own tenant, but the console's sign-in
+resolves the tenant *from the UPN's domain*, so withdrawing it would quietly lock that
+person out of the console. **What is not enforced:** nothing stops withdrawing the
+`is_default` domain while another remains, which leaves the tenant with no default. No
+code reads `is_default` except the ordering of the domain list, and there is no way to
+*change* the default, so refusing it would make the first domain permanently
+unremovable -- a worse trade.
+
+**77. A new client secret is returned in a `200` page, the one deliberate exception to
+decision 58's "a form post answers 303".** Only a SHA-256 hash is stored, so the response
+that creates the secret is the only place its value can ever exist; a redirect would throw
+it away. The consequence is accepted rather than hidden: a browser reload will offer to
+repost and would mint a *second* secret, which is untidy but harmless (both are valid, and
+either can be deleted). The value is not written into any form field on that page, is
+never re-rendered afterwards, and never reaches `audit_log` -- the row carries the key id
+and the expiry. `tests/admin_apps.rs` holds all four halves of that, and a teeth check
+confirmed the audit assertion catches a leak.
+*The alternative I rejected:* holding the value in the session row so a redirect could
+show it. That stores a live credential at rest to save one reload warning.
+
+**78. Pruning signing keys is authorized by `Key:Rotate`, because there is no
+`Key:Prune`.** Rotation and pruning are two halves of one lifecycle and only
+`PlatformAdministrator` holds either. Adding a verb would mean widening a role to hold it,
+which is not a change to make quietly. **Surfaced rather than done.**
+
+**79. A console key rotation is recorded against the administrator's home tenant, not
+against no tenant.** The CLI's `key rotate` writes `tenant_id = NULL`, which is honest --
+the keys belong to no tenant -- but the audit page filters by `tenant_id`, so a
+tenant-less row is invisible to everybody. Attributing it to the tenant of the person who
+did it keeps the one console action with platform-wide effect visible *somewhere*. The
+actor is the person either way.
+*To reverse:* pass `None` and add a platform audit page that can show tenant-less rows.
+
+**80. The audit page shows the newest 100 matching rows and does not page.** **100 is
+invented**, and smaller than the user list's 200 (decision 63) because audit rows are
+much wider. The table is append-only, unbounded, and *unauthenticated requests append to
+it* -- a failed client authentication is an event -- so an uncapped page is a denial of
+service against the administrator's own browser. The filters are the three indexes `0009`
+added for exactly this page, and the four query shapes are spelled out as separate
+literals rather than assembled, because `db::sql_stmt` takes a `&'static str` (that is
+what makes its SQL-safety assertion sound) and because an `OR`-based "no filter" trick
+would stop the planner using those indexes.
+
+**81. The audit page shows actors and targets as the identifiers they are**, not resolved
+to names. Resolving would mean a query per row, up to 100 of them, and a row whose subject
+has since been deleted would then read as though it had been about nobody. The user detail
+page links to `audit?target={object id}` instead, which is what the `(target)` index is
+for.
+
+**82. The audit page does not show rows belonging to no tenant.** Today that is only the
+CLI's `key rotate`. Showing them would mean deciding whose page they belong on; the page
+says plainly that they are not there.
+
+**83. App roles and exposed scopes can be added from the console but not removed or
+disabled.** Deleting an `app_roles` row cascades to every `app_role_assignments` row that
+references it, so one click would silently revoke access for everybody holding that role,
+and `app_scopes` has the same shape. Entra makes you disable a role before deleting it; we
+have an `enabled` column and no write path for it. **Not built**, and the page does not
+pretend otherwise.
+*To do it properly:* add `set_enabled` for both, then a delete that refuses while
+assignments exist.
+
+**84. An application must keep at least one Application ID URI.** `api://{appId}` is how a
+scope names the application as a resource, so a registration with none could no longer be
+asked for a token by name. Entra enforces nothing here; we do, because the alternative is
+a registration that silently stops working.
+
+**85. An unrecognised stored `app_scopes.type` is displayed as "unknown", not as `User`.**
+The same fail-closed direction decision 42 took for `app_redirect_uris.platform`: who may
+consent is a security property, and `User` is the weaker of the two values.
+
+**86. `keys::list` fails on a key whose status it cannot parse**, rather than skipping the
+row the way `apps::redirect_uris` does. Opposite direction to decision 42 and deliberately
+so: a skipped redirect URI fails closed (it matches nothing), but a skipped signing key
+would hide a key that *is* published in JWKS from the page that decides whether to rotate.
+It cannot happen in practice -- the schema has a CHECK constraint and `load_keys` would
+already have stopped the server signing.
+
+**87. The isolation tests are written against the rendered table, not the whole page, and
+that was a real trap rather than a tidiness point.** The audit page's filter `<select>`
+necessarily names every action this build knows, and its search box echoes back whatever
+was typed into it. A first version of those tests asserted over `page.body`: the
+"newest first" assertion then compared positions inside the `<option>` list and failed,
+and `!body.contains("fabrikam-secret")` failed on the administrator's *own* search term
+coming back. Both would have been easy to "fix" by weakening the assertion into something
+that proved nothing. The helper now extracts `<table>...</table>` and the absence
+assertions are made there.
+
+**88. What the console still does not have**, replacing decision 67: no MFA section (still
+blocked on question B), no `appRoleAssignmentRequired` toggle (the CLI's
+`app assignment-required` has no page), no removal or disabling of app roles and scopes
+(decision 83), no paging anywhere (decisions 63 and 80), no platform-wide audit page
+(decision 82), no way to change a tenant's default domain (decision 76), and no break-glass
+path if the signing keys or the root tenant are broken. Everything else the CLI can do to
+tenants, users, groups, applications, assignments and keys now has a page.
+
+**89. A teeth check that did *not* bite, reported rather than buried.** Breaking the
+tenant scoping inside `groups::find_by_id` -- the defence-in-depth layer -- left the groups
+isolation test passing, because `AdminContext::require` refuses the request before the
+lookup runs. That is the layering working as intended, but it meant the second layer was
+untested, so `a_group_lookup_is_scoped_to_its_tenant_whatever_the_id` now tests it
+directly, and that test does fail when the scoping is broken. The same is true of the
+tenant id in every other domain function's `WHERE`: the gate is what the HTTP tests prove.
 
 ---
 

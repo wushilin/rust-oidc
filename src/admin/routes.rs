@@ -1,5 +1,6 @@
-//! The console's routes: sign-in, the tenant list, assume/leave, and the
-//! platform's role bindings. The user pages live in [`crate::admin::users`].
+//! The console's routes: the router, the chrome around every page, sign-in,
+//! assume/leave and the platform's role bindings. Each section lives in its own
+//! module beside this one; this module holds only what is common to all of them.
 //!
 //! Every handler has the same shape: take an [`AdminContext`], `require` one
 //! action, check the CSRF token on a write, do the work through a domain module,
@@ -21,7 +22,11 @@ use crate::admin::context::{AdminContext, On};
 use crate::admin::session;
 use crate::admin::users as user_pages;
 use crate::admin::view::{self, Chrome, Nav, e};
-use crate::admin::{BINDING_READ, TENANT_ASSUME, TENANT_READ, USER_READ};
+use crate::admin::{
+    APP_READ, AUDIT_READ, BINDING_READ, GROUP_READ, KEY_READ, TENANT_ASSUME, TENANT_READ, TENANT_WRITE, USER_READ,
+};
+use crate::admin::{apps as app_pages, audit as audit_pages, groups as group_pages};
+use crate::admin::{keys as key_pages, settings as settings_pages, tenants as tenant_pages};
 use crate::db::{Actor, Event};
 use crate::rbac::{Scope, ScopeKind};
 use crate::routes::audit::{self, Channel, SignInReason};
@@ -55,15 +60,15 @@ pub fn router() -> Router<AppState> {
         .route("/admin", get(index))
         .route("/admin/signin", post(signin))
         .route("/admin/signout", post(signout))
-        .route("/admin/tenants", get(tenants))
+        // Platform pages. No `{tenant}` segment: a platform-scope grant covers
+        // every tenant, so there is no scope comparison for a URL key to reach.
+        .route("/admin/tenants", get(tenant_pages::page).post(tenant_pages::post))
+        .route("/admin/keys", get(key_pages::page).post(key_pages::post))
         .route("/admin/bindings", get(bindings_page))
         .route("/admin/assume/{tenant}", post(assume))
         .route("/admin/leave", post(leave))
+        // One tenant's sections.
         .route("/admin/tenants/{tenant}/users", get(user_pages::list_page))
-        .route(
-            "/admin/tenants/{tenant}/roles",
-            get(crate::admin::roles::page).post(crate::admin::roles::post),
-        )
         .route(
             "/admin/tenants/{tenant}/users/new",
             get(user_pages::new_page).post(user_pages::create_user),
@@ -72,6 +77,31 @@ pub fn router() -> Router<AppState> {
             "/admin/tenants/{tenant}/users/{user}",
             get(user_pages::detail_page).post(user_pages::detail_post),
         )
+        .route(
+            "/admin/tenants/{tenant}/groups",
+            get(group_pages::list_page).post(group_pages::create_group),
+        )
+        .route(
+            "/admin/tenants/{tenant}/groups/{group}",
+            get(group_pages::detail_page).post(group_pages::detail_post),
+        )
+        .route(
+            "/admin/tenants/{tenant}/apps",
+            get(app_pages::list_page).post(app_pages::create_app),
+        )
+        .route(
+            "/admin/tenants/{tenant}/apps/{app}",
+            get(app_pages::detail_page).post(app_pages::detail_post),
+        )
+        .route(
+            "/admin/tenants/{tenant}/roles",
+            get(crate::admin::roles::page).post(crate::admin::roles::post),
+        )
+        .route(
+            "/admin/tenants/{tenant}/settings",
+            get(settings_pages::page).post(settings_pages::post),
+        )
+        .route("/admin/tenants/{tenant}/audit", get(audit_pages::page))
 }
 
 /// The chrome for a page: who is signed in, the assumed-tenant banner, and a nav
@@ -86,16 +116,28 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext) -> Chrome<'a> {
             href: format!("{base}/admin/tenants"),
         });
     }
-    if ctx.can_in(USER_READ, here) {
-        nav.push(Nav {
-            label: "Users".into(),
-            href: format!("{base}/admin/tenants/{}/users", here.id),
-        });
+    // One entry per tenant section, each offered only where the action behind it
+    // is permitted, in the order the sections are usually worked in.
+    for (action, label, path) in [
+        (USER_READ, "Users", "users"),
+        (GROUP_READ, "Groups", "groups"),
+        (APP_READ, "Applications", "apps"),
+        (BINDING_READ, "Roles", "roles"),
+        (TENANT_WRITE, "Tenant settings", "settings"),
+        (AUDIT_READ, "Audit log", "audit"),
+    ] {
+        if ctx.can_in(action, here) {
+            nav.push(Nav {
+                label: label.into(),
+                href: format!("{base}/admin/tenants/{}/{path}", here.id),
+            });
+        }
     }
-    if ctx.can_in(BINDING_READ, here) {
+    // Platform-wide entries: an `all`-scope binding, not a grant in this tenant.
+    if ctx.can(KEY_READ, On::Platform) {
         nav.push(Nav {
-            label: "Roles".into(),
-            href: format!("{base}/admin/tenants/{}/roles", here.id),
+            label: "Signing keys".into(),
+            href: format!("{base}/admin/keys"),
         });
     }
     if ctx.can(BINDING_READ, On::Platform) {
@@ -312,69 +354,7 @@ async fn signout(ctx: AdminContext, State(st): State<AppState>, headers: HeaderM
     resp
 }
 
-// ---- tenants ----
-
-async fn tenants(ctx: AdminContext, State(st): State<AppState>) -> Response {
-    let all = match tenant::list(&st.pool).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("tenant list failed: {e}");
-            return view::server_error();
-        }
-    };
-    let base = st.public_url.base();
-    let may_assume = ctx.can(TENANT_ASSUME, On::Platform);
-    // A tenant this administrator cannot read is not listed at all: the console
-    // must not be a directory of tenants for a delegated admin.
-    let rows: String = all
-        .iter()
-        .filter(|(t, _)| ctx.can_in(TENANT_READ, t))
-        .map(|(t, domains)| {
-            let mut links = Vec::new();
-            if ctx.can_in(USER_READ, t) {
-                links.push(format!(
-                    r#"<a href="{base}/admin/tenants/{id}/users">Users</a>"#,
-                    base = e(base),
-                    id = e(&t.id)
-                ));
-            }
-            if ctx.can_in(BINDING_READ, t) {
-                links.push(format!(
-                    r#"<a href="{base}/admin/tenants/{id}/roles">Roles</a>"#,
-                    base = e(base),
-                    id = e(&t.id)
-                ));
-            }
-            if may_assume && ctx.acting_tenant.as_ref().is_none_or(|a| a.id != t.id) {
-                links.push(format!(
-                    r#"<form method="post" action="{base}/admin/assume/{id}" class="inline">{csrf}<button class="secondary" type="submit">Assume</button></form>"#,
-                    base = e(base),
-                    id = e(&t.id),
-                    csrf = view::csrf_input(&ctx.csrf),
-                ));
-            }
-            format!(
-                "<tr><td>{name}{root}</td><td class=\"muted\">{id}</td><td>{domains}</td><td>{links}</td></tr>",
-                name = e(&t.name),
-                root = if t.is_root { r#" <span class="pill">root</span>"# } else { "" },
-                id = e(&t.id),
-                domains = domains.iter().map(|d| format!(r#"<span class="pill">{}</span>"#, e(d))).collect::<String>(),
-                links = links.join(" "),
-            )
-        })
-        .collect();
-    let body = if rows.is_empty() {
-        r#"<h1>Tenants</h1><p class="sub">No tenant is listed for you. Your roles may still cover the
-people and objects inside one -- the links above go where they reach.</p>"#
-            .to_string()
-    } else {
-        format!(
-            r#"<h1>Tenants</h1><p class="sub">The tenants your roles cover.</p>
-<table><tr><th>Name</th><th>Tenant id</th><th>Domains</th><th></th></tr>{rows}</table>"#
-        )
-    };
-    view::page(&chrome(&st, &ctx), StatusCode::OK, "Tenants", &body)
-}
+// ---- assume and leave ----
 
 async fn assume(ctx: AdminContext, State(st): State<AppState>, Path(key): Path<String>, body: Bytes) -> Response {
     // Authorization first: an administrator who may not assume learns nothing

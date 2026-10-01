@@ -1006,3 +1006,218 @@ pub async fn remove_key_credential(pool: &DbPool, app: &Application, key_id: &st
     .await?;
     Ok(done.rows_affected() > 0)
 }
+
+// ---- reading back what is registered (the console's pages) ----
+
+/// A registered client secret, **without** the secret itself: only the hint,
+/// which is the first three characters, exactly as Entra shows it. The value
+/// exists once, in the response that created it, and nowhere else.
+#[derive(FromRow)]
+pub struct StoredSecret {
+    pub key_id: String,
+    pub display_name: Option<String>,
+    pub hint: String,
+    pub start_at: i64,
+    pub end_at: i64,
+}
+
+impl StoredSecret {
+    pub fn is_current(&self, at: i64) -> bool {
+        self.start_at <= at && at < self.end_at
+    }
+}
+
+pub async fn secrets(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<StoredSecret>> {
+    Ok(sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT key_id, display_name, hint, start_at, end_at FROM app_secrets
+         WHERE application_id = ? ORDER BY created_at",
+    ))
+    .bind(&app.id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// An exposed delegated permission. `consent` is `None` when the stored value is
+/// one this build does not know, which is the same fail-closed direction
+/// [`RedirectPlatform::parse`] takes: an unknown consent type is displayed as
+/// unknown rather than quietly shown as `User`.
+pub struct StoredScope {
+    pub id: String,
+    pub value: String,
+    pub display_name: String,
+    pub consent: Option<ScopeConsent>,
+    pub enabled: bool,
+}
+
+#[derive(FromRow)]
+struct ScopeRow {
+    id: String,
+    value: String,
+    display_name: String,
+    #[sqlx(rename = "type")]
+    consent: String,
+    #[sqlx(try_from = "crate::db::Flag")]
+    enabled: bool,
+}
+
+pub async fn scopes(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<StoredScope>> {
+    let rows: Vec<ScopeRow> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, value, display_name, type, enabled FROM app_scopes
+         WHERE application_id = ? ORDER BY value",
+    ))
+    .bind(&app.id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| StoredScope {
+            id: r.id,
+            value: r.value,
+            display_name: r.display_name,
+            consent: ScopeConsent::parse(&r.consent),
+            enabled: r.enabled,
+        })
+        .collect())
+}
+
+/// Remove a registered redirect URI. `false` when it was not registered under
+/// that platform, so the caller can say so rather than report a silent success.
+pub async fn remove_redirect_uri(
+    pool: &DbPool,
+    app: &Application,
+    platform: RedirectPlatform,
+    uri: &str,
+) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::q(
+        pool,
+        "DELETE FROM app_redirect_uris WHERE application_id = ? AND platform = ? AND uri = ?",
+    ))
+    .bind(&app.id)
+    .bind(platform.as_str())
+    .bind(uri)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Remove an Application ID URI.
+///
+/// The last one is refused: `api://{appId}` is how a scope names this app as a
+/// resource, so an application with no identifier URI could no longer be asked
+/// for a token by name. Entra enforces nothing here; we do, because the
+/// alternative is a registration that silently stops working.
+pub async fn remove_identifier_uri(pool: &DbPool, app: &Application, uri: &str) -> anyhow::Result<()> {
+    let registered = identifier_uris(pool, app).await?;
+    if !registered.iter().any(|u| u == uri) {
+        bail!("identifier URI '{uri}' is not registered on this application");
+    }
+    if registered.len() <= 1 {
+        bail!("an application must keep at least one Application ID URI");
+    }
+    sqlx::query(crate::db::q(
+        pool,
+        "DELETE FROM app_identifier_uris WHERE application_id = ? AND tenant_id = ? AND uri = ?",
+    ))
+    .bind(&app.id)
+    .bind(&app.tenant_id)
+    .bind(uri)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One app-role assignment on a resource, with the principal named rather than
+/// only identified: a page showing raw object ids is not usable.
+pub struct StoredAssignment {
+    pub id: String,
+    pub role_value: String,
+    pub principal_type: PrincipalType,
+    pub principal_id: String,
+    /// UPN, group name or application display name; the id when the principal
+    /// has since been removed.
+    pub principal_name: String,
+}
+
+/// Every app-role assignment on `resource`'s service principal in `tenant_id`.
+pub async fn role_assignments(
+    pool: &DbPool,
+    tenant_id: &str,
+    resource: &Application,
+) -> anyhow::Result<Vec<StoredAssignment>> {
+    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+        return Ok(Vec::new());
+    };
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT a.id, r.value, a.principal_type, a.principal_id FROM app_role_assignments a
+         JOIN app_roles r ON r.id = a.app_role_id
+         WHERE a.tenant_id = ? AND a.resource_id = ? ORDER BY r.value",
+    ))
+    .bind(tenant_id)
+    .bind(&sp.id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for (id, role_value, principal_type, principal_id) in rows {
+        // A principal type this build does not know is skipped rather than shown
+        // with a guessed kind: the row grants nothing we can describe.
+        let Some(principal_type) = PrincipalType::parse(&principal_type) else {
+            continue;
+        };
+        let principal_name = principal_name(pool, principal_type, &principal_id).await;
+        out.push(StoredAssignment {
+            id,
+            role_value,
+            principal_type,
+            principal_id,
+            principal_name,
+        });
+    }
+    Ok(out)
+}
+
+/// The display name behind an assignment's principal id, falling back to the id.
+async fn principal_name(pool: &DbPool, principal_type: PrincipalType, principal_id: &str) -> String {
+    let sql = match principal_type {
+        PrincipalType::User => "SELECT upn FROM users WHERE id = ? AND deleted_at IS NULL",
+        PrincipalType::Group => "SELECT name FROM user_groups WHERE id = ?",
+        PrincipalType::ServicePrincipal => {
+            "SELECT a.display_name FROM service_principals sp
+             JOIN applications a ON a.app_id = sp.app_id
+             WHERE sp.id = ? AND a.deleted_at IS NULL"
+        }
+    };
+    let found: Option<(String,)> = sqlx::query_as(crate::db::q(pool, sql))
+        .bind(principal_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+    found.map(|(n,)| n).unwrap_or_else(|| principal_id.to_string())
+}
+
+/// Withdraw one app-role assignment.
+///
+/// Scoped by tenant *and* by the resource's service principal, so an assignment
+/// id alone cannot reach another tenant's row even if one were guessed.
+pub async fn remove_role_assignment(
+    pool: &DbPool,
+    tenant_id: &str,
+    resource: &Application,
+    assignment_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+        return Ok(false);
+    };
+    let done = sqlx::query(crate::db::q(
+        pool,
+        "DELETE FROM app_role_assignments WHERE id = ? AND tenant_id = ? AND resource_id = ?",
+    ))
+    .bind(assignment_id)
+    .bind(tenant_id)
+    .bind(&sp.id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}

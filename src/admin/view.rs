@@ -50,6 +50,13 @@ button.danger { background:transparent; border-color:var(--err); color:var(--err
 .muted { color:var(--muted); }
 .pill { display:inline-block; font-size:12px; border:1px solid var(--border); border-radius:10px; padding:1px 8px; margin:0 4px 4px 0; color:var(--muted); }
 .card { background:var(--card); border:1px solid var(--border); border-radius:4px; padding:20px 24px; max-width:460px; margin:48px auto; }
+textarea { width:100%; max-width:560px; min-height:130px; padding:8px 10px; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--fg); background:transparent; border:1px solid var(--border); border-radius:4px; }
+textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+.notice { background:var(--card); border:1px solid var(--accent); border-left-width:4px; border-radius:4px; padding:12px 16px; margin:0 0 18px; }
+.once { display:block; margin:8px 0 0; padding:8px 10px; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-all; border:1px dashed var(--border); border-radius:4px; }
+dl.facts { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:0 0 8px; font-size:14px; }
+dl.facts dt { color:var(--muted); }
+dl.facts dd { margin:0; word-break:break-all; }
 "#;
 
 const CSP: &str =
@@ -212,6 +219,38 @@ pub fn server_error() -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Error",
         r#"<h1>Something went wrong</h1><p class="sub">The console could not complete that. The server log has the detail.</p>"#,
+    )
+}
+
+/// A Unix timestamp as RFC 3339 in UTC, for the pages that show when something
+/// was created, retired or expires.
+///
+/// Falls back to the raw number rather than hiding the column: a timestamp out
+/// of range is a storage problem the administrator should be able to see.
+pub fn ts(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_else(|| unix.to_string())
+}
+
+/// A page-level error, or nothing when there is none. Every section renders its
+/// failures the same way.
+pub fn error_block(error: Option<&str>) -> String {
+    error
+        .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
+        .unwrap_or_default()
+}
+
+/// A value shown exactly once, because it is not stored anywhere it could be
+/// shown again: a new client secret.
+pub fn shown_once(heading: &str, value: &str, note: &str) -> String {
+    format!(
+        r#"<div class="notice"><strong>{heading}</strong><code class="once">{value}</code>
+<p class="muted">{note}</p></div>"#,
+        heading = e(heading),
+        value = e(value),
+        note = e(note),
     )
 }
 

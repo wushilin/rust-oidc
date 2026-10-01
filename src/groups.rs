@@ -25,37 +25,15 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, name: &str, description: Opt
     Ok(id)
 }
 
+/// Add a member to a group named by name, as the CLI does. The console names a
+/// group by its object id instead; see [`add_member_by_id`]. Both resolve the
+/// user and record the membership through the same two helpers.
 pub async fn add_member(pool: &DbPool, tenant: &Tenant, group: &str, upn: &str) -> anyhow::Result<()> {
-    let group_id: Option<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
-        "SELECT id FROM user_groups WHERE tenant_id = ? AND name_folded = ?",
-    ))
-    .bind(&tenant.id)
-    .bind(crate::util::fold(group))
-    .fetch_optional(pool)
-    .await?;
-    let (group_id,) = group_id.with_context(|| format!("group '{group}' not found"))?;
-    let user_id: Option<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
-        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
-    ))
-    .bind(&tenant.id)
-    .bind(crate::util::fold(upn))
-    .fetch_optional(pool)
-    .await?;
-    let (user_id,) = user_id.with_context(|| format!("user '{upn}' not found"))?;
-    // Already a member is success: the primary key (group_id, user_id) makes it a no-op.
-    crate::db::inserted(
-        sqlx::query(crate::db::q(
-            pool,
-            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
-        ))
-        .bind(group_id)
-        .bind(user_id)
-        .execute(pool)
-        .await,
-    )?;
-    Ok(())
+    let group_id = find(pool, &tenant.id, group)
+        .await?
+        .with_context(|| format!("group '{group}' not found"))?;
+    let user_id = user_id_in(pool, &tenant.id, upn).await?;
+    insert_member(pool, &group_id, &user_id).await
 }
 
 /// Names of the user's groups (the `groups` claim).
@@ -80,4 +58,119 @@ pub async fn find(pool: &DbPool, tenant_id: &str, name: &str) -> anyhow::Result<
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id,)| id))
+}
+
+/// A group as the console lists it.
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+pub async fn list(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<Group>> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, name, description FROM user_groups WHERE tenant_id = ? ORDER BY name",
+    ))
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, description)| Group { id, name, description })
+        .collect())
+}
+
+/// One group of this tenant, by object id. `None` for a group of another tenant,
+/// so an id alone can never reach across the boundary.
+pub async fn find_by_id(pool: &DbPool, tenant_id: &str, group_id: &str) -> anyhow::Result<Option<Group>> {
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, name, description FROM user_groups WHERE tenant_id = ? AND id = ?",
+    ))
+    .bind(tenant_id)
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, name, description)| Group { id, name, description }))
+}
+
+/// A member of a group: the object id and the user name.
+pub struct Member {
+    pub user_id: String,
+    pub upn: String,
+}
+
+/// The group's members. A soft-deleted account is not one.
+pub async fn members(pool: &DbPool, group_id: &str) -> anyhow::Result<Vec<Member>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT u.id, u.upn FROM group_members m JOIN users u ON u.id = m.user_id
+         WHERE m.group_id = ? AND u.deleted_at IS NULL ORDER BY u.upn",
+    ))
+    .bind(group_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(user_id, upn)| Member { user_id, upn }).collect())
+}
+
+/// Add a member to a group named by its object id, for the console: the id is
+/// what a page link carries, where the CLI has only a name.
+///
+/// The group is looked up inside `tenant_id`, so a group id from another tenant
+/// is simply not found.
+pub async fn add_member_by_id(pool: &DbPool, tenant_id: &str, group_id: &str, upn: &str) -> anyhow::Result<()> {
+    let group = find_by_id(pool, tenant_id, group_id)
+        .await?
+        .with_context(|| format!("group '{group_id}' not found"))?;
+    let user_id = user_id_in(pool, tenant_id, upn).await?;
+    insert_member(pool, &group.id, &user_id).await
+}
+
+/// Remove a member. `false` when they were not one, so the caller can say so.
+pub async fn remove_member(pool: &DbPool, tenant_id: &str, group_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    // The tenant check first, as its own statement: MySQL refuses to delete from
+    // a table named in its own subquery, and two statements need no subquery.
+    if find_by_id(pool, tenant_id, group_id).await?.is_none() {
+        return Ok(false);
+    }
+    let done = sqlx::query(crate::db::q(
+        pool,
+        "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",
+    ))
+    .bind(group_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The id of a live account in this tenant, by user name.
+async fn user_id_in(pool: &DbPool, tenant_id: &str, upn: &str) -> anyhow::Result<String> {
+    let row: Option<(String,)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
+    ))
+    .bind(tenant_id)
+    .bind(crate::util::fold(upn))
+    .fetch_optional(pool)
+    .await?;
+    let (id,) = row.with_context(|| format!("user '{upn}' not found"))?;
+    Ok(id)
+}
+
+/// Record a membership. Already a member is success: the primary key
+/// `(group_id, user_id)` makes it a no-op.
+async fn insert_member(pool: &DbPool, group_id: &str, user_id: &str) -> anyhow::Result<()> {
+    crate::db::inserted(
+        sqlx::query(crate::db::q(
+            pool,
+            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+        ))
+        .bind(group_id)
+        .bind(user_id)
+        .execute(pool)
+        .await,
+    )?;
+    Ok(())
 }

@@ -498,6 +498,33 @@ pub enum Event {
     AdminUserDelete,
     AdminRoleGrant,
     AdminRoleRevoke,
+    // -- the console's remaining sections --
+    AdminAppCreate,
+    AdminAppFlags,
+    AdminAppIdentifierUriAdd,
+    AdminAppIdentifierUriRemove,
+    AdminAppRedirectUriAdd,
+    AdminAppRedirectUriRemove,
+    AdminAppScopeAdd,
+    AdminAppSecretAdd,
+    AdminAppSecretRemove,
+    AdminAppKeyAdd,
+    AdminAppKeyRemove,
+    AdminAppRoleAdd,
+    AdminAppRoleAssign,
+    AdminAppRoleUnassign,
+    AdminTenantCreate,
+    AdminTenantRename,
+    AdminTenantEnable,
+    AdminTenantDisable,
+    AdminTenantDomainAdd,
+    AdminTenantDomainRemove,
+    AdminTenantSettings,
+    AdminKeyRotate,
+    AdminKeyPrune,
+    AdminGroupCreate,
+    AdminGroupMemberAdd,
+    AdminGroupMemberRemove,
 }
 
 impl Event {
@@ -550,6 +577,32 @@ impl Event {
         Self::AdminUserDelete,
         Self::AdminRoleGrant,
         Self::AdminRoleRevoke,
+        Self::AdminAppCreate,
+        Self::AdminAppFlags,
+        Self::AdminAppIdentifierUriAdd,
+        Self::AdminAppIdentifierUriRemove,
+        Self::AdminAppRedirectUriAdd,
+        Self::AdminAppRedirectUriRemove,
+        Self::AdminAppScopeAdd,
+        Self::AdminAppSecretAdd,
+        Self::AdminAppSecretRemove,
+        Self::AdminAppKeyAdd,
+        Self::AdminAppKeyRemove,
+        Self::AdminAppRoleAdd,
+        Self::AdminAppRoleAssign,
+        Self::AdminAppRoleUnassign,
+        Self::AdminTenantCreate,
+        Self::AdminTenantRename,
+        Self::AdminTenantEnable,
+        Self::AdminTenantDisable,
+        Self::AdminTenantDomainAdd,
+        Self::AdminTenantDomainRemove,
+        Self::AdminTenantSettings,
+        Self::AdminKeyRotate,
+        Self::AdminKeyPrune,
+        Self::AdminGroupCreate,
+        Self::AdminGroupMemberAdd,
+        Self::AdminGroupMemberRemove,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -605,6 +658,32 @@ impl Event {
             Self::AdminUserDelete => "admin.user.delete",
             Self::AdminRoleGrant => "admin.role.grant",
             Self::AdminRoleRevoke => "admin.role.revoke",
+            Self::AdminAppCreate => "admin.app.create",
+            Self::AdminAppFlags => "admin.app.flags",
+            Self::AdminAppIdentifierUriAdd => "admin.app.identifier_uri.add",
+            Self::AdminAppIdentifierUriRemove => "admin.app.identifier_uri.remove",
+            Self::AdminAppRedirectUriAdd => "admin.app.redirect_uri.add",
+            Self::AdminAppRedirectUriRemove => "admin.app.redirect_uri.remove",
+            Self::AdminAppScopeAdd => "admin.app.scope.add",
+            Self::AdminAppSecretAdd => "admin.app.secret.add",
+            Self::AdminAppSecretRemove => "admin.app.secret.remove",
+            Self::AdminAppKeyAdd => "admin.app.key.add",
+            Self::AdminAppKeyRemove => "admin.app.key.remove",
+            Self::AdminAppRoleAdd => "admin.app.role.add",
+            Self::AdminAppRoleAssign => "admin.app.role.assign",
+            Self::AdminAppRoleUnassign => "admin.app.role.unassign",
+            Self::AdminTenantCreate => "admin.tenant.create",
+            Self::AdminTenantRename => "admin.tenant.rename",
+            Self::AdminTenantEnable => "admin.tenant.enable",
+            Self::AdminTenantDisable => "admin.tenant.disable",
+            Self::AdminTenantDomainAdd => "admin.tenant.domain.add",
+            Self::AdminTenantDomainRemove => "admin.tenant.domain.remove",
+            Self::AdminTenantSettings => "admin.tenant.settings",
+            Self::AdminKeyRotate => "admin.key.rotate",
+            Self::AdminKeyPrune => "admin.key.prune",
+            Self::AdminGroupCreate => "admin.group.create",
+            Self::AdminGroupMemberAdd => "admin.group.member.add",
+            Self::AdminGroupMemberRemove => "admin.group.member.remove",
         }
     }
 
@@ -644,6 +723,113 @@ pub async fn audit(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// One row of `audit_log`, for the console's audit page.
+pub struct AuditEntry {
+    pub id: i64,
+    /// Who did it: a user, application or service principal id, or one of the
+    /// two spelled-out non-identifiers. See [`Actor`].
+    pub actor: String,
+    /// The action, when this build knows it. `None` for a row written by a newer
+    /// build, which must still be listed rather than hidden.
+    pub action: Option<Event>,
+    /// The stored action string, so an unrecognised one can still be shown.
+    pub action_raw: String,
+    pub target: Option<String>,
+    pub details: Option<String>,
+    pub created_at: i64,
+}
+
+/// The most rows the audit page will read at once. The table is append-only,
+/// unbounded, and unauthenticated requests can append to it, so a page over it
+/// must be capped rather than trusted to be small. **Invented**: 100, recorded in
+/// `docs/decisions-log.md`.
+pub const AUDIT_PAGE_LIMIT: i64 = 100;
+
+/// The newest audit rows belonging to one tenant, optionally filtered.
+///
+/// `tenant_id` is never optional: a tenant administrator must only ever see
+/// their own tenant's rows, so there is no shape of this call that reads across
+/// the boundary and none that returns the platform's own `tenant_id IS NULL`
+/// rows (key rotation).
+///
+/// The four query shapes are spelled out rather than assembled, because
+/// [`sql_stmt`] takes a `&'static str` -- that is what makes its SQL-safety
+/// assertion sound -- and because each shape is the one the `0009` indexes serve:
+/// `(tenant_id, created_at)`, `(tenant_id, action, created_at)` and `(target)`.
+pub async fn audit_for_tenant(
+    pool: &DbPool,
+    tenant_id: &str,
+    action: Option<Event>,
+    target: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Vec<AuditEntry>> {
+    let limit = limit.clamp(1, AUDIT_PAGE_LIMIT);
+    type Row = (i64, String, String, Option<String>, Option<String>, i64);
+    let rows: Vec<Row> = match (action, target) {
+        (None, None) => {
+            sqlx::query_as(q(
+                pool,
+                "SELECT id, actor, action, target, details, created_at FROM audit_log
+                 WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            ))
+            .bind(tenant_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(event), None) => {
+            sqlx::query_as(q(
+                pool,
+                "SELECT id, actor, action, target, details, created_at FROM audit_log
+                 WHERE tenant_id = ? AND action = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            ))
+            .bind(tenant_id)
+            .bind(event.as_str())
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, Some(target)) => {
+            sqlx::query_as(q(
+                pool,
+                "SELECT id, actor, action, target, details, created_at FROM audit_log
+                 WHERE tenant_id = ? AND target = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            ))
+            .bind(tenant_id)
+            .bind(target)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(event), Some(target)) => {
+            sqlx::query_as(q(
+                pool,
+                "SELECT id, actor, action, target, details, created_at FROM audit_log
+                 WHERE tenant_id = ? AND action = ? AND target = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            ))
+            .bind(tenant_id)
+            .bind(event.as_str())
+            .bind(target)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(id, actor, action_raw, target, details, created_at)| AuditEntry {
+            id,
+            actor,
+            action: Event::parse(&action_raw),
+            action_raw,
+            target,
+            details,
+            created_at,
+        })
+        .collect())
 }
 
 /// Delete audit rows older than `older_than_secs`.

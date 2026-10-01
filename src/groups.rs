@@ -37,7 +37,7 @@ pub async fn add_member(pool: &DbPool, tenant: &Tenant, group: &str, upn: &str) 
     let (group_id,) = group_id.with_context(|| format!("group '{group}' not found"))?;
     let user_id: Option<(String,)> = sqlx::query_as(crate::db::q(
         pool,
-        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ?",
+        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
     ))
     .bind(&tenant.id)
     .bind(crate::util::fold(upn))
@@ -67,4 +67,17 @@ pub async fn names_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(n,)| n).collect())
+}
+
+/// A group's id by name within a tenant, case-insensitively.
+pub async fn find(pool: &DbPool, tenant_id: &str, name: &str) -> anyhow::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id FROM user_groups WHERE tenant_id = ? AND name_folded = ?",
+    ))
+    .bind(tenant_id)
+    .bind(crate::util::fold(name))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id,)| id))
 }

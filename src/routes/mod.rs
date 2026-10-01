@@ -51,6 +51,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/{tenant}/oauth2/v2.0/logout", get(logout::logout).post(logout::logout))
         .route("/healthz", get(|| async { "ok" }))
+        // The admin console. Mounted here so it sits under the public URL's path
+        // prefix like every other route.
+        .merge(crate::admin::routes::router())
         .with_state(state.clone());
 
     let prefix = state.public_url.path();

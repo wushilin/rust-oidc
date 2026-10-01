@@ -59,7 +59,8 @@ pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow
     let row: Option<(String, i64, String)> = sqlx::query_as(crate::db::q(
         pool,
         "SELECT s.user_id, s.auth_time, s.amr FROM sessions s JOIN users u ON u.id = s.user_id
-         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = ?",
+         WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = ?
+           AND u.deleted_at IS NULL",
     ))
     .bind(sha256_hex(cookie.as_bytes()))
     .bind(tenant_id)

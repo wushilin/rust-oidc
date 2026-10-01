@@ -48,6 +48,19 @@ const EXPECTED: &[(&str, &str)] = &[
     ("AppRoleAdd", "app.role.add"),
     ("AppRoleAssign", "app.role.assign"),
     ("KeyRotate", "key.rotate"),
+    ("AdminSignIn", "admin.sign_in"),
+    ("AdminSignInFailed", "admin.sign_in_failed"),
+    ("AdminSignOut", "admin.sign_out"),
+    ("AdminTenantAssume", "admin.tenant.assume"),
+    ("AdminTenantLeave", "admin.tenant.leave"),
+    ("AdminUserCreate", "admin.user.create"),
+    ("AdminUserUpdate", "admin.user.update"),
+    ("AdminUserEnable", "admin.user.enable"),
+    ("AdminUserDisable", "admin.user.disable"),
+    ("AdminUserReset", "admin.user.reset"),
+    ("AdminUserDelete", "admin.user.delete"),
+    ("AdminRoleGrant", "admin.role.grant"),
+    ("AdminRoleRevoke", "admin.role.revoke"),
 ];
 
 #[test]

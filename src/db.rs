@@ -479,6 +479,25 @@ pub enum Event {
     AppRoleAdd,
     AppRoleAssign,
     KeyRotate,
+    // -- admin console --
+    /// Signed in to the console itself, which is not an OAuth client of this
+    /// server: `auth.sign_in` stays the answer to "did this account authenticate
+    /// to an application".
+    AdminSignIn,
+    AdminSignInFailed,
+    AdminSignOut,
+    /// A platform administrator entered a tenant. The actor is always the person,
+    /// never a tenant-local identity.
+    AdminTenantAssume,
+    AdminTenantLeave,
+    AdminUserCreate,
+    AdminUserUpdate,
+    AdminUserEnable,
+    AdminUserDisable,
+    AdminUserReset,
+    AdminUserDelete,
+    AdminRoleGrant,
+    AdminRoleRevoke,
 }
 
 impl Event {
@@ -518,6 +537,19 @@ impl Event {
         Self::AppRoleAdd,
         Self::AppRoleAssign,
         Self::KeyRotate,
+        Self::AdminSignIn,
+        Self::AdminSignInFailed,
+        Self::AdminSignOut,
+        Self::AdminTenantAssume,
+        Self::AdminTenantLeave,
+        Self::AdminUserCreate,
+        Self::AdminUserUpdate,
+        Self::AdminUserEnable,
+        Self::AdminUserDisable,
+        Self::AdminUserReset,
+        Self::AdminUserDelete,
+        Self::AdminRoleGrant,
+        Self::AdminRoleRevoke,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -560,6 +592,19 @@ impl Event {
             Self::AppRoleAdd => "app.role.add",
             Self::AppRoleAssign => "app.role.assign",
             Self::KeyRotate => "key.rotate",
+            Self::AdminSignIn => "admin.sign_in",
+            Self::AdminSignInFailed => "admin.sign_in_failed",
+            Self::AdminSignOut => "admin.sign_out",
+            Self::AdminTenantAssume => "admin.tenant.assume",
+            Self::AdminTenantLeave => "admin.tenant.leave",
+            Self::AdminUserCreate => "admin.user.create",
+            Self::AdminUserUpdate => "admin.user.update",
+            Self::AdminUserEnable => "admin.user.enable",
+            Self::AdminUserDisable => "admin.user.disable",
+            Self::AdminUserReset => "admin.user.reset",
+            Self::AdminUserDelete => "admin.user.delete",
+            Self::AdminRoleGrant => "admin.role.grant",
+            Self::AdminRoleRevoke => "admin.role.revoke",
         }
     }
 

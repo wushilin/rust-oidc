@@ -507,7 +507,7 @@ pub async fn assign_role(
         Principal::User(upn) => {
             let row: Option<(String,)> = sqlx::query_as(crate::db::q(
                 pool,
-                "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ?",
+                "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
             ))
             .bind(&tenant.id)
             .bind(crate::util::fold(upn))

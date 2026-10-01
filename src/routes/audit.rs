@@ -36,6 +36,8 @@ pub enum Channel {
     Ropc,
     /// The RP-initiated logout endpoint.
     EndSession,
+    /// The admin console's own sign-in form, which is not an OAuth flow.
+    Console,
 }
 
 impl Channel {
@@ -45,6 +47,7 @@ impl Channel {
             Self::Device => "device",
             Self::Ropc => "password_grant",
             Self::EndSession => "end_session",
+            Self::Console => "console",
         }
     }
 }

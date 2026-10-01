@@ -578,3 +578,114 @@ pub async fn all_engine_pools() -> Vec<EnginePool> {
     }
     pools
 }
+
+// ---- admin console helpers ----
+
+use rust_oidc::admin::bindings::{self, PrincipalType};
+use rust_oidc::admin::session as admin_session;
+use rust_oidc::rbac::{RoleId, Scope};
+
+/// Give a user a console role at a scope.
+pub async fn bind(s: &TestServer, user_id: &str, role: RoleId, scope: Scope) -> String {
+    bindings::create(&s.pool, PrincipalType::User, user_id, role, &scope, "test")
+        .await
+        .unwrap()
+}
+
+/// A super administrator: tenant admin everywhere, plus the platform role that
+/// can create and assume tenants. The shape of `admin@wushilin.net` on the
+/// deployed service.
+pub async fn admin_fixture(s: &TestServer) -> UserFixture {
+    let f = user_fixture(s).await;
+    bind(s, &f.user_id, RoleId::GlobalAdministrator, Scope::All).await;
+    bind(s, &f.user_id, RoleId::PlatformAdministrator, Scope::All).await;
+    f
+}
+
+/// A delegated administrator: Global Administrator of one tenant and nothing
+/// else. The fixture the isolation tests are about.
+pub async fn tenant_admin_fixture(s: &TestServer) -> UserFixture {
+    let f = user_fixture(s).await;
+    bind(
+        s,
+        &f.user_id,
+        RoleId::GlobalAdministrator,
+        Scope::Tenants(vec![f.tenant.id.clone()]),
+    )
+    .await;
+    f
+}
+
+/// Read everything, change nothing.
+pub async fn reader_fixture(s: &TestServer) -> UserFixture {
+    let f = user_fixture(s).await;
+    bind(s, &f.user_id, RoleId::GlobalReader, Scope::All).await;
+    f
+}
+
+/// A browser signed in to the console, carrying that session's CSRF token so
+/// every form post this helper makes is a well-formed one.
+pub struct AdminBrowser {
+    pub b: Browser,
+    pub csrf: String,
+}
+
+impl AdminBrowser {
+    pub async fn get(&self, url: &str) -> Page {
+        self.b.get(url).await
+    }
+
+    /// Post a console form, with the session's CSRF token added.
+    pub async fn post(&self, url: &str, form: &[(&str, &str)]) -> Page {
+        let mut fields: Vec<(&str, &str)> = form.to_vec();
+        fields.push((admin_session::CSRF_FIELD, &self.csrf));
+        self.b.post_form(url, &fields).await
+    }
+
+    /// Post without the token, for the tests that are about the token.
+    pub async fn post_raw(&self, url: &str, form: &[(&str, &str)]) -> Page {
+        self.b.post_form(url, form).await
+    }
+}
+
+/// Sign in to the console as this fixture's user.
+pub async fn signed_in_admin(s: &TestServer, f: &UserFixture) -> AdminBrowser {
+    let b = Browser::new();
+    let page = b
+        .post_form(
+            &s.url("/admin/signin"),
+            &[("upn", f.upn.as_str()), ("password", f.password.as_str())],
+        )
+        .await;
+    assert_eq!(page.status, 303, "console sign-in failed: {}", page.body);
+    let cookie = admin_cookie(&page).expect("the sign-in set a console session cookie");
+    AdminBrowser {
+        b,
+        csrf: admin_session::csrf_for(&cookie),
+    }
+}
+
+/// Value of the console session cookie a response set, if any.
+pub fn admin_cookie(page: &Page) -> Option<String> {
+    let prefix = format!("{}=", admin_session::ADMIN_COOKIE);
+    page.headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.strip_prefix(&prefix))
+        .filter_map(|v| v.split(';').next())
+        .find(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Rows of the audit trail with this action, newest first.
+pub async fn audit_rows(s: &TestServer, action: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT actor, target, tenant_id FROM audit_log WHERE action = ? ORDER BY created_at DESC, id DESC",
+    ))
+    .bind(action)
+    .fetch_all(&s.pool)
+    .await
+    .unwrap()
+}

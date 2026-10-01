@@ -87,7 +87,7 @@ pub async fn find(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Resu
     Ok(sqlx::query_as(crate::db::q(
         pool,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
-         FROM users WHERE tenant_id = ? AND id = ?",
+         FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
     ))
     .bind(tenant_id)
     .bind(user_id)
@@ -149,7 +149,7 @@ pub async fn authenticate_traced(
         locked_until: Option<i64>,
     }
     let row: Option<Row> = sqlx::query_as(
-        crate::db::q(pool, "SELECT id, password_hash, enabled, failed_logins, locked_until FROM users WHERE tenant_id = ? AND upn_folded = ?"),
+        crate::db::q(pool, "SELECT id, password_hash, enabled, failed_logins, locked_until FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL"),
     )
     .bind(&tenant.id)
     .bind(crate::util::fold(upn))
@@ -213,7 +213,7 @@ pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
     let res = sqlx::query(crate::db::q(
         pool,
         "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
-         WHERE tenant_id = ? AND upn_folded = ?",
+         WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
     ))
     .bind(hash_password(password)?)
     .bind(now())
@@ -227,7 +227,7 @@ pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
     // As in Entra, a password reset revokes the user's refresh tokens and sessions.
     let user: (String,) = sqlx::query_as(crate::db::q(
         pool,
-        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ?",
+        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
     ))
     .bind(&tenant.id)
     .bind(crate::util::fold(upn))
@@ -246,4 +246,169 @@ pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Largest page the console will ask for, so a tenant with many users cannot
+/// produce an unbounded response. Invented; paging the console past this is a
+/// later task.
+pub const LIST_LIMIT: i64 = 200;
+
+/// A page of users in a tenant, optionally filtered by UPN or display name.
+/// Soft-deleted users are never returned.
+///
+/// UPN matching is against `upn_folded`, so it is case-insensitive the same way
+/// on every engine. Display-name matching is a plain `LIKE` and is therefore
+/// case-sensitive on SQLite and Postgres and case-insensitive under MySQL's
+/// default collation; display names are not identities, so the difference is
+/// cosmetic. `%` and `_` in the search term are wildcards.
+pub async fn list(
+    pool: &DbPool,
+    tenant_id: &str,
+    query: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<User>> {
+    let pattern = match query.map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => format!("%{q}%"),
+        None => "%".to_string(),
+    };
+    Ok(sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
+         FROM users
+         WHERE tenant_id = ? AND deleted_at IS NULL
+           AND (upn_folded LIKE ? OR COALESCE(display_name, '') LIKE ?)
+         ORDER BY upn LIMIT ? OFFSET ?",
+    ))
+    .bind(tenant_id)
+    .bind(crate::util::fold(&pattern))
+    .bind(&pattern)
+    .bind(limit.clamp(1, LIST_LIMIT))
+    .bind(offset.max(0))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The attributes the console can edit. Not the UPN: changing an identity is a
+/// different operation from editing a profile, and nothing needs it yet.
+pub struct UserAttributes<'a> {
+    pub display_name: Option<&'a str>,
+    pub given_name: Option<&'a str>,
+    pub family_name: Option<&'a str>,
+    pub email: Option<&'a str>,
+    pub email_verified: bool,
+}
+
+/// Overwrite a user's profile attributes. `false` when no such live user exists
+/// **in that tenant**: `tenant_id` is in the `WHERE`, so a handler cannot be
+/// talked into editing another tenant's user by guessing an id.
+pub async fn update_attributes(
+    pool: &DbPool,
+    tenant_id: &str,
+    user_id: &str,
+    attrs: &UserAttributes<'_>,
+) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::q(
+        pool,
+        "UPDATE users SET display_name = ?, given_name = ?, family_name = ?, email = ?,
+                          email_verified = ?, updated_at = ?
+         WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
+    ))
+    .bind(attrs.display_name)
+    .bind(attrs.given_name)
+    .bind(attrs.family_name)
+    .bind(attrs.email)
+    .bind(attrs.email_verified)
+    .bind(now())
+    .bind(user_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Enable or disable a user. Disabling also ends their browser sessions and
+/// revokes their refresh tokens: leaving those alive would mean a disabled
+/// account kept working until every token expired.
+pub async fn set_enabled(pool: &DbPool, tenant_id: &str, user_id: &str, enabled: bool) -> anyhow::Result<bool> {
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(crate::db::sql_stmt(
+        engine,
+        "UPDATE users SET enabled = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
+    ))
+    .bind(enabled)
+    .bind(now())
+    .bind(user_id)
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await?;
+    if !enabled {
+        revoke_access(&mut tx, engine, user_id).await?;
+    }
+    tx.commit().await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Mark a user deleted. Kept rather than removed so audit rows and the `oid` in
+/// already-issued tokens still resolve to something, and so the UPN is not freed
+/// for reuse by a different person.
+pub async fn soft_delete(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let engine = crate::db::engine_of(pool);
+    let ts = now();
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(crate::db::sql_stmt(
+        engine,
+        "UPDATE users SET deleted_at = ?, enabled = ?, updated_at = ?
+         WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
+    ))
+    .bind(ts)
+    .bind(false)
+    .bind(ts)
+    .bind(user_id)
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await?;
+    revoke_access(&mut tx, engine, user_id).await?;
+    tx.commit().await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// End every live credential a user holds: browser sessions, console sessions and
+/// refresh tokens. One definition, so disabling and deleting cannot diverge.
+async fn revoke_access(tx: &mut sqlx::AnyConnection, engine: crate::db::Engine, user_id: &str) -> anyhow::Result<()> {
+    sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM sessions WHERE user_id = ?"))
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM admin_sessions WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+    ))
+    .bind(now())
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// A live user by UPN within a tenant. Case-insensitive, through `upn_folded`,
+/// like every other identity lookup.
+pub async fn find_by_upn(pool: &DbPool, tenant_id: &str, upn: &str) -> anyhow::Result<Option<User>> {
+    Ok(sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
+         FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
+    ))
+    .bind(tenant_id)
+    .bind(crate::util::fold(upn))
+    .fetch_optional(pool)
+    .await?)
 }

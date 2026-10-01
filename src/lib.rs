@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod directory;
 pub mod error;
+pub mod flowtest;
 pub mod groups;
 pub mod html;
 pub mod keys;

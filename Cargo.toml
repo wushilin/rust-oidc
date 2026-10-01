@@ -16,6 +16,13 @@ hex = "0.4.3"
 hmac = "0.13"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }
+# A real HTTP client, in the binary and not only in the tests: the console's flow
+# tester redeems its authorization code against our own token endpoint over HTTP
+# rather than calling the handler directly, so what it reports is what a client
+# would see. Minimal features: rustls (aws-lc-rs, the provider the rest of the
+# binary already uses) and nothing else -- the request body is built by hand and
+# the response parsed with serde_json, so `form` and `json` are not needed.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rsa = { version = "0.9.10", features = ["sha2", "pem"] }
 rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-acme = { version = "0.15.4", features = ["axum"] }
@@ -36,5 +43,7 @@ uuid = { version = "1.26.1", features = ["v4"] }
 x509-cert = { version = "0.3.0", features = ["pem"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13.5", features = ["cookies", "form", "json", "rustls"] }
+# The test harness drives the server as a browser does: a cookie jar, form bodies
+# and JSON responses, on top of the features the dependency above already asks for.
+reqwest = { version = "0.13.5", features = ["cookies", "form", "json"] }
 tempfile = "3.27.0"

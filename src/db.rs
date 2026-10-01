@@ -525,6 +525,12 @@ pub enum Event {
     AdminGroupCreate,
     AdminGroupMemberAdd,
     AdminGroupMemberRemove,
+    /// An administrator sent an authorize request from the console's flow tester.
+    /// The row records who, against which application, and with what response
+    /// type -- never the state, the nonce or the PKCE verifier it generated.
+    AdminFlowTestStart,
+    /// What came back. The outcome only: never a code, a token or a claim value.
+    AdminFlowTestResult,
 }
 
 impl Event {
@@ -603,6 +609,8 @@ impl Event {
         Self::AdminGroupCreate,
         Self::AdminGroupMemberAdd,
         Self::AdminGroupMemberRemove,
+        Self::AdminFlowTestStart,
+        Self::AdminFlowTestResult,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -684,6 +692,8 @@ impl Event {
             Self::AdminGroupCreate => "admin.group.create",
             Self::AdminGroupMemberAdd => "admin.group.member.add",
             Self::AdminGroupMemberRemove => "admin.group.member.remove",
+            Self::AdminFlowTestStart => "admin.flow_test.start",
+            Self::AdminFlowTestResult => "admin.flow_test.result",
         }
     }
 

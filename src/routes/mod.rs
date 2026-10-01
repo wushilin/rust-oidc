@@ -13,7 +13,8 @@ use axum::routing::{get, post};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
-pub use authorize::Prompt;
+pub use authorize::{Prompt, ResponseMode, ResponseType};
+pub use token::GrantType;
 
 use crate::AppState;
 

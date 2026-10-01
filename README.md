@@ -161,6 +161,7 @@ all (tenant settings, group membership, audit).
 | `/admin/tenants/{tenant}/groups` | List, create, add and remove members | `Group:Read`, `Group:Write` |
 | `/admin/tenants/{tenant}/apps` | Register; secrets, certificates, redirect URIs per platform, Application ID URIs, exposed scopes, app roles, role assignments, and the password-grant and implicit toggles | `App:Read`, `App:Write`; credentials need `App:Rotate`; assignments need `Assignment:Write` |
 | `/admin/tenants/{tenant}/roles` | Grant and revoke console roles | `RoleBinding:Read`, `RoleBinding:Write` |
+| `/admin/tenants/{tenant}/flow` | Flow tester: what a flow needs configured, then drive it and read the result | `App:Read`; registering the callback or a test client needs `App:Write` |
 | `/admin/tenants/{tenant}/settings` | Token, session and refresh-token lifetimes | `Tenant:Write` |
 | `/admin/tenants/{tenant}/audit` | The tenant's audit log, filtered by action and target | `Audit:Read` |
 | `/admin/keys` | Signing keys, rotate and prune | `Key:Read`, `Key:Rotate`, **at `all` scope** |
@@ -180,6 +181,44 @@ Things worth knowing before using it:
   role binding may name a group.
 - No MFA page (TOTP does not exist), no paging on any list, and app roles and exposed
   scopes can be added but not removed. See `docs/decisions-log.md`.
+
+### Flow tester
+
+`/admin/tenants/{tenant}/flow` drives a real OAuth/OIDC flow against this server and shows
+what came back, for the times when a client says "it does not work" and you want to see the
+protocol rather than the client. The compatibility suites in `compat/` cover machine-driven
+fidelity; this is for reading one flow with your own eyes.
+
+**The landing page is a readiness check, not a form.** Pick an application and a flow, and
+the page states item by item what that combination needs, what is configured now, and what
+to change: the service principal, the callback URI (with the exact string, and which
+platform it is registered under), the client secret, `allow_id_token_implicit` and
+`allow_access_token_implicit` by name, `openid`, whether the scope resolves to a resource
+that exposes it, app role assignment, `allow_password_grant`, how the response gets back,
+and who redeems the code. It offers to run the flow only when nothing is missing.
+
+Then it sends the authorize request with a `state`, a `nonce` and a PKCE verifier it
+generated and held, and the result page shows the request, the response, the real HTTP token
+request and reply, and both tokens decoded -- with `nonce`, `c_hash`, `at_hash`, `iss`,
+`aud`, `exp` and the signature checked and any failure marked.
+
+Worth knowing:
+
+- **It changes nothing on its own.** Registering the callback on a real application is a
+  button of its own, audited as the redirect URI addition it is, and removable in the
+  applications section. There is also a per-tenant **flow tester client** the console will
+  register on request: one public client whose only redirect URI is the callback, which is
+  the zero-side-effect way to exercise the server.
+- **`form_post` is used for any response type that carries a token.** The console has no
+  JavaScript and a `default-src 'none'` CSP, so a URL fragment can never reach it; fragment
+  mode prints the authorize URL for you to open and says that nothing will be captured.
+- **A `web` client's code cannot be redeemed by the console**, because only a SHA-256 hash
+  of its secret is stored. The front channel is still tested end to end and the exact token
+  request is printed for you to run. Use the flow tester client to exercise the redemption
+  too.
+- **No tokens are logged or stored.** The audit log records that a flow test ran, by whom,
+  against which application, with what response type, and how it ended -- never the code,
+  the tokens, the state or the nonce. The pending row is deleted as soon as it is used.
 
 ## Deliberate differences from Entra
 

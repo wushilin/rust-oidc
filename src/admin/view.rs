@@ -21,8 +21,8 @@ pub fn e(s: &str) -> String {
 }
 
 const STYLE: &str = r#"
-:root { --bg:#f6f7f9; --card:#fff; --fg:#1b1b1b; --muted:#5f6368; --accent:#0f6cbd; --err:#b3261e; --border:#d0d4da; }
-@media (prefers-color-scheme: dark) { :root { --bg:#16181c; --card:#212429; --fg:#e8eaed; --muted:#a0a4ab; --accent:#4f9ae8; --err:#f2b8b5; --border:#3a3f46; } }
+:root { --bg:#f6f7f9; --card:#fff; --fg:#1b1b1b; --muted:#5f6368; --accent:#0f6cbd; --err:#b3261e; --ok:#1a7f37; --border:#d0d4da; }
+@media (prefers-color-scheme: dark) { :root { --bg:#16181c; --card:#212429; --fg:#e8eaed; --muted:#a0a4ab; --accent:#4f9ae8; --err:#f2b8b5; --ok:#56d364; --border:#3a3f46; } }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
 header.top { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:10px 20px; background:var(--card); border-bottom:1px solid var(--border); }
@@ -57,6 +57,13 @@ textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
 dl.facts { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:0 0 8px; font-size:14px; }
 dl.facts dt { color:var(--muted); }
 dl.facts dd { margin:0; word-break:break-all; }
+h3 { font-size:14px; font-weight:600; margin:18px 0 6px; color:var(--muted); }
+pre.raw { margin:0 0 14px; padding:12px 14px; background:var(--card); border:1px solid var(--border); border-radius:4px; font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; word-break:break-all; }
+code.wrap { font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-all; }
+.pill.good { border-color:var(--ok); color:var(--ok); }
+.pill.bad { border-color:var(--err); color:var(--err); font-weight:600; }
+tr.bad td:first-child { box-shadow:inset 3px 0 0 var(--err); font-weight:600; }
+.banner.bad { border-color:var(--err); }
 "#;
 
 const CSP: &str =

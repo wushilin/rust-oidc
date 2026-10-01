@@ -96,8 +96,11 @@ struct Validated {
 /// compiler checks. Any combination not listed is refused: Entra advertises
 /// `code`, `id_token`, `code id_token` and `id_token token`, and its documentation
 /// additionally demonstrates bare `token`.
+///
+/// Public because the admin console's flow tester offers the same closed set on a
+/// form and has to spell each one back into a request; there is one list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponseType {
+pub enum ResponseType {
     Code,
     IdToken,
     Token,
@@ -106,9 +109,29 @@ enum ResponseType {
 }
 
 impl ResponseType {
+    pub const ALL: &'static [ResponseType] = &[
+        Self::Code,
+        Self::IdToken,
+        Self::Token,
+        Self::CodeIdToken,
+        Self::IdTokenToken,
+    ];
+
+    /// The canonical spelling, which is what `response_types_supported` publishes
+    /// and what the flow tester puts in a request.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::IdToken => "id_token",
+            Self::Token => "token",
+            Self::CodeIdToken => "code id_token",
+            Self::IdTokenToken => "id_token token",
+        }
+    }
+
     /// Order-insensitive: the value is a space-delimited *set*, and Entra's own docs
     /// spell the hybrid type both ways round.
-    fn parse(raw: &str) -> Option<Self> {
+    pub fn parse(raw: &str) -> Option<Self> {
         let mut parts: Vec<&str> = raw.split_whitespace().collect();
         parts.sort_unstable();
         parts.dedup();
@@ -122,20 +145,20 @@ impl ResponseType {
         }
     }
 
-    fn has_code(self) -> bool {
+    pub fn has_code(self) -> bool {
         matches!(self, Self::Code | Self::CodeIdToken)
     }
 
-    fn has_id_token(self) -> bool {
+    pub fn has_id_token(self) -> bool {
         matches!(self, Self::IdToken | Self::CodeIdToken | Self::IdTokenToken)
     }
 
-    fn has_access_token(self) -> bool {
+    pub fn has_access_token(self) -> bool {
         matches!(self, Self::Token | Self::IdTokenToken)
     }
 
     /// Whether a token travels in the response itself, rather than only a code.
-    fn is_front_channel(self) -> bool {
+    pub fn is_front_channel(self) -> bool {
         self.has_id_token() || self.has_access_token()
     }
 }
@@ -152,11 +175,32 @@ fn response_type_not_allowed() -> AadError {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResponseMode {
+/// Where the authorize response is delivered. Public for the same reason
+/// [`ResponseType`] is: the console's flow tester offers the same three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
     Query,
     Fragment,
     FormPost,
+}
+
+impl ResponseMode {
+    pub const ALL: &'static [ResponseMode] = &[Self::Query, Self::Fragment, Self::FormPost];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Fragment => "fragment",
+            Self::FormPost => "form_post",
+        }
+    }
+
+    /// `None` for a mode this server does not implement, which is a caller error
+    /// reported as such, never defaulted: a token must not fall back to a query
+    /// string because the mode was misspelled.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|m| m.as_str() == raw)
+    }
 }
 
 impl Validated {
@@ -269,8 +313,9 @@ async fn run(
     let front_channel = get(params, "response_type")
         .and_then(ResponseType::parse)
         .is_some_and(ResponseType::is_front_channel);
-    let response_mode = match get(params, "response_mode") {
-        Some("query") if front_channel => {
+    let requested_mode = get(params, "response_mode");
+    let response_mode = match requested_mode.map(ResponseMode::parse) {
+        Some(Some(ResponseMode::Query)) if front_channel => {
             let v = Validated {
                 tenant,
                 client,
@@ -287,10 +332,9 @@ async fn run(
             )));
         }
         None if front_channel => ResponseMode::Fragment,
-        None | Some("query") => ResponseMode::Query,
-        Some("fragment") => ResponseMode::Fragment,
-        Some("form_post") => ResponseMode::FormPost,
-        Some(other) => {
+        None | Some(Some(ResponseMode::Query)) => ResponseMode::Query,
+        Some(Some(mode)) => mode,
+        Some(None) => {
             let v = Validated {
                 tenant,
                 client,
@@ -302,7 +346,10 @@ async fn run(
             };
             return Ok(v.error(AadError::invalid_request(
                 Aadsts::MissingOrInvalidParameter,
-                format!("The response_mode '{other}' is not supported."),
+                format!(
+                    "The response_mode '{}' is not supported.",
+                    requested_mode.unwrap_or_default()
+                ),
             )));
         }
     };

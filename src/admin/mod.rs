@@ -10,6 +10,7 @@ pub mod audit;
 pub mod authz;
 pub mod bindings;
 pub mod context;
+pub mod flow;
 pub mod groups;
 pub mod keys;
 pub mod roles;

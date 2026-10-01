@@ -666,6 +666,152 @@ untested, so `a_group_lookup_is_scoped_to_its_tenant_whatever_the_id` now tests 
 directly, and that test does fail when the scoping is broken. The same is true of the
 tenant id in every other domain function's `WHERE`: the gate is what the HTTP tests prove.
 
+
+---
+
+## Admin console: the flow tester (`/admin/tenants/{tenant}/flow`)
+
+**90. The landing page is a readiness check, not a form with a Go button.** The
+instruction was to "make the landing page of the flow explicit, what I need to configure as
+what to test it", and the diagnostic value is the whole feature: the compat suites already
+cover machine-driven fidelity. So the page states, item by item, what the chosen
+application and flow need (`flowtest::Requirement`), what is configured now, and what to
+change, and it offers to run the flow only when nothing is missing. Twelve requirements:
+the service principal, the callback, the platform it is registered under, the client
+secret, both front-channel toggles, `openid`, whether the scope resolves, user assignment,
+the password grant, how the response gets back, and who redeems the code. Each one is
+re-derived from the function the server itself uses -- `scopes::resolve` for the scope,
+`apps::redirect_uris` for the callback -- so the page cannot drift from the endpoint it
+describes.
+
+**91. Running a flow is `App:Read`; registering anything is `App:Write`.** A flow test
+changes no configuration, and the tokens it produces are the ones the person signing in
+could already get from any browser: the authorize endpoint makes them authenticate there,
+and the console session is no help at all. So a Global Reader can diagnose, which is the
+role most likely to be handed to somebody debugging an integration. The two operations that
+*do* change a registration -- adding the callback, registering the test client -- are
+`App:Write`, like every other registration change. `tests/admin_flow.rs::a_reader_can_diagnose_but_not_register_anything`
+holds both halves of that. **If you would rather a reader could not mint tokens at all,
+`FlowOp::Start.action()` is the one line to change.**
+
+**92. No silent configuration change, and the callback addition reuses the ordinary audit
+event.** Registering `{base}/admin/flow/callback` on a real application is a button with its
+own confirmation text, and it writes `admin.app.redirect_uri.add` with
+`details.purpose = "flow_test"` -- not a flow-tester-specific event -- because an auditor
+asking "what redirect URIs were added to this app" must see it. It then appears in the
+applications section like any other redirect URI, where it can be removed. Registering the
+test client likewise writes `admin.app.create` and `admin.app.redirect_uri.add`.
+
+**93. The per-tenant flow tester client is registered as a `publicClient`.** That is what
+makes it the zero-side-effect path *and* the complete one: a public client authenticates
+with nothing, so PKCE alone binds the code, and the console can redeem it for real. A `web`
+test client would have needed a secret the console cannot read (decision 97), and an `spa`
+one would only be redeemable as a cross-origin request. One per tenant, recorded in
+`flow_test_clients`; it is an ordinary application object, visible and deletable in the
+applications section, and if it is deleted the console offers to create another.
+
+**94. `form_post` for any response type that carries a token, and fragment mode is shown
+rather than driven.** The console's CSP is `default-src 'none'` with no `script-src`
+(`src/html.rs`, `src/admin/view.rs`), so there is nothing that could copy `location.hash`
+into a form, and a fragment never reaches the server anyway. Rather than add a script or
+relax the CSP for a debug page, `form_post` is the default as soon as a token is involved,
+`query` with a token is refused on the page before the server has to refuse it, and
+`fragment` prints the authorize URL to open by hand and says plainly that nothing will be
+captured or checked. A fragment-mode start writes **no** pending row: a row that can never
+be answered would only expire.
+
+**95. `reqwest` is now a real dependency, and the token exchange is a genuine HTTP
+request.** Features `default-features = false, features = ["rustls"]` (aws-lc-rs, the
+provider the rest of the binary already uses); the body is built with
+`url::form_urlencoded` and the response parsed with `serde_json`, so `form` and `json` are
+not needed in the binary. The dev-dependency keeps `cookies`, `form` and `json` for the
+test harness. The client is built with `.no_proxy()` -- an ambient `HTTP_PROXY` must not
+put a middlebox between the console and the endpoint it is testing -- and a ten-second
+timeout, invented. A debugger that called the handler directly instead would eventually
+lie about the layer being debugged; the cost is that a deployment whose own TLS certificate
+the process does not trust will show a transport error on the page, which is itself worth
+seeing.
+
+**96. `state`, `nonce` and the PKCE verifier are generated server-side, and the pending row
+is what stands in for a CSRF token on the callback.** An identity provider's `form_post`
+cannot carry the console's token, so the callback cannot be protected the way every other
+console form is. Instead: `state` is 32 random bytes, the row is keyed by its SHA-256 (as
+`auth_codes` and `device_codes` are keyed by the hash of their code), and the row is bound
+to the console session that created it (`admin_session`, with `ON DELETE CASCADE`, so
+signing out discards the pending rows). A callback that cannot name a live row belonging to
+this session is reported as an error -- never ignored -- and that covers both a replay and
+another administrator holding the URL. The callback also re-asks the guard
+(`ctx.can_in(APP_READ, tenant)`) rather than trusting the row, because a grant can be
+revoked between the request and its answer.
+
+**97. The console cannot complete the token exchange for a `web` client, and says so as a
+readiness item.** A web client must authenticate at the token endpoint, and only a SHA-256
+hash of its client secret is stored -- deliberately, and it is not going to change. The
+alternatives were all worse: asking the administrator to paste a secret into the console,
+minting a short-lived secret on a production app as a side effect of a debug action, or
+storing a test client's secret in clear. So the front channel is tested end to end (every
+check on an ID token delivered there still runs), the exact token request is printed with
+`client_secret=<the secret you hold>` for the administrator to run, and the readiness list
+names the two ways to exercise the redemption too: the tenant's flow tester client, or a
+callback registered under `spa`/`publicClient`. **This is the one readiness item that the
+stored data does not permit implementing, and the only part of the feature where the
+console stops short.**
+
+**98. The password grant is a readiness item only.** It needs both the client secret the
+console cannot read and a user's password, and an administration page is not where somebody
+should be typing a user's password. So the page reports `allow_password_grant` and where to
+change it, prints the request to run by hand, and has no password field anywhere -- which
+`the_password_grant_is_reported_but_never_driven` asserts by looking for
+`type="password"` in the rendered page.
+
+**99. The resource's own `app_role_assignment_required` is reported but not enforced, and
+the page says which.** This server checks assignment on the *client's* service principal at
+`/authorize` (`routes::authorize`), not on the resource's. Both are shown: the client's as
+a pass/fail checked against the administrator's own account (the likely signing-in user,
+and the only one the console can check), the resource's as a note saying it will not refuse
+the token here. Hiding the difference would make the page lie about the server; "assignment
+required" with no indication of *where* would make it useless.
+
+**100. A hybrid flow's two ID tokens are both kept.** The one delivered in the front
+channel carries `c_hash` over the code beside it -- the only check that binds the two -- and
+the one from the token endpoint does not. Collapsing them into one "ID token" section threw
+that away, so the result page renders a list of tokens, each headed with what it is and
+where it came from.
+
+**101. Nothing from a flow test reaches the audit log but the outcome.** `admin.flow_test.start`
+records the response type, the response mode, the clipped scope and whether the response
+will be captured; `admin.flow_test.result` records the response type, the mode, an
+`Outcome` and how many checks failed. No state, no nonce, no verifier, no code, no token,
+no claim value -- and `a_code_flow_runs_end_to_end_and_every_check_passes` asserts that by
+scanning *every* `details` value in the table for `eyJ`, `state`, `nonce` and
+`code_verifier`. This follows decisions 17-18 and the rule in `src/routes/audit.rs`.
+
+**102. The pending row lives ten minutes, is single use, and is deleted before the exchange
+is made.** Ten minutes because that is the authorization code's own lifetime, so keeping it
+longer buys nothing. Single use is enforced by taking the row with a `DELETE` whose
+`rows_affected` must be 1, so two simultaneous callbacks cannot both proceed. Tokens are
+never stored at all: the exchange happens inside the callback request and the values exist
+only in that response, which is `no-store` like every console page -- the same shape as the
+one-time secret reveal in the applications section.
+
+**103. `ResponseType` and `ResponseMode` are now public, and `response_mode` parsing goes
+through the enum.** The flow tester offers the same closed sets on a form and has to spell
+them back into a request, and there must be one list. Making `ResponseMode` an enum with
+`parse`/`as_str` also removed four bare `"query"`/`"fragment"`/`"form_post"` literals from
+`routes::authorize`, which is the standing no-magic-values rule; the behaviour, including
+the two error messages, is unchanged.
+
+**104. Signature verification uses `verify_ignoring_expiry`, so `exp` is its own check.** An
+expired token's signature is still either right or wrong, and reporting "signature failed"
+for a token that merely expired would be the kind of misleading diagnosis this page exists
+to prevent.
+
+**105. What the flow tester does not do.** No device-code flow (it has its own pages and no
+redirect URI to test), no refresh-token redemption, no client-credentials grant (there is no
+browser in it, so there is nothing to drive), no `login_hint`, no `max_age`, no multiple
+resources, and no history: a result page exists once and is not stored anywhere it could be
+read again.
+
 ---
 
 ## Housekeeping
@@ -678,8 +824,8 @@ produces values; it never parses them back.
 also routed two queries through `db::q` that had bypassed it — they only worked on all
 three engines because they happened to carry no placeholders.
 
-**24. Migration numbering:** `0009` audit indexes, `0010` implicit flow, MFA reserved
-`0011`. Renumbered twice as work landed ahead of it.
+**24. Migration numbering:** `0009` audit indexes, `0010` implicit flow, `0011` the flow
+tester's two tables, MFA reserved `0012`. Renumbered three times as work landed ahead of it.
 
 **25. The conformance harness reuses client1's credentials for the
 `client_secret_post` block.** rust-oidc accepts either auth method on any confidential

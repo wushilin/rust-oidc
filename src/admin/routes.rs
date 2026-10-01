@@ -25,7 +25,7 @@ use crate::admin::view::{self, Chrome, Nav, e};
 use crate::admin::{
     APP_READ, AUDIT_READ, BINDING_READ, GROUP_READ, KEY_READ, TENANT_ASSUME, TENANT_READ, TENANT_WRITE, USER_READ,
 };
-use crate::admin::{apps as app_pages, audit as audit_pages, groups as group_pages};
+use crate::admin::{apps as app_pages, audit as audit_pages, flow as flow_pages, groups as group_pages};
 use crate::admin::{keys as key_pages, settings as settings_pages, tenants as tenant_pages};
 use crate::db::{Actor, Event};
 use crate::rbac::{Scope, ScopeKind};
@@ -102,6 +102,17 @@ pub fn router() -> Router<AppState> {
             get(settings_pages::page).post(settings_pages::post),
         )
         .route("/admin/tenants/{tenant}/audit", get(audit_pages::page))
+        .route(
+            "/admin/tenants/{tenant}/flow",
+            get(flow_pages::page).post(flow_pages::post),
+        )
+        // The flow tester's callback. One fixed path, with no `{tenant}` segment,
+        // because it has to be registered as a redirect URI: the pending row names
+        // the tenant, and the guard is applied to that.
+        .route(
+            crate::flowtest::CALLBACK_PATH,
+            get(flow_pages::callback).post(flow_pages::callback),
+        )
 }
 
 /// The chrome for a page: who is signed in, the assumed-tenant banner, and a nav
@@ -123,6 +134,7 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext) -> Chrome<'a> {
         (GROUP_READ, "Groups", "groups"),
         (APP_READ, "Applications", "apps"),
         (BINDING_READ, "Roles", "roles"),
+        (APP_READ, "Flow tester", "flow"),
         (TENANT_WRITE, "Tenant settings", "settings"),
         (AUDIT_READ, "Audit log", "audit"),
     ] {

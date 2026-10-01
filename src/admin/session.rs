@@ -32,6 +32,64 @@ const CSRF_CONTEXT: &str = "rust-oidc admin csrf v1";
 /// The field every console form submits, echoing [`csrf_for`].
 pub const CSRF_FIELD: &str = "csrf";
 
+/// Cookie carrying the nonce that protects the *sign-in* form.
+///
+/// [`csrf_for`] cannot protect that form: it derives the token from the session
+/// cookie, and at sign-in there is no session yet. Without this a third-party
+/// page could post credentials the attacker controls and silently place the
+/// victim in the attacker's console session (login CSRF).
+pub const LOGIN_NONCE_COOKIE: &str = "rust_oidc_admin_login";
+
+/// Long enough to fill in a password manager prompt, short enough that a stale
+/// tab does not keep a usable nonce all day. Invented.
+pub const LOGIN_NONCE_LIFETIME_SECS: i64 = 900;
+
+/// Domain separation for the sign-in nonce, kept distinct from [`CSRF_CONTEXT`]
+/// so a token minted for one purpose can never satisfy the other.
+const LOGIN_NONCE_CONTEXT: &str = "rust-oidc admin login nonce v1";
+
+/// A fresh sign-in nonce: the cookie value to set, and the token the form carries.
+/// The form never carries the cookie value itself, so a page that leaks its own
+/// HTML does not leak the cookie.
+pub fn new_login_nonce() -> (String, String) {
+    let cookie = b64url(&random_bytes(32));
+    let token = login_token_for(&cookie);
+    (cookie, token)
+}
+
+/// The form token belonging to a sign-in nonce cookie.
+pub fn login_token_for(cookie: &str) -> String {
+    sha256_hex(format!("{LOGIN_NONCE_CONTEXT}{cookie}").as_bytes())
+}
+
+/// Whether a submitted sign-in form carries the token for the nonce cookie the
+/// browser was given. Compared in constant time; a missing cookie or token fails.
+pub fn login_nonce_ok(headers: &HeaderMap, submitted: &str) -> bool {
+    let Some(cookie) = crate::session::cookie(headers, LOGIN_NONCE_COOKIE) else {
+        return false;
+    };
+    !submitted.is_empty() && crate::util::ct_eq(&login_token_for(&cookie), submitted)
+}
+
+/// Set the sign-in nonce cookie.
+pub fn set_login_nonce(url: &PublicUrl, value: &str, max_age: i64) -> HeaderValue {
+    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let secure = if url.base().starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    HeaderValue::from_str(&format!(
+        "{LOGIN_NONCE_COOKIE}={value}; Path={path}; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}"
+    ))
+    .expect("cookie value is ASCII")
+}
+
+/// Clear it, once it has been spent.
+pub fn clear_login_nonce(url: &PublicUrl) -> HeaderValue {
+    set_login_nonce(url, "", 0)
+}
+
 #[derive(Debug, Clone)]
 pub struct AdminSession {
     pub cookie_hash: String,

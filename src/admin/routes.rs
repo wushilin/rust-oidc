@@ -134,10 +134,29 @@ pub async fn audited(
 /// distinguished, so the form cannot be used to enumerate administrators.
 const SIGN_IN_FAILED: &str = "That account or password is not correct.";
 
+/// Shown when the sign-in form carried no valid nonce. Deliberately not the same
+/// message as a bad password: this is a stale tab or a cross-site post, and
+/// telling someone their password is wrong when it was never checked is a lie.
+const SIGN_IN_EXPIRED: &str = "That sign-in form is no longer valid. Please try again.";
+
+/// Render the sign-in page with a fresh login nonce and set its cookie.
+///
+/// Every path that shows this form goes through here, so the form always carries
+/// a nonce the next post can be checked against.
+fn sign_in_page(st: &AppState, upn: &str, error: Option<&str>) -> Response {
+    let (cookie, token) = session::new_login_nonce();
+    let mut resp = view::sign_in(st.public_url.base(), upn, error, &token);
+    resp.headers_mut().append(
+        axum::http::header::SET_COOKIE,
+        session::set_login_nonce(&st.public_url, &cookie, session::LOGIN_NONCE_LIFETIME_SECS),
+    );
+    resp
+}
+
 async fn index(State(st): State<AppState>, headers: HeaderMap) -> Response {
     match session::find(&st.pool, &headers).await {
         Ok(Some(_)) => view::see_other(&format!("{}/admin/tenants", st.public_url.base())),
-        Ok(None) => view::sign_in(st.public_url.base(), "", None),
+        Ok(None) => sign_in_page(&st, "", None),
         Err(e) => {
             tracing::error!("admin session lookup failed: {e}");
             view::server_error()
@@ -145,8 +164,16 @@ async fn index(State(st): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 
-async fn signin(State(st): State<AppState>, body: Bytes) -> Response {
+async fn signin(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let form = parse_form(&body);
+    // Before anything else: this form must be one we served. The session-derived
+    // CSRF token cannot cover sign-in, because there is no session yet, so the
+    // sign-in page hands out a single-purpose nonce instead. Without this check a
+    // third-party page could post attacker-controlled credentials and leave the
+    // victim signed in as the attacker.
+    if !session::login_nonce_ok(&headers, field(&form, session::CSRF_FIELD)) {
+        return sign_in_page(&st, "", Some(SIGN_IN_EXPIRED));
+    }
     let upn = field(&form, "upn");
     let password = field(&form, "password");
     let base = st.public_url.base();
@@ -156,11 +183,11 @@ async fn signin(State(st): State<AppState>, body: Bytes) -> Response {
     // no tenant to attribute the attempt to, and the space of invented suffixes
     // is unbounded.
     let Some((_, domain)) = upn.rsplit_once('@') else {
-        return view::sign_in(base, upn, Some(SIGN_IN_FAILED));
+        return sign_in_page(&st, upn, Some(SIGN_IN_FAILED));
     };
     let home = match tenant::resolve(&st.pool, domain).await {
         Ok(Some(t)) => t,
-        Ok(None) => return view::sign_in(base, upn, Some(SIGN_IN_FAILED)),
+        Ok(None) => return sign_in_page(&st, upn, Some(SIGN_IN_FAILED)),
         Err(e) => {
             tracing::error!("tenant lookup failed during console sign-in: {e}");
             return view::server_error();
@@ -177,7 +204,7 @@ async fn signin(State(st): State<AppState>, body: Bytes) -> Response {
     };
     let AuthResult::Ok(user) = result else {
         sign_in_failed(&st, &home, upn, &result, &trace).await;
-        return view::sign_in(base, upn, Some(SIGN_IN_FAILED));
+        return sign_in_page(&st, upn, Some(SIGN_IN_FAILED));
     };
 
     let cookie = match session::create(&st.pool, &user.id, &home.id).await {
@@ -202,6 +229,9 @@ async fn signin(State(st): State<AppState>, body: Bytes) -> Response {
         header::SET_COOKIE,
         session::set_cookie(&st.public_url, &cookie, session::ADMIN_SESSION_LIFETIME_SECS),
     );
+    // The nonce has done its job; a spent one must not authorise a second post.
+    resp.headers_mut()
+        .append(header::SET_COOKIE, session::clear_login_nonce(&st.public_url));
     resp
 }
 

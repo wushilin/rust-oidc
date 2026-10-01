@@ -4,6 +4,39 @@ use common::*;
 
 use rust_oidc::db::Event;
 
+/// Post the sign-in form the way a browser does: fetch the page, carry its nonce.
+async fn attempt(s: &TestServer, b: &Browser, upn: &str, password: &str) -> Page {
+    let form = b.get(&s.url("/admin")).await;
+    let nonce = form
+        .field(rust_oidc::admin::session::CSRF_FIELD)
+        .expect("the sign-in form carries a login nonce");
+    b.post_form(
+        &s.url("/admin/signin"),
+        &[
+            ("upn", upn),
+            ("password", password),
+            (rust_oidc::admin::session::CSRF_FIELD, nonce.as_str()),
+        ],
+    )
+    .await
+}
+
+/// Blank the nonce so two sign-in responses can be compared: each page carries a
+/// fresh one, which is the point, so it is noise for an equality assertion.
+fn without_nonce(body: &str) -> String {
+    let marker = format!(r#"name="{}" value=""#, rust_oidc::admin::session::CSRF_FIELD);
+    match body.find(&marker) {
+        Some(i) => {
+            let start = i + marker.len();
+            match body[start..].find('"') {
+                Some(j) => format!("{}{}", &body[..start], &body[start + j..]),
+                None => body.to_string(),
+            }
+        }
+        None => body.to_string(),
+    }
+}
+
 #[tokio::test]
 async fn an_anonymous_visitor_gets_the_sign_in_form() {
     let s = TestServer::start().await;
@@ -60,25 +93,15 @@ async fn a_wrong_password_says_nothing_about_the_account() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let b = Browser::new();
-    let wrong = b
-        .post_form(
-            &s.url("/admin/signin"),
-            &[("upn", f.upn.as_str()), ("password", "not-the-password")],
-        )
-        .await;
-    let unknown = b
-        .post_form(
-            &s.url("/admin/signin"),
-            &[("upn", "nobody@contoso.com"), ("password", "not-the-password")],
-        )
-        .await;
+    let wrong = attempt(&s, &b, f.upn.as_str(), "not-the-password").await;
+    let unknown = attempt(&s, &b, "nobody@contoso.com", "not-the-password").await;
     assert_eq!(wrong.status, 401, "{}", wrong.body);
     assert_eq!(unknown.status, 401, "{}", unknown.body);
     assert!(admin_cookie(&wrong).is_none(), "no session was created");
     // The two must be indistinguishable, or the form enumerates administrators.
     assert_eq!(
-        wrong.body.replace(f.upn.as_str(), ""),
-        unknown.body.replace("nobody@contoso.com", "")
+        without_nonce(&wrong.body).replace(f.upn.as_str(), ""),
+        without_nonce(&unknown.body).replace("nobody@contoso.com", "")
     );
 }
 
@@ -104,11 +127,7 @@ async fn a_failed_sign_in_for_a_real_account_is_audited() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let b = Browser::new();
-    b.post_form(
-        &s.url("/admin/signin"),
-        &[("upn", f.upn.as_str()), ("password", "not-the-password")],
-    )
-    .await;
+    attempt(&s, &b, f.upn.as_str(), "not-the-password").await;
     let rows = audit_rows(&s, Event::AdminSignInFailed.as_str()).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, f.user_id);
@@ -158,4 +177,89 @@ async fn another_sessions_csrf_token_is_refused() {
         .post_raw(&s.url("/admin/signout"), &[("csrf", theirs.csrf.as_str())])
         .await;
     assert_eq!(page.status, 400, "{}", page.body);
+}
+
+/// Login CSRF: a sign-in post that did not come from our own form must not
+/// establish a session. Without this, a third-party page could post credentials
+/// the attacker controls and leave the victim signed in as the attacker.
+#[tokio::test]
+async fn a_sign_in_without_the_forms_nonce_is_refused() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = Browser::new();
+
+    // Correct credentials, but posted without ever fetching the form.
+    let page = b
+        .post_form(
+            &s.url("/admin/signin"),
+            &[("upn", f.upn.as_str()), ("password", f.password.as_str())],
+        )
+        .await;
+    assert_ne!(page.status, 303, "must not redirect into a session: {}", page.body);
+    assert!(
+        admin_cookie(&page).is_none(),
+        "no console session may be created: {}",
+        page.body
+    );
+    // And it says the form expired rather than claiming the password was wrong,
+    // because the password was never checked.
+    assert!(page.body.contains("no longer valid"), "{}", page.body);
+
+    // The same credentials through the form do work, so the refusal above was
+    // about the nonce and not about the account.
+    let ok = attempt(&s, &b, f.upn.as_str(), f.password.as_str()).await;
+    assert_eq!(ok.status, 303, "{}", ok.body);
+    assert!(admin_cookie(&ok).is_some());
+}
+
+/// A nonce minted for one browser must not authorise another's post.
+#[tokio::test]
+async fn one_browsers_nonce_does_not_work_in_another() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let victim = Browser::new();
+    let attacker = Browser::new();
+
+    // The attacker takes a token from a form served to them...
+    let form = attacker.get(&s.url("/admin")).await;
+    let stolen = form.field(rust_oidc::admin::session::CSRF_FIELD).expect("nonce");
+
+    // ...and plants it in a post from a browser that holds no matching cookie.
+    let page = victim
+        .post_form(
+            &s.url("/admin/signin"),
+            &[
+                ("upn", f.upn.as_str()),
+                ("password", f.password.as_str()),
+                (rust_oidc::admin::session::CSRF_FIELD, stolen.as_str()),
+            ],
+        )
+        .await;
+    assert_ne!(page.status, 303, "{}", page.body);
+    assert!(admin_cookie(&page).is_none(), "{}", page.body);
+}
+
+/// The nonce is single-use: once spent on a successful sign-in its cookie is
+/// cleared, so a replay of the same form cannot open a second session.
+#[tokio::test]
+async fn a_spent_nonce_cannot_be_replayed() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = Browser::new();
+    let form = b.get(&s.url("/admin")).await;
+    let nonce = form.field(rust_oidc::admin::session::CSRF_FIELD).expect("nonce");
+    let fields = [
+        ("upn", f.upn.as_str()),
+        ("password", f.password.as_str()),
+        (rust_oidc::admin::session::CSRF_FIELD, nonce.as_str()),
+    ];
+    let first = b.post_form(&s.url("/admin/signin"), &fields).await;
+    assert_eq!(first.status, 303, "{}", first.body);
+
+    let replay = b.post_form(&s.url("/admin/signin"), &fields).await;
+    assert_ne!(
+        replay.status, 303,
+        "a spent nonce must not sign in again: {}",
+        replay.body
+    );
 }

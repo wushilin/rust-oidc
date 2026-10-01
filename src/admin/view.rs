@@ -145,7 +145,7 @@ fn card(status: StatusCode, title: &str, body: &str) -> Response {
 }
 
 /// The console's sign-in form.
-pub fn sign_in(base: &str, upn: &str, error: Option<&str>) -> Response {
+pub fn sign_in(base: &str, upn: &str, error: Option<&str>, csrf: &str) -> Response {
     let error = error
         .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
         .unwrap_or_default();
@@ -154,9 +154,10 @@ pub fn sign_in(base: &str, upn: &str, error: Option<&str>) -> Response {
 <form method="post" action="{base}/admin/signin">
 <label for="upn">Email or username</label><input id="upn" name="upn" type="email" autocomplete="username" required value="{upn}" autofocus>
 <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
-{error}<div class="actions"><button type="submit">Sign in</button></div></form>"#,
+{csrf}{error}<div class="actions"><button type="submit">Sign in</button></div></form>"#,
         base = e(base),
         upn = e(upn),
+        csrf = csrf_input(csrf),
     );
     let status = if error.is_empty() {
         StatusCode::OK

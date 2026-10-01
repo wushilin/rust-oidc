@@ -651,10 +651,20 @@ impl AdminBrowser {
 /// Sign in to the console as this fixture's user.
 pub async fn signed_in_admin(s: &TestServer, f: &UserFixture) -> AdminBrowser {
     let b = Browser::new();
+    // Fetch the form first, as a browser does: it carries the single-use nonce
+    // that protects sign-in, and sets the cookie the nonce is checked against.
+    let form = b.get(&s.url("/admin")).await;
+    let nonce = form
+        .field(admin_session::CSRF_FIELD)
+        .expect("the sign-in form carries a login nonce");
     let page = b
         .post_form(
             &s.url("/admin/signin"),
-            &[("upn", f.upn.as_str()), ("password", f.password.as_str())],
+            &[
+                ("upn", f.upn.as_str()),
+                ("password", f.password.as_str()),
+                (admin_session::CSRF_FIELD, nonce.as_str()),
+            ],
         )
         .await;
     assert_eq!(page.status, 303, "console sign-in failed: {}", page.body);

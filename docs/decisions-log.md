@@ -876,6 +876,29 @@ I have not verified — and asserting Entra behaviour from memory has been wrong
 this project already. It needs checking against Microsoft's documentation first. The flow
 tester's readiness page already reports this limitation rather than hiding it.
 
+## Flow tester: a runnable command and a fresh sign-in
+
+**113. The request the console cannot make is printed as a curl command, not as raw HTTP.**
+It runs as pasted once one `export` line is filled in. The secret is read from an
+environment variable named after the application (`Hello World` gives
+`HELLO_WORLD_SECRET`, falling back to `CLIENT_SECRET` when the name has nothing usable and
+prefixed `APP_` when it starts with a digit), so the secret never appears in the command
+or in shell history as part of it. Every other value is single-quoted with `'` escaped,
+because a command meant to be pasted must not let a value leave its quotes; that is
+checked against a real shell, and the whole printed command is run with a real `curl`
+against the test server in the integration test. The password-grant block gets the same
+treatment, with `ROPC_USERNAME` and `ROPC_PASSWORD` (names invented).
+
+**114. "Forget this sign-in" ends the browser's session with the tenant.** The authorize
+endpoint remembers a sign-in, correctly, so a second flow test went straight through
+without the sign-in page. The landing and result pages now say whether this browser is
+signed in to the tenant and as whom, and offer a button that ends that session. It needs
+`App:Read`, the same as running a test: it ends only the browser's own session, which the
+logout endpoint would do anyway. It leaves the console session alone and writes
+`session.end` with the administrator as actor. `prompt=login` on the form remains the
+protocol's own way to force a sign-in; the button is for testing from a genuinely clean
+state. *To reverse:* remove `FlowOp::ForgetSignIn`.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

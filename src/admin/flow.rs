@@ -24,7 +24,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use serde_json::{Value, json};
 
@@ -41,8 +41,10 @@ use crate::flowtest::{
     Verdict,
 };
 use crate::rbac::Action;
+use crate::routes::audit::Channel;
 use crate::routes::{Prompt, ResponseMode, ResponseType};
 use crate::tenant::Tenant;
+use crate::{session, users};
 
 /// What a post to the flow tester asks for.
 ///
@@ -56,10 +58,18 @@ pub enum FlowOp {
     AddCallback,
     /// Register this tenant's own flow tester client.
     CreateTestClient,
+    /// End this browser's remembered sign-in to the tenant, so the next test
+    /// starts from the sign-in page.
+    ForgetSignIn,
 }
 
 impl FlowOp {
-    pub const ALL: &'static [FlowOp] = &[Self::Start, Self::AddCallback, Self::CreateTestClient];
+    pub const ALL: &'static [FlowOp] = &[
+        Self::Start,
+        Self::AddCallback,
+        Self::CreateTestClient,
+        Self::ForgetSignIn,
+    ];
 
     pub const FIELD: &'static str = "op";
 
@@ -68,6 +78,7 @@ impl FlowOp {
             Self::Start => "start",
             Self::AddCallback => "add_callback",
             Self::CreateTestClient => "create_test_client",
+            Self::ForgetSignIn => "forget_sign_in",
         }
     }
 
@@ -84,7 +95,9 @@ impl FlowOp {
     /// registration are `App:Write`, like every other registration change.
     fn action(self) -> Action {
         match self {
-            Self::Start => APP_READ,
+            // Forgetting a sign-in ends only this browser's own session with the
+            // tenant, which the browser could do at the logout endpoint anyway.
+            Self::Start | Self::ForgetSignIn => APP_READ,
             Self::AddCallback | Self::CreateTestClient => APP_WRITE,
         }
     }
@@ -105,6 +118,7 @@ pub async fn page(
     State(st): State<AppState>,
     Path(key): Path<String>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = ctx.require(APP_READ, On::Tenant(&key)) {
         return resp;
@@ -113,7 +127,7 @@ pub async fn page(
         return view::not_found();
     };
     let form = parse_form(query.unwrap_or_default().as_bytes());
-    landing(&st, &ctx, tenant, &form, None, StatusCode::OK).await
+    landing(&st, &ctx, &headers, tenant, &form, None, StatusCode::OK).await
 }
 
 /// The chosen configuration, read back from the query string or from the hidden
@@ -137,6 +151,7 @@ fn probe_from(form: &Params) -> Probe {
 async fn landing(
     st: &AppState,
     ctx: &AdminContext,
+    headers: &HeaderMap,
     tenant: &Tenant,
     form: &Params,
     error: Option<&str>,
@@ -207,10 +222,12 @@ and PKCE verifier, and checks the response against them. The compatibility suite
 {form_html}
 {readiness_html}
 {run_html}
+{sign_in_html}
 {callback_html}
 {ropc_html}"#,
         tenant_name = e(&tenant.name),
         error = view::error_block(error),
+        sign_in_html = sign_in_section(st, headers, tenant, &url, &ctx.csrf, &hidden_probe(app, &probe)).await,
         form_html = config_form(&url, &registered, test_client.as_ref(), app, &probe),
         readiness_html = readiness_table(&readiness, base, tenant, app),
         run_html = run_section(&url, &ctx.csrf, app, &probe, &readiness, is_test_client),
@@ -559,6 +576,72 @@ changes. It is an ordinary registration and can be deleted in the applications s
     )
 }
 
+/// What the printed `export` line holds until the administrator replaces it.
+const SECRET_PLACEHOLDER: &str = "<your-secret>";
+/// Variables the printed password-grant command reads the user's credentials from.
+const ROPC_USERNAME_VAR: &str = "ROPC_USERNAME";
+const ROPC_PASSWORD_VAR: &str = "ROPC_PASSWORD";
+
+/// A value in a printed curl command: either written out, or read from an
+/// environment variable the administrator sets first.
+enum CurlValue<'a> {
+    Literal(&'a str),
+    Env(&'a str),
+}
+
+/// Quote a value for a POSIX shell. Single quotes take everything literally, so
+/// the only character needing care is the single quote itself. This matters: the
+/// command is meant to be pasted and run, so a value that escaped its quotes would
+/// run as shell.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// The environment variable a printed command reads this application's secret
+/// from, named after the application: `Hello World` gives `HELLO_WORLD_SECRET`.
+fn secret_env_var(display_name: &str) -> String {
+    let mut name = String::new();
+    for c in display_name.chars() {
+        if c.is_ascii_alphanumeric() {
+            name.push(c.to_ascii_uppercase());
+        } else if !name.is_empty() && !name.ends_with('_') {
+            name.push('_');
+        }
+    }
+    let name = name.trim_end_matches('_');
+    match name.chars().next() {
+        None => "CLIENT_SECRET".to_string(),
+        // A shell variable cannot begin with a digit.
+        Some(c) if c.is_ascii_digit() => format!("APP_{name}_SECRET"),
+        Some(_) => format!("{name}_SECRET"),
+    }
+}
+
+/// A token request as a curl command that runs as pasted. Values the console
+/// knows are written out; anything secret is read from an environment variable,
+/// with the `export` lines to fill in printed above the command.
+fn curl_command(endpoint: &str, fields: &[(&str, CurlValue<'_>)], exports: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (var, placeholder) in exports {
+        out.push_str(&format!("export {var}={}\n", sh_quote(placeholder)));
+    }
+    if !exports.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("curl -sS {}", sh_quote(endpoint)));
+    for (name, value) in fields {
+        let arg = match value {
+            CurlValue::Literal(v) => sh_quote(&format!("{name}={v}")),
+            // Double quotes so the shell substitutes the variable, and nothing else:
+            // the name is ours and the variable name is restricted to [A-Z0-9_].
+            CurlValue::Env(var) => format!("\"{name}=${var}\""),
+        };
+        out.push_str(&format!(" \\\n  --data-urlencode {arg}"));
+    }
+    out.push('\n');
+    out
+}
+
 /// The password grant, which the console deliberately does not run: it would have
 /// to hold a client secret it cannot read and collect a user's password, which it
 /// will not do. So it shows the request instead.
@@ -567,22 +650,33 @@ fn ropc_section(st: &AppState, tenant: &Tenant, app: &Application, probe: &Probe
         return String::new();
     }
     let endpoint = st.public_url.tenant_url(&tenant.id, "oauth2/v2.0/token");
-    let request = format!(
-        "{} {}\nContent-Type: application/x-www-form-urlencoded\n\n\
-         grant_type={}&client_id={}&client_secret=<the secret you hold>\
-         &username=<upn>&password=<password>&scope={}",
-        flowtest::TOKEN_METHOD,
-        endpoint,
-        crate::routes::GrantType::Password.as_str(),
-        app.app_id,
-        probe.scope,
+    let secret_var = secret_env_var(&app.display_name);
+    let request = curl_command(
+        &endpoint,
+        &[
+            (
+                "grant_type",
+                CurlValue::Literal(crate::routes::GrantType::Password.as_str()),
+            ),
+            ("client_id", CurlValue::Literal(&app.app_id)),
+            ("scope", CurlValue::Literal(&probe.scope)),
+            ("username", CurlValue::Env(ROPC_USERNAME_VAR)),
+            ("password", CurlValue::Env(ROPC_PASSWORD_VAR)),
+            ("client_secret", CurlValue::Env(&secret_var)),
+        ],
+        &[
+            (&secret_var, SECRET_PLACEHOLDER),
+            (ROPC_USERNAME_VAR, "<user-upn>"),
+            (ROPC_PASSWORD_VAR, "<user-password>"),
+        ],
     );
     format!(
         r#"<h2>The password grant</h2>
 <p>The console does not run this one. It would have to send the client secret, which it cannot read
 because only a SHA-256 hash of it is stored, and a user's password, which it will not ask you to
-type into an administration page. The request is here to run yourself; the requirement above tells
-you whether this application would accept it.</p>
+type into an administration page. The command is here to run yourself: fill in the three
+<code>export</code> lines and paste it. The requirement above tells you whether this application
+would accept it.</p>
 <pre class="raw">{request}</pre>"#,
         request = e(&request),
     )
@@ -590,7 +684,13 @@ you whether this application would accept it.</p>
 
 // ---- the posts ----
 
-pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path<String>, body: Bytes) -> Response {
+pub async fn post(
+    ctx: AdminContext,
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let form = parse_form(&body);
     let Some(op) = FlowOp::parse(field(&form, FlowOp::FIELD)) else {
         return view::bad_request("That is not an operation this page offers.");
@@ -605,13 +705,20 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
         return view::not_found();
     };
     match op {
-        FlowOp::CreateTestClient => create_test_client(&st, &ctx, tenant, &form).await,
-        FlowOp::AddCallback => add_callback(&st, &ctx, tenant, &form).await,
+        FlowOp::CreateTestClient => create_test_client(&st, &ctx, &headers, tenant, &form).await,
+        FlowOp::AddCallback => add_callback(&st, &ctx, &headers, tenant, &form).await,
         FlowOp::Start => start(&st, &ctx, tenant, &form).await,
+        FlowOp::ForgetSignIn => forget_sign_in(&st, &ctx, &headers, tenant, &form).await,
     }
 }
 
-async fn create_test_client(st: &AppState, ctx: &AdminContext, tenant: &Tenant, form: &Params) -> Response {
+async fn create_test_client(
+    st: &AppState,
+    ctx: &AdminContext,
+    headers: &HeaderMap,
+    tenant: &Tenant,
+    form: &Params,
+) -> Response {
     // A mapping left behind by a deleted application would otherwise block this.
     if flowtest::test_client(&st.pool, &tenant.id)
         .await
@@ -653,16 +760,23 @@ async fn create_test_client(st: &AppState, ctx: &AdminContext, tenant: &Tenant, 
         }
         Err(e) => {
             let message = e.to_string();
-            landing(st, ctx, tenant, form, Some(&message), StatusCode::BAD_REQUEST).await
+            landing(st, ctx, headers, tenant, form, Some(&message), StatusCode::BAD_REQUEST).await
         }
     }
 }
 
-async fn add_callback(st: &AppState, ctx: &AdminContext, tenant: &Tenant, form: &Params) -> Response {
+async fn add_callback(
+    st: &AppState,
+    ctx: &AdminContext,
+    headers: &HeaderMap,
+    tenant: &Tenant,
+    form: &Params,
+) -> Response {
     let Some(platform) = RedirectPlatform::parse(field(form, PLATFORM_FIELD)) else {
         return landing(
             st,
             ctx,
+            headers,
             tenant,
             form,
             Some("Choose a platform."),
@@ -693,13 +807,87 @@ async fn add_callback(st: &AppState, ctx: &AdminContext, tenant: &Tenant, form: 
         }
         Err(e) => {
             let message = e.to_string();
-            landing(st, ctx, tenant, form, Some(&message), StatusCode::BAD_REQUEST).await
+            landing(st, ctx, headers, tenant, form, Some(&message), StatusCode::BAD_REQUEST).await
         }
     }
 }
 
 /// Carry the configuration back into the redirect after a post, so the page the
 /// administrator returns to is the one they were on.
+/// End this browser's sign-in to the tenant. The authorize endpoint remembers a
+/// sign-in, as it should, so a second flow test goes straight through without
+/// asking for a password; this is how the administrator gets the sign-in page back.
+async fn forget_sign_in(
+    st: &AppState,
+    ctx: &AdminContext,
+    headers: &HeaderMap,
+    tenant: &Tenant,
+    form: &Params,
+) -> Response {
+    let found = match session::find(&st.pool, headers, &tenant.id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("flow tester could not read the browser session: {e}");
+            return view::server_error();
+        }
+    };
+    if let Err(e) = session::end(&st.pool, headers, &tenant.id).await {
+        tracing::error!("flow tester could not end the browser session: {e}");
+        return view::server_error();
+    }
+    // Only a session that existed is an event, as at the logout endpoint.
+    if let Some(s) = found {
+        audited(
+            st,
+            ctx,
+            &tenant.id,
+            Event::SessionEnd,
+            Some(&s.user_id),
+            json!({ "via": Channel::Console.as_str(), "purpose": flowtest::PURPOSE }),
+        )
+        .await;
+    }
+    view::see_other(&with_probe(&flow_url(st.public_url.base(), tenant), form))
+}
+
+/// Whether this browser is signed in to the tenant, and the button that ends it.
+///
+/// Stated on the page because it decides what the next test looks like: with a
+/// remembered sign-in the authorize endpoint answers at once, without one it shows
+/// the sign-in page.
+async fn sign_in_section(
+    st: &AppState,
+    headers: &HeaderMap,
+    tenant: &Tenant,
+    url: &str,
+    csrf: &str,
+    hidden: &str,
+) -> String {
+    let Ok(Some(s)) = session::find(&st.pool, headers, &tenant.id).await else {
+        return r#"<h2>Sign-in</h2><p class="muted">This browser has no sign-in remembered for this tenant, so the next
+test starts at the sign-in page.</p>"#
+            .to_string();
+    };
+    let who = match users::find(&st.pool, &tenant.id, &s.user_id).await {
+        Ok(Some(u)) => u.upn,
+        _ => s.user_id.clone(),
+    };
+    format!(
+        r#"<h2>Sign-in</h2>
+<p>This browser is signed in to this tenant as <strong>{who}</strong>, so the next test will go
+straight through without asking for a password. Forget the sign-in to test from the sign-in page
+again.</p>
+<form method="post" action="{url}">{csrf}{hidden}
+<input type="hidden" name="{op_field}" value="{op}">
+<div class="actions"><button class="secondary" type="submit">Forget this sign-in</button></div></form>"#,
+        who = e(&who),
+        url = e(url),
+        csrf = view::csrf_input(csrf),
+        op_field = FlowOp::FIELD,
+        op = FlowOp::ForgetSignIn.as_str(),
+    )
+}
+
 fn with_probe(url: &str, form: &Params) -> String {
     let probe = probe_from(form);
     let mut out = url::Url::parse(url).expect("a console URL parses");
@@ -810,6 +998,7 @@ pub async fn callback(
     State(st): State<AppState>,
     method: Method,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let raw = if method == Method::POST {
@@ -873,7 +1062,25 @@ pub async fn callback(
         }),
     )
     .await;
-    result_page(&st, &ctx, &tenant, &app, &pending, &result)
+    // The test just signed someone in, so say so and offer to undo it: otherwise
+    // the next test silently reuses this sign-in.
+    let again = Probe {
+        response_type: pending.response_type,
+        response_mode: pending.response_mode,
+        scope: pending.scope.clone(),
+        prompt: None,
+        password_grant: false,
+    };
+    let sign_in_html = sign_in_section(
+        &st,
+        &headers,
+        &tenant,
+        &flow_url(st.public_url.base(), &tenant),
+        &ctx.csrf,
+        &hidden_probe(&app, &again),
+    )
+    .await;
+    result_page(&st, &ctx, &tenant, &app, &pending, &result, &sign_in_html)
 }
 
 fn state_mismatch(st: &AppState, ctx: &AdminContext, posted: bool) -> Response {
@@ -1164,6 +1371,7 @@ fn result_page(
     app: &Application,
     pending: &Pending,
     result: &FlowResult,
+    sign_in_html: &str,
 ) -> Response {
     let failed = result.failed();
     let banner = if let Some(error) = &result.error {
@@ -1214,7 +1422,7 @@ fn result_page(
         (None, Some(why)) => format!(
             r#"<h2>The token request</h2><p>{why}</p>{manual}"#,
             why = e(why),
-            manual = manual_request(st, pending, result),
+            manual = manual_request(st, app, pending, result),
         ),
         (None, None) => r#"<h2>The token request</h2><p class="muted">There was no code to redeem: this
 response type delivers everything in the front channel.</p>"#
@@ -1234,6 +1442,7 @@ generated and held; everything below is checked against them.</p>
 <table><tr><th>Parameter</th><th>Value</th></tr>{rows}</table>
 {exchange}
 {tokens}
+{sign_in_html}
 <div class="actions"><a href="{back}">Run another flow test</a></div>"#,
         name = e(&app.display_name),
         tenant_name = e(&tenant.name),
@@ -1274,28 +1483,33 @@ client would have sent.</p>
     )
 }
 
-/// The request the administrator has to make themselves, when the console cannot.
-fn manual_request(st: &AppState, pending: &Pending, result: &FlowResult) -> String {
+/// The request the administrator has to make themselves, when the console cannot:
+/// a curl command that runs as pasted once the secret's `export` line is filled in.
+fn manual_request(st: &AppState, app: &Application, pending: &Pending, result: &FlowResult) -> String {
     let Some(code) = &result.code else {
         return String::new();
     };
-    let mut body = url::form_urlencoded::Serializer::new(String::new());
-    body.append_pair("grant_type", crate::routes::GrantType::AuthorizationCode.as_str());
-    body.append_pair("client_id", &pending.client_app_id);
-    body.append_pair("code", code);
-    body.append_pair("redirect_uri", &pending.redirect_uri);
-    body.append_pair("scope", &pending.scope);
+    let secret_var = secret_env_var(&app.display_name);
+    let endpoint = st.public_url.tenant_url(&pending.tenant_id, "oauth2/v2.0/token");
+    let mut fields = vec![
+        (
+            "grant_type",
+            CurlValue::Literal(crate::routes::GrantType::AuthorizationCode.as_str()),
+        ),
+        ("client_id", CurlValue::Literal(&pending.client_app_id)),
+        ("code", CurlValue::Literal(code)),
+        ("redirect_uri", CurlValue::Literal(&pending.redirect_uri)),
+        ("scope", CurlValue::Literal(&pending.scope)),
+    ];
     if let Some(verifier) = &pending.code_verifier {
-        body.append_pair("code_verifier", verifier);
+        fields.push(("code_verifier", CurlValue::Literal(verifier)));
     }
-    let request = format!(
-        "{} {}\nContent-Type: application/x-www-form-urlencoded\n\n{}&client_secret=<the secret you hold>",
-        flowtest::TOKEN_METHOD,
-        st.public_url.tenant_url(&pending.tenant_id, "oauth2/v2.0/token"),
-        body.finish(),
-    );
+    fields.push(("client_secret", CurlValue::Env(&secret_var)));
+    let request = curl_command(&endpoint, &fields, &[(&secret_var, SECRET_PLACEHOLDER)]);
     format!(
-        r#"<pre class="raw">{request}</pre>
+        r#"<p>Put the application's secret in the <code>export</code> line, then paste both into a
+terminal.</p>
+<pre class="raw">{request}</pre>
 <p class="muted">The code is single use and expires in ten minutes.</p>"#,
         request = e(&request),
     )
@@ -1339,6 +1553,84 @@ fn token_section(view: &TokenView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_secret_variable_is_named_after_the_application() {
+        assert_eq!(secret_env_var("Hello World"), "HELLO_WORLD_SECRET");
+        assert_eq!(secret_env_var("orders-api"), "ORDERS_API_SECRET");
+        assert_eq!(secret_env_var("  My  (test)  app! "), "MY_TEST_APP_SECRET");
+        // A shell variable cannot start with a digit.
+        assert_eq!(secret_env_var("9lives"), "APP_9LIVES_SECRET");
+        // Nothing usable in the name at all.
+        assert_eq!(secret_env_var("!!!"), "CLIENT_SECRET");
+        assert_eq!(secret_env_var(""), "CLIENT_SECRET");
+        // Whatever the name, the result is a valid, inert variable name.
+        for name in ["$(reboot)", "a;b", "é", "x`y`"] {
+            let var = secret_env_var(name);
+            assert!(
+                var.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "{var}"
+            );
+        }
+    }
+
+    /// The command is meant to be pasted and run, so a value must never be able to
+    /// leave its quotes. Checked against a real shell: `curl` is replaced by a
+    /// function that prints its arguments, and they must come back unchanged.
+    #[test]
+    fn a_hostile_value_stays_inside_its_quotes() {
+        let hostile = r#"openid'; touch /tmp/pwned; echo '$(id) `id` "x" \ end"#;
+        let command = curl_command(
+            "https://example.test/token?a=b&c='d'",
+            &[
+                ("scope", CurlValue::Literal(hostile)),
+                ("client_secret", CurlValue::Env("HELLO_WORLD_SECRET")),
+            ],
+            &[("HELLO_WORLD_SECRET", SECRET_PLACEHOLDER)],
+        );
+        let script = format!("curl() {{ printf '%s\\n' \"$@\"; }}\n{command}");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let printed = String::from_utf8_lossy(&out.stdout);
+        let args: Vec<&str> = printed.lines().collect();
+        assert_eq!(
+            args,
+            vec![
+                "-sS",
+                "https://example.test/token?a=b&c='d'",
+                "--data-urlencode",
+                &format!("scope={hostile}"),
+                "--data-urlencode",
+                "client_secret=<your-secret>",
+            ],
+            "the shell saw something other than what was written: {printed}"
+        );
+    }
+
+    #[test]
+    fn the_command_reads_the_secret_from_the_environment_and_never_spells_it() {
+        let command = curl_command(
+            "https://example.test/token",
+            &[
+                ("grant_type", CurlValue::Literal("authorization_code")),
+                ("client_secret", CurlValue::Env("HELLO_WORLD_SECRET")),
+            ],
+            &[("HELLO_WORLD_SECRET", SECRET_PLACEHOLDER)],
+        );
+        assert!(
+            command.starts_with("export HELLO_WORLD_SECRET='<your-secret>'\n\ncurl -sS "),
+            "{command}"
+        );
+        assert!(
+            command.contains("--data-urlencode \"client_secret=$HELLO_WORLD_SECRET\""),
+            "{command}"
+        );
+    }
 
     #[test]
     fn operations_round_trip_and_are_distinct() {

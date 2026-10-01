@@ -414,12 +414,64 @@ async fn a_web_client_is_told_the_console_cannot_redeem_its_code() {
     .await;
     assert_eq!(result.status, 200, "{}", result.body);
     assert!(result.body.contains("is a web client"), "{}", result.body);
-    // The request to run by hand, with the secret left to the administrator.
+    // The request to run by hand is a curl command, with the secret left to the
+    // administrator as an environment variable named after the application.
+    let command = printed_command(&result.body).expect("a curl command is printed");
+    assert!(command.contains("export "), "{command}");
+    assert!(command.contains("_SECRET='<your-secret>'"), "{command}");
+    assert!(command.contains("curl -sS "), "{command}");
     assert!(
-        result.body.contains("&lt;the secret you hold&gt;"),
-        "the console never fills in a secret: {}",
-        result.body
+        !command.contains(&f.web.secret),
+        "the console never fills in a secret: {command}"
     );
+
+    // And it does what it says: fill in the one export line, paste, run. This is
+    // the whole promise of the page, so it is checked against a real shell and a
+    // real curl rather than by reading the text.
+    let filled = command.replace("'<your-secret>'", &format!("'{}'", f.web.secret));
+    // Off the async runtime: the test server lives on this same single-threaded
+    // runtime, so a blocking wait here would starve the server curl is calling.
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("timeout")
+            .args(["30", "sh", "-c", &filled])
+            .output()
+            .expect("sh and curl are available")
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let body: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "the pasted command did not return JSON ({e}): stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert!(
+        body["access_token"].is_string(),
+        "the pasted command was refused: {body}"
+    );
+    assert!(body["id_token"].is_string(), "{body}");
+}
+
+/// The command printed in the page's `<pre>` block, as a terminal would receive it.
+fn printed_command(body: &str) -> Option<String> {
+    let marker = r#"<pre class="raw">"#;
+    body.match_indices(marker)
+        .map(|(i, _)| {
+            let start = i + marker.len();
+            let end = body[start..].find("</pre>").map_or(body.len(), |j| start + j);
+            &body[start..end]
+        })
+        .find(|block| block.contains("curl -sS"))
+        .map(|block| {
+            block
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&#x27;", "'")
+                .replace("&amp;", "&")
+        })
 }
 
 /// The password grant is a readiness item, not something the console runs.
@@ -767,4 +819,70 @@ async fn the_forms_are_csrf_protected() {
         assert_eq!(posted.status, 400, "{form:?}: {}", posted.body);
     }
     assert!(flowtest::test_client(&s.pool, &f.tenant.id).await.unwrap().is_none());
+}
+
+/// The authorize endpoint remembers a sign-in, so a second test goes straight
+/// through. The page says so and offers to forget it, which brings the sign-in
+/// page back for the next test.
+#[tokio::test]
+async fn a_remembered_sign_in_can_be_forgotten_so_the_next_test_starts_fresh() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let flow = s.url(&format!("/admin/tenants/{}/flow", f.tenant.id));
+    let app = apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap();
+    apps::add_redirect_uri(&s.pool, &app, RedirectPlatform::Web, &callback(&s))
+        .await
+        .unwrap();
+
+    // Before any test there is nothing to forget, and no button offering to.
+    let before = b.get(&flow).await;
+    assert_eq!(before.status, 200, "{}", before.body);
+    assert!(before.body.contains("no sign-in remembered"), "{}", before.body);
+    assert!(!before.body.contains("forget_sign_in"), "{}", before.body);
+
+    // Run one flow, signing in on the way.
+    let fields = [
+        ("app", f.web.app_id.as_str()),
+        ("response_type", "code"),
+        ("response_mode", "query"),
+        ("scope", "openid"),
+    ];
+    let result = run_flow(&s, &b, &f, &fields).await;
+    assert_eq!(result.status, 200, "{}", result.body);
+    // The result page itself says who is now signed in and offers the button.
+    assert!(result.body.contains(&f.upn), "{}", result.body);
+    assert!(result.body.contains("forget_sign_in"), "{}", result.body);
+
+    // So does the landing page, and a second authorize now skips the sign-in page.
+    let remembered = b.get(&flow).await;
+    assert!(remembered.body.contains("Forget this sign-in"), "{}", remembered.body);
+    let mut start: Vec<(&str, &str)> = fields.to_vec();
+    start.push(("op", "start"));
+    let second = b.post(&flow, &start).await;
+    let authorize = second.location.clone().expect("start redirects to authorize");
+    let straight_through = b.b.get(&authorize).await;
+    assert_eq!(straight_through.status, 302, "a remembered sign-in answers at once");
+    assert!(straight_through.field("csrf").is_none());
+
+    // Forget it.
+    let mut forget: Vec<(&str, &str)> = fields.to_vec();
+    forget.push(("op", "forget_sign_in"));
+    let forgotten = b.post(&flow, &forget).await;
+    assert_eq!(forgotten.status, 303, "{}", forgotten.body);
+    let after = b.get(&flow).await;
+    assert!(after.body.contains("no sign-in remembered"), "{}", after.body);
+
+    // And the next test is asked to sign in again.
+    let third = b.post(&flow, &start).await;
+    let authorize = third.location.clone().expect("start redirects to authorize");
+    let asked = b.b.get(&authorize).await;
+    assert_eq!(asked.status, 200, "the sign-in page is back");
+    assert!(asked.field("csrf").is_some(), "{}", asked.body);
+
+    // Forgetting ended only the tenant sign-in, not the console session.
+    assert_eq!(b.get(&s.url("/admin/tenants")).await.status, 200);
+    // And it is on the record, as the administrator's act.
+    let rows = audit_rows(&s, rust_oidc::db::Event::SessionEnd.as_str()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
 }

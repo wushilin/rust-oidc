@@ -886,3 +886,81 @@ async fn a_remembered_sign_in_can_be_forgotten_so_the_next_test_starts_fresh() {
     let rows = audit_rows(&s, rust_oidc::db::Event::SessionEnd.as_str()).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
 }
+
+/// The Start button must run the settings on screen. It used to be a separate
+/// form holding the last-checked settings in hidden fields, so choosing a prompt
+/// and pressing Start ran the flow without it and showed no account picker.
+#[tokio::test]
+async fn start_runs_the_settings_on_screen_not_a_hidden_copy() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let flow = s.url(&flow_path(&f.tenant.id));
+    let app = apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap();
+    apps::add_redirect_uri(&s.pool, &app, RedirectPlatform::Web, &callback(&s))
+        .await
+        .unwrap();
+
+    // One form holds the settings, and the Start button belongs to it. With no
+    // sign-in remembered there is no other form on the page carrying a copy.
+    let page = b
+        .get(&format!(
+            "{flow}?app={}&response_type=code&response_mode=query&scope=openid",
+            f.web.app_id
+        ))
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains(r#"<form id="flow-config" method="post""#),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains(r#"form="flow-config" name="op" value="start""#),
+        "the Start button submits the settings form: {}",
+        page.body
+    );
+    assert!(
+        !page.body.contains(r#"type="hidden" name="response_type""#),
+        "a hidden copy of the settings is back: {}",
+        page.body
+    );
+
+    // Check posts the settings and lands on a page that reflects them.
+    let fields = [
+        ("app", f.web.app_id.as_str()),
+        ("response_type", "code"),
+        ("response_mode", "query"),
+        ("scope", "openid"),
+        ("prompt", "select_account"),
+    ];
+    let mut check: Vec<(&str, &str)> = fields.to_vec();
+    check.push(("op", "check"));
+    let checked = b.post(&flow, &check).await;
+    assert_eq!(checked.status, 303, "{}", checked.body);
+    let landed = checked.location.expect("check redirects back to the page");
+    assert!(landed.contains("prompt=select_account"), "{landed}");
+
+    // Sign in once, so there is an account for the picker to offer.
+    let done = run_flow(&s, &b, &f, &fields[..4]).await;
+    assert_eq!(done.status, 200, "{}", done.body);
+
+    // Start, with the prompt chosen and Check never pressed for it: the prompt
+    // reaches the authorize endpoint and the account picker is shown.
+    let mut start: Vec<(&str, &str)> = fields.to_vec();
+    start.push(("op", "start"));
+    let started = b.post(&flow, &start).await;
+    assert_eq!(started.status, 303, "{}", started.body);
+    let authorize = started.location.expect("start redirects to authorize");
+    assert!(authorize.contains("prompt=select_account"), "{authorize}");
+    let picker = b.b.get(&authorize).await;
+    assert_eq!(
+        picker.status, 200,
+        "select_account shows a page rather than going straight through"
+    );
+    assert!(
+        picker.body.contains(&f.upn),
+        "the account picker names the account: {}",
+        picker.body
+    );
+}

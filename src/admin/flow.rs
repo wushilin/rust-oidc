@@ -61,6 +61,8 @@ pub enum FlowOp {
     /// End this browser's remembered sign-in to the tenant, so the next test
     /// starts from the sign-in page.
     ForgetSignIn,
+    /// Re-read the requirements for the settings on screen, running nothing.
+    Check,
 }
 
 impl FlowOp {
@@ -69,6 +71,7 @@ impl FlowOp {
         Self::AddCallback,
         Self::CreateTestClient,
         Self::ForgetSignIn,
+        Self::Check,
     ];
 
     pub const FIELD: &'static str = "op";
@@ -79,6 +82,7 @@ impl FlowOp {
             Self::AddCallback => "add_callback",
             Self::CreateTestClient => "create_test_client",
             Self::ForgetSignIn => "forget_sign_in",
+            Self::Check => "check",
         }
     }
 
@@ -97,7 +101,7 @@ impl FlowOp {
         match self {
             // Forgetting a sign-in ends only this browser's own session with the
             // tenant, which the browser could do at the logout endpoint anyway.
-            Self::Start | Self::ForgetSignIn => APP_READ,
+            Self::Start | Self::ForgetSignIn | Self::Check => APP_READ,
             Self::AddCallback | Self::CreateTestClient => APP_WRITE,
         }
     }
@@ -228,9 +232,9 @@ and PKCE verifier, and checks the response against them. The compatibility suite
         tenant_name = e(&tenant.name),
         error = view::error_block(error),
         sign_in_html = sign_in_section(st, headers, tenant, &url, &ctx.csrf, &hidden_probe(app, &probe)).await,
-        form_html = config_form(&url, &registered, test_client.as_ref(), app, &probe),
+        form_html = config_form(&url, &ctx.csrf, &registered, test_client.as_ref(), app, &probe),
         readiness_html = readiness_table(&readiness, base, tenant, app),
-        run_html = run_section(&url, &ctx.csrf, app, &probe, &readiness, is_test_client),
+        run_html = run_section(&probe, &readiness, is_test_client),
         callback_html = callback_section(
             &url,
             &ctx.csrf,
@@ -250,6 +254,7 @@ and PKCE verifier, and checks the response against them. The compatibility suite
 /// travels in a URL where a proxy log or a `Referer` header could keep it.
 fn config_form(
     url: &str,
+    csrf: &str,
     registered: &[Application],
     test_client: Option<&Application>,
     chosen: &Application,
@@ -310,16 +315,22 @@ fn config_form(
     .collect();
     format!(
         r#"<h2>What to test</h2>
-<form method="get" action="{url}">
+<form id="{CONFIG_FORM_ID}" method="post" action="{url}">{csrf}
 <label for="app">Application</label><select id="app" name="{APP_FIELD}">{apps}</select>
 <label for="response_type">Response type</label><select id="response_type" name="{RESPONSE_TYPE_FIELD}">{response_types}</select>
 <label for="response_mode">Response mode</label><select id="response_mode" name="{RESPONSE_MODE_FIELD}">{response_modes}</select>
 <label for="scope">Scope</label><input id="scope" name="{SCOPE_FIELD}" type="text" value="{scope}">
 <label for="prompt">Prompt</label><select id="prompt" name="{PROMPT_FIELD}">{prompts}</select>
+<p class="muted"><code>login</code> forces the sign-in page and <code>select_account</code> the account
+picker, even with a remembered sign-in. <code>consent</code> is accepted and shows nothing: this server
+has no consent screen, because applications are consented by an administrator.</p>
 <label><input type="checkbox" name="{PASSWORD_GRANT_FIELD}"{ropc}> I am also testing the password grant (ROPC)</label>
-<div class="actions"><button class="secondary" type="submit">Check this configuration</button></div>
+<div class="actions"><button class="secondary" type="submit" name="{op_field}" value="{check}">Check this configuration</button></div>
 </form>"#,
         url = e(url),
+        csrf = view::csrf_input(csrf),
+        op_field = FlowOp::FIELD,
+        check = FlowOp::Check.as_str(),
         scope = e(&probe.scope),
         ropc = if probe.password_grant { " checked" } else { "" },
     )
@@ -393,14 +404,7 @@ fn finding_row(f: &Finding, app_page: &str) -> String {
 }
 
 /// The start button, or the reason there is none.
-fn run_section(
-    url: &str,
-    csrf: &str,
-    app: &Application,
-    probe: &Probe,
-    readiness: &Readiness,
-    is_test_client: bool,
-) -> String {
+fn run_section(probe: &Probe, readiness: &Readiness, is_test_client: bool) -> String {
     if !readiness.ready() {
         return format!(
             r#"<h2>Run it</h2><p>Not yet: {} of the requirements above are not met. Each one says what to change.</p>"#,
@@ -430,13 +434,15 @@ application's registration.</p>"#
 it does sign a user in, and that sign-in is recorded in the audit log as any other would be.</p>"#
     };
     format!(
-        r#"<h2>Run it</h2><form method="post" action="{url}">{csrf}{hidden}
-<input type="hidden" name="{field}" value="{op}">
+        // The button belongs to the settings form above (the `form` attribute), so it
+        // runs what is selected on screen *now*. It used to be a form of its own
+        // carrying the last-checked settings in hidden fields, so changing a setting
+        // and pressing Start silently ran the old one.
+        r#"<h2>Run it</h2>
 <p>{note}</p>{client_note}
-<div class="actions"><button type="submit">{button}</button></div></form>"#,
-        url = e(url),
-        csrf = view::csrf_input(csrf),
-        hidden = hidden_probe(app, probe),
+<p class="muted">This runs the settings as they are shown above right now, whether or not you
+pressed Check since changing them.</p>
+<div class="actions"><button type="submit" form="{CONFIG_FORM_ID}" name="{field}" value="{op}">{button}</button></div>"#,
         field = FlowOp::FIELD,
         op = FlowOp::Start.as_str(),
         note = e(note),
@@ -576,6 +582,10 @@ changes. It is an ordinary registration and can be deleted in the applications s
     )
 }
 
+/// The settings form. The Start button lives further down the page and belongs to
+/// this form by id, so there is one set of settings and no hidden copy of them.
+const CONFIG_FORM_ID: &str = "flow-config";
+
 /// What the printed `export` line holds until the administrator replaces it.
 const SECRET_PLACEHOLDER: &str = "<your-secret>";
 /// Variables the printed password-grant command reads the user's credentials from.
@@ -709,6 +719,9 @@ pub async fn post(
         FlowOp::AddCallback => add_callback(&st, &ctx, &headers, tenant, &form).await,
         FlowOp::Start => start(&st, &ctx, tenant, &form).await,
         FlowOp::ForgetSignIn => forget_sign_in(&st, &ctx, &headers, tenant, &form).await,
+        // Back to the page with these settings in its address, where the readiness
+        // check is a plain GET that can be reloaded and bookmarked.
+        FlowOp::Check => view::see_other(&with_probe(&flow_url(st.public_url.base(), tenant), &form)),
     }
 }
 

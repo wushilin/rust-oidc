@@ -899,6 +899,20 @@ logout endpoint would do anyway. It leaves the console session alone and writes
 protocol's own way to force a sign-in; the button is for testing from a genuinely clean
 state. *To reverse:* remove `FlowOp::ForgetSignIn`.
 
+**115. The flow tester has one settings form, and Start belongs to it.** Start used to be
+a separate form carrying the last-checked settings in hidden fields, so choosing a prompt
+and pressing Start ran the flow without it: `select_account` showed no account picker and
+looked broken. The Start button now belongs to the settings form by the `form` attribute
+and submits what is on screen. Check became a post that redirects to the same readable
+GET page. The page also says that `prompt=consent` shows nothing, because this server
+has no consent screen. Verified on SQLite only, at the user's request (see 116).
+
+**116. From here, commits are verified on SQLite only.** The user asked to skip the
+Postgres and MySQL runs for now because they take 12-20 minutes each time. Both
+deployments run SQLite. The last three-engine pass is commit `ccc02c1`; anything touching
+SQL or migrations after it is unverified on the other two engines until that run is made
+again.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

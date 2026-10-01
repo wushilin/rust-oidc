@@ -95,8 +95,16 @@ async fn render(
     };
     let url = roles_url(st.public_url.base(), tenant);
     let csrf = view::csrf_input(&ctx.csrf);
+    // A binding at `all` scope is the platform's, not this tenant's, and its
+    // principal may administer tenants this viewer cannot see. Only somebody who
+    // can read platform-wide is shown it; they have `/admin/bindings` for exactly
+    // that question.
+    let platform_visible = ctx.can(BINDING_READ, On::Platform);
     let mut rows = String::new();
-    for b in &listed {
+    for b in listed
+        .iter()
+        .filter(|b| platform_visible || b.scope.kind() == ScopeKind::Tenants)
+    {
         // The revoke button appears only where the no-widening rule would allow
         // it; `authz::delete` checks it again, and the lock-out rule too.
         let revoke = if authz::may_write_binding(ctx.bindings(), &b.scope) {
@@ -117,7 +125,7 @@ async fn render(
             who = e(&principal_name(st, b).await),
             kind = e(b.principal_type.as_str()),
             role = e(b.role.display_name()),
-            scope = scope_cell(&b.scope),
+            scope = scope_cell(&b.scope, tenant, platform_visible),
         ));
     }
 
@@ -125,13 +133,19 @@ async fn render(
         .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
         .unwrap_or_default();
     let grant = if ctx.can_in(BINDING_WRITE, tenant) {
+        // `PlatformAdministrator`'s actions are platform-wide, so a tenant-scoped
+        // grant of it grants nothing at all (`a_tenant_scoped_platform_binding_cannot_assume`).
+        // Offering it to somebody who cannot grant at every-tenant scope would be a
+        // trap: the grant would appear to work and would do nothing.
+        let may_grant_everywhere = authz::may_write_binding(ctx.bindings(), &Scope::All);
         let roles: String = RoleId::ALL
             .iter()
+            .filter(|r| may_grant_everywhere || **r != RoleId::PlatformAdministrator)
             .map(|r| format!(r#"<option value="{}">{}</option>"#, e(r.as_str()), e(r.display_name())))
             .collect();
         // The `all` option is offered only to someone who already holds the action
         // everywhere, because a grant at `all` scope would otherwise be a widening.
-        let all_option = if authz::may_write_binding(ctx.bindings(), &Scope::All) {
+        let all_option = if may_grant_everywhere {
             format!(
                 r#"<option value="{}">Every tenant</option>"#,
                 e(ScopeKind::All.as_str())
@@ -171,14 +185,28 @@ async fn render(
     view::page(&chrome(st, ctx), status, "Roles", &body)
 }
 
-fn scope_cell(scope: &Scope) -> String {
+/// The scope of a binding as this viewer may see it. Another tenant's id is not
+/// theirs to know, so a binding that also covers other tenants is summarised by
+/// how many rather than by which.
+fn scope_cell(scope: &Scope, tenant: &Tenant, platform_visible: bool) -> String {
     match scope {
         Scope::All => format!(r#"<span class="pill">{}</span>"#, e(ScopeKind::All.as_str())),
         Scope::Tenants(ids) if ids.is_empty() => r#"<span class="muted">no live tenant</span>"#.to_string(),
-        Scope::Tenants(ids) => ids
+        Scope::Tenants(ids) if platform_visible => ids
             .iter()
             .map(|id| format!(r#"<span class="pill">{}</span>"#, e(id)))
             .collect(),
+        Scope::Tenants(ids) => {
+            let others = ids.iter().filter(|id| *id != &tenant.id).count();
+            let mut cell = r#"<span class="pill">this tenant</span>"#.to_string();
+            if others > 0 {
+                cell.push_str(&format!(
+                    r#"<span class="muted">and {others} other tenant{s}</span>"#,
+                    s = if others == 1 { "" } else { "s" }
+                ));
+            }
+            cell
+        }
     }
 }
 
@@ -276,6 +304,16 @@ async fn grant(
     // principal can grant reach it does not already hold.
     if !authz::may_write_binding(ctx.bindings(), &scope) {
         return Err(Refusal::Forbidden);
+    }
+    // Refused rather than stored: the platform role's actions are platform-wide, so a
+    // tenant-scoped binding of it would grant nothing, while reading -- to whoever
+    // found it later -- as a platform administrator who is not one.
+    if role == RoleId::PlatformAdministrator && scope != Scope::All {
+        return Err(Refusal::Message(
+            "The platform role only means anything at every-tenant scope. Scoped to one \
+             tenant it would grant nothing."
+                .into(),
+        ));
     }
 
     let principal_id = match principal_type {

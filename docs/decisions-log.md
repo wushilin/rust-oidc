@@ -466,6 +466,23 @@ account would be an enumeration oracle (decision 33).
 already covers the tenant, so the assumed tenant is display and defaults only.
 `assuming_does_not_widen_what_is_permitted` holds it.
 
+**69. A delegated administrator's roles page shows neither the platform's
+administrators nor another tenant's id.** `bindings::list_for_tenant` returns
+`all`-scope bindings too, and a principal id resolves to a UPN whatever tenant the
+account lives in, so the first version of the page would have told a tenant
+administrator who the super administrator is -- an account in a tenant they cannot see.
+An `all`-scope row is now shown only to somebody who can read platform-wide (who has
+`/admin/bindings` for that), and a binding covering several tenants is summarised as
+"this tenant and N others" rather than listing ids that are not theirs to know.
+
+**70. A tenant-scoped `PlatformAdministrator` grant is refused, not stored.** The form
+does not offer the role to anyone who cannot grant at every-tenant scope, and the post
+refuses it as well. Its actions are platform-wide, so the binding would grant nothing
+while reading, to whoever found it later, as a platform administrator who is not one --
+which is the same confusion that made the lock-out rule wrong in decision 52. Found by a
+test written for something else: the roles page listed "Platform Administrator" in its
+`<select>`, which is how the trap came to light.
+
 **68. `PlatformAdministrator` still holds no role over roles, and I did not widen it.**
 On the deployed service `admin@wushilin.net` holds `PlatformAdministrator` at `all` plus
 `GlobalAdministrator` scoped to the root tenant only. In the console that account can

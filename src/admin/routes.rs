@@ -334,7 +334,8 @@ async fn tenants(ctx: AdminContext, State(st): State<AppState>) -> Response {
         })
         .collect();
     let body = if rows.is_empty() {
-        r#"<h1>Tenants</h1><p class="sub">You are not an administrator of any tenant that still exists.</p>"#
+        r#"<h1>Tenants</h1><p class="sub">No tenant is listed for you. Your roles may still cover the
+people and objects inside one -- the links above go where they reach.</p>"#
             .to_string()
     } else {
         format!(

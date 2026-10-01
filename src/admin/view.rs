@@ -21,8 +21,8 @@ pub fn e(s: &str) -> String {
 }
 
 const STYLE: &str = r#"
-:root { --bg:#f6f7f9; --card:#fff; --fg:#1b1b1b; --muted:#5f6368; --accent:#0f6cbd; --err:#b3261e; --ok:#146c2e; --border:#d0d4da; }
-@media (prefers-color-scheme: dark) { :root { --bg:#16181c; --card:#212429; --fg:#e8eaed; --muted:#a0a4ab; --accent:#4f9ae8; --err:#f2b8b5; --ok:#6dd58c; --border:#3a3f46; } }
+:root { --bg:#f6f7f9; --card:#fff; --fg:#1b1b1b; --muted:#5f6368; --accent:#0f6cbd; --err:#b3261e; --border:#d0d4da; }
+@media (prefers-color-scheme: dark) { :root { --bg:#16181c; --card:#212429; --fg:#e8eaed; --muted:#a0a4ab; --accent:#4f9ae8; --err:#f2b8b5; --border:#3a3f46; } }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
 header.top { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:10px 20px; background:var(--card); border-bottom:1px solid var(--border); }
@@ -40,8 +40,8 @@ th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(-
 tr:last-child td { border-bottom:none; }
 form.inline { display:inline; }
 label { display:block; font-size:13px; margin:14px 0 4px; }
-input[type=text], input[type=email], input[type=password], input[type=search] { width:100%; max-width:420px; padding:8px 10px; font:inherit; color:var(--fg); background:transparent; border:1px solid var(--border); border-radius:4px; }
-input:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+input[type=text], input[type=email], input[type=password], input[type=search], select { width:100%; max-width:420px; padding:8px 10px; font:inherit; color:var(--fg); background:transparent; border:1px solid var(--border); border-radius:4px; }
+input:focus, select:focus { outline:2px solid var(--accent); outline-offset:-1px; }
 button { font:inherit; padding:7px 14px; border-radius:4px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
 button.secondary { background:transparent; color:var(--accent); }
 button.danger { background:transparent; border-color:var(--err); color:var(--err); }

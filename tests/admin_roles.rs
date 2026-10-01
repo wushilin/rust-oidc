@@ -310,3 +310,116 @@ async fn a_user_administrator_cannot_see_the_roles_page() {
     let b = signed_in_admin(&s, &f).await;
     assert_eq!(b.get(&roles_url(&s, &f.tenant.id)).await.status, 403);
 }
+
+/// A delegated administrator's roles page must not name the platform's
+/// administrators, who may be accounts in tenants this one cannot see, nor the ids
+/// of other tenants a binding happens to cover.
+#[tokio::test]
+async fn a_tenant_admin_is_not_shown_the_platform_administrators() {
+    let s = TestServer::start().await;
+    let platform = admin_fixture(&s).await;
+    let other = s.tenant("Fabrikam", "fabrikam.test").await;
+    let delegated = user_fixture_in(&s, other.clone(), "boss@fabrikam.test").await;
+    bind(
+        &s,
+        &delegated.user_id,
+        RoleId::GlobalAdministrator,
+        Scope::Tenants(vec![other.id.clone()]),
+    )
+    .await;
+    // A binding that covers this tenant *and* another one.
+    let shared = user_fixture_in(&s, other.clone(), "shared@fabrikam.test").await;
+    bind(
+        &s,
+        &shared.user_id,
+        RoleId::GlobalReader,
+        Scope::Tenants(vec![other.id.clone(), platform.tenant.id.clone()]),
+    )
+    .await;
+
+    let b = signed_in_admin(&s, &delegated).await;
+    let page = b.get(&roles_url(&s, &other.id)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("boss@fabrikam.test"), "their own: {}", page.body);
+    assert!(
+        !page.body.contains(&platform.upn),
+        "the platform administrator is not named: {}",
+        page.body
+    );
+    assert!(
+        !page.body.contains(RoleId::PlatformAdministrator.display_name()),
+        "{}",
+        page.body
+    );
+    assert!(
+        !page.body.contains(&platform.tenant.id),
+        "another tenant's id is not theirs to know: {}",
+        page.body
+    );
+    assert!(
+        page.body.contains("1 other tenant"),
+        "summarised instead: {}",
+        page.body
+    );
+}
+
+/// A tenant-scoped `PlatformAdministrator` binding grants nothing, so the console
+/// refuses to create one rather than storing a role that only looks like power.
+#[tokio::test]
+async fn the_platform_role_cannot_be_granted_to_one_tenant() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let helper = user_fixture_in(&s, f.tenant.clone(), "helper@contoso.com").await;
+    let b = signed_in_admin(&s, &f).await;
+
+    let page = b
+        .post(
+            &roles_url(&s, &f.tenant.id),
+            &[
+                ("op", "grant"),
+                ("principal", "helper@contoso.com"),
+                ("principal_type", "User"),
+                ("role", RoleId::PlatformAdministrator.as_str()),
+                ("scope", "tenants"),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 400, "{}", page.body);
+    assert!(page.body.contains("every-tenant scope"), "{}", page.body);
+    assert!(effective_for_user(&s.pool, &helper.user_id).await.unwrap().is_empty());
+
+    // At every-tenant scope it is accepted, because there it means something.
+    let wide = b
+        .post(
+            &roles_url(&s, &f.tenant.id),
+            &[
+                ("op", "grant"),
+                ("principal", "helper@contoso.com"),
+                ("principal_type", "User"),
+                ("role", RoleId::PlatformAdministrator.as_str()),
+                ("scope", "all"),
+            ],
+        )
+        .await;
+    assert_eq!(wide.status, 303, "{}", wide.body);
+    let eff = effective_for_user(&s.pool, &helper.user_id).await.unwrap();
+    assert_eq!(eff.len(), 1);
+    assert_eq!(eff[0].scope, Scope::All);
+}
+
+/// And a tenant admin, who cannot grant at every-tenant scope, is not even shown
+/// the platform role in the form.
+#[tokio::test]
+async fn a_tenant_admin_is_not_offered_the_platform_role() {
+    let s = TestServer::start().await;
+    let f = tenant_admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let page = b.get(&roles_url(&s, &f.tenant.id)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Grant a role"), "{}", page.body);
+    assert!(
+        !page.body.contains(RoleId::PlatformAdministrator.as_str()),
+        "{}",
+        page.body
+    );
+}

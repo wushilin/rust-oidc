@@ -442,6 +442,9 @@ pub enum Event {
     Lockout,
     SessionCreate,
     SessionEnd,
+    /// The user answered the consent page for an application.
+    ConsentGranted,
+    ConsentDenied,
     // -- token endpoint --
     TokenIssued,
     TokenClientAuthFailed,
@@ -540,6 +543,8 @@ impl Event {
         Self::Lockout,
         Self::SessionCreate,
         Self::SessionEnd,
+        Self::ConsentGranted,
+        Self::ConsentDenied,
         Self::TokenIssued,
         Self::TokenClientAuthFailed,
         Self::TokenAssertionRejected,
@@ -620,6 +625,8 @@ impl Event {
             Self::Lockout => "auth.lockout",
             Self::SessionCreate => "session.create",
             Self::SessionEnd => "session.end",
+            Self::ConsentGranted => "auth.consent_granted",
+            Self::ConsentDenied => "auth.consent_denied",
             Self::TokenIssued => "token.issued",
             Self::TokenClientAuthFailed => "token.client_auth_failed",
             Self::TokenAssertionRejected => "token.assertion_rejected",

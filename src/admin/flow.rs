@@ -322,8 +322,8 @@ fn config_form(
 <label for="scope">Scope</label><input id="scope" name="{SCOPE_FIELD}" type="text" value="{scope}">
 <label for="prompt">Prompt</label><select id="prompt" name="{PROMPT_FIELD}">{prompts}</select>
 <p class="muted"><code>login</code> forces the sign-in page and <code>select_account</code> the account
-picker, even with a remembered sign-in. <code>consent</code> is accepted and shows nothing: this server
-has no consent screen, because applications are consented by an administrator.</p>
+picker, even with a remembered sign-in. <code>consent</code> shows the permissions page, where the
+person signing in allows or refuses what the application asked for.</p>
 <label><input type="checkbox" name="{PASSWORD_GRANT_FIELD}"{ropc}> I am also testing the password grant (ROPC)</label>
 <div class="actions"><button class="secondary" type="submit" name="{op_field}" value="{check}">Check this configuration</button></div>
 </form>"#,

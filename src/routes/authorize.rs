@@ -75,6 +75,10 @@ enum Interaction {
     SignedIn,
     /// Picked the existing account on the account picker.
     ChoseAccount,
+    /// Pressed Allow on the consent page.
+    Consented,
+    /// Pressed Deny on it.
+    ConsentDenied,
 }
 
 /// A validated request, ready to be answered at the client's redirect URI.
@@ -443,14 +447,16 @@ impl Prompt {
 
 /// The prompts one request asked for.
 ///
-/// `consent` and `create` are accepted and have no effect here -- apps are
-/// admin-consented and there is no sign-up -- so they are absorbed at parse time
-/// and never reach a decision.
+/// `consent` shows the consent page even though nothing here requires it: apps
+/// are treated as consented by an administrator, so the page appears only when a
+/// client asks for it. `create` is accepted and has no effect, since there is no
+/// sign-up.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PromptSet {
     pub none: bool,
     pub login: bool,
     pub select_account: bool,
+    pub consent: bool,
 }
 
 impl PromptSet {
@@ -462,8 +468,9 @@ impl PromptSet {
                 Some(Prompt::None) => set.none = true,
                 Some(Prompt::Login) => set.login = true,
                 Some(Prompt::SelectAccount) => set.select_account = true,
-                // Accepted, no effect: apps are admin-consented and there is no sign-up.
-                Some(Prompt::Consent) | Some(Prompt::Create) => {}
+                Some(Prompt::Consent) => set.consent = true,
+                // Accepted, no effect: there is no sign-up.
+                Some(Prompt::Create) => {}
                 None => {
                     return Err(AadError::invalid_request(
                         Aadsts::UnsupportedParameter,
@@ -472,7 +479,7 @@ impl PromptSet {
                 }
             }
         }
-        if set.none && (set.login || set.select_account) {
+        if set.none && (set.login || set.select_account || set.consent) {
             return Err(AadError::invalid_request(
                 Aadsts::UnsupportedParameter,
                 "prompt=none cannot be combined with other values.",
@@ -583,9 +590,18 @@ async fn continue_authorize(
         None => None,
     };
     let fresh = interaction == Interaction::SignedIn;
+    // With `prompt=login consent` the sign-in page comes first and the consent
+    // page second, so by the time the consent answer arrives the user has already
+    // re-authenticated for this request. Honour that -- but only if the session
+    // really is that recent, so posting a consent answer cannot be used to dodge
+    // `prompt=login` on an old session.
+    let answered_consent = matches!(interaction, Interaction::Consented | Interaction::ConsentDenied)
+        && session
+            .as_ref()
+            .is_some_and(|s| now() - s.auth_time <= CONSENT_REAUTH_WINDOW);
     let mut needs_login = user.is_none();
     if !fresh {
-        needs_login |= prompt.login;
+        needs_login |= prompt.login && !answered_consent;
         if let (Some(max_age), Some(s)) = (max_age, &session) {
             needs_login |= now() - s.auth_time > max_age;
         }
@@ -625,6 +641,44 @@ async fn continue_authorize(
             apps::not_assigned_message(&v.client),
         );
         return Err(Step::Page(html::error(Some(&v.tenant.name), &err.description())));
+    }
+
+    // ---- consent, when the client asked for it ----
+    if prompt.consent {
+        match interaction {
+            Interaction::Consented => {
+                let details = serde_json::json!({ "clientId": v.client.app_id, "scope": grant.granted.join(" ") });
+                audit::record(
+                    st,
+                    &v.tenant.id,
+                    Actor::Id(&user.id),
+                    Event::ConsentGranted,
+                    Some(&v.client.app_id),
+                    details,
+                )
+                .await;
+            }
+            Interaction::ConsentDenied => {
+                let details = serde_json::json!({ "clientId": v.client.app_id, "scope": grant.granted.join(" ") });
+                audit::record(
+                    st,
+                    &v.tenant.id,
+                    Actor::Id(&user.id),
+                    Event::ConsentDenied,
+                    Some(&v.client.app_id),
+                    details,
+                )
+                .await;
+                return Err(AadError::new(
+                    StatusCode::FORBIDDEN,
+                    OAuthError::AccessDenied,
+                    Aadsts::ConsentDeclined,
+                    "The user declined to consent to access the app.",
+                )
+                .into());
+            }
+            _ => return Err(Step::Page(consent_page(st, v, request, &user, &grant).await)),
+        }
     }
 
     // ---- issue ----
@@ -749,6 +803,61 @@ fn account_picker(st: &AppState, v: &Validated, request: &str, user: &User) -> R
     resp
 }
 
+/// How long after a sign-in a consent answer still counts as part of that same
+/// exchange, for `prompt=login consent`. Invented: ten minutes, the lifetime of
+/// the pages involved.
+const CONSENT_REAUTH_WINDOW: i64 = 600;
+
+/// The consent page for this request: the application, and every scope it will
+/// be granted, each with what it means.
+async fn consent_page(
+    st: &AppState,
+    v: &Validated,
+    request: &str,
+    user: &User,
+    grant: &crate::scopes::Grant,
+) -> Response {
+    let mut items: Vec<html::ConsentItem> = grant
+        .oidc
+        .iter()
+        .map(|s| html::ConsentItem {
+            scope: s.to_string(),
+            description: crate::scopes::oidc_description(s).to_string(),
+        })
+        .collect();
+    // A resource's own scopes carry the display name its owner gave them.
+    if let crate::scopes::Resource::App { app, .. } = &grant.resource {
+        let named = apps::scopes(&st.pool, app).await.unwrap_or_default();
+        for value in &grant.scp {
+            let description = named
+                .iter()
+                .find(|s| s.value == *value)
+                .map(|s| s.display_name.clone())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| format!("Access {} as you", app.display_name));
+            items.push(html::ConsentItem {
+                scope: format!("{} ({})", value, app.display_name),
+                description,
+            });
+        }
+    }
+    let csrf = session::new_token();
+    let mut resp = html::consent(&html::Consent {
+        tenant_name: &v.tenant.name,
+        client_name: &v.client.display_name,
+        action: &form_action(st, v),
+        csrf: &csrf,
+        request,
+        upn: &user.upn,
+        items: &items,
+    });
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        session::set_cookie(&st.public_url, CSRF_COOKIE, &csrf, 3600),
+    );
+    resp
+}
+
 /// `POST /{tenant}/login` — the sign-in form and account picker submit here.
 /// The original authorize request travels in the `request` field and is
 /// validated again from scratch.
@@ -790,10 +899,27 @@ pub async fn login(
         );
     }
 
-    let result = match form.get("op").map(String::as_str) {
-        Some("continue") => run(&st, &tenant_key, &headers, &params, &request, Interaction::ChoseAccount).await,
-        Some("other") => return login_page(&st, &v, &request, "", None),
-        _ => {
+    let op = form.get("op").and_then(|raw| html::LoginOp::parse(raw));
+    let result = match op {
+        Some(html::LoginOp::Continue) => {
+            run(&st, &tenant_key, &headers, &params, &request, Interaction::ChoseAccount).await
+        }
+        Some(html::LoginOp::Other) => return login_page(&st, &v, &request, "", None),
+        Some(html::LoginOp::ConsentAccept) => {
+            run(&st, &tenant_key, &headers, &params, &request, Interaction::Consented).await
+        }
+        Some(html::LoginOp::ConsentDeny) => {
+            run(
+                &st,
+                &tenant_key,
+                &headers,
+                &params,
+                &request,
+                Interaction::ConsentDenied,
+            )
+            .await
+        }
+        None => {
             let upn = form.get("upn").map(|s| s.trim().to_string()).unwrap_or_default();
             let password = form.get("password").cloned().unwrap_or_default();
             let (outcome, trace) = match users::authenticate_traced(&st.pool, &v.tenant, &upn, &password).await {
@@ -875,12 +1001,27 @@ async fn signed_in(
             HeaderValue::from_str(&format!("{SESSION_COOKIE}={cookie}")).expect("ascii"),
         );
     }
-    let mut resp = run(st, tenant_key, &headers, params, request, Interaction::SignedIn).await?;
+    // The session cookie goes on whatever comes next, a page as much as a redirect.
+    // It used to be attached only to a redirect, which was harmless while the only
+    // page that could follow a sign-in was an error; the consent page follows one
+    // and then needs the browser to still be signed in when it is answered.
+    let outcome = run(st, tenant_key, &headers, params, request, Interaction::SignedIn).await;
+    let (Ok(mut resp) | Err(mut resp)) = outcome;
+    // A following page brings its own CSRF cookie for its own form; only clear the
+    // sign-in form's when nothing replaced it.
+    let csrf_prefix = format!("{CSRF_COOKIE}=");
+    let sets_csrf = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .any(|v| v.to_str().is_ok_and(|v| v.starts_with(&csrf_prefix)));
     let h = resp.headers_mut();
     h.append(
         header::SET_COOKIE,
         session::set_cookie(&st.public_url, SESSION_COOKIE, &cookie, lifetime),
     );
-    h.append(header::SET_COOKIE, session::clear_cookie(&st.public_url, CSRF_COOKIE));
+    if !sets_csrf {
+        h.append(header::SET_COOKIE, session::clear_cookie(&st.public_url, CSRF_COOKIE));
+    }
     Ok(resp)
 }

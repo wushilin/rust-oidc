@@ -38,6 +38,8 @@ button.link { background:none; border:none; color:var(--accent); padding:0; }
 .actions { display:flex; justify-content:flex-end; align-items:center; gap:16px; margin-top:24px; }
 .error { color:var(--err); margin:12px 0 0; font-size:14px; }
 .account { display:flex; justify-content:space-between; align-items:center; width:100%; text-align:left; background:none; color:var(--fg); border:1px solid var(--border); padding:12px 14px; margin:8px 0; }
+ul.consent { list-style:none; padding:0; margin:12px 0; }
+ul.consent li { border:1px solid var(--border); padding:10px 14px; margin:8px 0; }
 .code { color:var(--muted); font-size:12px; word-break:break-all; margin-top:18px; }
 "#;
 
@@ -109,6 +111,93 @@ pub fn login(f: &LoginForm) -> Response {
     respond(status, page("Sign in", Some(f.tenant_name), &body), CSP_DEFAULT)
 }
 
+/// What a sign-in page's form asks the login endpoint to do, carried in `op`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOp {
+    /// Carry on as the account already signed in.
+    Continue,
+    /// Sign in as somebody else.
+    Other,
+    /// Allow the application the permissions it asked for.
+    ConsentAccept,
+    /// Refuse them.
+    ConsentDeny,
+}
+
+impl LoginOp {
+    pub const ALL: &'static [LoginOp] = &[Self::Continue, Self::Other, Self::ConsentAccept, Self::ConsentDeny];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Other => "other",
+            Self::ConsentAccept => "consent_accept",
+            Self::ConsentDeny => "consent_deny",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|o| o.as_str() == raw)
+    }
+}
+
+/// One permission on the consent page: the scope as requested, and what it
+/// means in words.
+pub struct ConsentItem {
+    pub scope: String,
+    pub description: String,
+}
+
+pub struct Consent<'a> {
+    pub tenant_name: &'a str,
+    pub client_name: &'a str,
+    pub action: &'a str,
+    pub csrf: &'a str,
+    pub request: &'a str,
+    pub upn: &'a str,
+    pub items: &'a [ConsentItem],
+}
+
+/// "This application wants these permissions. Allow?"
+pub fn consent(p: &Consent) -> Response {
+    let hidden = format!(
+        r#"<input type="hidden" name="csrf" value="{}"><input type="hidden" name="request" value="{}">"#,
+        escape(p.csrf),
+        escape(p.request)
+    );
+    let items: String = p
+        .items
+        .iter()
+        .map(|i| {
+            format!(
+                r#"<li><strong>{}</strong><br><span class="sub">{}</span></li>"#,
+                escape(&i.description),
+                escape(&i.scope)
+            )
+        })
+        .collect();
+    let body = format!(
+        r#"<h1>Permissions requested</h1><p class="sub">{upn}</p>
+<p><strong>{client}</strong> would like to:</p>
+<ul class="consent">{items}</ul>
+<p class="sub">Allowing this lets the application use these permissions for your account. You can
+refuse and nothing is shared.</p>
+<form method="post" action="{action}">{hidden}
+<div class="actions"><button type="submit" name="op" value="{accept}">Allow</button>
+<button class="link" type="submit" name="op" value="{deny}">Deny</button></div></form>"#,
+        upn = escape(p.upn),
+        client = escape(p.client_name),
+        action = escape(p.action),
+        accept = LoginOp::ConsentAccept.as_str(),
+        deny = LoginOp::ConsentDeny.as_str(),
+    );
+    respond(
+        StatusCode::OK,
+        page("Permissions requested", Some(p.tenant_name), &body),
+        CSP_DEFAULT,
+    )
+}
+
 pub struct AccountPicker<'a> {
     pub tenant_name: &'a str,
     pub client_name: &'a str,
@@ -127,14 +216,16 @@ pub fn account_picker(p: &AccountPicker) -> Response {
     );
     let body = format!(
         r#"<h1>Pick an account</h1><p class="sub">to continue to {client}</p>
-<form method="post" action="{action}">{hidden}<input type="hidden" name="op" value="continue">
+<form method="post" action="{action}">{hidden}<input type="hidden" name="op" value="{op_continue}">
 <button class="account" type="submit"><span><strong>{name}</strong><br><span class="sub">{upn}</span></span><span>&rsaquo;</span></button></form>
-<form method="post" action="{action}">{hidden}<input type="hidden" name="op" value="other">
+<form method="post" action="{action}">{hidden}<input type="hidden" name="op" value="{op_other}">
 <div class="actions"><button class="link" type="submit">Use another account</button></div></form>"#,
         client = escape(p.client_name),
         action = escape(p.action),
         name = escape(p.display_name),
         upn = escape(p.upn),
+        op_continue = LoginOp::Continue.as_str(),
+        op_other = LoginOp::Other.as_str(),
     );
     respond(
         StatusCode::OK,

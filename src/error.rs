@@ -182,6 +182,10 @@ pub enum Aadsts {
     SilentSignInFailed,
     /// The app requires assignment and this user has none.
     NotAssigned,
+    /// The user pressed Deny on the consent page. **Our guess**: 65004 is the
+    /// number Entra documents for a declined consent, not verified against a
+    /// live tenant.
+    ConsentDeclined,
 
     // ---- grants ----
     UnsupportedGrantType,
@@ -260,6 +264,7 @@ impl Aadsts {
         Self::AccountDisabled,
         Self::SilentSignInFailed,
         Self::NotAssigned,
+        Self::ConsentDeclined,
         Self::UnsupportedGrantType,
         Self::PasswordGrantNotAllowed,
         Self::GrantRevoked,
@@ -311,6 +316,7 @@ impl Aadsts {
             Self::AccountDisabled => 50057,
             Self::SilentSignInFailed => 50058,
             Self::NotAssigned => 50105,
+            Self::ConsentDeclined => 65004,
             Self::UnsupportedGrantType => 70003,
             Self::PasswordGrantNotAllowed => 700034,
             Self::GrantRevoked => 50173,

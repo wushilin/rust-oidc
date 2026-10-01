@@ -913,6 +913,37 @@ deployments run SQLite. The last three-engine pass is commit `ccc02c1`; anything
 SQL or migrations after it is unverified on the other two engines until that run is made
 again.
 
+## Consent page
+
+**117. `prompt=consent` shows a consent page; nothing else does.** The page names the
+application, the person, and every scope with what it means, and offers Allow and Deny.
+Applications are still treated as consented by an administrator, so an ordinary sign-in
+has no extra step and no existing client changes behaviour. **No grant is stored**: Allow
+is not remembered, because the page appears only when asked for. This is a smaller thing
+than Entra's consent framework, which also prompts on first use, records grants per user
+and has an administrator-consent path; those remain a gap. *To extend:* store grants and
+show the page when a requested scope has none.
+
+**118. Deny answers `access_denied` with AADSTS65004**, delivered to the redirect URI in
+the request's own response mode with its `state`. The wording is Entra's; **the number is
+our guess**, marked so in the `Aadsts` enum like 700054 and 90055.
+
+**119. `prompt=none consent` is refused**, like `none login`: a page cannot be both
+required and forbidden.
+
+**120. With `prompt=login consent`, the consent answer does not ask for the sign-in
+again -- but only within ten minutes of that sign-in.** Otherwise posting a consent answer
+would be a way around `prompt=login` on an old session. The ten minutes is invented.
+
+**121. A sign-in now sets the session cookie on whatever follows it, a page as much as a
+redirect.** It was attached only to a redirect, which never mattered while the only page
+that could follow a sign-in was an error. The consent page follows one and has to find the
+browser still signed in when it is answered. Found by the consent tests.
+
+**122. Scope wording lives beside the list of OpenID scopes** (`scopes::oidc_description`),
+with a test that every scope has its own, so one added later cannot reach the consent page
+with the fallback text. A resource's own scopes use the display name its owner gave them.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

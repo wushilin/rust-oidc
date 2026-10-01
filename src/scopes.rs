@@ -16,6 +16,21 @@ use crate::error::{AadError, Aadsts};
 use crate::tenant::Tenant;
 
 pub const OIDC_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
+
+/// What each OpenID scope means to the person consenting, in the words Entra's
+/// consent page uses. Kept beside [`OIDC_SCOPES`] so a scope added there cannot
+/// reach the consent page without wording; a test holds the two together.
+pub fn oidc_description(scope: &str) -> &'static str {
+    match scope {
+        "openid" => "Sign you in",
+        "profile" => "View your basic profile",
+        "email" => "View your email address",
+        "offline_access" => "Maintain access to data you have given it access to",
+        _ => OIDC_DESCRIPTION_FALLBACK,
+    }
+}
+
+const OIDC_DESCRIPTION_FALLBACK: &str = "Use this permission";
 pub const GRAPH_APP_ID: &str = "00000003-0000-0000-c000-000000000000";
 const GRAPH_RESOURCE: &str = "https://graph.microsoft.com";
 const GRAPH_SCOPES: [&str; 1] = ["User.Read"];
@@ -157,4 +172,20 @@ fn more_than_one_resource() -> AadError {
         Aadsts::MultipleResourcesInScope,
         "Provided value for the input parameter scope is not valid because it contains more than one resource.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_oidc_scope_has_its_own_consent_wording() {
+        for scope in OIDC_SCOPES {
+            assert_ne!(
+                oidc_description(scope),
+                OIDC_DESCRIPTION_FALLBACK,
+                "{scope} has no wording"
+            );
+        }
+    }
 }

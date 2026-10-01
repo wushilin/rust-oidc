@@ -333,3 +333,23 @@ async fn a_tenant_admin_cannot_use_the_platform_tenant_routes() {
         assert!(!page.body.contains(offered), "{offered} is offered: {}", page.body);
     }
 }
+
+/// Each tenant row on the Tenants page links straight to that tenant's flow
+/// tester, so testing a sign-in does not start with hunting through the menu.
+#[tokio::test]
+async fn each_tenant_row_links_to_its_flow_tester() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let page = b.get(&s.url("/admin/tenants")).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let link = format!("/admin/tenants/{}/flow\"", f.tenant.id);
+    assert!(
+        page.body.contains(&link),
+        "no flow tester link for the tenant: {}",
+        page.body
+    );
+    // And the link leads somewhere real.
+    let flow = b.get(&s.url(&format!("/admin/tenants/{}/flow", f.tenant.id))).await;
+    assert_eq!(flow.status, 200, "{}", flow.body);
+}

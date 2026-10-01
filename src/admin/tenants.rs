@@ -263,6 +263,7 @@ fn links_cell(base: &str, csrf: &str, ctx: &AdminContext, t: &Tenant, may_assume
         (GROUP_READ, "Groups", "groups"),
         (APP_READ, "Applications", "apps"),
         (BINDING_READ, "Roles", "roles"),
+        (APP_READ, "Flow tester", "flow"),
         (TENANT_WRITE, "Settings", "settings"),
         (AUDIT_READ, "Audit", "audit"),
     ] {

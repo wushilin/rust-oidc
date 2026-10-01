@@ -812,6 +812,34 @@ browser in it, so there is nothing to drive), no `login_hint`, no `max_age`, no 
 resources, and no history: a result page exists once and is not stored anywhere it could be
 read again.
 
+**106. A remedy is a link where there is a page to link to.** `Finding::fix` names the
+place (`Fix::ApplicationPage`, `Fix::CallbackSection`, `Fix::ThisForm`) and the page builds
+the link, so the readiness list answers "where do I change it" with an anchor rather than
+only prose -- without `flowtest` learning any console URLs. The application's own page now
+links the other way too, into the flow tester for that application.
+
+**107. The client-secret requirement counts a certificate credential as well.** A web
+client may authenticate with `private_key_jwt`, and the first version of the check said
+"secret or certificate" in its failure text while only looking at `app_secrets`. It now
+reads `app_key_credentials` too and says which of the two it found.
+
+**108. Three teeth checks, all of which bit.** (a) Deleting the callback's own
+`ctx.can_in(APP_READ, &tenant)` made
+`the_callback_refuses_a_tenant_the_administrator_may_no_longer_read` fail -- it served the
+full result page, with another tenant's user's claims in it, as `200`. (b) Dropping
+`AND admin_session = ?` from `flowtest::take` made
+`another_administrators_session_cannot_complete_a_flow_test` fail: the second
+administrator read the first one's tokens. (c) Removing the `require` from `flow::post`
+made `a_tenant_admin_cannot_flow_test_another_tenants_app` fail on the first POST it tried.
+Each was restored and the suite re-run.
+
+That third test only bites because it was **rewritten** after the first version did not.
+Revoking the administrator's only role binding makes `AdminContext` answer `no_access`
+before any handler runs, so the callback's own check was never reached and the test would
+have passed with the guard deleted -- decision 89's trap exactly. The administrator now
+keeps a binding on a second tenant, which is what makes the `403` the callback's own answer,
+and the test asserts afterwards that the console session still works.
+
 ---
 
 ## Housekeeping

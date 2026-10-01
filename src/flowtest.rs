@@ -219,6 +219,30 @@ impl Verdict {
     }
 }
 
+/// Where the remedy for a finding is. This module names the place; the page builds
+/// the link, because console URLs are not this module's business.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fix {
+    /// The application's own page in the console.
+    ApplicationPage,
+    /// The callback section further down the flow tester's own page.
+    CallbackSection,
+    /// One of the boxes in the form at the top of this page.
+    ThisForm,
+}
+
+impl Fix {
+    pub const ALL: &'static [Fix] = &[Self::ApplicationPage, Self::CallbackSection, Self::ThisForm];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplicationPage => "application_page",
+            Self::CallbackSection => "callback_section",
+            Self::ThisForm => "this_form",
+        }
+    }
+}
+
 /// One line of the readiness list: what is configured now, and what to do when it
 /// is not what the chosen flow needs.
 #[derive(Debug, Clone)]
@@ -229,6 +253,8 @@ pub struct Finding {
     pub detail: String,
     /// What to change, and where. `None` when there is nothing to do.
     pub remedy: Option<String>,
+    /// Where to go to do it, so the page can offer a link rather than only prose.
+    pub fix: Option<Fix>,
 }
 
 impl Finding {
@@ -238,11 +264,17 @@ impl Finding {
             verdict,
             detail: detail.into(),
             remedy: None,
+            fix: None,
         }
     }
 
     fn with_remedy(mut self, remedy: impl Into<String>) -> Self {
         self.remedy = Some(remedy.into());
+        self
+    }
+
+    fn at(mut self, fix: Fix) -> Self {
+        self.fix = Some(fix);
         self
     }
 }
@@ -337,30 +369,44 @@ pub async fn readiness(
         .with_remedy(
             "Add it below, or on the application's own page. The console will not add it on its own: \
              a redirect URI is part of a registration, and a debug action must not change one silently.",
-        ),
+        )
+        .at(Fix::CallbackSection),
     });
     findings.push(platform_finding(platform));
 
     // -- credentials. The console never has a secret value and never asks for one.
-    let needs_secret = platform == Some(RedirectPlatform::Web) || probe.password_grant;
-    let current_secret = apps::secrets(pool, app).await?.iter().any(|s| s.is_current(now()));
-    findings.push(match (needs_secret, current_secret) {
-        (false, _) => Finding::new(
+    //    A web client may authenticate with a certificate instead, so both count.
+    let needs_credential = platform == Some(RedirectPlatform::Web) || probe.password_grant;
+    let secret = apps::secrets(pool, app).await?.iter().any(|s| s.is_current(now()));
+    let certificate = apps::key_credentials(pool, app)
+        .await?
+        .iter()
+        .any(|c| c.is_current(now()));
+    findings.push(match (needs_credential, secret, certificate) {
+        (false, _, _) => Finding::new(
             Requirement::ClientSecret,
             Verdict::Note,
             "Not used by this flow: only a web client, and the password grant, authenticate at the token endpoint.",
         ),
-        (true, true) => Finding::new(
-            Requirement::ClientSecret,
-            Verdict::Pass,
-            "An unexpired client secret is registered. Its value is not shown here and is not known to the console: only a SHA-256 hash of it is stored.",
-        ),
-        (true, false) => Finding::new(
+        (true, false, false) => Finding::new(
             Requirement::ClientSecret,
             Verdict::Fail,
-            "This client must authenticate at the token endpoint and has no unexpired secret or certificate credential.",
+            "This client must authenticate at the token endpoint and has neither an unexpired client secret nor a current certificate credential.",
         )
-        .with_remedy("Add a client secret on the application's page. You will never be asked to type it here."),
+        .with_remedy("Add a client secret on the application's page. You will never be asked to type one here.")
+        .at(Fix::ApplicationPage),
+        (true, s, c) => Finding::new(
+            Requirement::ClientSecret,
+            Verdict::Pass,
+            format!(
+                "{} registered and current. The value is not shown here and is not known to the console: only a SHA-256 hash of a secret is stored, and only the public part of a certificate.",
+                match (s, c) {
+                    (true, true) => "A client secret and a certificate credential are",
+                    (true, false) => "A client secret is",
+                    _ => "A certificate credential is",
+                }
+            ),
+        ),
     });
 
     // -- the two front-channel toggles, named as the page that holds them names them
@@ -392,7 +438,8 @@ pub async fn readiness(
             Verdict::Fail,
             "The response type asks for an id_token, which requires the openid scope.",
         )
-        .with_remedy("Add openid to the scope above."),
+        .with_remedy("Add openid to the scope above.")
+        .at(Fix::ThisForm),
         (false, false) => Finding::new(
             Requirement::OpenidScope,
             Verdict::Note,
@@ -432,7 +479,8 @@ pub async fn readiness(
                 .with_remedy(
                     "A delegated permission has to be exposed and enabled on the API it names, \
                      and one request may target only one resource.",
-                ),
+                )
+                .at(Fix::ThisForm),
             );
             None
         }
@@ -461,6 +509,7 @@ pub async fn readiness(
                 "allow_password_grant is off, so grant_type=password is refused for this application.",
             )
             .with_remedy("Turn on \"Allow the resource owner password grant (ROPC)\" in the Grants section of the application's page.")
+            .at(Fix::ApplicationPage)
         });
     }
 
@@ -533,7 +582,8 @@ fn toggle_finding(
             Verdict::Fail,
             format!("Off, so a response_type containing {response_value} is refused with AADSTS700054 before any sign-in page is shown."),
         )
-        .with_remedy(format!("Tick \"{checkbox}\" in the Grants section of the application's page.")),
+        .with_remedy(format!("Tick \"{checkbox}\" in the Grants section of the application's page."))
+        .at(Fix::ApplicationPage),
     }
 }
 
@@ -589,6 +639,7 @@ async fn assignment_finding(
             format!("Required, and your own account does not hold one, so signing in as yourself would be refused with AADSTS50105.{resource_note}"),
         )
         .with_remedy("Assign a user or a group to an app role of this application, in the Role assignments section of its page.")
+        .at(Fix::ApplicationPage)
     })
 }
 
@@ -599,7 +650,8 @@ fn delivery_finding(probe: &Probe) -> Finding {
             Verdict::Fail,
             "response_mode=query cannot be used with a response type that carries a token; the server refuses it, and a token in a query string would end up in logs and Referer headers.",
         )
-        .with_remedy("Choose form_post."),
+        .with_remedy("Choose form_post.")
+        .at(Fix::ThisForm),
         (ResponseMode::Query, false) => Finding::new(
             Requirement::Delivery,
             Verdict::Pass,
@@ -616,7 +668,8 @@ fn delivery_finding(probe: &Probe) -> Finding {
             "A URL fragment never reaches the server, and the console's content security policy has no script to copy one into a form. \
              The flow will not be captured here: the console shows you the authorize URL to open yourself, and the response stays in your address bar.",
         )
-        .with_remedy("Choose form_post to have the values arrive here instead."),
+        .with_remedy("Choose form_post to have the values arrive here instead.")
+        .at(Fix::ThisForm),
     }
 }
 
@@ -642,7 +695,8 @@ fn exchange_finding(probe: &Probe, platform: Option<RedirectPlatform>, can_excha
         )
         .with_remedy(
             "To exercise the redemption too, use this tenant's flow tester client, which is registered as a public client and needs no secret.",
-        ),
+        )
+        .at(Fix::CallbackSection),
         (None, _) => Finding::new(
             Requirement::Exchange,
             Verdict::Note,
@@ -1345,6 +1399,10 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for o in Outcome::ALL {
             assert!(seen.insert(o.as_str()), "two outcomes are both {}", o.as_str());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for f in Fix::ALL {
+            assert!(seen.insert(f.as_str()), "two places are both {}", f.as_str());
         }
     }
 

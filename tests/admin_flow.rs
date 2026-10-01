@@ -54,7 +54,14 @@ async fn run_flow(s: &TestServer, b: &AdminBrowser, f: &UserFixture, probe: &[(&
         200 => {
             let action = answered.form_action();
             let mut fields: Vec<(&str, String)> = Vec::new();
-            for name in ["code", "state", "id_token", "access_token", "error", "error_description"] {
+            for name in [
+                "code",
+                "state",
+                "id_token",
+                "access_token",
+                "error",
+                "error_description",
+            ] {
                 if let Some(value) = answered.field(name) {
                     fields.push((name, value));
                 }
@@ -98,9 +105,14 @@ async fn the_landing_page_says_what_is_missing_and_what_it_needs() {
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
     // The exact URI that has to be registered, and the fact that it is not.
-    assert!(page.body.contains(&callback(&s)), "the exact callback URI: {}", page.body);
     assert!(
-        page.body.contains("is not one of this application&#x27;s redirect URIs"),
+        page.body.contains(&callback(&s)),
+        "the exact callback URI: {}",
+        page.body
+    );
+    assert!(
+        page.body
+            .contains("is not one of this application&#x27;s redirect URIs"),
         "says the callback is missing: {}",
         page.body
     );
@@ -210,9 +222,7 @@ async fn the_console_registers_a_flow_tester_client_on_request() {
     assert_eq!(apps::list(&s.pool, &f.tenant.id).await.unwrap().len(), 3);
 
     // It is an ordinary registration: the applications section lists it.
-    let page = b
-        .get(&s.url(&format!("/admin/tenants/{}/apps", f.tenant.id)))
-        .await;
+    let page = b.get(&s.url(&format!("/admin/tenants/{}/apps", f.tenant.id))).await;
     assert!(page.body.contains(flowtest::TEST_CLIENT_NAME), "{}", page.body);
 }
 
@@ -309,7 +319,11 @@ async fn a_hybrid_flow_checks_c_hash_against_the_code_that_came_with_it() {
         "{}",
         result.body
     );
-    assert!(result.body.contains("returned by the token endpoint"), "{}", result.body);
+    assert!(
+        result.body.contains("returned by the token endpoint"),
+        "{}",
+        result.body
+    );
     assert!(!result.body.contains("pill bad"), "{}", result.body);
 }
 
@@ -324,11 +338,7 @@ async fn a_state_that_names_no_pending_flow_test_is_an_error() {
         .get(&s.url(&format!("{}?code=whatever&state=invented", flowtest::CALLBACK_PATH)))
         .await;
     assert_eq!(page.status, 400, "{}", page.body);
-    assert!(
-        page.body.contains("does not match a flow test"),
-        "{}",
-        page.body
-    );
+    assert!(page.body.contains("does not match a flow test"), "{}", page.body);
     let rows = audit_rows(&s, "admin.flow_test.result").await;
     assert_eq!(rows.len(), 1, "the refusal is recorded: {rows:?}");
 }
@@ -559,26 +569,42 @@ async fn a_tenant_admin_cannot_flow_test_another_tenants_app() {
     assert_eq!(pending, 0);
 }
 
-/// Reading the *result* is scoped too. The flow is started by somebody who may
-/// administer the tenant; by the time the answer comes back that may no longer be
-/// true, and the callback asks the guard again rather than trusting the row.
+/// Reading the *result* is scoped to the tenant, not to the row. The flow is
+/// started by somebody who may administer that tenant; by the time the answer
+/// comes back that may no longer be true, and the callback asks the guard again
+/// rather than trusting the pending row it just matched.
+///
+/// The administrator keeps a binding on *another* tenant on purpose: revoking
+/// their last one would make `AdminContext` answer `no_access` before the
+/// callback's own check was reached, and then this test would be proving nothing
+/// about the callback (decision 89's trap).
 #[tokio::test]
 async fn the_callback_refuses_a_tenant_the_administrator_may_no_longer_read() {
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
-    let binding = bind(
+    let other = s.tenant("Fabrikam", "fabrikam.test").await;
+    // The flow signs a user in to the *other* tenant, so it needs an account there.
+    let theirs = user_fixture_in(&s, other.clone(), "carol@fabrikam.test").await;
+    bind(
         &s,
         &f.user_id,
         rust_oidc::rbac::RoleId::GlobalAdministrator,
         rust_oidc::rbac::Scope::Tenants(vec![f.tenant.id.clone()]),
     )
     .await;
+    let revoked = bind(
+        &s,
+        &f.user_id,
+        rust_oidc::rbac::RoleId::GlobalAdministrator,
+        rust_oidc::rbac::Scope::Tenants(vec![other.id.clone()]),
+    )
+    .await;
     let b = signed_in_admin(&s, &f).await;
-    let app_id = create_test_client(&s, &b, &f.tenant.id).await;
+    let app_id = create_test_client(&s, &b, &other.id).await;
 
     let start = b
         .post(
-            &s.url(&flow_path(&f.tenant.id)),
+            &s.url(&flow_path(&other.id)),
             &[
                 ("op", "start"),
                 ("app", &app_id),
@@ -588,21 +614,29 @@ async fn the_callback_refuses_a_tenant_the_administrator_may_no_longer_read() {
             ],
         )
         .await;
+    assert_eq!(start.status, 303, "{}", start.body);
     let login = b.b.get(&start.location.unwrap()).await;
-    let answered = b.b.login(&login, &f.upn, &f.password).await;
+    let answered = b.b.login(&login, &theirs.upn, &theirs.password).await;
     let callback_url = answered.location.expect("a redirect to the callback");
 
-    // The grant goes away between the authorize request and its answer.
+    // The grant on that tenant goes away between the authorize request and its
+    // answer. The console session stays valid, because the other binding remains.
     assert!(
-        rust_oidc::admin::bindings::delete(&s.pool, &binding).await.unwrap(),
+        rust_oidc::admin::bindings::delete(&s.pool, &revoked).await.unwrap(),
         "the binding was revoked"
     );
     let page = b.b.get(&callback_url).await;
-    assert_ne!(page.status, 200, "the result must not be shown: {}", page.body);
+    assert_eq!(page.status, 403, "the result must not be shown: {}", page.body);
     assert!(
         !page.body.contains("eyJ"),
         "no token may appear on a refused page: {}",
         page.body
+    );
+    // Still signed in, which is what makes the 403 the callback's own answer.
+    assert_eq!(
+        b.get(&s.url(&flow_path(&f.tenant.id))).await.status,
+        200,
+        "the session itself is unaffected"
     );
 }
 
@@ -671,7 +705,10 @@ async fn the_flow_tester_is_not_reachable_without_a_console_session() {
         .post_form(&s.url(&flow_path(&f.tenant.id)), &[("op", "create_test_client")])
         .await;
     assert_eq!(posted.status, 303, "{}", posted.body);
-    assert!(apps::list(&s.pool, &f.tenant.id).await.unwrap().len() == 2, "nothing was created");
+    assert!(
+        apps::list(&s.pool, &f.tenant.id).await.unwrap().len() == 2,
+        "nothing was created"
+    );
 }
 
 /// A reader may diagnose -- that is the whole value of the page -- but must not be

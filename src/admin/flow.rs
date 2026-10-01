@@ -36,7 +36,7 @@ use crate::admin::{APP_READ, APP_WRITE};
 use crate::apps::{self, Application, RedirectPlatform};
 use crate::db::Event;
 use crate::flowtest::{
-    self, APP_FIELD, DecodedToken, Expected, Finding, HttpCall, Observation, Outcome, PASSWORD_GRANT_FIELD,
+    self, APP_FIELD, DecodedToken, Expected, Finding, Fix, HttpCall, Observation, Outcome, PASSWORD_GRANT_FIELD,
     PLATFORM_FIELD, PROMPT_FIELD, Pending, Probe, RESPONSE_MODE_FIELD, RESPONSE_TYPE_FIELD, Readiness, SCOPE_FIELD,
     Verdict,
 };
@@ -324,7 +324,8 @@ fn verdict_pill(verdict: Verdict) -> String {
 /// The readiness list: one row per requirement, each reading as met or missing,
 /// with the remedy beside it.
 fn readiness_table(readiness: &Readiness, base: &str, tenant: &Tenant, app: &Application) -> String {
-    let rows: String = readiness.findings.iter().map(finding_row).collect();
+    let app_page = app_url(base, tenant, &app.app_id);
+    let rows: String = readiness.findings.iter().map(|f| finding_row(f, &app_page)).collect();
     let summary = if readiness.ready() {
         "Everything this flow needs is configured.".to_string()
     } else {
@@ -344,11 +345,22 @@ and from the tenant. Nothing on this page changes it.</p>"#,
     )
 }
 
-fn finding_row(f: &Finding) -> String {
+fn finding_row(f: &Finding, app_page: &str) -> String {
+    // Where to go, as a link when there is a page to link to and as a pointer when
+    // the thing to change is on this one.
+    let fix = match f.fix {
+        Some(Fix::ApplicationPage) => format!(
+            r#" <a href="{app_page}">Open the application&#x27;s page</a>."#,
+            app_page = e(app_page),
+        ),
+        Some(Fix::CallbackSection) => " See &ldquo;The callback&rdquo; below.".to_string(),
+        Some(Fix::ThisForm) => " Change it in the form above.".to_string(),
+        None => String::new(),
+    };
     let remedy = f
         .remedy
         .as_deref()
-        .map(|r| format!(r#"<p class="muted">{}</p>"#, e(r)))
+        .map(|r| format!(r#"<p class="muted">{}{fix}</p>"#, e(r)))
         .unwrap_or_default();
     format!(
         r#"<tr{class}><td>{title}</td><td>{pill}</td><td>{detail}{remedy}</td></tr>"#,

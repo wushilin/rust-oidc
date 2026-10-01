@@ -340,10 +340,18 @@ async fn detail(
 
     let facts = format!(
         r#"<dl class="facts"><dt>Application (client) id</dt><dd>{app_id}</dd>
-<dt>Object id</dt><dd>{id}</dd><dt>Tenant</dt><dd>{tenant_name}</dd></dl>"#,
+<dt>Object id</dt><dd>{id}</dd><dt>Tenant</dt><dd>{tenant_name}</dd></dl>
+<p class="muted"><a href="{flow}">Test a sign-in flow with this application</a>, which says what the
+flow needs before it runs anything.</p>"#,
         app_id = e(&app.app_id),
         id = e(&app.id),
         tenant_name = e(&tenant.name),
+        flow = e(&format!(
+            "{base}/admin/tenants/{}/flow?{}={}",
+            tenant.id,
+            crate::flowtest::APP_FIELD,
+            app.app_id
+        )),
     );
 
     let flags = flags_form(&url, &csrf, app, may_write);

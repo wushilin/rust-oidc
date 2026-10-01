@@ -11,7 +11,11 @@ tenants (realms) are built in.
 - Interactive sign-in: authorize and login page, auth code + PKCE, ID tokens, refresh
   tokens, UserInfo and logout.
 
-TOTP MFA and the admin console come next.
+The **admin console** (web UI at `/rust-oidc/admin`) has its first pass: sign-in, the
+tenant list, assume-tenant for a platform administrator, a read-only view of who holds
+which role, and the users section (list, search, create, edit, enable/disable, reset
+password, delete), plus granting and revoking console roles per tenant. Groups,
+applications and assignments are still command-line only. TOTP MFA does not exist.
 
 ## Quick start
 
@@ -51,6 +55,7 @@ metadata always use the GUID.
 | Logout | `/rust-oidc/{tenant}/oauth2/v2.0/logout` |
 | UserInfo | `/rust-oidc/oidc/userinfo` (accepts the "Graph" token, as in Entra) |
 | Issuer | `https://host/rust-oidc/{tid}/v2.0` |
+| Admin console | `/rust-oidc/admin` (sign in with an administrator account) |
 
 ## Sign-in behaviour (as in Entra)
 
@@ -133,6 +138,23 @@ Running servers pick up rotations within 30 seconds.
 cargo test          # protocol, error codes, sign-in flows, key rotation, tenant isolation
 compat/run.sh       # MSAL Python (app + user), MSAL Node, openid-client (certified RP) over TLS
 ```
+
+## Admin console
+
+`/rust-oidc/admin`, server-rendered, no JavaScript. Sign in with an account that holds a
+console role; a user with none is told so rather than shown an error.
+
+- **Who can do what** is a role (which carries actions) granted at a scope (`all`, or a
+  list of tenants). A tenant administrator sees only the tenants they are bound to, and
+  no page or nav entry offers an action the guard would refuse.
+- **A platform administrator can assume a tenant** and act as its administrator. Every
+  action stays attributable to them personally in `audit_log`; the assume itself is
+  recorded.
+- **Granting a role**: `/rust-oidc/admin/tenants/{tenant}/roles` grants a role to a user
+  or a group of that tenant, scoped to the tenant or -- only for someone who already holds
+  the action everywhere -- to every tenant. Revoking is refused if it would leave the
+  platform with no administrator. `/rust-oidc/admin/bindings` lists every binding on the
+  deployment, read-only, for a platform administrator.
 
 ## Deliberate differences from Entra
 

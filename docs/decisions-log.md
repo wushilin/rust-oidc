@@ -16,6 +16,7 @@ possible**, and **no magic values**.
 | A | **Branch integration**: merge `feat/admin-console` to `main`, open a PR, or keep it? | Asked twice, still unanswered. The branch carries everything below plus the half-built console. |
 | B | **TOTP MFA, four questions** in `docs/superpowers/specs/2026-09-30-totp-mfa-design.md`: where the seed-encryption key comes from; whether a missing key should fail startup closed; whether enabling `mfa_required` revokes existing refresh families; recovery codes now or later. | The key-management one is operational and affects deployment. Guessing it would bake in an ops burden you did not choose. |
 | C | **Rate limiting — now built; only the numbers are still yours.** Implemented in `src/ratelimit.rs` (decisions 29-38). What remains for you: the four allowances are **invented** (decision 37), there is no way to tune them without a rebuild, and the counters are in-process so multiple instances multiply the effective limits (decision 38). | The limits are a product decision and the per-instance behaviour is an operational one. |
+| E | **Should `PlatformAdministrator` be able to grant roles?** Today it cannot (decision 68), so the deployed super admin can assume the second tenant but not administer it, and cannot fix that from the console. Widening the role, or granting that account `GlobalAdministrator` at `all` scope, both work; they mean different things. | It changes what the platform role *is*, which is the security model you agreed in the spec. |
 | D | **`acr`**: emit it when `acr_values` is requested, or accept the omission? | Evidence is genuinely ambiguous — see decision 5. Untouched; still needs a capture from a live Entra tenant, which I cannot do. |
 
 **None of this is deployed.** Everything above lives on `feat/admin-console` only.
@@ -378,6 +379,114 @@ was confirmed to fail against the seeded bug before the fix was restored.
 **53. `authz::delete` treats "already gone" as success.** If a binding disappears between
 the check and the delete, the end state is the one the caller asked for. *To reverse:*
 return `NotPermitted` and make every caller handle a race it cannot do anything about.
+
+---
+
+## Admin console: the UI (plan tasks 7-14)
+
+**54. The console signs in with its own password form, not an OIDC round-trip to
+itself.** Plan task 6 (a reserved console app registration) and task 8's authorization
+code exchange are **not built**. The console is the same process as the token endpoint,
+so an OIDC loop would have to call itself over loopback -- and `reqwest` is a
+dev-dependency only, so that meant adding an HTTP client to the production dependency
+tree to talk to ourselves. The form resolves the account's tenant from its UPN suffix
+and calls `users::authenticate_traced`, so Entra's smart lockout, the audit trail and
+the password rules all apply unchanged. *Costs:* no SSO between the console and an
+application sign-in, and no PKCE/`state` plumbing to get wrong. *To reverse:* implement
+plan task 6, add an HTTP client, and swap `POST /admin/signin` for `/admin/callback`.
+
+**55. The console session is eight hours and its cookie is `SameSite=Lax`.** The
+lifetime is **invented**: a working day, so an unattended console is not one by the next
+morning. `Lax` (not the `None` the OIDC cookies need for silent sign-in in an iframe)
+means a cross-site form post does not carry the cookie at all; the console is never
+embedded. Separate table and separate cookie from `sessions`, so an OIDC sign-in to any
+application does not grant console access.
+
+**56. The CSRF token is derived from the session cookie**, `sha256("rust-oidc admin
+csrf v1" || cookie)`, rather than a second cookie (which the OIDC login form would
+clobber, since it reuses one name) or a stored column. It is unguessable without the
+cookie, which is `HttpOnly`, and it is bound to that one session -- another session's
+token is refused. *To reverse:* add an `admin_sessions.csrf` column and a random value.
+
+**57. The console's HTML is `format!` plus `html::escape`, not askama, and there is no
+JavaScript at all.** The plan chose askama with vendored htmx; the user asked for the
+UI "simple as a start", and `src/html.rs` already renders the sign-in pages this way, so
+a second rendering mechanism in the same binary would have cost more than it saved. The
+content security policy is therefore `default-src 'none'`, which is only honest because
+nothing loads. The risk this takes on is a forgotten `e(...)` at an interpolation;
+`a_display_name_cannot_inject_markup` holds that line and was teeth-checked by making
+`e` the identity function. *To reverse:* add askama and port the page bodies; the
+`view` module is the only file that knows how a page is built.
+
+**58. A form post answers `303 See Other`, not the plan's `302`.** A refresh of the
+result then cannot repeat the write.
+
+**59. A console audit row's actor is the administrator's user id**, not their UPN. The
+plan's test sketch asserted the UPN; every other actor in the table is an id
+(`db::Actor::Id`), and an id does not change when a person is renamed.
+
+**60. Disabling and deleting a user revoke everything the account holds** -- browser
+sessions, console sessions and refresh tokens -- through one private helper, so the two
+paths cannot diverge. `soft_delete` also clears `enabled`, which means the soft-delete
+*filters* are belt to that braces: `a_deleted_row_cannot_sign_in_even_while_it_still_says_enabled`
+exists because without it the filters could be deleted with every other test still green
+(found by a teeth check, exactly as with decision 52).
+
+**61. A tenant the administrator cannot read is not listed at all**, rather than listed
+and greyed out. The console must not be a directory of every tenant on the deployment
+for a delegated admin; `a_tenant_admin_does_not_see_other_tenants_listed` holds it.
+
+**62. Roles are granted and revoked per tenant, not platform-wide.** The form lives at
+`/admin/tenants/{tenant}/roles` because that is where a principal can be *named*: a UPN
+and a group name are unique within a tenant, not across the deployment. The scope choice
+is that tenant, or every tenant -- and the second option is only rendered, and only
+accepted, for someone `may_write_binding` already allows it to, so the no-widening rule
+decides what the form offers. `/admin/bindings` stays a read-only platform-wide list.
+There is no confirmation step on a revoke: the refusals that matter are rules, not
+prompts.
+
+**63. The user list shows at most 200 accounts and does not page.** 200 is **invented**.
+Beyond it the page says to narrow the search. *To reverse:* the `offset` argument is
+already there; add the links.
+
+**64. Searching by display name is case-sensitive on SQLite and Postgres and
+case-insensitive on MySQL.** The UPN half of the search is matched against
+`upn_folded`, so identity matching is the same everywhere; display names are not
+identities. Using `lower()` instead would make the behaviour depend on the database's
+locale, which `docs/databases.md` rules out.
+
+**65. A console sign-in naming an unverified domain writes no audit row at all.** There
+is no tenant to attribute it to and the space of invented domains is unbounded. A failed
+sign-in for a *known* domain reuses `Limit::UnknownUser`, keyed per tenant, exactly as
+the `/authorize` form does, and never changes the response -- a 429 for only the unknown
+account would be an enumeration oracle (decision 33).
+
+**66. Assuming a tenant changes nothing about what is permitted.** No handler consults
+`acting_tenant` when deciding access: the `All`-scope binding that allowed the assume
+already covers the tenant, so the assumed tenant is display and defaults only.
+`assuming_does_not_widen_what_is_permitted` holds it.
+
+**68. `PlatformAdministrator` still holds no role over roles, and I did not widen it.**
+On the deployed service `admin@wushilin.net` holds `PlatformAdministrator` at `all` plus
+`GlobalAdministrator` scoped to the root tenant only. In the console that account can
+create and assume any tenant, but it cannot administer the second tenant's users after
+assuming (assuming grants nothing -- decision 66), cannot grant itself a wider binding
+(the no-widening rule), and cannot even open `/admin/bindings`, because
+`PlatformAdministrator`'s actions are tenant create/write/assume, keys and audit: no
+`RoleBinding:Read`. That is the agreed role model doing exactly what it says, and the
+console is honest about it -- but it means **that account cannot yet be used to
+administer the OIDF Conformance tenant**, and no page can repair it. Giving
+`PlatformAdministrator` `RoleBinding` actions would make the platform role able to
+appoint tenant administrators anywhere, which is a real widening of what "platform
+administrator" means and is yours to decide, not mine. See open question E.
+*To work around it today:* grant that account `GlobalAdministrator` at `all` scope the
+way `bootstrap` does.
+
+**67. What the console does not have yet**, so nobody reads the branch as finished:
+no MFA section (deliberately skipped -- TOTP does not exist and is blocked on question
+B), no groups, applications, assignments, domains, tenant-settings or signing-key pages,
+no role-binding writes, no paging, and no tenant create or disable. The authorization
+layer underneath all of them is built and tested; these are pages.
 
 ---
 

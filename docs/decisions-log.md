@@ -842,6 +842,40 @@ and the test asserts afterwards that the console session still works.
 
 ---
 
+## Assignment required: enforced on every user grant
+
+**109. "Assignment required" is now checked where every user grant ends, not only on the
+authorize page.** It was enforced in exactly one place, `src/routes/authorize.rs`, so the
+rule an administrator sets to block unassigned users did not hold for the password grant
+or the device code grant, and a refresh token kept working after its holder was
+unassigned. Confirmed by a probe before fixing: the password grant returned HTTP 200 with
+an access token for an unassigned user on an app that required assignment. The check now
+lives in `user_grants::issue`, the one function every user grant passes through, so it
+cannot be routed around by choosing a different grant. Found by reading the flow tester's
+readiness output, which surfaced that the rule was enforced in only one place.
+*To reverse:* delete the block in `issue` — which reopens the bypass.
+
+**110. The token endpoint answers `invalid_grant` with AADSTS50105.** The message text is
+the same one the authorize page already used, now produced by a single function
+(`apps::not_assigned_message`) so the two sites cannot drift. `invalid_grant` is what this
+codebase uses for every other "this grant cannot be honoured" case at the token endpoint;
+**the pairing of that OAuth error with 50105 is not verified against a live tenant**, the
+same caveat as decisions 16 and the 429 number.
+
+**111. Unassigning a user now cuts off their refresh token.** A consequence of 109 rather
+than a separate choice, but it changes behaviour: previously a refresh token survived
+unassignment until it expired. That is the point of unassigning someone, so it is the
+intended outcome.
+
+**112. NOT changed: assignment is still enforced on the *client's* service principal only,
+never the *resource's*.** Entra is reported to enforce "assignment required" on the
+resource API's service principal too, so that an API owner can restrict who may obtain a
+token for it. That may be a real access-control gap here. I did not change it, because it
+would alter which users can get tokens for which APIs on the strength of an Entra behaviour
+I have not verified — and asserting Entra behaviour from memory has been wrong twice in
+this project already. It needs checking against Microsoft's documentation first. The flow
+tester's readiness page already reports this limitation rather than hiding it.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

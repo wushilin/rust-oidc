@@ -792,6 +792,16 @@ pub async fn user_is_assigned(pool: &DbPool, sp_id: &str, user_id: &str) -> anyh
     Ok(n > 0)
 }
 
+/// The AADSTS50105 text for a user who is not assigned to an app that requires it.
+/// One function, because the rule is enforced in two places (the authorize page
+/// and token issuance) and they must say the same thing.
+pub fn not_assigned_message(app: &Application) -> String {
+    format!(
+        "Your administrator has configured the application {} ('{}') to block users unless they are specifically granted ('assigned') access to the application.",
+        app.display_name, app.app_id
+    )
+}
+
 pub async fn set_assignment_required(pool: &DbPool, sp_id: &str, required: bool) -> anyhow::Result<()> {
     sqlx::query(crate::db::q(
         pool,

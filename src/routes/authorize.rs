@@ -622,10 +622,7 @@ async fn continue_authorize(
             StatusCode::FORBIDDEN,
             OAuthError::AccessDenied,
             Aadsts::NotAssigned,
-            format!(
-                "Your administrator has configured the application {} ('{}') to block users unless they are specifically granted ('assigned') access to the application.",
-                v.client.display_name, v.client.app_id
-            ),
+            apps::not_assigned_message(&v.client),
         );
         return Err(Step::Page(html::error(Some(&v.tenant.name), &err.description())));
     }

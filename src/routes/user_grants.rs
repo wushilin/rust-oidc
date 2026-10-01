@@ -384,6 +384,20 @@ pub(super) async fn issue(
     let client: Application = apps::find(&st.pool, client_app_id)
         .await?
         .ok_or_else(|| AadError::app_not_found(client_app_id, &tenant.id))?;
+    // "Assignment required" has to hold for every way a user can obtain a token.
+    // It was enforced only on the /authorize page, so an unassigned user got
+    // tokens through the device code and password grants, and a refresh token
+    // kept working after its holder was unassigned. Every user grant ends here,
+    // so this is the one place the rule cannot be routed around.
+    let sp = apps::service_principal(&st.pool, &tenant.id, &client.app_id)
+        .await?
+        .ok_or_else(|| AadError::app_not_found(client_app_id, &tenant.id))?;
+    if sp.app_role_assignment_required && !apps::user_is_assigned(&st.pool, &sp.id, &user.id).await? {
+        return Err(AadError::invalid_grant(
+            Aadsts::NotAssigned,
+            apps::not_assigned_message(&client),
+        ));
+    }
     let sign_in = SignIn {
         tenant: tenant.clone(),
         user: user.clone(),

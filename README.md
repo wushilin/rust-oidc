@@ -229,3 +229,7 @@ Worth knowing:
 - Refresh tokens rotate, and replaying an old one revokes the chain. Entra keeps old refresh tokens valid.
 - ID tokens include `email_verified` when an email is present.
 - Client secrets are stored as SHA-256 hashes. They are ~200-bit random values, so a slow hash adds nothing.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

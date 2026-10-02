@@ -111,7 +111,7 @@ async fn a_tenant_admin_cannot_grant_at_every_tenant() {
             ],
         )
         .await;
-    assert_eq!(wide.status, 403, "{}", wide.body);
+    assert_eq!(wide.status, 400, "{}", wide.body);
     let eff = effective_for_user(&s.pool, &helper.user_id).await.unwrap();
     assert_eq!(eff.len(), 1, "only the tenant-scoped grant exists: {eff:?}");
     assert!(matches!(eff[0].scope, Scope::Tenants(_)));
@@ -184,7 +184,7 @@ async fn revoking_the_last_platform_binding_is_refused_with_a_reason() {
         &s.pool,
         "SELECT id FROM role_bindings WHERE role_id = ? AND scope_kind = ?",
     ))
-    .bind(RoleId::PlatformAdministrator.as_str())
+    .bind(RoleId::GlobalAdministrator.as_str())
     .bind("all")
     .fetch_one(&s.pool)
     .await
@@ -199,7 +199,7 @@ async fn revoking_the_last_platform_binding_is_refused_with_a_reason() {
         .await;
     assert_eq!(page.status, 400, "{}", page.body);
     assert!(
-        page.body.to_lowercase().contains("last binding"),
+        page.body.contains("last Global Administrator"),
         "the page says why: {}",
         page.body
     );
@@ -327,21 +327,10 @@ async fn a_tenant_admin_is_not_shown_the_platform_administrators() {
     bind(
         &s,
         &delegated.user_id,
-        RoleId::GlobalAdministrator,
+        RoleId::TenantAdministrator,
         Scope::Tenants(vec![other.id.clone()]),
     )
     .await;
-    // A binding that covers this tenant *and* another one.
-    // Only a root-tenant account can hold one.
-    let shared = user_fixture_in(&s, platform.tenant.clone(), "shared@contoso.com").await;
-    bind(
-        &s,
-        &shared.user_id,
-        RoleId::GlobalReader,
-        Scope::Tenants(vec![other.id.clone(), platform.tenant.id.clone()]),
-    )
-    .await;
-
     let b = signed_in_admin(&s, &delegated).await;
     let page = b.get(&roles_url(&s, &other.id)).await;
     assert_eq!(page.status, 200, "{}", page.body);
@@ -352,7 +341,7 @@ async fn a_tenant_admin_is_not_shown_the_platform_administrators() {
         page.body
     );
     assert!(
-        !page.body.contains(RoleId::PlatformAdministrator.display_name()),
+        !page.body.contains(RoleId::GlobalAdministrator.display_name()),
         "{}",
         page.body
     );
@@ -361,55 +350,36 @@ async fn a_tenant_admin_is_not_shown_the_platform_administrators() {
         "another tenant's id is not theirs to know: {}",
         page.body
     );
-    assert!(
-        page.body.contains("1 other tenant"),
-        "summarised instead: {}",
-        page.body
-    );
 }
 
-/// A tenant-scoped `PlatformAdministrator` binding grants nothing, so the console
-/// refuses to create one rather than storing a role that only looks like power.
+/// Global Administrator is not a role of one tenant, so a tenant's Roles page
+/// neither offers nor accepts it, even from somebody who could grant it elsewhere.
 #[tokio::test]
-async fn the_platform_role_cannot_be_granted_to_one_tenant() {
+async fn global_administrator_is_not_granted_from_a_tenants_page() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let helper = user_fixture_in(&s, f.tenant.clone(), "helper@contoso.com").await;
     let b = signed_in_admin(&s, &f).await;
 
-    let page = b
-        .post(
-            &roles_url(&s, &f.tenant.id),
-            &[
-                ("op", "grant"),
-                ("principal", "helper@contoso.com"),
-                ("principal_type", "User"),
-                ("role", RoleId::PlatformAdministrator.as_str()),
-                ("scope", "tenants"),
-            ],
-        )
-        .await;
-    assert_eq!(page.status, 400, "{}", page.body);
-    assert!(page.body.contains("every-tenant scope"), "{}", page.body);
+    for extra in [("scope", "tenants"), ("scope", "all")] {
+        let page = b
+            .post(
+                &roles_url(&s, &f.tenant.id),
+                &[
+                    ("op", "grant"),
+                    ("principal", "helper@contoso.com"),
+                    ("principal_type", "User"),
+                    ("role", RoleId::GlobalAdministrator.as_str()),
+                    extra,
+                ],
+            )
+            .await;
+        assert_eq!(page.status, 400, "{}", page.body);
+        assert!(page.body.contains("All roles page"), "{}", page.body);
+    }
     assert!(effective_for_user(&s.pool, &helper.user_id).await.unwrap().is_empty());
-
-    // At every-tenant scope it is accepted, because there it means something.
-    let wide = b
-        .post(
-            &roles_url(&s, &f.tenant.id),
-            &[
-                ("op", "grant"),
-                ("principal", "helper@contoso.com"),
-                ("principal_type", "User"),
-                ("role", RoleId::PlatformAdministrator.as_str()),
-                ("scope", "all"),
-            ],
-        )
-        .await;
-    assert_eq!(wide.status, 303, "{}", wide.body);
-    let eff = effective_for_user(&s.pool, &helper.user_id).await.unwrap();
-    assert_eq!(eff.len(), 1);
-    assert_eq!(eff[0].scope, Scope::All);
+    let page = b.get(&roles_url(&s, &f.tenant.id)).await;
+    assert!(!page.body.contains(r#"value="GlobalAdministrator""#), "{}", page.body);
 }
 
 /// And a tenant admin, who cannot grant at every-tenant scope, is not even shown
@@ -423,7 +393,7 @@ async fn a_tenant_admin_is_not_offered_the_platform_role() {
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(page.body.contains("Grant a role"), "{}", page.body);
     assert!(
-        !page.body.contains(RoleId::PlatformAdministrator.as_str()),
+        !page.body.contains(RoleId::GlobalAdministrator.as_str()),
         "{}",
         page.body
     );

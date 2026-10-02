@@ -40,56 +40,85 @@ impl Action {
     }
 }
 
-/// Built-in roles. Those that exist in Entra keep Microsoft's template GUID so
-/// the `wids` claim stays faithful.
+/// Built-in roles.
+///
+/// One role is about the deployment and everything in it; the rest are about
+/// what is inside a tenant, each either the whole tenant or one kind of object,
+/// and each either an administrator (view and change) or a viewer (view only).
+/// The role decides the shape of its scope: see [`RoleId::scope_kind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleId {
+    /// Everything, outside tenants and inside every one of them.
     GlobalAdministrator,
-    GlobalReader,
+    /// Everything inside the tenants it is granted in, and nothing outside them.
+    TenantAdministrator,
+    TenantViewer,
     UserAdministrator,
+    UserViewer,
     GroupsAdministrator,
+    GroupViewer,
     ApplicationAdministrator,
-    CloudApplicationAdministrator,
-    PrivilegedRoleAdministrator,
-    PlatformAdministrator,
+    ApplicationViewer,
 }
 
 use Resource::*;
 use Verb::*;
 
-const READ_ALL: &[Action] = &[
+/// Everything there is to view inside a tenant.
+const VIEW_TENANT: &[Action] = &[
     Action::new(Tenant, Read),
     Action::new(User, Read),
     Action::new(Group, Read),
     Action::new(App, Read),
     Action::new(Assignment, Read),
     Action::new(RoleBinding, Read),
-    Action::new(Key, Read),
     Action::new(Audit, Read),
+];
+
+/// Everything there is to change inside a tenant.
+const CHANGE_TENANT: &[Action] = &[
+    Action::new(Tenant, Write),
+    Action::new(User, Write),
+    Action::new(User, Reset),
+    Action::new(Group, Write),
+    Action::new(App, Write),
+    Action::new(App, Rotate),
+    Action::new(Assignment, Write),
+    Action::new(RoleBinding, Write),
+];
+
+/// What is about the deployment rather than any tenant.
+const OUTSIDE_TENANTS: &[Action] = &[
+    Action::new(Tenant, Create),
+    Action::new(Tenant, Assume),
+    Action::new(Key, Read),
+    Action::new(Key, Rotate),
 ];
 
 impl RoleId {
     pub const ALL: &'static [RoleId] = &[
         Self::GlobalAdministrator,
-        Self::GlobalReader,
+        Self::TenantAdministrator,
+        Self::TenantViewer,
         Self::UserAdministrator,
+        Self::UserViewer,
         Self::GroupsAdministrator,
+        Self::GroupViewer,
         Self::ApplicationAdministrator,
-        Self::CloudApplicationAdministrator,
-        Self::PrivilegedRoleAdministrator,
-        Self::PlatformAdministrator,
+        Self::ApplicationViewer,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::GlobalAdministrator => "GlobalAdministrator",
-            Self::GlobalReader => "GlobalReader",
+            Self::TenantAdministrator => "TenantAdministrator",
+            Self::TenantViewer => "TenantViewer",
             Self::UserAdministrator => "UserAdministrator",
+            Self::UserViewer => "UserViewer",
             Self::GroupsAdministrator => "GroupsAdministrator",
+            Self::GroupViewer => "GroupViewer",
             Self::ApplicationAdministrator => "ApplicationAdministrator",
-            Self::CloudApplicationAdministrator => "CloudApplicationAdministrator",
-            Self::PrivilegedRoleAdministrator => "PrivilegedRoleAdministrator",
-            Self::PlatformAdministrator => "PlatformAdministrator",
+            Self::ApplicationViewer => "ApplicationViewer",
         }
     }
 
@@ -97,32 +126,90 @@ impl RoleId {
         Self::ALL.iter().copied().find(|r| r.as_str() == raw)
     }
 
-    /// Human-readable name, matching Entra's where one exists.
     pub fn display_name(self) -> &'static str {
         match self {
             Self::GlobalAdministrator => "Global Administrator",
-            Self::GlobalReader => "Global Reader",
+            Self::TenantAdministrator => "Tenant Administrator",
+            Self::TenantViewer => "Tenant Viewer",
             Self::UserAdministrator => "User Administrator",
-            Self::GroupsAdministrator => "Groups Administrator",
+            Self::UserViewer => "User Viewer",
+            Self::GroupsAdministrator => "Group Administrator",
+            Self::GroupViewer => "Group Viewer",
             Self::ApplicationAdministrator => "Application Administrator",
-            Self::CloudApplicationAdministrator => "Cloud Application Administrator",
-            Self::PrivilegedRoleAdministrator => "Privileged Role Administrator",
-            Self::PlatformAdministrator => "Platform Administrator",
+            Self::ApplicationViewer => "Application Viewer",
         }
     }
 
-    /// Microsoft's well-known GUID, for roles Entra also has. `None` means the
-    /// role is ours alone and must never appear in `wids`.
+    /// One line on what the role is for, shown where it is granted.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::GlobalAdministrator => "Everything: tenants, signing keys, and everything inside every tenant.",
+            Self::TenantAdministrator => "Everything inside the tenant, including its settings, roles and audit log.",
+            Self::TenantViewer => "Sees everything inside the tenant. Changes nothing.",
+            Self::UserAdministrator => "Sees and changes users, including passwords.",
+            Self::UserViewer => "Sees users. Changes nothing.",
+            Self::GroupsAdministrator => "Sees and changes groups and who is in them.",
+            Self::GroupViewer => "Sees groups. Changes nothing.",
+            Self::ApplicationAdministrator => {
+                "Sees and changes applications, their secrets and who is assigned to them, and runs the flow tester."
+            }
+            Self::ApplicationViewer => "Sees applications and who is assigned to them. Changes nothing.",
+        }
+    }
+
+    /// The shape of scope this role is granted at, which is not a choice made per
+    /// grant. `GlobalAdministrator` is everything and takes no list of tenants;
+    /// every other role is about named tenants and is never "all of them".
+    /// Enforced where bindings are written and read (`admin::bindings`).
+    pub fn scope_kind(self) -> ScopeKind {
+        match self {
+            Self::GlobalAdministrator => ScopeKind::All,
+            Self::TenantAdministrator
+            | Self::TenantViewer
+            | Self::UserAdministrator
+            | Self::UserViewer
+            | Self::GroupsAdministrator
+            | Self::GroupViewer
+            | Self::ApplicationAdministrator
+            | Self::ApplicationViewer => ScopeKind::Tenants,
+        }
+    }
+
+    /// The Entra directory role this one stands for in the `wids` claim of a
+    /// tenant's tokens. A tenant's administrator is that directory's Global
+    /// Administrator in Entra's terms, and its viewer the Global Reader. `None`
+    /// for roles Entra has no counterpart of, which never appear in `wids`.
     pub fn template_id(self) -> Option<&'static str> {
         match self {
-            Self::GlobalAdministrator => Some(directory::GLOBAL_ADMINISTRATOR),
-            Self::GlobalReader => Some("f2ef992c-3afb-46b9-b7cf-a126ee74c451"),
-            Self::UserAdministrator => Some("fe930be7-5e62-47db-91af-98c3a49a38b1"),
-            Self::GroupsAdministrator => Some("fdd7a751-b60b-444a-984c-02652fe8fa1c"),
-            Self::ApplicationAdministrator => Some("9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3"),
-            Self::CloudApplicationAdministrator => Some("158c047a-c907-4556-b7ef-446551a6b5f7"),
-            Self::PrivilegedRoleAdministrator => Some("e8611ab8-c189-46e8-94e1-60213ab1f814"),
-            Self::PlatformAdministrator => None,
+            Self::GlobalAdministrator | Self::TenantAdministrator => Some(directory::GLOBAL_ADMINISTRATOR),
+            Self::TenantViewer => Some(directory::GLOBAL_READER),
+            Self::UserAdministrator => Some(directory::USER_ADMINISTRATOR),
+            Self::GroupsAdministrator => Some(directory::GROUPS_ADMINISTRATOR),
+            Self::ApplicationAdministrator => Some(directory::APPLICATION_ADMINISTRATOR),
+            Self::UserViewer | Self::GroupViewer | Self::ApplicationViewer => None,
+        }
+    }
+
+    /// The role a tenant-scoped grant of an Entra directory role maps to.
+    pub fn for_template_in_tenant(template_id: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|r| r.scope_kind() == ScopeKind::Tenants && r.template_id() == Some(template_id))
+    }
+
+    /// The one scope this role can be held at by a principal whose own tenant is
+    /// `home`: the whole of the rule about where a role applies.
+    ///
+    /// `GlobalAdministrator` is everything, and belongs to the root tenant, where
+    /// the people who run the deployment have their accounts. Every other role
+    /// applies to the principal's own tenant and nowhere else, so there is never a
+    /// tenant to choose when granting one. `None` means the principal cannot hold
+    /// the role at all.
+    pub fn scope_held_by(self, home: &str, home_is_root: bool) -> Option<Scope> {
+        match self.scope_kind() {
+            ScopeKind::All => home_is_root.then_some(Scope::All),
+            ScopeKind::Tenants => Some(Scope::Tenants(vec![home.to_string()])),
         }
     }
 
@@ -130,63 +217,31 @@ impl RoleId {
         let mut out: Vec<Action> = Vec::new();
         match self {
             Self::GlobalAdministrator => {
-                out.extend_from_slice(READ_ALL);
-                out.extend_from_slice(&[
-                    Action::new(Tenant, Write),
-                    Action::new(User, Write),
-                    Action::new(User, Reset),
-                    Action::new(Group, Write),
-                    Action::new(App, Write),
-                    Action::new(App, Rotate),
-                    Action::new(Assignment, Write),
-                    Action::new(RoleBinding, Write),
-                ]);
+                out.extend_from_slice(VIEW_TENANT);
+                out.extend_from_slice(CHANGE_TENANT);
+                out.extend_from_slice(OUTSIDE_TENANTS);
             }
-            Self::GlobalReader => out.extend_from_slice(READ_ALL),
+            Self::TenantAdministrator => {
+                out.extend_from_slice(VIEW_TENANT);
+                out.extend_from_slice(CHANGE_TENANT);
+            }
+            Self::TenantViewer => out.extend_from_slice(VIEW_TENANT),
             Self::UserAdministrator => out.extend_from_slice(&[
                 Action::new(User, Read),
                 Action::new(User, Write),
                 Action::new(User, Reset),
-                Action::new(Group, Read),
-                Action::new(Audit, Read),
             ]),
-            Self::GroupsAdministrator => out.extend_from_slice(&[
-                Action::new(Group, Read),
-                Action::new(Group, Write),
-                Action::new(User, Read),
-                Action::new(Audit, Read),
-            ]),
+            Self::UserViewer => out.push(Action::new(User, Read)),
+            Self::GroupsAdministrator => out.extend_from_slice(&[Action::new(Group, Read), Action::new(Group, Write)]),
+            Self::GroupViewer => out.push(Action::new(Group, Read)),
             Self::ApplicationAdministrator => out.extend_from_slice(&[
                 Action::new(App, Read),
                 Action::new(App, Write),
                 Action::new(App, Rotate),
                 Action::new(Assignment, Read),
                 Action::new(Assignment, Write),
-                Action::new(Audit, Read),
             ]),
-            Self::CloudApplicationAdministrator => out.extend_from_slice(&[
-                Action::new(App, Read),
-                Action::new(App, Write),
-                Action::new(Assignment, Read),
-                Action::new(Assignment, Write),
-                Action::new(Audit, Read),
-            ]),
-            Self::PrivilegedRoleAdministrator => out.extend_from_slice(&[
-                Action::new(RoleBinding, Read),
-                Action::new(RoleBinding, Write),
-                Action::new(Assignment, Read),
-                Action::new(Assignment, Write),
-                Action::new(Audit, Read),
-            ]),
-            Self::PlatformAdministrator => out.extend_from_slice(&[
-                Action::new(Tenant, Read),
-                Action::new(Tenant, Create),
-                Action::new(Tenant, Write),
-                Action::new(Tenant, Assume),
-                Action::new(Key, Read),
-                Action::new(Key, Rotate),
-                Action::new(Audit, Read),
-            ]),
+            Self::ApplicationViewer => out.extend_from_slice(&[Action::new(App, Read), Action::new(Assignment, Read)]),
         }
         out
     }
@@ -235,35 +290,6 @@ impl Scope {
         match self {
             Self::All => true,
             Self::Tenants(ids) => ids.iter().any(|t| t == tenant_id),
-        }
-    }
-
-    /// Whether a principal whose own tenant is `home` may hold this scope.
-    ///
-    /// Reach beyond one's own tenant belongs to the root tenant: that is where the
-    /// people who run the platform have their accounts. A principal of any other
-    /// tenant holds roles in its own tenant and nowhere else, so "administrator of
-    /// every tenant" is never an account one of those tenants owns, can rename, or
-    /// can reset the password of.
-    pub fn may_be_held_by(&self, home: &str, home_is_root: bool) -> bool {
-        home_is_root
-            || match self {
-                Self::All => false,
-                Self::Tenants(ids) => ids.iter().all(|id| id == home),
-            }
-    }
-
-    /// The part of this scope such a principal actually holds. What
-    /// [`Self::may_be_held_by`] refuses at write time, this removes at read time,
-    /// so a row that reached the table some other way still grants nothing beyond
-    /// the principal's own tenant.
-    pub fn held_by(self, home: &str, home_is_root: bool) -> Scope {
-        if home_is_root {
-            return self;
-        }
-        match self {
-            Self::All => Self::Tenants(vec![home.to_string()]),
-            Self::Tenants(ids) => Self::Tenants(ids.into_iter().filter(|id| id == home).collect()),
         }
     }
 }
@@ -317,22 +343,69 @@ mod tests {
 
     #[test]
     fn role_limits_actions_independently_of_scope() {
-        // Global Administrator is broad but cannot create tenants.
-        let b = [binding(RoleId::GlobalAdministrator, Scope::All)];
+        // A tenant's administrator runs the tenant, not the deployment.
+        let b = [binding(RoleId::TenantAdministrator, Scope::Tenants(vec!["t1".into()]))];
+        assert!(allowed(&b, Action::new(Resource::User, Verb::Write), "t1"));
         assert!(!allowed(&b, Action::new(Resource::Tenant, Verb::Create), "t1"));
-        // Global Reader can read but never write, even at all scope.
-        let r = [binding(RoleId::GlobalReader, Scope::All)];
+        assert!(!allowed(&b, Action::new(Resource::Key, Verb::Read), "t1"));
+        // A viewer reads and never writes.
+        let r = [binding(RoleId::TenantViewer, Scope::Tenants(vec!["t1".into()]))];
         assert!(allowed(&r, Action::new(Resource::User, Verb::Read), "t1"));
         assert!(!allowed(&r, Action::new(Resource::User, Verb::Write), "t1"));
     }
 
     #[test]
-    fn platform_administrator_holds_the_platform_actions() {
-        let b = [binding(RoleId::PlatformAdministrator, Scope::All)];
-        for verb in [Verb::Create, Verb::Assume] {
-            assert!(allowed(&b, Action::new(Resource::Tenant, verb), "t1"), "{verb:?}");
+    fn global_administrator_holds_every_action_any_role_holds() {
+        let global = RoleId::GlobalAdministrator.actions();
+        for role in RoleId::ALL {
+            for action in role.actions() {
+                assert!(global.contains(&action), "{role:?} {action:?}");
+            }
         }
-        assert!(allowed(&b, Action::new(Resource::Key, Verb::Rotate), "t1"));
+    }
+
+    #[test]
+    fn only_global_administrator_is_granted_at_every_tenant() {
+        for role in RoleId::ALL {
+            assert_eq!(
+                role.scope_kind() == ScopeKind::All,
+                *role == RoleId::GlobalAdministrator,
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_viewer_holds_no_action_that_changes_anything() {
+        for role in [
+            RoleId::TenantViewer,
+            RoleId::UserViewer,
+            RoleId::GroupViewer,
+            RoleId::ApplicationViewer,
+        ] {
+            assert!(role.actions().iter().all(|a| a.verb == Verb::Read), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn the_narrow_roles_do_not_overlap() {
+        let narrow = [
+            (RoleId::UserAdministrator, RoleId::UserViewer),
+            (RoleId::GroupsAdministrator, RoleId::GroupViewer),
+            (RoleId::ApplicationAdministrator, RoleId::ApplicationViewer),
+        ];
+        for (i, (admin, viewer)) in narrow.iter().enumerate() {
+            // Each viewer is its administrator's read half.
+            for action in viewer.actions() {
+                assert!(admin.actions().contains(&action), "{viewer:?} {action:?}");
+            }
+            // And no two kinds share an action.
+            for (other, _) in narrow.iter().skip(i + 1) {
+                for action in admin.actions() {
+                    assert!(!other.actions().contains(&action), "{admin:?} {other:?} {action:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -347,12 +420,34 @@ mod tests {
     }
 
     #[test]
-    fn platform_administrator_has_no_template_id() {
-        assert!(RoleId::PlatformAdministrator.template_id().is_none());
+    fn roles_without_an_entra_counterpart_have_no_template_id() {
+        assert!(RoleId::UserViewer.template_id().is_none());
         assert_eq!(
-            RoleId::GlobalAdministrator.template_id(),
+            RoleId::TenantAdministrator.template_id(),
             Some(crate::directory::GLOBAL_ADMINISTRATOR)
         );
+        assert_eq!(
+            RoleId::for_template_in_tenant(crate::directory::GLOBAL_ADMINISTRATOR),
+            Some(RoleId::TenantAdministrator)
+        );
+    }
+
+    #[test]
+    fn a_role_is_held_at_exactly_one_scope() {
+        assert_eq!(
+            RoleId::GlobalAdministrator.scope_held_by("root", true),
+            Some(Scope::All)
+        );
+        assert_eq!(RoleId::GlobalAdministrator.scope_held_by("t1", false), None);
+        for role in RoleId::ALL.iter().filter(|r| **r != RoleId::GlobalAdministrator) {
+            for is_root in [true, false] {
+                assert_eq!(
+                    role.scope_held_by("t1", is_root),
+                    Some(Scope::Tenants(vec!["t1".into()])),
+                    "{role:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -362,132 +457,16 @@ mod tests {
         }
     }
 
-    fn keys(actions: &[Action]) -> Vec<String> {
-        let mut v: Vec<String> = actions
-            .iter()
-            .map(|a| format!("{:?}:{:?}", a.resource, a.verb))
-            .collect();
-        v.sort();
-        v
-    }
-
-    fn expected(list: &[(Resource, Verb)]) -> Vec<String> {
-        let acts: Vec<Action> = list.iter().map(|(r, v)| Action::new(*r, *v)).collect();
-        keys(&acts)
-    }
-
-    const READ_EVERYTHING: [(Resource, Verb); 8] = [
-        (Resource::Tenant, Verb::Read),
-        (Resource::User, Verb::Read),
-        (Resource::Group, Verb::Read),
-        (Resource::App, Verb::Read),
-        (Resource::Assignment, Verb::Read),
-        (Resource::RoleBinding, Verb::Read),
-        (Resource::Key, Verb::Read),
-        (Resource::Audit, Verb::Read),
-    ];
-
     #[test]
-    fn every_role_grants_exactly_its_expected_actions() {
-        use Resource::*;
-        use Verb::*;
+    fn what_is_outside_tenants_is_held_by_global_administrator_alone() {
         for role in RoleId::ALL {
-            let want: Vec<(Resource, Verb)> = match role {
-                RoleId::GlobalAdministrator => {
-                    let mut w = READ_EVERYTHING.to_vec();
-                    w.extend([
-                        (Tenant, Write),
-                        (User, Write),
-                        (User, Reset),
-                        (Group, Write),
-                        (App, Write),
-                        (App, Rotate),
-                        (Assignment, Write),
-                        (RoleBinding, Write),
-                    ]);
-                    w
-                }
-                RoleId::GlobalReader => READ_EVERYTHING.to_vec(),
-                RoleId::UserAdministrator => {
-                    vec![(User, Read), (User, Write), (User, Reset), (Group, Read), (Audit, Read)]
-                }
-                RoleId::GroupsAdministrator => {
-                    vec![(Group, Read), (Group, Write), (User, Read), (Audit, Read)]
-                }
-                RoleId::ApplicationAdministrator => vec![
-                    (App, Read),
-                    (App, Write),
-                    (App, Rotate),
-                    (Assignment, Read),
-                    (Assignment, Write),
-                    (Audit, Read),
-                ],
-                RoleId::CloudApplicationAdministrator => vec![
-                    (App, Read),
-                    (App, Write),
-                    (Assignment, Read),
-                    (Assignment, Write),
-                    (Audit, Read),
-                ],
-                RoleId::PrivilegedRoleAdministrator => vec![
-                    (RoleBinding, Read),
-                    (RoleBinding, Write),
-                    (Assignment, Read),
-                    (Assignment, Write),
-                    (Audit, Read),
-                ],
-                RoleId::PlatformAdministrator => vec![
-                    (Tenant, Read),
-                    (Tenant, Create),
-                    (Tenant, Write),
-                    (Tenant, Assume),
-                    (Key, Read),
-                    (Key, Rotate),
-                    (Audit, Read),
-                ],
-            };
-            assert_eq!(keys(&role.actions()), expected(&want), "{role:?}");
-        }
-    }
-
-    #[test]
-    fn platform_only_actions_are_held_by_no_other_role() {
-        let platform_only = [
-            Action::new(Resource::Tenant, Verb::Create),
-            Action::new(Resource::Tenant, Verb::Assume),
-            Action::new(Resource::Key, Verb::Rotate),
-        ];
-        for role in RoleId::ALL {
-            for action in platform_only {
+            for action in OUTSIDE_TENANTS {
                 assert_eq!(
-                    role.actions().contains(&action),
-                    *role == RoleId::PlatformAdministrator,
+                    role.actions().contains(action),
+                    *role == RoleId::GlobalAdministrator,
                     "{role:?} {action:?}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn only_platform_administrator_lacks_a_template_id() {
-        for role in RoleId::ALL {
-            assert_eq!(
-                role.template_id().is_none(),
-                *role == RoleId::PlatformAdministrator,
-                "{role:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn template_ids_and_names_match_the_directory() {
-        for role in RoleId::ALL {
-            let Some(id) = role.template_id() else { continue };
-            let dir = crate::directory::ROLES
-                .iter()
-                .find(|r| r.template_id == id)
-                .unwrap_or_else(|| panic!("{role:?} GUID {id} missing from directory::ROLES"));
-            assert_eq!(dir.name, role.display_name(), "{role:?}");
         }
     }
 
@@ -509,7 +488,7 @@ mod tests {
         assert!(allowed_at_all_scope(&all, action));
         assert!(!allowed_at_all_scope(&some, action));
         // Right scope, wrong role.
-        let wrong = [binding(RoleId::GlobalReader, Scope::All)];
+        let wrong = [binding(RoleId::UserViewer, Scope::All)];
         assert!(!allowed_at_all_scope(&wrong, action));
     }
 }

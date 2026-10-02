@@ -62,7 +62,6 @@ impl RoleOp {
 const PRINCIPAL_TYPE: &str = "principal_type";
 const PRINCIPAL: &str = "principal";
 const ROLE: &str = "role";
-const SCOPE: &str = "scope";
 const BINDING: &str = "binding";
 
 fn roles_url(base: &str, tenant: &Tenant) -> String {
@@ -125,7 +124,7 @@ async fn render(
             who = e(&principal_name(st, b).await),
             kind = e(b.principal_type.as_str()),
             role = e(b.role.display_name()),
-            scope = scope_cell(&b.scope, tenant, platform_visible),
+            scope = scope_cell(&b.scope),
         ));
     }
 
@@ -134,28 +133,15 @@ async fn render(
         .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
         .unwrap_or_default();
     let grant = if ctx.can_in(BINDING_WRITE, tenant) {
-        // `PlatformAdministrator`'s actions are platform-wide, so a tenant-scoped
-        // grant of it grants nothing at all (`a_tenant_scoped_platform_binding_cannot_assume`).
-        // Offering it to somebody who cannot grant at every-tenant scope would be a
-        // trap: the grant would appear to work and would do nothing.
-        let may_grant_everywhere = authz::may_write_binding(ctx.bindings(), &Scope::All);
-        let roles: String = RoleId::ALL
-            .iter()
-            .filter(|r| may_grant_everywhere || **r != RoleId::PlatformAdministrator)
+        // The roles that are held inside a tenant. Global Administrator is not one
+        // of them; it is granted from the Global roles page.
+        let tenant_roles = || RoleId::ALL.iter().filter(|r| r.scope_kind() == ScopeKind::Tenants);
+        let roles: String = tenant_roles()
             .map(|r| format!(r#"<option value="{}">{}</option>"#, e(r.as_str()), e(r.display_name())))
             .collect();
-        // The `all` option is offered only to someone who already holds the action
-        // everywhere, because a grant at `all` scope would otherwise be a widening.
-        // Offered only where it could be granted: by someone who holds it
-        // everywhere, to a principal of the root tenant.
-        let all_option = if may_grant_everywhere && tenant.is_root {
-            format!(
-                r#"<option value="{}">Every tenant</option>"#,
-                e(ScopeKind::All.as_str())
-            )
-        } else {
-            String::new()
-        };
+        let explained: String = tenant_roles()
+            .map(|r| format!("<dt>{}</dt><dd>{}</dd>", e(r.display_name()), e(r.summary())))
+            .collect();
         view::expander(
             "Grant a role",
             &format!(
@@ -167,8 +153,7 @@ async fn render(
 <select id="principal_type" name="{PRINCIPAL_TYPE}">
 <option value="{user}">User</option><option value="{group}">Group</option></select>
 <label for="role">Role</label><select id="role" name="{ROLE}">{roles}</select>
-<label for="scope">Scope</label><select id="scope" name="{SCOPE}">
-<option value="{tenants}">This tenant only</option>{all_option}</select>
+<dl class="roles">{explained}</dl>
 <div class="actions"><button type="submit">Grant</button></div></form>"#,
                 url = e(&url),
                 op_field = RoleOp::FIELD,
@@ -176,7 +161,6 @@ async fn render(
                 tenant_name = e(&tenant.name),
                 user = e(PrincipalType::User.as_str()),
                 group = e(PrincipalType::Group.as_str()),
-                tenants = e(ScopeKind::Tenants.as_str()),
             ),
             had_error,
         )
@@ -185,8 +169,8 @@ async fn render(
     };
 
     let body = format!(
-        r#"<h1>Roles</h1><p class="sub">{tenant_name} &middot; a role carries actions, a binding carries the scope.</p>{error}
-<table><tr><th>Principal</th><th>Type</th><th>Role</th><th>Scope</th><th></th></tr>{rows}</table>{grant}"#,
+        r#"<h1>Roles</h1><p class="sub">Who can administer or view {tenant_name} in this console. A role granted here applies to this tenant only.</p>{error}
+<table><tr><th>Who</th><th>Type</th><th>Role</th><th>Applies to</th><th></th></tr>{rows}</table>{grant}"#,
         tenant_name = e(&tenant.name),
     );
     view::page(
@@ -197,28 +181,14 @@ async fn render(
     )
 }
 
-/// The scope of a binding as this viewer may see it. Another tenant's id is not
-/// theirs to know, so a binding that also covers other tenants is summarised by
-/// how many rather than by which.
-fn scope_cell(scope: &Scope, tenant: &Tenant, platform_visible: bool) -> String {
+/// Where a binding listed on this tenant's page applies. A tenant role applies
+/// to its holder's own tenant, which is this one; only Global Administrator is
+/// wider.
+fn scope_cell(scope: &Scope) -> &'static str {
     match scope {
-        Scope::All => format!(r#"<span class="pill">{}</span>"#, e(ScopeKind::All.as_str())),
-        Scope::Tenants(ids) if ids.is_empty() => r#"<span class="muted">no live tenant</span>"#.to_string(),
-        Scope::Tenants(ids) if platform_visible => ids
-            .iter()
-            .map(|id| format!(r#"<span class="pill">{}</span>"#, e(id)))
-            .collect(),
-        Scope::Tenants(ids) => {
-            let others = ids.iter().filter(|id| *id != &tenant.id).count();
-            let mut cell = r#"<span class="pill">this tenant</span>"#.to_string();
-            if others > 0 {
-                cell.push_str(&format!(
-                    r#"<span class="muted">and {others} other tenant{s}</span>"#,
-                    s = if others == 1 { "" } else { "s" }
-                ));
-            }
-            cell
-        }
+        Scope::All => r#"<span class="pill good">everything</span>"#,
+        Scope::Tenants(ids) if ids.is_empty() => r#"<span class="muted">no live tenant</span>"#,
+        Scope::Tenants(_) => r#"<span class="pill">this tenant</span>"#,
     }
 }
 
@@ -304,11 +274,9 @@ impl From<RefusedReason> for Refusal {
     fn from(reason: RefusedReason) -> Self {
         match reason {
             RefusedReason::NotPermitted => Refusal::Forbidden,
-            RefusedReason::WouldLockOut => Refusal::Message(
-                "That is the last binding that can administer the platform. Grant the \
-                 platform role to somebody else first."
-                    .into(),
-            ),
+            RefusedReason::WouldLockOut => {
+                Refusal::Message("That is the last Global Administrator. Make somebody else one first.".into())
+            }
         }
     }
 }
@@ -326,25 +294,19 @@ async fn grant(
     let Some(role) = RoleId::parse(field(form, ROLE)) else {
         return Err(Refusal::Message("Choose a role.".into()));
     };
-    let scope = match ScopeKind::parse(field(form, SCOPE)) {
-        Some(ScopeKind::All) => Scope::All,
-        Some(ScopeKind::Tenants) => Scope::Tenants(vec![tenant.id.clone()]),
-        None => return Err(Refusal::Message("Choose a scope.".into())),
-    };
-    // The rule: a binding write is authorized against the *target* scope, so no
-    // principal can grant reach it does not already hold.
+    if role.scope_kind() != ScopeKind::Tenants {
+        return Err(Refusal::Message(format!(
+            "{} is not a role of one tenant. It is granted from the All roles page.",
+            role.display_name()
+        )));
+    }
+    // Where it applies is not asked: a role granted here applies to this tenant,
+    // which is the principal's own. `bindings::create` holds the rule.
+    let scope = Scope::Tenants(vec![tenant.id.clone()]);
+    // A binding write is authorized against the *target* scope, so no principal
+    // can grant reach it does not already hold.
     if !authz::may_write_binding(ctx.bindings(), &scope) {
         return Err(Refusal::Forbidden);
-    }
-    // Refused rather than stored: the platform role's actions are platform-wide, so a
-    // tenant-scoped binding of it would grant nothing, while reading -- to whoever
-    // found it later -- as a platform administrator who is not one.
-    if role == RoleId::PlatformAdministrator && scope != Scope::All {
-        return Err(Refusal::Message(
-            "The platform role only means anything at every-tenant scope. Scoped to one \
-             tenant it would grant nothing."
-                .into(),
-        ));
     }
 
     let principal_id = match principal_type {

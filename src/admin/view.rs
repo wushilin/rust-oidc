@@ -106,6 +106,9 @@ fieldset.choice { border:none; margin:14px 0 0; padding:0; }
 fieldset.choice legend { padding:0; font-size:13px; font-weight:600; margin-bottom:2px; }
 .when-some { margin:6px 0 0 24px; padding:2px 0 6px 14px; border-left:2px solid var(--line); }
 fieldset.choice:not(:has(input.some:checked)) .when-some { display:none; }
+dl.roles { margin:8px 0 0; font-size:13px; display:grid; grid-template-columns:max-content 1fr; gap:3px 14px; }
+dl.roles dt { font-weight:600; }
+dl.roles dd { margin:0; color:var(--muted); }
 /* User name: the part before the @, then the tenant's domain. A full name typed
    in makes the input match no longer (its pattern excludes @), which is what
    hides the domain beside it. */

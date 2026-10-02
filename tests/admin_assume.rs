@@ -135,62 +135,6 @@ async fn work_done_while_assuming_is_still_recorded_as_the_admin() {
     assert_eq!(rows[0].2.as_deref(), Some(target.id.as_str()));
 }
 
-/// Assuming is a convenience, not a grant: it cannot reach a tenant the
-/// administrator's bindings do not already cover.
-#[tokio::test]
-async fn assuming_does_not_widen_what_is_permitted() {
-    let s = TestServer::start().await;
-    let f = root_user_fixture(&s).await;
-    let other = s.tenant("Fabrikam", "fabrikam.test").await;
-    // Platform administrator can assume, but holds no user-administration role.
-    bind(
-        &s,
-        &f.user_id,
-        rust_oidc::rbac::RoleId::PlatformAdministrator,
-        rust_oidc::rbac::Scope::All,
-    )
-    .await;
-    let b = signed_in_admin(&s, &f).await;
-    assert_eq!(
-        b.post(&s.url(&format!("/admin/assume/{}", other.id)), &[]).await.status,
-        303
-    );
-    let page = b.get(&s.url(&format!("/admin/tenants/{}/users", other.id))).await;
-    assert_eq!(page.status, 403, "assuming grants nothing new: {}", page.body);
-}
-
-/// The platform's actions are platform-wide, so holding the platform role at a
-/// *tenant* scope must grant nothing at all. Without this, only the role half of
-/// the rule is tested and the scope half can be removed unnoticed — the same hole
-/// the lock-out rule had.
-#[tokio::test]
-async fn a_tenant_scoped_platform_binding_cannot_assume() {
-    let s = TestServer::start().await;
-    let f = root_user_fixture(&s).await;
-    let other = s.tenant("Fabrikam", "fabrikam.test").await;
-    bind(
-        &s,
-        &f.user_id,
-        rust_oidc::rbac::RoleId::PlatformAdministrator,
-        rust_oidc::rbac::Scope::Tenants(vec![f.tenant.id.clone(), other.id.clone()]),
-    )
-    .await;
-    let b = signed_in_admin(&s, &f).await;
-    for target in [&f.tenant.id, &other.id] {
-        let page = b.post(&s.url(&format!("/admin/assume/{target}")), &[]).await;
-        assert_eq!(
-            page.status, 403,
-            "a tenant-scoped platform binding assumed {target}: {}",
-            page.body
-        );
-    }
-    let session: (Option<String>,) = sqlx::query_as("SELECT acting_tenant FROM admin_sessions")
-        .fetch_one(&s.pool)
-        .await
-        .unwrap();
-    assert_eq!(session.0, None, "and no tenant was entered");
-}
-
 /// An assumed tenant has one way out: Leave. The "All tenants" link is for a
 /// tenant that was merely opened.
 #[tokio::test]

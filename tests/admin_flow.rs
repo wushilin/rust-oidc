@@ -633,24 +633,14 @@ async fn a_tenant_admin_cannot_flow_test_another_tenants_app() {
 #[tokio::test]
 async fn the_callback_refuses_a_tenant_the_administrator_may_no_longer_read() {
     let s = TestServer::start().await;
-    let f = root_user_fixture(&s).await;
-    let other = s.tenant("Fabrikam", "fabrikam.test").await;
-    // The flow signs a user in to the *other* tenant, so it needs an account there.
-    let theirs = user_fixture_in(&s, other.clone(), "carol@fabrikam.test").await;
-    bind(
-        &s,
-        &f.user_id,
-        rust_oidc::rbac::RoleId::GlobalAdministrator,
-        rust_oidc::rbac::Scope::Tenants(vec![f.tenant.id.clone()]),
-    )
-    .await;
-    let revoked = bind(
-        &s,
-        &f.user_id,
-        rust_oidc::rbac::RoleId::GlobalAdministrator,
-        rust_oidc::rbac::Scope::Tenants(vec![other.id.clone()]),
-    )
-    .await;
+    // A role applies to its holder's own tenant, so the administrator and the
+    // flow are in the same one; a second account there is who signs in.
+    let f = user_fixture(&s).await;
+    let other = f.tenant.clone();
+    let theirs = user_fixture_in(&s, other.clone(), "carol@contoso.com").await;
+    // Enough to stay signed in to the console once the other role is gone.
+    bind_in_own_tenant(&s, &f, rust_oidc::rbac::RoleId::UserViewer).await;
+    let revoked = bind_in_own_tenant(&s, &f, rust_oidc::rbac::RoleId::ApplicationAdministrator).await;
     let b = signed_in_admin(&s, &f).await;
     let app_id = create_test_client(&s, &b, &other.id).await;
 
@@ -672,7 +662,7 @@ async fn the_callback_refuses_a_tenant_the_administrator_may_no_longer_read() {
     let callback_url = answered.location.expect("a redirect to the callback");
 
     // The grant on that tenant goes away between the authorize request and its
-    // answer. The console session stays valid, because the other binding remains.
+    // answer. The console session stays valid, because the other role remains.
     assert!(
         rust_oidc::admin::bindings::delete(&s.pool, &revoked).await.unwrap(),
         "the binding was revoked"
@@ -686,7 +676,9 @@ async fn the_callback_refuses_a_tenant_the_administrator_may_no_longer_read() {
     );
     // Still signed in, which is what makes the 403 the callback's own answer.
     assert_eq!(
-        b.get(&s.url(&flow_path(&f.tenant.id))).await.status,
+        b.get(&s.url(&format!("/admin/tenants/{}/users", f.tenant.id)))
+            .await
+            .status,
         200,
         "the session itself is unaffected"
     );
@@ -763,34 +755,31 @@ async fn the_flow_tester_is_not_reachable_without_a_console_session() {
     );
 }
 
-/// A reader may diagnose -- that is the whole value of the page -- but must not be
-/// able to change a registration from it.
+/// The tester signs in and registers clients, so it belongs to whoever administers
+/// applications. A viewer, even of the whole tenant, is not offered it.
 #[tokio::test]
-async fn a_reader_can_diagnose_but_not_register_anything() {
+async fn the_flow_tester_is_for_application_administrators_not_viewers() {
     let s = TestServer::start().await;
     let f = reader_fixture(&s).await;
     let b = signed_in_admin(&s, &f).await;
-
-    let page = b.get(&s.url(&flow_path(&f.tenant.id))).await;
-    assert_eq!(page.status, 200, "{}", page.body);
-    assert!(page.body.contains("What this needs"), "{}", page.body);
-    assert!(
-        !page.body.contains("Create a flow tester client"),
-        "no button a reader cannot use: {}",
-        page.body
-    );
-    for form in [
-        vec![("op", "create_test_client")],
-        vec![
-            ("op", "add_callback"),
-            ("app", f.web.app_id.as_str()),
-            ("platform", "publicClient"),
-        ],
-    ] {
+    assert_eq!(b.get(&s.url(&flow_path(&f.tenant.id))).await.status, 403);
+    for form in [vec![("op", "create_test_client")], vec![("op", "check")]] {
         let posted = b.post(&s.url(&flow_path(&f.tenant.id)), &form).await;
         assert_eq!(posted.status, 403, "{form:?}: {}", posted.body);
     }
     assert!(flowtest::test_client(&s.pool, &f.tenant.id).await.unwrap().is_none());
+    let apps = b.get(&s.url(&format!("/admin/tenants/{}/apps", f.tenant.id))).await;
+    assert_eq!(apps.status, 200);
+    assert!(!apps.body.contains("Flow tester"), "no tab: {}", apps.body);
+
+    // An Application Administrator has it, and needs no other role for it.
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    bind_in_own_tenant(&s, &f, rust_oidc::rbac::RoleId::ApplicationAdministrator).await;
+    let b = signed_in_admin(&s, &f).await;
+    let page = b.get(&s.url(&flow_path(&f.tenant.id))).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Create a flow tester client"), "{}", page.body);
 }
 
 /// Every console form carries the session's token, and this one is no exception --

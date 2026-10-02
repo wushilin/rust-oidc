@@ -24,7 +24,7 @@ fn tenants(ids: &[&str]) -> Scope {
 
 #[test]
 fn an_admin_may_grant_within_tenants_they_hold() {
-    let me = [held(RoleId::GlobalAdministrator, tenants(&["t1", "t2"]))];
+    let me = [held(RoleId::TenantAdministrator, tenants(&["t1", "t2"]))];
     assert!(authz::may_write_binding(&me, &tenants(&["t1"])));
     assert!(authz::may_write_binding(&me, &tenants(&["t1", "t2"])));
     assert!(authz::may_write_binding(&me, &tenants(&["t2"])));
@@ -32,7 +32,7 @@ fn an_admin_may_grant_within_tenants_they_hold() {
 
 #[test]
 fn an_admin_may_not_grant_outside_their_scope() {
-    let me = [held(RoleId::GlobalAdministrator, tenants(&["t1"]))];
+    let me = [held(RoleId::TenantAdministrator, tenants(&["t1"]))];
     assert!(!authz::may_write_binding(&me, &tenants(&["t2"])));
     // A partial overlap is still a widening: t2 is not theirs to give.
     assert!(!authz::may_write_binding(&me, &tenants(&["t1", "t2"])));
@@ -40,7 +40,7 @@ fn an_admin_may_not_grant_outside_their_scope() {
 
 #[test]
 fn only_an_all_scope_principal_may_mint_an_all_scope_binding() {
-    let scoped = [held(RoleId::GlobalAdministrator, tenants(&["t1"]))];
+    let scoped = [held(RoleId::TenantAdministrator, tenants(&["t1"]))];
     assert!(
         !authz::may_write_binding(&scoped, &Scope::All),
         "this is the escalation the rule exists to stop"
@@ -82,7 +82,7 @@ async fn removing_the_last_platform_binding_is_refused() {
         &s.pool,
         PrincipalType::User,
         &f.user_id,
-        RoleId::PlatformAdministrator,
+        RoleId::GlobalAdministrator,
         &Scope::All,
         "test",
     )
@@ -113,7 +113,7 @@ async fn removing_the_last_platform_binding_is_refused() {
         &s.pool,
         PrincipalType::User,
         &other,
-        RoleId::PlatformAdministrator,
+        RoleId::GlobalAdministrator,
         &Scope::All,
         "test",
     )
@@ -122,79 +122,46 @@ async fn removing_the_last_platform_binding_is_refused() {
     assert!(authz::check_delete(&s.pool, &id).await.is_ok());
 }
 
-/// The lock-out rule is about the platform role at `All` scope only. Any other
-/// binding may be the last of its kind and still be removable.
+/// The lock-out rule is about Global Administrator only. Any other binding may
+/// be the last of its kind and still be removable.
 #[tokio::test]
 async fn the_lockout_rule_does_not_block_other_bindings() {
     let s = TestServer::start().await;
     let f = root_user_fixture(&s).await;
-    let plain = bindings::create(
-        &s.pool,
-        PrincipalType::User,
-        &f.user_id,
-        RoleId::GlobalAdministrator,
-        &Scope::All,
-        "test",
-    )
-    .await
-    .unwrap();
+    let plain = bind_in_own_tenant(&s, &f, RoleId::TenantAdministrator).await;
     assert!(
         authz::check_delete(&s.pool, &plain).await.is_ok(),
-        "the last Global Administrator is not a platform lock-out"
+        "the last Tenant Administrator is not a lock-out of the deployment"
     );
-
-    // A tenant-scoped platform binding is not the load-bearing one either: it
-    // cannot create or assume a tenant in the first place.
-    let scoped = bindings::create(
-        &s.pool,
-        PrincipalType::User,
-        &f.user_id,
-        RoleId::PlatformAdministrator,
-        &Scope::Tenants(vec![f.tenant.id.clone()]),
-        "test",
-    )
-    .await
-    .unwrap();
-    assert!(authz::check_delete(&s.pool, &scoped).await.is_ok());
 }
 
-/// The other half of the same rule, and the one a first draft missed: a
-/// tenant-scoped platform binding must **not** count towards the platform's
-/// survival. If the count ignored `scope_kind`, deleting the last `All`-scope
-/// binding would look safe because a scoped one existed -- and that scoped one
-/// cannot create or assume a tenant, so the platform would be locked out anyway.
+/// The other half of the same rule, and the one a first draft missed: a Global
+/// Administrator row that is not at every-tenant scope must **not** count towards
+/// the deployment's survival, because it grants nothing. `create` refuses to
+/// write one, so it is put there by hand, as an older build or a restore might.
 ///
 /// Found by teeth-checking: dropping `scope_kind = 'all'` from the count left
 /// every other test in this file passing.
 #[tokio::test]
-async fn a_tenant_scoped_platform_binding_does_not_keep_the_platform_alive() {
+async fn a_global_administrator_row_that_grants_nothing_does_not_keep_the_deployment_alive() {
     let s = TestServer::start().await;
     let f = root_user_fixture(&s).await;
-    let load_bearing = bindings::create(
+    let load_bearing = bind(&s, &f.user_id, RoleId::GlobalAdministrator, Scope::All).await;
+    sqlx::query(rust_oidc::db::q(
         &s.pool,
-        PrincipalType::User,
-        &f.user_id,
-        RoleId::PlatformAdministrator,
-        &Scope::All,
-        "test",
-    )
-    .await
-    .unwrap();
-    bindings::create(
-        &s.pool,
-        PrincipalType::User,
-        &f.user_id,
-        RoleId::PlatformAdministrator,
-        &Scope::Tenants(vec![f.tenant.id.clone()]),
-        "test",
-    )
+        "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at, created_by)
+         VALUES ('by-hand', 'User', ?, ?, 'tenants', 0, 'by-hand')",
+    ))
+    .bind(&f.user_id)
+    .bind(RoleId::GlobalAdministrator.as_str())
+    .execute(&s.pool)
     .await
     .unwrap();
 
     assert_eq!(
         authz::check_delete(&s.pool, &load_bearing).await.unwrap_err(),
         RefusedReason::WouldLockOut,
-        "a tenant-scoped platform binding is not a substitute for the all-scope one"
+        "a row that grants nothing is not a substitute for a real Global Administrator"
     );
 }
 
@@ -215,12 +182,13 @@ async fn the_combined_delete_applies_both_rules() {
     let s = TestServer::start().await;
     let f = root_user_fixture(&s).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
+    let fabrikam_user = user_fixture_in(&s, other.clone(), "zed@fabrikam.test").await;
 
     // A binding in Fabrikam, and an actor who only holds Contoso.
     let theirs = bindings::create(
         &s.pool,
         PrincipalType::User,
-        &f.user_id,
+        &fabrikam_user.user_id,
         RoleId::UserAdministrator,
         &Scope::Tenants(vec![other.id.clone()]),
         "test",
@@ -228,7 +196,7 @@ async fn the_combined_delete_applies_both_rules() {
     .await
     .unwrap();
     let contoso_only = [held(
-        RoleId::GlobalAdministrator,
+        RoleId::TenantAdministrator,
         Scope::Tenants(vec![f.tenant.id.clone()]),
     )];
     assert_eq!(
@@ -255,7 +223,7 @@ async fn the_combined_delete_still_refuses_a_lockout() {
         &s.pool,
         PrincipalType::User,
         &f.user_id,
-        RoleId::PlatformAdministrator,
+        RoleId::GlobalAdministrator,
         &Scope::All,
         "test",
     )

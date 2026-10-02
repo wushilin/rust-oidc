@@ -29,10 +29,10 @@ use axum::response::Response;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::admin::APP_WRITE;
 use crate::admin::context::{AdminContext, On};
 use crate::admin::routes::{At, Params, PlatformTab, TenantTab, audited, checked, chrome, field, optional, parse_form};
 use crate::admin::view::{self, e};
-use crate::admin::{APP_READ, APP_WRITE};
 use crate::apps::{self, Application, RedirectPlatform};
 use crate::db::Event;
 use crate::flowtest::{
@@ -90,19 +90,13 @@ impl FlowOp {
         Self::ALL.iter().copied().find(|o| o.as_str() == raw)
     }
 
-    /// The action that authorizes it.
-    ///
-    /// Running a flow is `App:Read`: it changes no configuration, and the tokens it
-    /// produces are the ones the person signing in could already get from any
-    /// browser -- the authorize endpoint makes them authenticate there, and the
-    /// console session is no help at all. The two operations that *do* change a
-    /// registration are `App:Write`, like every other registration change.
+    /// The action each operation needs. All of them need `App:Write`: the tester
+    /// is a tool of whoever administers applications, and a viewer -- who sees
+    /// applications and changes nothing -- is given none of it, not even the
+    /// operations that would change nothing.
     fn action(self) -> Action {
         match self {
-            // Forgetting a sign-in ends only this browser's own session with the
-            // tenant, which the browser could do at the logout endpoint anyway.
-            Self::Start | Self::ForgetSignIn | Self::Check => APP_READ,
-            Self::AddCallback | Self::CreateTestClient => APP_WRITE,
+            Self::Start | Self::ForgetSignIn | Self::Check | Self::AddCallback | Self::CreateTestClient => APP_WRITE,
         }
     }
 }
@@ -124,7 +118,7 @@ pub async fn page(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = ctx.require(APP_READ, On::Tenant(&key)) {
+    if let Err(resp) = ctx.require(APP_WRITE, On::Tenant(&key)) {
         return resp;
     }
     let Some(tenant) = ctx.tenant(&key) else {
@@ -1067,7 +1061,7 @@ pub async fn callback(
             return view::server_error();
         }
     };
-    if !ctx.can_in(APP_READ, &tenant) {
+    if !ctx.can_in(APP_WRITE, &tenant) {
         return view::forbidden();
     }
     let Ok(app) = apps::find_in_tenant(&st.pool, &tenant, &pending.client_app_id).await else {
@@ -1686,7 +1680,7 @@ mod tests {
     /// does, and must need the action that governs a registration.
     #[test]
     fn only_the_operations_that_change_a_registration_need_app_write() {
-        assert_eq!(FlowOp::Start.action(), APP_READ);
+        assert_eq!(FlowOp::Start.action(), APP_WRITE);
         assert_eq!(FlowOp::AddCallback.action(), APP_WRITE);
         assert_eq!(FlowOp::CreateTestClient.action(), APP_WRITE);
     }

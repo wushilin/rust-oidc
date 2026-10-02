@@ -187,7 +187,7 @@ async fn a_tenant_admin_cannot_read_or_write_another_tenants_settings() {
 async fn a_platform_administrator_can_set_any_tenants_settings() {
     let s = TestServer::start().await;
     let f = root_user_fixture(&s).await;
-    bind(&s, &f.user_id, RoleId::PlatformAdministrator, Scope::All).await;
+    bind(&s, &f.user_id, RoleId::GlobalAdministrator, Scope::All).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
     let b = signed_in_admin(&s, &f).await;
 

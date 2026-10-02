@@ -397,8 +397,8 @@ async fn deleting_a_user_ends_their_console_session() {
     bind(
         &s,
         &victim.user_id,
-        rust_oidc::rbac::RoleId::GlobalReader,
-        rust_oidc::rbac::Scope::All,
+        rust_oidc::rbac::RoleId::TenantViewer,
+        rust_oidc::rbac::Scope::Tenants(vec![f.tenant.id.clone()]),
     )
     .await;
     let theirs = signed_in_admin(&s, &victim).await;

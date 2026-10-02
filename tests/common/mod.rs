@@ -599,35 +599,33 @@ pub async fn bind(s: &TestServer, user_id: &str, role: RoleId, scope: Scope) -> 
         .unwrap()
 }
 
-/// A super administrator: tenant admin everywhere, plus the platform role that
-/// can create and assume tenants. The shape of `admin@wushilin.net` on the
-/// deployed service.
+/// A Global Administrator: everything, outside tenants and inside every one. The
+/// shape of `admin@wushilin.net` on the deployed service. In the root tenant,
+/// the only place the role can be held.
 pub async fn admin_fixture(s: &TestServer) -> UserFixture {
     let f = root_user_fixture(s).await;
     bind(s, &f.user_id, RoleId::GlobalAdministrator, Scope::All).await;
-    bind(s, &f.user_id, RoleId::PlatformAdministrator, Scope::All).await;
     f
 }
 
-/// A delegated administrator: Global Administrator of one tenant and nothing
-/// else. The fixture the isolation tests are about.
+/// A delegated administrator: Tenant Administrator of their own tenant and
+/// nothing else. The fixture the isolation tests are about.
 pub async fn tenant_admin_fixture(s: &TestServer) -> UserFixture {
     let f = user_fixture(s).await;
-    bind(
-        s,
-        &f.user_id,
-        RoleId::GlobalAdministrator,
-        Scope::Tenants(vec![f.tenant.id.clone()]),
-    )
-    .await;
+    bind_in_own_tenant(s, &f, RoleId::TenantAdministrator).await;
     f
 }
 
-/// Read everything, change nothing.
+/// Sees everything in their own tenant, changes nothing.
 pub async fn reader_fixture(s: &TestServer) -> UserFixture {
-    let f = root_user_fixture(s).await;
-    bind(s, &f.user_id, RoleId::GlobalReader, Scope::All).await;
+    let f = user_fixture(s).await;
+    bind_in_own_tenant(s, &f, RoleId::TenantViewer).await;
     f
+}
+
+/// Give a fixture's user a tenant role, which applies to their own tenant.
+pub async fn bind_in_own_tenant(s: &TestServer, f: &UserFixture, role: RoleId) -> String {
+    bind(s, &f.user_id, role, Scope::Tenants(vec![f.tenant.id.clone()])).await
 }
 
 /// A browser signed in to the console, carrying that session's CSRF token so

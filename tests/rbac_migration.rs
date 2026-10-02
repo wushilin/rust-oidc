@@ -62,8 +62,8 @@ async fn effective_bindings_keep_two_roles_scopes_separate() {
     let f = root_user_fixture(&s).await;
     let other = s.tenant("Other", "other.test").await;
     for (id, role, tenant) in [
-        ("b-admin", RoleId::GlobalAdministrator, &f.tenant.id),
-        ("b-reader", RoleId::GlobalReader, &other.id),
+        ("b-admin", RoleId::TenantAdministrator, &f.tenant.id),
+        ("b-reader", RoleId::TenantViewer, &other.id),
     ] {
         let e = rust_oidc::db::engine_of(&s.pool);
         sqlx::query(rust_oidc::db::sql_stmt(
@@ -90,12 +90,11 @@ async fn effective_bindings_keep_two_roles_scopes_separate() {
     let eff = rust_oidc::admin::bindings::effective_for_user(&s.pool, &f.user_id)
         .await
         .unwrap();
-    let scope_of = |role: RoleId| eff.iter().find(|b| b.role == role).unwrap().scope.clone();
-    assert_eq!(
-        scope_of(RoleId::GlobalAdministrator),
-        Scope::Tenants(vec![f.tenant.id.clone()])
-    );
-    assert_eq!(scope_of(RoleId::GlobalReader), Scope::Tenants(vec![other.id.clone()]));
+    // The role in the holder's own tenant is in effect; the one stored against
+    // another tenant grants nothing (`RoleId::scope_held_by`).
+    assert_eq!(eff.len(), 1);
+    assert_eq!(eff[0].role, RoleId::TenantAdministrator);
+    assert_eq!(eff[0].scope, Scope::Tenants(vec![f.tenant.id.clone()]));
 }
 
 const GLOBAL_ADMIN: &str = "62e90394-69f5-4237-9190-012177145e10";

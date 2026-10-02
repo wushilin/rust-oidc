@@ -432,15 +432,6 @@ async fn main() -> anyhow::Result<()> {
                 "bootstrap",
             )
             .await?;
-            role_bindings::create(
-                &pool,
-                PrincipalType::User,
-                &user_id,
-                RoleId::PlatformAdministrator,
-                &Scope::All,
-                "bootstrap",
-            )
-            .await?;
             keys::ensure(&pool).await?;
             db::audit(
                 &pool,
@@ -541,11 +532,7 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
                 let Some(found) = directory::find(&role) else {
                     bail!("unknown directory role '{role}'");
                 };
-                let Some(role_id) = RoleId::ALL
-                    .iter()
-                    .copied()
-                    .find(|r| r.template_id() == Some(found.template_id))
-                else {
+                let Some(role_id) = RoleId::for_template_in_tenant(found.template_id) else {
                     bail!("directory role '{role}' has no RBAC role");
                 };
                 role_bindings::create(

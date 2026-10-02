@@ -1,4 +1,4 @@
-//! Platform roles: every role binding on the deployment, and granting or revoking
+//! All roles: every role binding on the deployment, and granting or revoking them
 //! the ones that reach across tenants.
 //!
 //! A tenant's own Roles page grants within that tenant. This page is where an
@@ -26,15 +26,12 @@ use crate::admin::view::{self, e};
 use crate::admin::{BINDING_READ, BINDING_WRITE};
 use crate::db::Event;
 use crate::directory::PrincipalType;
-use crate::rbac::{RoleId, Scope, ScopeKind};
+use crate::rbac::{RoleId, Scope};
 use crate::tenant::{self, Tenant};
 
 /// Form field names, named once.
 const ACCOUNT: &str = "account";
 const ROLE: &str = "role";
-const SCOPE: &str = "scope";
-/// Repeated once per ticked tenant.
-const TENANT: &str = "tenant";
 const BINDING: &str = "binding";
 
 fn page_url(base: &str) -> String {
@@ -71,10 +68,10 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
             Some(t) => e(&t.name),
             None => r#"<span class="muted">unknown</span>"#.to_string(),
         };
-        // Granted before the rule existed, or by hand: kept, but pointed out.
+        // Kept from before the rule, or written by hand: shown, and pointed out.
         let beyond = match home {
-            Some(t) if !b.scope.may_be_held_by(&t.id, t.is_root) => {
-                r#" <span class="pill bad" title="Only a principal of the root tenant can reach beyond its own tenant. This part of the binding grants nothing.">not in effect beyond its tenant</span>"#
+            Some(t) if b.role.scope_held_by(&t.id, t.is_root).as_ref() != Some(&b.scope) => {
+                r#" <span class="pill bad" title="A role applies to the tenant its holder belongs to; only Global Administrator, held from the root tenant, covers more. Whatever this binding says beyond that grants nothing.">not in effect as written</span>"#
             }
             _ => "",
         };
@@ -105,33 +102,23 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
             .iter()
             .map(|r| format!(r#"<option value="{}">{}</option>"#, e(r.as_str()), e(r.display_name())))
             .collect();
-        let boxes: String = tenants
+        let explained: String = RoleId::ALL
             .iter()
-            .map(|t| {
-                format!(
-                    r#"<label><input type="checkbox" name="{TENANT}" value="{id}"> {name}</label>"#,
-                    id = e(&t.id),
-                    name = e(&t.name),
-                )
-            })
+            .map(|r| format!("<dt>{}</dt><dd>{}</dd>", e(r.display_name()), e(r.summary())))
             .collect();
         view::expander(
             "Grant a role",
             &format!(
                 r#"<form method="post" action="{url}">{csrf}
 <label for="account">Account</label><input id="account" name="{ACCOUNT}" type="email" required>
-<p class="muted">An account in the root tenant, by its sign-in name. Accounts of other tenants are given
-roles in their own tenant, from that tenant's Roles tab.</p>
+<p class="muted">The account's full sign-in name. The part after the @ says which tenant it belongs to,
+and that is the tenant the role applies to. Only Global Administrator covers more, and only an account
+in the root tenant can hold it.</p>
 <label for="role">Role</label><select id="role" name="{ROLE}">{roles}</select>
-<fieldset class="choice"><legend>Where it applies</legend>
-<label><input type="radio" name="{SCOPE}" value="{all}" checked> Every tenant, including ones added later</label>
-<label><input type="radio" name="{SCOPE}" value="{some}" class="some"> Only these tenants</label>
-<div class="when-some">{boxes}</div></fieldset>
-<p class="muted">To grant a role to a group, use the Roles tab inside the root tenant.</p>
+<dl class="roles">{explained}</dl>
+<p class="muted">To grant a role to a group, use the Roles tab inside the group's tenant.</p>
 <div class="actions"><button type="submit" name="{field}" value="{op}">Grant role</button></div></form>"#,
                 url = e(&url),
-                all = e(ScopeKind::All.as_str()),
-                some = e(ScopeKind::Tenants.as_str()),
                 field = RoleOp::FIELD,
                 op = RoleOp::Grant.as_str(),
             ),
@@ -142,15 +129,15 @@ roles in their own tenant, from that tenant's Roles tab.</p>
     };
 
     let body = format!(
-        r#"<h1>Platform roles</h1><p class="sub">Who can administer what, across every tenant. A role says what someone
-may do; where it applies says in which tenants.</p>{error}
-<table><tr><th>Who</th><th>Their tenant</th><th>Type</th><th>Role</th><th>Where it applies</th><th></th></tr>{rows}</table>{grant}"#,
+        r#"<h1>All roles</h1><p class="sub">Every role granted on this deployment. A Global Administrator can do
+everything; every other role applies to the tenant its holder belongs to.</p>{error}
+<table><tr><th>Who</th><th>Their tenant</th><th>Type</th><th>Role</th><th>Applies to</th><th></th></tr>{rows}</table>{grant}"#,
         error = view::error_block(error),
     );
     view::page(
         &chrome(st, ctx, At::Platform(PlatformTab::Roles)),
         status,
-        "Platform roles",
+        "All roles",
         &body,
     )
 }
@@ -159,7 +146,7 @@ may do; where it applies says in which tenants.</p>{error}
 /// nothing and is shown as such rather than as a bare id.
 fn scope_cell(b: &StoredBinding, tenants: &[&Tenant]) -> String {
     match &b.scope {
-        Scope::All => r#"<span class="pill good">every tenant</span>"#.to_string(),
+        Scope::All => r#"<span class="pill good">everything</span>"#.to_string(),
         Scope::Tenants(ids) if ids.is_empty() => r#"<span class="muted">no live tenant</span>"#.to_string(),
         Scope::Tenants(ids) => ids
             .iter()
@@ -181,11 +168,9 @@ impl From<RefusedReason> for Refusal {
     fn from(reason: RefusedReason) -> Self {
         match reason {
             RefusedReason::NotPermitted => Refusal::Forbidden,
-            RefusedReason::WouldLockOut => Refusal::Message(
-                "That is the last binding that can administer the platform. Grant the platform role \
-                 to somebody else first."
-                    .into(),
-            ),
+            RefusedReason::WouldLockOut => {
+                Refusal::Message("That is the last Global Administrator. Make somebody else one first.".into())
+            }
         }
     }
 }
@@ -247,41 +232,6 @@ async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String
     let Some(role) = RoleId::parse(one(ROLE)) else {
         return Err(Refusal::Message("Choose a role.".into()));
     };
-    let scope = match ScopeKind::parse(one(SCOPE)) {
-        Some(ScopeKind::All) => Scope::All,
-        Some(ScopeKind::Tenants) => {
-            let mut ids: Vec<String> = Vec::new();
-            for (_, value) in pairs.iter().filter(|(k, _)| k == TENANT) {
-                // Resolved, so the binding names tenants that exist and never a
-                // domain alias or a stray string.
-                match tenant::resolve(&st.pool, value).await {
-                    Ok(Some(t)) if !ids.contains(&t.id) => ids.push(t.id),
-                    Ok(_) => {}
-                    Err(_) => return Err(Refusal::Message("A tenant could not be looked up.".into())),
-                }
-            }
-            if ids.is_empty() {
-                return Err(Refusal::Message(
-                    "Tick at least one tenant, or choose every tenant.".into(),
-                ));
-            }
-            Scope::Tenants(ids)
-        }
-        None => return Err(Refusal::Message("Choose where the role applies.".into())),
-    };
-    // The rule: a binding write is authorized against the *target* scope, so no
-    // principal can grant reach it does not already hold.
-    if !authz::may_write_binding(ctx.bindings(), &scope) {
-        return Err(Refusal::Forbidden);
-    }
-    if role == RoleId::PlatformAdministrator && scope != Scope::All {
-        return Err(Refusal::Message(
-            "The platform role only means anything across every tenant. Limited to some tenants it \
-             would grant nothing."
-                .into(),
-        ));
-    }
-
     // The account's tenant is the one that owns the part after the @.
     let Some((_, domain)) = account.rsplit_once('@') else {
         return Err(Refusal::Message(
@@ -300,6 +250,16 @@ async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String
     let Some(user) = user else {
         return Err(Refusal::Message(format!("There is no account named '{account}'.")));
     };
+
+    // Where the role applies follows from the role and the account's tenant.
+    let Some(scope) = home.as_ref().and_then(|t| role.scope_held_by(&t.id, t.is_root)) else {
+        return Err(Refusal::Message(bindings::ScopeRefused::GlobalOutsideRoot.to_string()));
+    };
+    // A binding write is authorized against the *target* scope, so no principal
+    // can grant reach it does not already hold.
+    if !authz::may_write_binding(ctx.bindings(), &scope) {
+        return Err(Refusal::Forbidden);
+    }
 
     let id = bindings::create(&st.pool, PrincipalType::User, &user.id, role, &scope, &ctx.user.id)
         .await

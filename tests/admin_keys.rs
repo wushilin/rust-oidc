@@ -14,7 +14,6 @@ mod common;
 
 use common::*;
 use rust_oidc::keys::{self, KeyStatus};
-use rust_oidc::rbac::{RoleId, Scope};
 
 async fn kids_by_status(s: &TestServer, status: KeyStatus) -> Vec<String> {
     keys::list(&s.pool)
@@ -186,29 +185,4 @@ async fn a_tenant_admin_can_neither_see_nor_rotate_the_signing_keys() {
     let tenants = b.get(&s.url("/admin/tenants")).await;
     assert_eq!(tenants.status, 200);
     assert!(!tenants.body.contains("Signing keys"), "{}", tenants.body);
-}
-
-/// `Key:Read` without `Key:Rotate` — Global Reader at platform scope — may look
-/// and not touch.
-#[tokio::test]
-async fn a_platform_reader_sees_the_keys_but_cannot_rotate_them() {
-    let s = TestServer::start().await;
-    let f = root_user_fixture(&s).await;
-    bind(&s, &f.user_id, RoleId::GlobalReader, Scope::All).await;
-    let b = signed_in_admin(&s, &f).await;
-    let url = s.url("/admin/keys");
-    let active_before = kids_by_status(&s, KeyStatus::Active).await;
-
-    let page = b.get(&url).await;
-    assert_eq!(page.status, 200, "{}", page.body);
-    assert!(page.body.contains(&active_before[0]), "the keys are listed");
-    assert!(
-        !page.body.contains("Rotate the signing key"),
-        "a reader is offered rotation: {}",
-        page.body
-    );
-
-    let refused = b.post(&url, &[("op", "rotate")]).await;
-    assert_eq!(refused.status, 403, "{}", refused.body);
-    assert_eq!(kids_by_status(&s, KeyStatus::Active).await, active_before);
 }

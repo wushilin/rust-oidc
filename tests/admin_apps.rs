@@ -12,14 +12,14 @@
 //!
 //! A third is about actions rather than tenants: `App:Rotate` is separate from
 //! `App:Write` precisely so a role can administer a registration without being
-//! able to mint a credential for it, and `CloudApplicationAdministrator` is the
+//! able to mint a credential for it, and no built-in role does so today; the
 //! built-in role that holds the one and not the other.
 
 mod common;
 
 use common::*;
 use rust_oidc::apps::{self, MemberType, RedirectPlatform, ScopeConsent, SecretCheck};
-use rust_oidc::rbac::{RoleId, Scope};
+use rust_oidc::rbac::RoleId;
 
 /// A self-signed RSA certificate and the matching private key PEM, for the
 /// certificate-credential tests.
@@ -445,41 +445,24 @@ async fn a_certificate_is_registered_by_thumbprint_and_a_private_key_is_refused(
     assert!(apps::key_credentials(&s.pool, &app).await.unwrap().is_empty());
 }
 
-/// `App:Rotate` is a separate action so that a role can administer a registration
-/// without being able to mint a credential for it. Cloud Application
-/// Administrator is the built-in role that holds the one and not the other.
+/// An Application Viewer sees a registration and can change nothing about it.
 #[tokio::test]
-async fn a_role_without_app_rotate_can_configure_an_app_but_not_credential_it() {
+async fn an_application_viewer_sees_an_app_and_changes_nothing() {
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
-    bind(
-        &s,
-        &f.user_id,
-        RoleId::CloudApplicationAdministrator,
-        Scope::Tenants(vec![f.tenant.id.clone()]),
-    )
-    .await;
+    bind_in_own_tenant(&s, &f, RoleId::ApplicationViewer).await;
     let b = signed_in_admin(&s, &f).await;
     let url = s.url(&format!("/admin/tenants/{}/apps/{}", f.tenant.id, f.web.app_id));
     let app = apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap();
     let before = apps::secrets(&s.pool, &app).await.unwrap().len();
 
-    // The registration: permitted.
-    let wrote = b
-        .post(
-            &url,
-            &[
-                ("op", "redirect_uri_add"),
-                ("platform", "web"),
-                ("uri", "https://configured.example.com/cb"),
-            ],
-        )
-        .await;
-    assert_eq!(wrote.status, 303, "{}", wrote.body);
-
-    // The credentials: refused, both kinds.
     let cert = make_cert();
     for form in [
+        vec![
+            ("op", "redirect_uri_add"),
+            ("platform", "web"),
+            ("uri", "https://configured.example.com/cb"),
+        ],
         vec![("op", "secret_add"), ("days", "30")],
         vec![("op", "secret_remove"), ("key_id", "whatever")],
         vec![("op", "certificate_add"), ("certificate", cert.cert_pem.as_str())],
@@ -487,21 +470,20 @@ async fn a_role_without_app_rotate_can_configure_an_app_but_not_credential_it() 
         let page = b.post(&url, &form).await;
         assert_eq!(page.status, 403, "{form:?} was allowed: {}", page.body);
     }
-    assert_eq!(
-        apps::secrets(&s.pool, &app).await.unwrap().len(),
-        before,
-        "no secret was added or removed"
-    );
+    assert_eq!(apps::secrets(&s.pool, &app).await.unwrap().len(), before);
     assert!(apps::key_credentials(&s.pool, &app).await.unwrap().is_empty());
 
-    // And the page offers neither button, so the console never shows what the
-    // guard would refuse.
     let page = b.get(&url).await;
     assert_eq!(page.status, 200);
-    assert!(!page.body.contains("Add a client secret"), "{}", page.body);
-    assert!(!page.body.contains("Upload a certificate"), "{}", page.body);
-    // What it may do is still offered.
-    assert!(page.body.contains("Add a redirect URI"), "{}", page.body);
+    for offered in ["Add a client secret", "Upload a certificate", "Add a redirect URI"] {
+        assert!(!page.body.contains(offered), "{offered}: {}", page.body);
+    }
+    // Their tabs are the applications and nothing else: no flow tester, no users.
+    assert!(
+        !page.body.contains("Flow tester") && !page.body.contains(">Users<"),
+        "{}",
+        page.body
+    );
 }
 
 /// The isolation test for this section: every route, aimed at a tenant the

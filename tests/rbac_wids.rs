@@ -12,7 +12,7 @@ async fn a_tenant_scoped_binding_appears_in_wids_for_that_tenant_only() {
         &s.pool,
         PrincipalType::User,
         &f.user_id,
-        RoleId::GlobalAdministrator,
+        RoleId::TenantAdministrator,
         &Scope::Tenants(vec![f.tenant.id.clone()]),
         "test",
     )
@@ -22,10 +22,7 @@ async fn a_tenant_scoped_binding_appears_in_wids_for_that_tenant_only() {
     let here = rust_oidc::directory::wids_for_user(&s.pool, &f.tenant.id, &f.user_id)
         .await
         .unwrap();
-    assert_eq!(
-        here,
-        vec![RoleId::GlobalAdministrator.template_id().unwrap().to_string()]
-    );
+    assert_eq!(here, vec![rust_oidc::directory::GLOBAL_ADMINISTRATOR.to_string()]);
     let there = rust_oidc::directory::wids_for_user(&s.pool, &other.id, &f.user_id)
         .await
         .unwrap();
@@ -58,22 +55,16 @@ async fn an_all_scope_binding_appears_in_every_tenants_wids() {
     }
 }
 
+/// A tenant's administrator is that directory's Global Administrator in Entra's
+/// terms, and its viewer the Global Reader. A role Entra has no counterpart of
+/// is not a wid.
 #[tokio::test]
-async fn platform_administrator_never_appears_in_wids() {
+async fn tenant_roles_appear_as_their_entra_counterparts_or_not_at_all() {
     let s = TestServer::start().await;
-    let f = root_user_fixture(&s).await;
-    bindings::create(
-        &s.pool,
-        PrincipalType::User,
-        &f.user_id,
-        RoleId::PlatformAdministrator,
-        &Scope::All,
-        "test",
-    )
-    .await
-    .unwrap();
-    let wids = rust_oidc::directory::wids_for_user(&s.pool, &f.tenant.id, &f.user_id)
-        .await
-        .unwrap();
-    assert!(wids.is_empty(), "it has no Entra template id, so it is not a wid");
+    let f = user_fixture(&s).await;
+    let wids = || rust_oidc::directory::wids_for_user(&s.pool, &f.tenant.id, &f.user_id);
+    bind_in_own_tenant(&s, &f, RoleId::UserViewer).await;
+    assert!(wids().await.unwrap().is_empty(), "it has no Entra template id");
+    bind_in_own_tenant(&s, &f, RoleId::TenantViewer).await;
+    assert_eq!(wids().await.unwrap(), [rust_oidc::directory::GLOBAL_READER]);
 }

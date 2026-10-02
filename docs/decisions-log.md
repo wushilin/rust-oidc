@@ -1033,6 +1033,42 @@ marks any stored binding the rule above leaves without effect.
 **137. An assumed tenant is left with Leave only.** The "All tenants" link is shown for
 a tenant that was opened, not for one that is assumed.
 
+**138. The console roles are redefined** (user's design, 2 Oct), replacing the
+Entra-shaped set, which overlapped and did not say what each could do. Nine roles:
+Global Administrator (everything, outside tenants and in every one); Tenant
+Administrator and Tenant Viewer (everything in a tenant, or seeing all of it); and an
+administrator and a viewer each for users, groups and applications. A viewer holds
+only read actions; the three narrow kinds share no action. Gone: Global Reader, Cloud
+Application Administrator, Privileged Role Administrator, Platform Administrator.
+Mine within that: only the tenant roles read the audit log and manage roles; the
+stored id `GroupsAdministrator` is kept (shown as "Group Administrator").
+
+**139. Where a role applies is never chosen** (user's rule, superseding 135's
+"named tenants"). Global Administrator is everything and can be held only from the root
+tenant; every other role applies to the tenant its holder belongs to. It is one
+function, `RoleId::scope_held_by`, enforced in `bindings::create` (`ScopeRefused`) and
+on read in `effective_for_user`. No form asks for a scope or a tenant. Consequence: a
+root-tenant account can no longer be, say, User Administrator of another tenant; it is
+Global Administrator or nothing there. *To reverse:* widen `scope_held_by`.
+
+**140. `wids` keeps Entra's ids.** In a tenant's tokens a Tenant Administrator (and a
+Global Administrator) is Entra's Global Administrator, a Tenant Viewer is Global
+Reader, and the user, group and application administrators keep their own template
+ids. The three narrow viewers have no Entra counterpart and are not in `wids`.
+
+**141. The flow tester needs `App:Write`**, every operation of it, so it belongs to
+Application Administrator (and above) and no viewer has it. Before, any reader of
+applications could run it.
+
+**142. Existing bindings are migrated in place by `0012_console_roles`**: platform role
+folded into Global Administrator; tenant-scoped Global Administrator and Privileged
+Role Administrator become Tenant Administrator; Cloud Application Administrator becomes
+Application Administrator; Global Reader becomes Tenant Viewer; every non-global
+binding is cut to its holder's own tenant, and what then applies nowhere is deleted.
+Dry-run on copies of both live databases: nobody lost anything. **Not run on Postgres
+or MySQL** (SQLite-only testing for now); the SQL is identical on all three and written
+to avoid MySQL's same-table subquery limit, but that is untested.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

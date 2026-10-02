@@ -767,7 +767,7 @@ async fn groups_wids_and_assignment_required() {
         &s.pool,
         rust_oidc::admin::bindings::PrincipalType::User,
         &f.user_id,
-        rust_oidc::rbac::RoleId::GlobalAdministrator,
+        rust_oidc::rbac::RoleId::TenantAdministrator,
         &rust_oidc::rbac::Scope::Tenants(vec![f.tenant.id.clone()]),
         "test",
     )

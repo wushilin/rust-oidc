@@ -48,6 +48,10 @@ pub struct DirectoryRole {
 }
 
 pub const GLOBAL_ADMINISTRATOR: &str = "62e90394-69f5-4237-9190-012177145e10";
+pub const GLOBAL_READER: &str = "f2ef992c-3afb-46b9-b7cf-a126ee74c451";
+pub const USER_ADMINISTRATOR: &str = "fe930be7-5e62-47db-91af-98c3a49a38b1";
+pub const GROUPS_ADMINISTRATOR: &str = "fdd7a751-b60b-444a-984c-02652fe8fa1c";
+pub const APPLICATION_ADMINISTRATOR: &str = "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3";
 
 pub const ROLES: &[DirectoryRole] = &[
     DirectoryRole {
@@ -55,19 +59,19 @@ pub const ROLES: &[DirectoryRole] = &[
         name: "Global Administrator",
     },
     DirectoryRole {
-        template_id: "f2ef992c-3afb-46b9-b7cf-a126ee74c451",
+        template_id: GLOBAL_READER,
         name: "Global Reader",
     },
     DirectoryRole {
-        template_id: "fe930be7-5e62-47db-91af-98c3a49a38b1",
+        template_id: USER_ADMINISTRATOR,
         name: "User Administrator",
     },
     DirectoryRole {
-        template_id: "fdd7a751-b60b-444a-984c-02652fe8fa1c",
+        template_id: GROUPS_ADMINISTRATOR,
         name: "Groups Administrator",
     },
     DirectoryRole {
-        template_id: "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3",
+        template_id: APPLICATION_ADMINISTRATOR,
         name: "Application Administrator",
     },
     DirectoryRole {

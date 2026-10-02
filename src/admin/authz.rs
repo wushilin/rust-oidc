@@ -43,7 +43,7 @@ pub enum RefusedReason {
 
 /// Refuse a delete that would leave the platform with no administrator.
 ///
-/// Only `PlatformAdministrator` at `All` scope can create a tenant or assume one,
+/// Only `GlobalAdministrator` can create a tenant or assume one,
 /// so the last such binding is load-bearing: without it the console can still be
 /// signed into but no tenant can ever be added or entered again, and there is no
 /// CLI to repair it (the console is deliberately web-only).
@@ -66,16 +66,16 @@ pub async fn check_delete(pool: &DbPool, binding_id: &str) -> Result<(), Refused
     let Some((role, scope_kind)) = row else {
         return Err(RefusedReason::NotPermitted);
     };
-    // Anything that is not an all-scope platform-administrator binding cannot be
+    // Anything that is not a Global Administrator binding cannot be
     // the last thing holding the platform up.
-    if role != RoleId::PlatformAdministrator.as_str() || scope_kind != ScopeKind::All.as_str() {
+    if role != RoleId::GlobalAdministrator.as_str() || scope_kind != ScopeKind::All.as_str() {
         return Ok(());
     }
     let (count,): (i64,) = sqlx::query_as(crate::db::q(
         pool,
         "SELECT COUNT(*) FROM role_bindings WHERE role_id = ? AND scope_kind = ?",
     ))
-    .bind(RoleId::PlatformAdministrator.as_str())
+    .bind(RoleId::GlobalAdministrator.as_str())
     .bind(ScopeKind::All.as_str())
     .fetch_one(pool)
     .await

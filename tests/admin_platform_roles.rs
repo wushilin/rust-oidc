@@ -1,4 +1,4 @@
-//! Platform roles: granting and revoking the bindings that reach across tenants,
+//! The page of every role: granting and revoking, Global Administrator included,
 //! and where an administrator lands after signing in.
 
 mod common;
@@ -39,7 +39,7 @@ async fn another_user(s: &TestServer, f: &UserFixture, upn: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_role_is_granted_across_every_tenant_and_revoked_again() {
+async fn global_administrator_is_granted_and_revoked_again() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let b = signed_in_admin(&s, &f).await;
@@ -48,6 +48,10 @@ async fn a_role_is_granted_across_every_tenant_and_revoked_again() {
     let page = b.get(&s.url(PAGE)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(page.body.contains("Grant a role"), "{}", page.body);
+    // Every role is explained where it is granted.
+    for role in RoleId::ALL {
+        assert!(page.body.contains(role.display_name()), "{role:?}: {}", page.body);
+    }
 
     let granted = b
         .post(
@@ -55,19 +59,18 @@ async fn a_role_is_granted_across_every_tenant_and_revoked_again() {
             &[
                 ("op", "grant"),
                 ("account", "bea@contoso.com"),
-                ("role", RoleId::GlobalReader.as_str()),
-                ("scope", "all"),
+                ("role", RoleId::GlobalAdministrator.as_str()),
             ],
         )
         .await;
     assert_eq!(granted.status, 303, "{}", granted.body);
-    assert_eq!(scopes_of(&s, &other, RoleId::GlobalReader).await, [Scope::All]);
+    assert_eq!(scopes_of(&s, &other, RoleId::GlobalAdministrator).await, [Scope::All]);
     assert_eq!(audit_rows(&s, Event::AdminRoleGrant.as_str()).await.len(), 1);
 
     // It is listed, by name, with where it applies in words.
     let page = b.get(&s.url(PAGE)).await;
     assert!(page.body.contains("bea@contoso.com"), "{}", page.body);
-    assert!(page.body.contains("every tenant"), "{}", page.body);
+    assert!(page.body.contains(">everything<"), "{}", page.body);
 
     let id = bindings::list_all(&s.pool)
         .await
@@ -78,45 +81,40 @@ async fn a_role_is_granted_across_every_tenant_and_revoked_again() {
         .id;
     let revoked = b.post(&s.url(PAGE), &[("op", "revoke"), ("binding", &id)]).await;
     assert_eq!(revoked.status, 303, "{}", revoked.body);
-    assert!(scopes_of(&s, &other, RoleId::GlobalReader).await.is_empty());
+    assert!(scopes_of(&s, &other, RoleId::GlobalAdministrator).await.is_empty());
     assert_eq!(audit_rows(&s, Event::AdminRoleRevoke.as_str()).await.len(), 1);
 }
 
-/// "Administrator of these two tenants" is one binding naming both.
+/// No tenant is ever picked: a tenant role applies to the account's own tenant,
+/// whatever the form is made to say.
 #[tokio::test]
-async fn a_role_can_be_limited_to_chosen_tenants() {
+async fn a_tenant_role_applies_to_the_accounts_own_tenant() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let fabrikam = s.tenant("Fabrikam", "fabrikam.test").await;
-    let _unpicked = s.tenant("Northwind", "northwind.test").await;
+    let theirs = user_fixture_in(&s, fabrikam.clone(), "zed@fabrikam.test").await;
     let b = signed_in_admin(&s, &f).await;
-    let other = another_user(&s, &f, "bea@contoso.com").await;
 
     let granted = b
         .post(
             &s.url(PAGE),
             &[
                 ("op", "grant"),
-                ("account", "bea@contoso.com"),
+                ("account", "zed@fabrikam.test"),
                 ("role", RoleId::UserAdministrator.as_str()),
-                ("scope", "tenants"),
+                // Stale or forged fields from the old form change nothing.
+                ("scope", "all"),
                 ("tenant", f.tenant.id.as_str()),
-                ("tenant", fabrikam.id.as_str()),
             ],
         )
         .await;
     assert_eq!(granted.status, 303, "{}", granted.body);
-    let scopes = scopes_of(&s, &other, RoleId::UserAdministrator).await;
-    assert_eq!(scopes.len(), 1, "{scopes:?}");
-    let Scope::Tenants(mut ids) = scopes[0].clone() else {
-        panic!("expected a tenant-limited scope, got {:?}", scopes[0]);
-    };
-    ids.sort();
-    let mut want = vec![f.tenant.id.clone(), fabrikam.id.clone()];
-    want.sort();
-    assert_eq!(ids, want, "exactly the ticked tenants, and not the third");
+    assert_eq!(
+        scopes_of(&s, &theirs.user_id, RoleId::UserAdministrator).await,
+        [Scope::Tenants(vec![fabrikam.id.clone()])]
+    );
 
-    // The page names the tenants rather than printing their ids.
+    // The page names the tenant rather than printing its id.
     let page = b.get(&s.url(PAGE)).await;
     assert!(
         page.body.contains(r#"<span class="pill">Fabrikam</span>"#),
@@ -129,8 +127,9 @@ async fn a_role_can_be_limited_to_chosen_tenants() {
 async fn what_cannot_be_granted_is_refused_with_a_reason() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
+    let fabrikam = s.tenant("Fabrikam", "fabrikam.test").await;
+    user_fixture_in(&s, fabrikam, "zed@fabrikam.test").await;
     let b = signed_in_admin(&s, &f).await;
-    another_user(&s, &f, "bea@contoso.com").await;
     let before = bindings::list_all(&s.pool).await.unwrap().len();
 
     for (form, why) in [
@@ -138,29 +137,25 @@ async fn what_cannot_be_granted_is_refused_with_a_reason() {
             vec![
                 ("op", "grant"),
                 ("account", "nobody@contoso.com"),
-                ("role", "GlobalReader"),
-                ("scope", "all"),
+                ("role", "TenantViewer"),
             ],
             "no account named",
         ),
         (
             vec![
                 ("op", "grant"),
-                ("account", "bea@contoso.com"),
-                ("role", "GlobalReader"),
-                ("scope", "tenants"),
+                ("account", "zed@fabrikam.test"),
+                ("role", "PlatformAdministrator"),
             ],
-            "Tick at least one tenant",
+            "Choose a role",
         ),
         (
             vec![
                 ("op", "grant"),
-                ("account", "bea@contoso.com"),
-                ("role", "PlatformAdministrator"),
-                ("scope", "tenants"),
-                ("tenant", f.tenant.id.as_str()),
+                ("account", "zed@fabrikam.test"),
+                ("role", "GlobalAdministrator"),
             ],
-            "only means anything across every tenant",
+            "Only accounts and groups in the root tenant",
         ),
     ] {
         let page = b.post(&s.url(PAGE), &form).await;
@@ -191,7 +186,6 @@ async fn a_tenant_admin_cannot_read_or_grant_platform_roles() {
                 ("op", "grant"),
                 ("account", f.upn.as_str()),
                 ("role", RoleId::GlobalAdministrator.as_str()),
-                ("scope", "all"),
             ],
         )
         .await;
@@ -213,15 +207,15 @@ async fn the_last_platform_binding_cannot_be_revoked() {
         .await
         .unwrap()
         .into_iter()
-        .find(|x| x.role == RoleId::PlatformAdministrator)
+        .find(|x| x.role == RoleId::GlobalAdministrator)
         .unwrap();
     let page = b
         .post(&s.url(PAGE), &[("op", "revoke"), ("binding", &platform.id)])
         .await;
     assert_eq!(page.status, 400, "{}", page.body);
-    assert!(page.body.contains("last binding"), "{}", page.body);
+    assert!(page.body.contains("last Global Administrator"), "{}", page.body);
     assert_eq!(
-        scopes_of(&s, &f.user_id, RoleId::PlatformAdministrator).await,
+        scopes_of(&s, &f.user_id, RoleId::GlobalAdministrator).await,
         [Scope::All]
     );
 }
@@ -253,7 +247,7 @@ async fn where_an_administrator_lands_depends_on_their_reach() {
             page.body
         );
     }
-    for tab in [">Tenants<", ">Signing keys<", ">Platform roles<"] {
+    for tab in [">Tenants<", ">Signing keys<", ">All roles<"] {
         assert!(page.body.contains(tab), "{tab} missing: {}", page.body);
     }
 

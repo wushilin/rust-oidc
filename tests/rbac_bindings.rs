@@ -68,7 +68,7 @@ async fn all_scope_round_trips_without_tenant_rows() {
         &s.pool,
         PrincipalType::User,
         &f.user_id,
-        RoleId::PlatformAdministrator,
+        RoleId::GlobalAdministrator,
         &Scope::All,
         "test",
     )
@@ -90,13 +90,13 @@ async fn all_scope_round_trips_without_tenant_rows() {
 #[tokio::test]
 async fn a_binding_for_a_deleted_tenant_grants_nothing() {
     let s = TestServer::start().await;
-    let f = root_user_fixture(&s).await;
     let doomed = s.tenant("Doomed", "doomed.test").await;
+    let f = user_fixture_in(&s, doomed.clone(), "alice@doomed.test").await;
     bindings::create(
         &s.pool,
         PrincipalType::User,
         &f.user_id,
-        RoleId::GlobalAdministrator,
+        RoleId::TenantAdministrator,
         &Scope::Tenants(vec![doomed.id.clone()]),
         "test",
     )
@@ -107,21 +107,23 @@ async fn a_binding_for_a_deleted_tenant_grants_nothing() {
     let eff = bindings::effective_for_user(&s.pool, &f.user_id).await.unwrap();
     assert!(allowed(&eff, WRITE_USER, &doomed.id));
 
-    sqlx::query(rust_oidc::db::q(&s.pool, "DELETE FROM tenants WHERE id = ?"))
-        .bind(&doomed.id)
-        .execute(&s.pool)
-        .await
-        .unwrap();
+    // Only the scope row: the holder's tenant is still there, so what is tested
+    // is the orphaned scope and not the missing tenant.
+    sqlx::query(rust_oidc::db::q(
+        &s.pool,
+        "DELETE FROM role_binding_tenants WHERE tenant_id = ?",
+    ))
+    .bind(&doomed.id)
+    .execute(&s.pool)
+    .await
+    .unwrap();
 
     let eff = bindings::effective_for_user(&s.pool, &f.user_id).await.unwrap();
     assert!(
         !allowed(&eff, WRITE_USER, &doomed.id),
         "an orphaned scope row must not grant anything"
     );
-    assert!(
-        !allowed(&eff, WRITE_USER, &f.tenant.id),
-        "and it certainly must not widen to another tenant"
-    );
+    assert!(eff.is_empty(), "nor anything anywhere else");
 }
 
 /// Review Focus 1: `{tenant}` in a URL may be a GUID or a verified domain, but a
@@ -135,7 +137,7 @@ async fn scope_is_compared_against_the_canonical_tenant_id() {
         &s.pool,
         PrincipalType::User,
         &f.user_id,
-        RoleId::GlobalAdministrator,
+        RoleId::TenantAdministrator,
         &Scope::Tenants(vec![f.tenant.id.clone()]),
         "test",
     )
@@ -247,7 +249,7 @@ async fn listings_see_all_scope_bindings_from_every_tenant() {
         &s.pool,
         PrincipalType::User,
         &f.user_id,
-        RoleId::PlatformAdministrator,
+        RoleId::GlobalAdministrator,
         &Scope::All,
         "test",
     )
@@ -271,5 +273,5 @@ async fn listings_see_all_scope_bindings_from_every_tenant() {
     assert_eq!(mine.len(), 2, "own binding plus the all-scope one");
     let theirs = bindings::list_for_tenant(&s.pool, &other.id).await.unwrap();
     assert_eq!(theirs.len(), 1, "only the all-scope one reaches Fabrikam");
-    assert_eq!(theirs[0].role, RoleId::PlatformAdministrator);
+    assert_eq!(theirs[0].role, RoleId::GlobalAdministrator);
 }

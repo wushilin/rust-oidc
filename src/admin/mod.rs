@@ -40,8 +40,7 @@ pub const APP_READ: Action = Action::new(Resource::App, Verb::Read);
 /// An app registration and everything about it *except* its credentials: URIs,
 /// scopes, roles and the grant flags.
 pub const APP_WRITE: Action = Action::new(Resource::App, Verb::Write);
-/// Credentials: client secrets and certificate key credentials. Its own action
-/// because `CloudApplicationAdministrator` deliberately does not hold it.
+/// Credentials: client secrets and certificate key credentials.
 pub const APP_ROTATE: Action = Action::new(Resource::App, Verb::Rotate);
 pub const ASSIGNMENT_READ: Action = Action::new(Resource::Assignment, Verb::Read);
 pub const ASSIGNMENT_WRITE: Action = Action::new(Resource::Assignment, Verb::Write);

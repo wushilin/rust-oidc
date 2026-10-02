@@ -242,12 +242,12 @@ async fn a_role_without_audit_read_is_refused_the_page() {
     let f = root_user_fixture(&s).await;
     // Platform Administrator holds `Audit:Read`; this one deliberately does not,
     // so the test is about the action and not about the scope.
-    bind(&s, &f.user_id, RoleId::PlatformAdministrator, Scope::All).await;
+    bind(&s, &f.user_id, RoleId::GlobalAdministrator, Scope::All).await;
     let no_audit = user_fixture_in(&s, s.tenant("Northwind", "northwind.test").await, "eve@northwind.test").await;
     bind(
         &s,
         &no_audit.user_id,
-        RoleId::GlobalReader,
+        RoleId::TenantViewer,
         Scope::Tenants(vec![no_audit.tenant.id.clone()]),
     )
     .await;

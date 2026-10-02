@@ -3,8 +3,6 @@
 
 use std::collections::BTreeSet;
 
-use rust_oidc::rbac::RoleId;
-
 const FILES: [(&str, &str); 3] = [
     ("sqlite", include_str!("../migrations/sqlite/0006_admin_rbac.sql")),
     ("postgres", include_str!("../migrations/postgres/0006_admin_rbac.sql")),
@@ -32,10 +30,23 @@ fn case_blocks(sql: &str) -> Vec<Arms> {
         .collect()
 }
 
+/// The roles `0006` was written against. The role set has since changed
+/// (`0012_console_roles` carries those rows on), so this is pinned to history and
+/// not to `RoleId`: an applied migration must never change.
+const ROLES_AT_0006: [(&str, &str); 7] = [
+    ("62e90394-69f5-4237-9190-012177145e10", "GlobalAdministrator"),
+    ("f2ef992c-3afb-46b9-b7cf-a126ee74c451", "GlobalReader"),
+    ("fe930be7-5e62-47db-91af-98c3a49a38b1", "UserAdministrator"),
+    ("fdd7a751-b60b-444a-984c-02652fe8fa1c", "GroupsAdministrator"),
+    ("9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3", "ApplicationAdministrator"),
+    ("158c047a-c907-4556-b7ef-446551a6b5f7", "CloudApplicationAdministrator"),
+    ("e8611ab8-c189-46e8-94e1-60213ab1f814", "PrivilegedRoleAdministrator"),
+];
+
 fn expected() -> Arms {
-    RoleId::ALL
+    ROLES_AT_0006
         .iter()
-        .filter_map(|r| r.template_id().map(|t| (t.to_string(), r.as_str().to_string())))
+        .map(|(guid, role)| (guid.to_string(), role.to_string()))
         .collect()
 }
 
@@ -70,7 +81,10 @@ fn every_dialect_carries_the_same_role_arms_in_both_inserts() {
             blocks[0], blocks[1],
             "{engine}: the two INSERTs disagree on the arm list"
         );
-        assert_eq!(blocks[0], want, "{engine}: arms differ from RoleId::template_id");
+        assert_eq!(
+            blocks[0], want,
+            "{engine}: arms differ from the roles 0006 was written against"
+        );
     }
 }
 

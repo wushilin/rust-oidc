@@ -22,14 +22,20 @@ pub struct StoredBinding {
     pub scope: Scope,
 }
 
-/// Refusal of a grant that would give a principal outside the root tenant reach
-/// beyond its own tenant. See [`Scope::may_be_held_by`].
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "Only accounts and groups in the root tenant can be given roles that reach beyond their own tenant. \
-     This one can be given roles in its own tenant, from that tenant's Roles tab."
-)]
-pub struct ReachRefused;
+/// Refusal of a grant at a scope the role cannot be held at by that principal.
+/// See [`RoleId::scope_held_by`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ScopeRefused {
+    #[error(
+        "Only accounts and groups in the root tenant can be Global Administrator. \
+         This one can be given roles in its own tenant."
+    )]
+    GlobalOutsideRoot,
+    #[error("Global Administrator covers everything. It cannot be limited to some tenants.")]
+    GlobalNeedsEverything,
+    #[error("{0} applies to the tenant the account or group belongs to, and to no other.")]
+    OwnTenantOnly(&'static str),
+}
 
 #[derive(sqlx::FromRow)]
 struct Home {
@@ -69,9 +75,10 @@ where
 
 /// The one way a role binding is written.
 ///
-/// The rule that only the root tenant's principals reach beyond their own tenant
-/// is checked here, inside the transaction that writes the row, so no page, CLI
-/// command or future caller can grant around it.
+/// Where a role applies is not the caller's choice: [`RoleId::scope_held_by`] says
+/// what it is for this principal, and anything else is refused here, inside the
+/// transaction that writes the row, so no page, CLI command or future caller can
+/// grant around it.
 pub async fn create(
     pool: &DbPool,
     principal_type: PrincipalType,
@@ -93,8 +100,11 @@ pub async fn create(
     let Some((home, home_is_root)) = home_of(&mut *tx, engine, principal_type, principal_id).await? else {
         anyhow::bail!("no such user or group");
     };
-    if !scope.may_be_held_by(&home, home_is_root) {
-        return Err(ReachRefused.into());
+    match role.scope_held_by(&home, home_is_root) {
+        Some(held) if held == *scope => {}
+        None => return Err(ScopeRefused::GlobalOutsideRoot.into()),
+        Some(Scope::All) => return Err(ScopeRefused::GlobalNeedsEverything.into()),
+        Some(Scope::Tenants(_)) => return Err(ScopeRefused::OwnTenantOnly(role.display_name()).into()),
     }
     sqlx::query(crate::db::sql_stmt(
         engine,
@@ -171,8 +181,8 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
     .fetch_all(pool)
     .await?;
 
-    // The read-side half of the rule `create` enforces: whatever a row says, a
-    // user outside the root tenant holds nothing beyond their own tenant.
+    // The read-side half of the rule `create` enforces, applied with the user's
+    // own tenant (a group is always in its members' tenant).
     let Some((home, home_is_root)) = home_of(pool, crate::db::engine_of(pool), PrincipalType::User, user_id).await?
     else {
         return Ok(Vec::new());
@@ -187,10 +197,20 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
         let Some(kind) = ScopeKind::parse(row.get::<String, _>("scope_kind").as_str()) else {
             continue;
         };
-        out.push(EffectiveBinding {
-            role,
-            scope: scope_of(pool, &id, kind).await?.held_by(&home, home_is_root),
-        });
+        // A stored scope grants what the role can be held at and nothing more:
+        // a row that says otherwise is cut back to that, or grants nothing.
+        let stored = scope_of(pool, &id, kind).await?;
+        let Some(held) = role.scope_held_by(&home, home_is_root) else {
+            continue;
+        };
+        let in_effect = match (&held, &stored) {
+            (Scope::All, Scope::All) => true,
+            (Scope::Tenants(own), stored) => own.iter().all(|t| stored.covers(t)),
+            (Scope::All, Scope::Tenants(_)) => false,
+        };
+        if in_effect {
+            out.push(EffectiveBinding { role, scope: held });
+        }
     }
     Ok(out)
 }

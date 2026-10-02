@@ -218,7 +218,7 @@ async fn a_tenant_admin_cannot_reach_another_tenants_groups() {
         &s.pool,
         PrincipalType::Group,
         &privileged,
-        RoleId::GlobalAdministrator,
+        RoleId::TenantAdministrator,
         &Scope::Tenants(vec![other.id.clone()]),
         "test",
     )

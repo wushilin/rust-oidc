@@ -23,7 +23,7 @@ use crate::admin::session;
 use crate::admin::users as user_pages;
 use crate::admin::view::{self, Chrome, Tab};
 use crate::admin::{
-    APP_READ, AUDIT_READ, BINDING_READ, GROUP_READ, KEY_READ, TENANT_ASSUME, TENANT_READ, TENANT_WRITE, USER_READ,
+    APP_READ, APP_WRITE, AUDIT_READ, BINDING_READ, GROUP_READ, KEY_READ, TENANT_ASSUME, TENANT_READ, USER_READ,
 };
 use crate::admin::{apps as app_pages, audit as audit_pages, flow as flow_pages, groups as group_pages};
 use crate::admin::{keys as key_pages, settings as settings_pages, tenants as tenant_pages};
@@ -183,9 +183,12 @@ impl TenantTab {
         match self {
             Self::Users => USER_READ,
             Self::Groups => GROUP_READ,
-            Self::Apps | Self::Flow => APP_READ,
+            Self::Apps => APP_READ,
+            // The tester signs in and registers test clients: a tool for whoever
+            // administers applications, not something to view.
+            Self::Flow => APP_WRITE,
             Self::Roles => BINDING_READ,
-            Self::Settings => TENANT_WRITE,
+            Self::Settings => TENANT_READ,
             Self::Audit => AUDIT_READ,
         }
     }
@@ -233,7 +236,7 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext, at: At<'a>) -> Chrome
             }
             if ctx.can(BINDING_READ, On::Platform) {
                 tabs.push(Tab {
-                    label: "Platform roles",
+                    label: "All roles",
                     href: format!("{base}/admin/bindings"),
                     active: active == PlatformTab::Roles,
                 });

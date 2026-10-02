@@ -577,9 +577,7 @@ async fn client_credentials(
     claims.insert("azpacr".into(), json!(client.azpacr.as_str()));
     claims.insert("idtyp".into(), json!(crate::claims::IdType::App.as_str()));
     claims.insert("oid".into(), json!(client.sp.id));
-    if !roles.is_empty() {
-        claims.insert("roles".into(), json!(roles));
-    }
+    crate::claims::insert_roles(&mut claims, &roles);
     claims.insert("sub".into(), json!(client.sp.id));
     claims.insert("tid".into(), json!(tenant.id));
     claims.insert("uti".into(), json!(b64url(&random_bytes(16))));

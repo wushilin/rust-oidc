@@ -38,13 +38,29 @@ pub async fn add_member(pool: &DbPool, tenant: &Tenant, group: &str, upn: &str) 
 
 /// Names of the user's groups (the `groups` claim).
 pub async fn names_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        crate::db::q(pool, "SELECT g.name FROM user_groups g JOIN group_members m ON m.group_id = g.id WHERE m.user_id = ? ORDER BY g.name"),
-    )
+    Ok(for_user(pool, user_id).await?.into_iter().map(|g| g.name).collect())
+}
+
+/// A group as a token names it: the name, and the id that stays the same when the
+/// group is renamed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRef {
+    pub id: String,
+    pub name: String,
+}
+
+/// The groups a user belongs to, in one fixed order (by name, then id), so the
+/// `groups` and `group_ids` claims built from it line up position for position.
+pub async fn for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<GroupRef>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT g.id, g.name FROM user_groups g JOIN group_members m ON m.group_id = g.id
+         WHERE m.user_id = ? ORDER BY g.name, g.id",
+    ))
     .bind(user_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(n,)| n).collect())
+    Ok(rows.into_iter().map(|(id, name)| GroupRef { id, name }).collect())
 }
 
 /// A group's id by name within a tenant, case-insensitively.

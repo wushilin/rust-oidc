@@ -944,6 +944,16 @@ browser still signed in when it is answered. Found by the consent tests.
 with a test that every scope has its own, so one added later cannot reach the consent page
 with the fallback text. A resource's own scopes use the display name its owner gave them.
 
+## Token claims: ids beside names
+
+**123. `group_ids` and `role_ids` are emitted beside `groups` and `roles`, same members,
+same order.** `groups` here has always been names (decided at the start, against Entra,
+which emits object ids) and `roles` is app role values. An application that wants a key
+that survives a rename reads `group_ids[i]` for `groups[i]`. Both lists are built from one
+ordered query (by name or value, then id), so they cannot fall out of step; neither appears
+when its names are absent. These two claims are this server's own and do not exist in
+Entra. They are in user tokens (ID and access) and application tokens.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

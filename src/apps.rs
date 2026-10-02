@@ -556,20 +556,28 @@ pub async fn assign_role(
     Ok(())
 }
 
+/// An app role as a token names it: the value an application checks, and the id
+/// that stays the same if the value is ever changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleRef {
+    pub id: String,
+    pub value: String,
+}
+
 /// Role values of `resource_sp` assigned to the client service principal
 /// `client_sp_id` (the `roles` claim of an app-only token).
 pub async fn app_roles_for_service_principal(
     pool: &DbPool,
     resource_sp_id: &str,
     client_sp_id: &str,
-) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::q(
+) -> anyhow::Result<Vec<RoleRef>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::q(
         pool,
-        "SELECT r.value, r.allowed_member_types FROM app_role_assignments a
+        "SELECT r.value, r.id, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND a.principal_id = ? AND a.principal_type = ?
            AND r.enabled = ?
-         ORDER BY r.value",
+         ORDER BY r.value, r.id",
     ))
     .bind(resource_sp_id)
     .bind(client_sp_id)
@@ -579,8 +587,8 @@ pub async fn app_roles_for_service_principal(
     .await?;
     Ok(rows
         .into_iter()
-        .filter(|(_, types)| MemberType::parse_list(types).contains(&MemberType::Application))
-        .map(|(value, _)| value)
+        .filter(|(_, _, types)| MemberType::parse_list(types).contains(&MemberType::Application))
+        .map(|(value, id, _)| RoleRef { id, value })
         .collect())
 }
 
@@ -745,16 +753,16 @@ pub async fn enabled_scopes(pool: &DbPool, app: &Application) -> anyhow::Result<
 
 /// Role values of `resource_sp_id` a user holds directly or through group
 /// membership (the `roles` claim of user tokens).
-pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::q(
+pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &str) -> anyhow::Result<Vec<RoleRef>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::q(
         pool,
-        "SELECT DISTINCT r.value, r.allowed_member_types FROM app_role_assignments a
+        "SELECT DISTINCT r.value, r.id, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND r.enabled = ?
            AND ((a.principal_type = ? AND a.principal_id = ?)
              OR (a.principal_type = ? AND a.principal_id IN
                    (SELECT group_id FROM group_members WHERE user_id = ?)))
-         ORDER BY r.value",
+         ORDER BY r.value, r.id",
     ))
     .bind(resource_sp_id)
     .bind(true)
@@ -766,8 +774,8 @@ pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &s
     .await?;
     Ok(rows
         .into_iter()
-        .filter(|(_, types)| MemberType::parse_list(types).contains(&MemberType::User))
-        .map(|(value, _)| value)
+        .filter(|(_, _, types)| MemberType::parse_list(types).contains(&MemberType::User))
+        .map(|(value, id, _)| RoleRef { id, value })
         .collect())
 }
 

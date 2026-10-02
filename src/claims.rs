@@ -112,7 +112,7 @@ pub async fn issue(
     let tid = &sign_in.tenant.id;
     let iat = now();
     let sub = st.secrets.pairwise_sub(&user.id, &sign_in.client.app_id).await?;
-    let group_names = groups::names_for_user(pool, &user.id).await?;
+    let user_groups = groups::for_user(pool, &user.id).await?;
     let wids = directory::wids_for_user(pool, tid, &user.id).await?;
     let name = user.display_name.clone().unwrap_or_else(|| user.upn.clone());
 
@@ -131,12 +131,12 @@ pub async fn issue(
     at.insert("amr".into(), json!(sign_in.amr));
     at.insert("azp".into(), json!(sign_in.client.app_id));
     at.insert("azpacr".into(), json!(azpacr.as_str()));
-    insert_nonempty(&mut at, "groups", &group_names);
+    insert_groups(&mut at, &user_groups);
     at.insert("idtyp".into(), json!(IdType::User.as_str()));
     at.insert("name".into(), json!(name));
     at.insert("oid".into(), json!(user.id));
     at.insert("preferred_username".into(), json!(user.upn));
-    insert_nonempty(&mut at, "roles", &resource_roles);
+    insert_roles(&mut at, &resource_roles);
     at.insert("scp".into(), json!(grant.scp.join(" ")));
     at.insert("sub".into(), json!(sub));
     at.insert("tid".into(), json!(tid));
@@ -173,7 +173,7 @@ pub async fn issue(
             id.insert("email".into(), json!(email));
             id.insert("email_verified".into(), json!(user.email_verified));
         }
-        insert_nonempty(&mut id, "groups", &group_names);
+        insert_groups(&mut id, &user_groups);
         if let Some(nonce) = nonce {
             id.insert("nonce".into(), json!(nonce));
         }
@@ -189,7 +189,7 @@ pub async fn issue(
                 id.insert("family_name".into(), json!(v));
             }
         }
-        insert_nonempty(&mut id, "roles", &client_roles);
+        insert_roles(&mut id, &client_roles);
         id.insert("sub".into(), json!(sub));
         id.insert("tid".into(), json!(tid));
         id.insert("uti".into(), json!(uti()));
@@ -211,6 +211,40 @@ fn insert_nonempty(map: &mut Map<String, Value>, key: &str, values: &[String]) {
     if !values.is_empty() {
         map.insert(key.into(), json!(values));
     }
+}
+
+/// `groups` (names, as before) and `group_ids`, the same groups in the same order.
+///
+/// Names are what this server has always emitted; Entra emits ids. An application
+/// that keys on something stable reads `group_ids[i]` for `groups[i]`. Both come
+/// from one ordered list, so they cannot fall out of step.
+fn insert_groups(claims: &mut Map<String, Value>, groups: &[groups::GroupRef]) {
+    if groups.is_empty() {
+        return;
+    }
+    claims.insert(
+        "groups".into(),
+        json!(groups.iter().map(|g| &g.name).collect::<Vec<_>>()),
+    );
+    claims.insert(
+        "group_ids".into(),
+        json!(groups.iter().map(|g| &g.id).collect::<Vec<_>>()),
+    );
+}
+
+/// `roles` (app role values) and `role_ids`, the same roles in the same order.
+pub fn insert_roles(claims: &mut Map<String, Value>, roles: &[apps::RoleRef]) {
+    if roles.is_empty() {
+        return;
+    }
+    claims.insert(
+        "roles".into(),
+        json!(roles.iter().map(|r| &r.value).collect::<Vec<_>>()),
+    );
+    claims.insert(
+        "role_ids".into(),
+        json!(roles.iter().map(|r| &r.id).collect::<Vec<_>>()),
+    );
 }
 
 fn uti() -> String {

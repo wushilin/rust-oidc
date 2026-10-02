@@ -954,6 +954,43 @@ ordered query (by name or value, then id), so they cannot fall out of step; neit
 when its names are absent. These two claims are this server's own and do not exist in
 Entra. They are in user tokens (ID and access) and application tokens.
 
+## Console: tabs, the tenant in view, and platform roles
+
+**124. The tabs follow the page, not the session.** There were ten links in one row,
+always, built for whichever tenant the session defaulted to. Now a page is either at the
+platform level (tabs: Tenants, Signing keys, Platform roles) or inside one tenant (that
+tenant's tabs, built for that tenant, with a way back to the list). No tenant tab is
+offered while no tenant is in view. The tenant in view is named in the top right.
+
+**125. A platform administrator starts with no tenant in view.** After sign-in someone
+with an every-tenant reach lands on the list of tenants; the root tenant is no longer the
+default context. Someone whose roles are all inside a tenant lands in their own tenant.
+Opening a tenant is following its name in the list. Assume is still there, and still
+audited, but is no longer needed to work in a tenant.
+
+**126. A tenant's name, domains and availability moved to its Settings tab.** They were
+forms inside the cells of the tenants table. They still post to the tenants page, which
+owns those operations and their platform-scope check, and return to Settings. Enable stays
+on the list, because a disabled tenant has no pages of its own to enable it from.
+
+**127. Add-forms are folded behind their label** (`<details>`, no script), so a page reads
+as its tables. One is shown open when it comes back with an error. A table with no rows is
+replaced by a sentence; that is done once, where a page is assembled, rather than at each
+table.
+
+**128. Platform roles can be granted and revoked from the console.** The page was
+read-only. A grant names an account by its sign-in name (the tenant is found from the part
+after the @), a role, and where it applies: every tenant, or the tenants ticked. Both rules
+are the existing ones in `authz`: nobody grants reach they do not hold, and the last
+binding that can administer the platform cannot be revoked. These events are written to
+the root tenant's audit log. Groups are granted roles from their tenant's Roles tab.
+
+**129. Visual direction.** One accent (petrol) for actions; amber is used for exactly one
+thing, the tenant in view. System fonts only, because the content security policy allows
+no web fonts; a monospace stack for identifiers, which are machine strings. Table headings
+are sentence case. Left-aligned under the tabs rather than a centred column. Checked with
+screenshots in light, dark and at phone width.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

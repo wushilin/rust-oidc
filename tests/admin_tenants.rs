@@ -334,22 +334,51 @@ async fn a_tenant_admin_cannot_use_the_platform_tenant_routes() {
     }
 }
 
-/// Each tenant row on the Tenants page links straight to that tenant's flow
-/// tester, so testing a sign-in does not start with hunting through the menu.
+/// The list is a list: a tenant's name opens it, and what can be done inside it
+/// is on its own tabs rather than repeated on every row.
 #[tokio::test]
-async fn each_tenant_row_links_to_its_flow_tester() {
+async fn a_tenant_row_opens_the_tenant_whose_tabs_include_the_flow_tester() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let b = signed_in_admin(&s, &f).await;
     let page = b.get(&s.url("/admin/tenants")).await;
     assert_eq!(page.status, 200, "{}", page.body);
-    let link = format!("/admin/tenants/{}/flow\"", f.tenant.id);
+    // The name is the link, to the first section these roles reach.
+    let opened = format!(r#"/admin/tenants/{}/users">"#, f.tenant.id);
     assert!(
-        page.body.contains(&link),
-        "no flow tester link for the tenant: {}",
+        page.body.contains(&opened),
+        "the tenant name opens the tenant: {}",
         page.body
     );
-    // And the link leads somewhere real.
+    // No tenant is in view on the list, so no tenant tab is offered there.
+    assert!(page.body.contains("No tenant selected"), "{}", page.body);
+    assert!(
+        !page.body.contains(&format!("/admin/tenants/{}/flow", f.tenant.id)),
+        "{}",
+        page.body
+    );
+
+    // Inside the tenant its name is in the corner and its tabs are shown.
+    let inside = b.get(&s.url(&format!("/admin/tenants/{}/users", f.tenant.id))).await;
+    assert_eq!(inside.status, 200, "{}", inside.body);
+    assert!(
+        inside.body.contains(&format!(
+            r#"<span class="tenant">Tenant <strong>{}</strong></span>"#,
+            f.tenant.name
+        )),
+        "{}",
+        inside.body
+    );
+    assert!(
+        inside.body.contains(&format!("/admin/tenants/{}/flow\"", f.tenant.id)),
+        "{}",
+        inside.body
+    );
+    assert!(
+        inside.body.contains(r#"class="active" aria-current="page""#),
+        "{}",
+        inside.body
+    );
     let flow = b.get(&s.url(&format!("/admin/tenants/{}/flow", f.tenant.id))).await;
     assert_eq!(flow.status, 200, "{}", flow.body);
 }

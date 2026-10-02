@@ -13,6 +13,7 @@ pub mod context;
 pub mod flow;
 pub mod groups;
 pub mod keys;
+pub mod platform_roles;
 pub mod roles;
 pub mod routes;
 pub mod session;

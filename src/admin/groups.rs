@@ -17,7 +17,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, audited, chrome, field, optional, parse_form};
+use crate::admin::routes::{At, Params, TenantTab, audited, chrome, field, optional, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{GROUP_READ, GROUP_WRITE};
 use crate::db::Event;
@@ -102,15 +102,19 @@ async fn list(st: &AppState, ctx: &AdminContext, tenant: &Tenant, error: Option<
         })
         .collect();
     let create = if ctx.can_in(GROUP_WRITE, tenant) {
-        format!(
-            r#"<h2>Create a group</h2><form method="post" action="{url}">{csrf}
+        view::expander(
+            "Create a group",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}
 <label for="name">Name</label><input id="name" name="{NAME}" type="text" required>
 <label for="description">Description</label><input id="description" name="{DESCRIPTION}" type="text">
 <div class="actions"><button type="submit">Create</button></div>
 <p class="muted">The name is what appears in the <code>groups</code> claim, and is unique within
 the tenant regardless of case.</p></form>"#,
-            url = e(&groups_url(base, tenant)),
-            csrf = view::csrf_input(&ctx.csrf),
+                url = e(&groups_url(base, tenant)),
+                csrf = view::csrf_input(&ctx.csrf),
+            ),
+            error.is_some(),
         )
     } else {
         String::new()
@@ -121,7 +125,12 @@ the tenant regardless of case.</p></form>"#,
         tenant_name = e(&tenant.name),
         error = view::error_block(error),
     );
-    view::page(&chrome(st, ctx), status, "Groups", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Groups)),
+        status,
+        "Groups",
+        &body,
+    )
 }
 
 pub async fn create_group(
@@ -219,15 +228,19 @@ async fn detail(
         .collect();
 
     let add = if may_write {
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{field}" value="{op}">
+        view::expander(
+            "Add a member",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{field}" value="{op}">
 <label for="upn">User name</label><input id="upn" name="{UPN}" type="email" required>
 <div class="actions"><button type="submit">Add member</button></div>
 <p class="muted">An account of this tenant. A console role may be granted to a group, so adding
 somebody to one can give them administrative rights -- check the roles page if in doubt.</p></form>"#,
-            url = e(&url),
-            field = MemberOp::FIELD,
-            op = MemberOp::Add.as_str(),
+                url = e(&url),
+                field = MemberOp::FIELD,
+                op = MemberOp::Add.as_str(),
+            ),
+            error.is_some(),
         )
     } else {
         r#"<p class="muted">Your roles allow seeing this group but not changing its membership.</p>"#.to_string()
@@ -243,7 +256,12 @@ somebody to one can give them administrative rights -- check the roles page if i
         description = e(group.description.as_deref().unwrap_or("")),
         error = view::error_block(error),
     );
-    view::page(&chrome(st, ctx), status, &group.name, &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Groups)),
+        status,
+        &group.name,
+        &body,
+    )
 }
 
 pub async fn detail_post(

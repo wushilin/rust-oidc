@@ -20,7 +20,7 @@ use crate::AppState;
 use crate::admin::authz::{self, RefusedReason};
 use crate::admin::bindings::{self, StoredBinding};
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, Params, TenantTab, audited, chrome, field, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{BINDING_READ, BINDING_WRITE};
 use crate::db::Event;
@@ -129,6 +129,7 @@ async fn render(
         ));
     }
 
+    let had_error = error.is_some();
     let error = error
         .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
         .unwrap_or_default();
@@ -153,8 +154,10 @@ async fn render(
         } else {
             String::new()
         };
-        format!(
-            r#"<h2>Grant a role</h2><form method="post" action="{url}">{csrf}
+        view::expander(
+            "Grant a role",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}
 <input type="hidden" name="{op_field}" value="{grant}">
 <label for="principal">User name or group name in {tenant_name}</label>
 <input id="principal" name="{PRINCIPAL}" type="text" required>
@@ -165,13 +168,15 @@ async fn render(
 <label for="scope">Scope</label><select id="scope" name="{SCOPE}">
 <option value="{tenants}">This tenant only</option>{all_option}</select>
 <div class="actions"><button type="submit">Grant</button></div></form>"#,
-            url = e(&url),
-            op_field = RoleOp::FIELD,
-            grant = RoleOp::Grant.as_str(),
-            tenant_name = e(&tenant.name),
-            user = e(PrincipalType::User.as_str()),
-            group = e(PrincipalType::Group.as_str()),
-            tenants = e(ScopeKind::Tenants.as_str()),
+                url = e(&url),
+                op_field = RoleOp::FIELD,
+                grant = RoleOp::Grant.as_str(),
+                tenant_name = e(&tenant.name),
+                user = e(PrincipalType::User.as_str()),
+                group = e(PrincipalType::Group.as_str()),
+                tenants = e(ScopeKind::Tenants.as_str()),
+            ),
+            had_error,
         )
     } else {
         r#"<p class="muted">Your roles allow seeing who administers this tenant but not changing it.</p>"#.to_string()
@@ -182,7 +187,12 @@ async fn render(
 <table><tr><th>Principal</th><th>Type</th><th>Role</th><th>Scope</th><th></th></tr>{rows}</table>{grant}"#,
         tenant_name = e(&tenant.name),
     );
-    view::page(&chrome(st, ctx), status, "Roles", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Roles)),
+        status,
+        "Roles",
+        &body,
+    )
 }
 
 /// The scope of a binding as this viewer may see it. Another tenant's id is not

@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, audited, checked, chrome, field, optional, parse_form};
+use crate::admin::routes::{At, Params, TenantTab, audited, checked, chrome, field, optional, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{GROUP_READ, USER_READ, USER_RESET, USER_WRITE};
 use crate::db::Event;
@@ -132,7 +132,10 @@ pub async fn list_page(
     // The create link is emitted only where the action is permitted, so the
     // console never offers what the guard would refuse.
     let create = if ctx.can_in(USER_WRITE, tenant) {
-        format!(r#"<a href="{}/new">New user</a>"#, e(&users_url(base, tenant)))
+        format!(
+            r#"<a class="button" href="{}/new">New user</a>"#,
+            e(&users_url(base, tenant))
+        )
     } else {
         String::new()
     };
@@ -145,16 +148,20 @@ pub async fn list_page(
         String::new()
     };
     let body = format!(
-        r#"<h1>Users</h1><p class="sub">{tenant_name}</p>
-<form method="get" action="{url}"><label for="q">Search by name or user name</label>
-<input id="q" name="{QUERY_PARAM}" type="search" value="{search}">
-<div class="actions"><button type="submit">Search</button>{create}</div></form>
+        r#"<h1>Users</h1><p class="sub">The accounts that can sign in to this tenant.</p>
+<div class="toolbar"><form method="get" action="{url}">
+<input id="q" name="{QUERY_PARAM}" type="search" value="{search}" placeholder="Name or user name" aria-label="Search by name or user name">
+<button class="secondary" type="submit">Search</button></form>{create}</div>
 <table><tr><th>User name</th><th>Name</th><th>State</th></tr>{rows}</table>{full}"#,
-        tenant_name = e(&tenant.name),
         url = e(&users_url(base, tenant)),
         search = e(search),
     );
-    view::page(&chrome(&st, &ctx), StatusCode::OK, "Users", &body)
+    view::page(
+        &chrome(&st, &ctx, At::Tenant(tenant, TenantTab::Users)),
+        StatusCode::OK,
+        "Users",
+        &body,
+    )
 }
 
 // ---- create ----
@@ -199,7 +206,12 @@ fn new_user_page(
         family = e(field(form, "family_name")),
         email = e(field(form, "email")),
     );
-    view::page(&chrome(st, ctx), status, "New user", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Users)),
+        status,
+        "New user",
+        &body,
+    )
 }
 
 pub async fn create_user(
@@ -396,7 +408,12 @@ async fn detail(
         tenant_name = e(&tenant.name),
         id = e(&user.id),
     );
-    view::page(&chrome(st, ctx), status, &user.upn, &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Users)),
+        status,
+        &user.upn,
+        &body,
+    )
 }
 
 pub async fn detail_post(

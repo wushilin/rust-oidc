@@ -21,7 +21,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{audited, chrome, field, parse_form};
+use crate::admin::routes::{At, TenantTab, audited, chrome, field, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{TENANT_READ, TENANT_WRITE};
 use crate::db::Event;
@@ -45,10 +45,10 @@ pub async fn page(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
     let Some(tenant) = ctx.tenant(&key) else {
         return view::not_found();
     };
-    render(&st, &ctx, tenant, &tenant.settings, None, StatusCode::OK)
+    render(&st, &ctx, tenant, &tenant.settings, None, StatusCode::OK).await
 }
 
-fn render(
+async fn render(
     st: &AppState,
     ctx: &AdminContext,
     tenant: &Tenant,
@@ -58,6 +58,16 @@ fn render(
 ) -> Response {
     let may_write = ctx.can_in(TENANT_WRITE, tenant);
     let disabled = if may_write { "" } else { " disabled" };
+    // Renaming, domains and disabling are platform operations: they need an
+    // every-tenant binding, which a tenant's own administrator does not hold.
+    let domains = crate::tenant::domains(&st.pool, &tenant.id).await.unwrap_or_default();
+    let manage = crate::admin::tenants::manage(
+        st.public_url.base(),
+        &view::csrf_input(&ctx.csrf),
+        tenant,
+        &domains,
+        ctx.can(TENANT_WRITE, On::Platform),
+    );
     let row = |id: &str, label: &str, value: i64, lo: i64, hi: i64| {
         format!(
             r#"<label for="{id}">{label}</label><input id="{id}" name="{id}" type="text" value="{value}"{disabled}>
@@ -68,14 +78,15 @@ fn render(
         )
     };
     let body = format!(
-        r#"<h1>Tenant settings</h1><p class="sub">{tenant_name} &middot; the lifetimes this tenant issues.</p>{error}
+        r#"<h1>Settings</h1><p class="sub">How long what this tenant issues lasts, and the tenant itself.</p>{error}
+<h2>Lifetimes</h2>
 <form method="post" action="{url}">{csrf}
 {access}{session}{refresh}
 {save}</form>
 <p class="muted">A change applies to tokens and sessions issued from now on. Those already
-issued are self-contained and cannot be shortened after the fact.</p>"#,
-        tenant_name = e(&tenant.name),
+issued are self-contained and cannot be shortened after the fact.</p>{manage}"#,
         error = view::error_block(error),
+        manage = manage,
         url = e(&settings_url(st.public_url.base(), tenant)),
         csrf = view::csrf_input(&ctx.csrf),
         access = row(
@@ -105,7 +116,12 @@ issued are self-contained and cannot be shortened after the fact.</p>"#,
             r#"<p class="muted">Your roles allow reading these settings but not changing them.</p>"#
         },
     );
-    view::page(&chrome(st, ctx), status, "Tenant settings", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Settings)),
+        status,
+        "Tenant settings",
+        &body,
+    )
 }
 
 /// A number of seconds in words, so a text box full of digits is readable.
@@ -166,7 +182,8 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
                 &tenant.settings,
                 Some(&message),
                 StatusCode::BAD_REQUEST,
-            );
+            )
+            .await;
         }
     };
 
@@ -180,7 +197,8 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
             &tenant.settings,
             Some(&err.to_string()),
             StatusCode::BAD_REQUEST,
-        );
+        )
+        .await;
     }
     // Lifetimes are configuration, not anyone's personal data, so the values
     // themselves are safe to record and are what makes the row useful.

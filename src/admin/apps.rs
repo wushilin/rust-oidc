@@ -23,7 +23,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, audited, checked, chrome, field, optional, parse_form};
+use crate::admin::routes::{At, Params, TenantTab, audited, checked, chrome, field, optional, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{APP_READ, APP_ROTATE, APP_WRITE, ASSIGNMENT_READ, ASSIGNMENT_WRITE};
 use crate::apps::{self, Application, MemberType, Principal, RedirectPlatform, ScopeConsent};
@@ -205,14 +205,18 @@ async fn list(st: &AppState, ctx: &AdminContext, tenant: &Tenant, error: Option<
     // Offered only where permitted, so the console never shows a button the
     // guard would refuse.
     let create = if ctx.can_in(APP_WRITE, tenant) {
-        format!(
-            r#"<h2>Register an application</h2><form method="post" action="{url}">{csrf}
+        view::expander(
+            "Register an application",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}
 <label for="name">Display name</label><input id="name" name="{NAME}" type="text" required>
 <div class="actions"><button type="submit">Register</button></div>
 <p class="muted">Creates the application, its service principal in this tenant and the
 Application ID URI <code>api://{{appId}}</code>.</p></form>"#,
-            url = e(&apps_url(base, tenant)),
-            csrf = view::csrf_input(&ctx.csrf),
+                url = e(&apps_url(base, tenant)),
+                csrf = view::csrf_input(&ctx.csrf),
+            ),
+            error.is_some(),
         )
     } else {
         String::new()
@@ -223,7 +227,12 @@ Application ID URI <code>api://{{appId}}</code>.</p></form>"#,
         tenant_name = e(&tenant.name),
         error = view::error_block(error),
     );
-    view::page(&chrome(st, ctx), status, "Applications", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Apps)),
+        status,
+        "Applications",
+        &body,
+    )
 }
 
 /// The non-default grant flags, as pills. Nothing is shown for an application
@@ -389,7 +398,12 @@ flow needs before it runs anything.</p>"#,
         tenant_name = e(&tenant.name),
         error = view::error_block(page.error),
     );
-    view::page(&chrome(st, ctx), status, &app.display_name, &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Apps)),
+        status,
+        &app.display_name,
+        &body,
+    )
 }
 
 fn flags_form(url: &str, csrf: &str, app: &Application, may_write: bool) -> String {
@@ -474,15 +488,19 @@ fn secrets_section(url: &str, csrf: &str, secrets: &[apps::StoredSecret], may_ro
         })
         .collect();
     let add = if may_rotate {
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+        view::expander(
+            "Add a client secret",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 <label for="secret_name">Description</label><input id="secret_name" name="{NAME}" type="text">
 <label for="secret_days">Valid for (days)</label><input id="secret_days" name="{DAYS}" type="text" value="{DEFAULT_SECRET_DAYS}">
 <div class="actions"><button type="submit">Add a client secret</button></div>
 <p class="muted">The value is shown once, on the page that follows, and is never stored in clear.</p></form>"#,
-            url = e(url),
-            op_field = AppOp::FIELD,
-            op = AppOp::SecretAdd.as_str(),
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::SecretAdd.as_str(),
+            ),
+            false,
         )
     } else {
         String::new()
@@ -518,17 +536,21 @@ fn certificates_section(url: &str, csrf: &str, certs: &[apps::KeyCredential], ma
         })
         .collect();
     let add = if may_rotate {
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+        view::expander(
+            "Upload a certificate",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 <label for="cert_name">Description</label><input id="cert_name" name="{NAME}" type="text">
 <label for="certificate">PEM certificate</label>
 <textarea id="certificate" name="{CERT}" required placeholder="-----BEGIN CERTIFICATE-----"></textarea>
 <div class="actions"><button type="submit">Upload a certificate</button></div>
 <p class="muted">The certificate only, never the private key. RSA only, as Entra requires for
 client assertions. Its thumbprint becomes the credential's key id.</p></form>"#,
-            url = e(url),
-            op_field = AppOp::FIELD,
-            op = AppOp::CertificateAdd.as_str(),
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::CertificateAdd.as_str(),
+            ),
+            false,
         )
     } else {
         String::new()
@@ -580,17 +602,21 @@ fn redirect_section(url: &str, csrf: &str, uris: &[(RedirectPlatform, String)], 
         })
         .collect();
     let add = if may_write {
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+        view::expander(
+            "Add a redirect URI",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 {platform}<label for="redirect_uri">Redirect URI</label>
 <input id="redirect_uri" name="{URI}" type="text" required>
 <div class="actions"><button type="submit">Add a redirect URI</button></div>
 <p class="muted">web and spa must use https, except on localhost. No fragments. The platform
 decides the client rules: web authenticates, spa needs PKCE, publicClient needs neither.</p></form>"#,
-            url = e(url),
-            op_field = AppOp::FIELD,
-            op = AppOp::RedirectUriAdd.as_str(),
-            platform = platform_select("redirect_platform"),
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::RedirectUriAdd.as_str(),
+                platform = platform_select("redirect_platform"),
+            ),
+            false,
         )
     } else {
         String::new()
@@ -614,16 +640,20 @@ fn identifier_section(url: &str, csrf: &str, uris: &[String], may_write: bool) -
         })
         .collect();
     let add = if may_write {
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+        view::expander(
+            "Add an Application ID URI",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 <label for="identifier_uri">Application ID URI</label>
 <input id="identifier_uri" name="{URI}" type="text" required>
 <div class="actions"><button type="submit">Add an Application ID URI</button></div>
 <p class="muted">How a scope names this application as a resource, e.g.
 <code>api://&hellip;/Orders.Read</code>. Unique across the tenant; the last one cannot be removed.</p></form>"#,
-            url = e(url),
-            op_field = AppOp::FIELD,
-            op = AppOp::IdentifierUriAdd.as_str(),
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::IdentifierUriAdd.as_str(),
+            ),
+            false,
         )
     } else {
         String::new()
@@ -658,19 +688,22 @@ fn scope_section(url: &str, csrf: &str, scopes: &[apps::StoredScope], may_write:
             .iter()
             .map(|c| format!(r#"<option value="{v}">{v}</option>"#, v = e(c.as_str())))
             .collect();
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+        view::expander(
+            "Expose a scope",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 <label for="scope_value">Scope name</label><input id="scope_value" name="{VALUE}" type="text" required>
 <label for="scope_display">Display name</label><input id="scope_display" name="{DISPLAY_NAME}" type="text">
 <label for="scope_consent">Who can consent</label>
 <select id="scope_consent" name="{CONSENT}">{options}</select>
 <div class="actions"><button type="submit">Expose a scope</button></div>
-<p class="muted">Emitted in the <code>scp</code> claim. There is no interactive consent in this
-server, so every application is treated as admin-consented; the value is recorded for
-fidelity with Entra and for clients that read it.</p></form>"#,
-            url = e(url),
-            op_field = AppOp::FIELD,
-            op = AppOp::ScopeAdd.as_str(),
+<p class="muted">Emitted in the <code>scp</code> claim. The display name is what the consent page
+shows when a client asks for it with <code>prompt=consent</code>.</p></form>"#,
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::ScopeAdd.as_str(),
+            ),
+            false,
         )
     } else {
         String::new()
@@ -712,8 +745,10 @@ fn role_section(url: &str, csrf: &str, roles: &[apps::AppRole], may_write: bool)
                 )
             })
             .collect();
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+        view::expander(
+            "Define an app role",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 <label for="role_value">Role value</label><input id="role_value" name="{VALUE}" type="text" required>
 <label for="role_display">Display name</label><input id="role_display" name="{DISPLAY_NAME}" type="text">
 <label for="role_description">Description</label><input id="role_description" name="{DESCRIPTION}" type="text">
@@ -721,9 +756,11 @@ fn role_section(url: &str, csrf: &str, roles: &[apps::AppRole], may_write: bool)
 <div class="actions"><button type="submit">Define an app role</button></div>
 <p class="muted">Emitted in the <code>roles</code> claim. <em>User</em> covers users and groups;
 <em>Application</em> covers service principals through the client credentials grant.</p></form>"#,
-            url = e(url),
-            op_field = AppOp::FIELD,
-            op = AppOp::RoleAdd.as_str(),
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::RoleAdd.as_str(),
+            ),
+            false,
         )
     } else {
         String::new()
@@ -779,18 +816,22 @@ fn assignment_section(
             )
         })
         .collect();
-        format!(
-            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+        view::expander(
+            "Assign a role",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 <label for="assign_role">Role</label><select id="assign_role" name="{ROLE}">{role_options}</select>
 <label for="assign_kind">Assign to</label>
 <select id="assign_kind" name="{PRINCIPAL_TYPE}">{kind_options}</select>
 <label for="assign_principal">Name in {tenant_name}</label>
 <input id="assign_principal" name="{PRINCIPAL}" type="text" required>
 <div class="actions"><button type="submit">Assign</button></div></form>"#,
-            url = e(url),
-            op_field = AppOp::FIELD,
-            op = AppOp::RoleAssign.as_str(),
-            tenant_name = e(&tenant.name),
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::RoleAssign.as_str(),
+                tenant_name = e(&tenant.name),
+            ),
+            false,
         )
     } else if may_assign {
         r#"<p class="muted">Define an app role first; there is nothing to assign yet.</p>"#.to_string()

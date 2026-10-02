@@ -18,7 +18,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, Params, PlatformTab, audited, chrome, field, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{KEY_READ, KEY_ROTATE};
 use crate::db::Event;
@@ -121,7 +121,12 @@ certificate thumbprint, so <code>kid</code> = <code>x5t</code>.</p>{error}
 {actions}"#,
         error = view::error_block(error),
     );
-    view::page(&chrome(st, ctx), status, "Signing keys", &body)
+    view::page(
+        &chrome(st, ctx, At::Platform(PlatformTab::Keys)),
+        status,
+        "Signing keys",
+        &body,
+    )
 }
 
 fn row(k: &StoredKey) -> String {

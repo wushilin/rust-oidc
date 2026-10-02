@@ -40,8 +40,13 @@ async fn fill(s: &TestServer, tenant_id: &str, event: Event, target: &str, n: us
 /// and the search box echoes back whatever was typed into it. Either would make a
 /// "this is on the page" assertion pass for the wrong reason, and -- worse -- make
 /// a "this is absent" assertion fail for the wrong reason.
+///
+/// A page with no rows has no table at all: the console writes a sentence in its
+/// place, so "no table" is "no rows" and is returned as the empty string.
 fn table(page: &Page) -> &str {
-    let start = page.body.find("<table>").expect("the page has a table");
+    let Some(start) = page.body.find("<table>") else {
+        return "";
+    };
     let end = page.body[start..].find("</table>").expect("the table is closed") + start;
     &page.body[start..end]
 }

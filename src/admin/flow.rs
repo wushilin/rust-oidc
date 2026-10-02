@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, audited, checked, chrome, field, optional, parse_form};
+use crate::admin::routes::{At, Params, PlatformTab, TenantTab, audited, checked, chrome, field, optional, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{APP_READ, APP_WRITE};
 use crate::apps::{self, Application, RedirectPlatform};
@@ -195,7 +195,12 @@ client for testing.</p>{create}"#,
             apps = e(&format!("{base}/admin/tenants/{}/apps", tenant.id)),
             create = create_test_client_form(&url, &ctx.csrf, &callback, may_write, None),
         );
-        return view::page(&chrome(st, ctx), status, "Flow tester", &body);
+        return view::page(
+            &chrome(st, ctx, At::Tenant(tenant, TenantTab::Flow)),
+            status,
+            "Flow tester",
+            &body,
+        );
     };
 
     // The assignment requirement is about whoever signs in. The administrator is
@@ -219,10 +224,8 @@ client for testing.</p>{create}"#,
     let body = format!(
         r#"<h1>Flow tester</h1><p class="sub">{tenant_name} &middot; drive a real sign-in against this server and read what comes back</p>
 {error}
-<p>Pick an application and a flow. The console states what that combination needs before it offers
-to run it, sends the authorize request with a server-generated <code>state</code>, <code>nonce</code>
-and PKCE verifier, and checks the response against them. The compatibility suites in
-<code>compat/</code> cover machine-driven fidelity; this is for reading one flow with your own eyes.</p>
+<p>Pick an application and a flow. The page says what that combination needs, runs the sign-in
+with a server-generated <code>state</code>, <code>nonce</code> and PKCE verifier, and checks what comes back.</p>
 {form_html}
 {readiness_html}
 {run_html}
@@ -246,7 +249,12 @@ and PKCE verifier, and checks the response against them. The compatibility suite
         ),
         ropc_html = ropc_section(st, tenant, app, &probe),
     );
-    view::page(&chrome(st, ctx), status, "Flow tester", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Flow)),
+        status,
+        "Flow tester",
+        &body,
+    )
 }
 
 /// The configuration form. `method="get"`, so filling it in changes nothing and
@@ -316,14 +324,15 @@ fn config_form(
     format!(
         r#"<h2>What to test</h2>
 <form id="{CONFIG_FORM_ID}" method="post" action="{url}">{csrf}
-<label for="app">Application</label><select id="app" name="{APP_FIELD}">{apps}</select>
-<label for="response_type">Response type</label><select id="response_type" name="{RESPONSE_TYPE_FIELD}">{response_types}</select>
-<label for="response_mode">Response mode</label><select id="response_mode" name="{RESPONSE_MODE_FIELD}">{response_modes}</select>
-<label for="scope">Scope</label><input id="scope" name="{SCOPE_FIELD}" type="text" value="{scope}">
-<label for="prompt">Prompt</label><select id="prompt" name="{PROMPT_FIELD}">{prompts}</select>
-<p class="muted"><code>login</code> forces the sign-in page and <code>select_account</code> the account
-picker, even with a remembered sign-in. <code>consent</code> shows the permissions page, where the
-person signing in allows or refuses what the application asked for.</p>
+<div class="fields">
+<div><label for="app">Application</label><select id="app" name="{APP_FIELD}">{apps}</select></div>
+<div><label for="scope">Scope</label><input id="scope" name="{SCOPE_FIELD}" type="text" value="{scope}"></div>
+<div><label for="response_type">Response type</label><select id="response_type" name="{RESPONSE_TYPE_FIELD}">{response_types}</select></div>
+<div><label for="response_mode">Response mode</label><select id="response_mode" name="{RESPONSE_MODE_FIELD}">{response_modes}</select></div>
+<div><label for="prompt">Prompt</label><select id="prompt" name="{PROMPT_FIELD}">{prompts}</select></div>
+</div>
+<p class="muted">Prompt: <code>login</code> forces the sign-in page, <code>select_account</code> the account
+picker, and <code>consent</code> the permissions page, even with a remembered sign-in.</p>
 <label><input type="checkbox" name="{PASSWORD_GRANT_FIELD}"{ropc}> I am also testing the password grant (ROPC)</label>
 <div class="actions"><button class="secondary" type="submit" name="{op_field}" value="{check}">Check this configuration</button></div>
 </form>"#,
@@ -995,7 +1004,12 @@ and be checked instead.</p>
         url = e(authorize_url),
         back = e(&flow_url(st.public_url.base(), tenant)),
     );
-    view::page(&chrome(st, ctx), StatusCode::OK, "Flow tester", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Flow)),
+        StatusCode::OK,
+        "Flow tester",
+        &body,
+    )
 }
 
 // ---- the callback ----
@@ -1110,7 +1124,14 @@ response was not produced by a request this session made at all.</p>
         minutes = flowtest::PENDING_LIFETIME_SECS / 60,
         back = e(&flow_url(st.public_url.base(), ctx.default_tenant())),
     );
-    view::page(&chrome(st, ctx), StatusCode::BAD_REQUEST, "Flow test result", &body)
+    // The state matched no pending test, so there is no tenant to show: this page
+    // sits at the platform level, where the way back is the list of tenants.
+    view::page(
+        &chrome(st, ctx, At::Platform(PlatformTab::Tenants)),
+        StatusCode::BAD_REQUEST,
+        "Flow test result",
+        &body,
+    )
 }
 
 // ---- putting the result together ----
@@ -1466,7 +1487,12 @@ generated and held; everything below is checked against them.</p>
         tokens = result.tokens.iter().map(token_section).collect::<String>(),
         back = e(&flow_url(st.public_url.base(), tenant)),
     );
-    view::page(&chrome(st, ctx), StatusCode::OK, "Flow test result", &body)
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Flow)),
+        StatusCode::OK,
+        "Flow test result",
+        &body,
+    )
 }
 
 fn exchange_section(call: &HttpCall) -> String {

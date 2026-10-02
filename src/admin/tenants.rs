@@ -23,11 +23,9 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, Params, PlatformTab, audited, chrome, field, parse_form};
 use crate::admin::view::{self, e};
-use crate::admin::{
-    APP_READ, AUDIT_READ, BINDING_READ, GROUP_READ, TENANT_ASSUME, TENANT_CREATE, TENANT_READ, TENANT_WRITE, USER_READ,
-};
+use crate::admin::{TENANT_ASSUME, TENANT_CREATE, TENANT_READ, TENANT_WRITE};
 use crate::db::Event;
 use crate::rbac::Action;
 use crate::tenant::{self, Tenant};
@@ -95,6 +93,8 @@ impl TenantOp {
 const TENANT: &str = "tenant";
 const NAME: &str = "name";
 const DOMAIN: &str = "domain";
+/// Set by the tenant's own Settings page, so a change made there returns there.
+const BACK: &str = "back";
 
 fn tenants_url(base: &str) -> String {
     format!("{base}/admin/tenants")
@@ -125,34 +125,49 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
         .iter()
         .filter(|(t, _)| ctx.can_in(TENANT_READ, t))
         .map(|(t, domains)| {
+            // The name opens the tenant, at the first section these roles reach. A
+            // disabled tenant has no pages to open.
+            let name = match crate::admin::routes::tenant_home(base, ctx, t).filter(|_| t.enabled) {
+                Some(href) => format!(r#"<a href="{}">{}</a>"#, e(&href), e(&t.name)),
+                None => e(&t.name),
+            };
+            let domains: String = domains
+                .iter()
+                .map(|d| format!(r#"<span class="pill">{}</span>"#, e(d)))
+                .collect();
             format!(
-                "<tr><td>{name}{root}</td><td class=\"muted\">{id}</td><td>{domains}</td><td>{state}</td><td>{links}</td></tr>",
-                name = e(&t.name),
+                "<tr><td>{name}{root}</td><td>{domains}</td><td>{state}</td><td class=\"id\">{id}</td><td>{actions}</td></tr>",
                 root = if t.is_root {
                     r#" <span class="pill">root</span>"#
                 } else {
                     ""
                 },
+                state = if t.enabled {
+                    "Enabled"
+                } else {
+                    r#"<span class="pill bad">disabled</span>"#
+                },
                 id = e(&t.id),
-                domains = domain_cell(&url, &csrf, t, domains, may_write),
-                state = state_cell(&url, &csrf, t, may_write),
-                links = links_cell(base, &csrf, ctx, t, may_assume),
+                actions = row_actions(base, &url, &csrf, ctx, t, may_assume, may_write),
             )
         })
         .collect();
 
     let create = if may_create {
-        format!(
-            r#"<h2>Create a tenant</h2><form method="post" action="{url}">{csrf}
+        view::expander(
+            "Create a tenant",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}
 <input type="hidden" name="{field}" value="{create}">
 <label for="new_name">Name</label><input id="new_name" name="{NAME}" type="text" required>
 <label for="new_domain">First verified domain</label><input id="new_domain" name="{DOMAIN}" type="text" required>
-<div class="actions"><button type="submit">Create</button></div>
-<p class="muted">The domain becomes the tenant's default and must not belong to another tenant.
-The new tenant is never a root tenant: there is exactly one, enforced by the schema.</p></form>"#,
-            url = e(&url),
-            field = TenantOp::FIELD,
-            create = TenantOp::Create.as_str(),
+<p class="muted">The domain becomes the tenant's default and must not belong to another tenant.</p>
+<div class="actions"><button type="submit">Create tenant</button></div></form>"#,
+                url = e(&url),
+                field = TenantOp::FIELD,
+                create = TenantOp::Create.as_str(),
+            ),
+            error.is_some(),
         )
     } else {
         String::new()
@@ -160,130 +175,130 @@ The new tenant is never a root tenant: there is exactly one, enforced by the sch
 
     let body = if rows.is_empty() && !may_create {
         format!(
-            r#"<h1>Tenants</h1><p class="sub">No tenant is listed for you. Your roles may still cover the
-people and objects inside one -- the links above go where they reach.</p>{error}"#,
+            r#"<h1>Tenants</h1><p class="sub">No tenant is listed for you.</p>{error}"#,
             error = view::error_block(error),
         )
     } else {
         format!(
-            r#"<h1>Tenants</h1><p class="sub">The tenants your roles cover.</p>{error}
-<table><tr><th>Name</th><th>Tenant id</th><th>Verified domains</th><th>State</th><th></th></tr>{rows}</table>{create}"#,
+            r#"<h1>Tenants</h1><p class="sub">Open a tenant to work with its users, groups and applications.</p>{error}
+<table><tr><th>Tenant</th><th>Verified domains</th><th>State</th><th>Tenant id</th><th></th></tr>{rows}</table>{create}"#,
             error = view::error_block(error),
         )
     };
-    view::page(&chrome(st, ctx), status, "Tenants", &body)
-}
-
-/// The verified domains of one tenant, each removable where permitted, plus the
-/// box that adds one.
-fn domain_cell(url: &str, csrf: &str, t: &Tenant, domains: &[String], may_write: bool) -> String {
-    let mut cell = String::new();
-    for domain in domains {
-        cell.push_str(&format!(r#"<span class="pill">{}</span>"#, e(domain)));
-        if may_write {
-            cell.push_str(&format!(
-                r#"<form method="post" action="{url}" class="inline">{csrf}
-<input type="hidden" name="{TENANT}" value="{id}"><input type="hidden" name="{DOMAIN}" value="{domain}">
-<button class="danger" type="submit" name="{field}" value="{op}">Remove</button></form> "#,
-                url = e(url),
-                id = e(&t.id),
-                domain = e(domain),
-                field = TenantOp::FIELD,
-                op = TenantOp::DomainRemove.as_str(),
-            ));
-        }
-    }
-    if may_write {
-        cell.push_str(&format!(
-            r#"<form method="post" action="{url}" class="inline">{csrf}
-<input type="hidden" name="{TENANT}" value="{id}">
-<input name="{DOMAIN}" type="text" aria-label="New domain for {name}">
-<button class="secondary" type="submit" name="{field}" value="{op}">Add domain</button></form>"#,
-            url = e(url),
-            id = e(&t.id),
-            name = e(&t.name),
-            field = TenantOp::FIELD,
-            op = TenantOp::DomainAdd.as_str(),
-        ));
-    }
-    cell
-}
-
-/// Enabled or disabled, with the button that changes it and the rename box.
-fn state_cell(url: &str, csrf: &str, t: &Tenant, may_write: bool) -> String {
-    let state = if t.enabled {
-        "Enabled".to_string()
-    } else {
-        r#"<span class="pill">disabled</span>"#.to_string()
-    };
-    if !may_write {
-        return state;
-    }
-    let (op, label) = if t.enabled {
-        (TenantOp::Disable, "Disable")
-    } else {
-        (TenantOp::Enable, "Enable")
-    };
-    // The root tenant is never offered a disable button: `tenant::set_enabled`
-    // refuses it, and offering what the domain layer would refuse is exactly what
-    // the console does not do.
-    let toggle = if t.is_root && t.enabled {
-        String::new()
-    } else {
-        format!(
-            r#"<form method="post" action="{url}" class="inline">{csrf}
-<input type="hidden" name="{TENANT}" value="{id}">
-<button class="danger" type="submit" name="{field}" value="{op}">{label}</button></form>"#,
-            url = e(url),
-            id = e(&t.id),
-            field = TenantOp::FIELD,
-            op = op.as_str(),
-            label = e(label),
-        )
-    };
-    format!(
-        r#"{state} {toggle}<form method="post" action="{url}" class="inline">{csrf}
-<input type="hidden" name="{TENANT}" value="{id}">
-<input name="{NAME}" type="text" value="{name}" aria-label="Name of {name}">
-<button class="secondary" type="submit" name="{field}" value="{rename}">Rename</button></form>"#,
-        url = e(url),
-        id = e(&t.id),
-        name = e(&t.name),
-        field = TenantOp::FIELD,
-        rename = TenantOp::Rename.as_str(),
+    view::page(
+        &chrome(st, ctx, At::Platform(PlatformTab::Tenants)),
+        status,
+        "Tenants",
+        &body,
     )
 }
 
-/// Links into the tenant's own sections, each emitted only where the action
-/// behind it is permitted, plus the assume button.
-fn links_cell(base: &str, csrf: &str, ctx: &AdminContext, t: &Tenant, may_assume: bool) -> String {
-    let mut links = Vec::new();
-    for (action, label, path) in [
-        (USER_READ, "Users", "users"),
-        (GROUP_READ, "Groups", "groups"),
-        (APP_READ, "Applications", "apps"),
-        (BINDING_READ, "Roles", "roles"),
-        (APP_READ, "Flow tester", "flow"),
-        (TENANT_WRITE, "Settings", "settings"),
-        (AUDIT_READ, "Audit", "audit"),
-    ] {
-        if ctx.can_in(action, t) {
-            links.push(format!(
-                r#"<a href="{base}/admin/tenants/{id}/{path}">{label}</a>"#,
-                base = e(base),
-                id = e(&t.id),
-                label = e(label),
-            ));
-        }
+/// What can be done to a tenant from the list itself: bring a disabled one back
+/// (it has no pages of its own to do that from), or assume it.
+fn row_actions(
+    base: &str,
+    url: &str,
+    csrf: &str,
+    ctx: &AdminContext,
+    t: &Tenant,
+    may_assume: bool,
+    may_write: bool,
+) -> String {
+    let mut out = String::new();
+    if !t.enabled && may_write {
+        out.push_str(&format!(
+            r#"<form method="post" action="{url}" class="inline">{csrf}
+<input type="hidden" name="{TENANT}" value="{id}">
+<button class="secondary" type="submit" name="{field}" value="{op}">Enable</button></form>"#,
+            url = e(url),
+            id = e(&t.id),
+            field = TenantOp::FIELD,
+            op = TenantOp::Enable.as_str(),
+        ));
     }
-    if may_assume && ctx.acting_tenant.as_ref().is_none_or(|a| a.id != t.id) {
-        links.push(format!(
+    if t.enabled && may_assume && ctx.acting_tenant.as_ref().is_none_or(|a| a.id != t.id) {
+        out.push_str(&format!(
             r#"<form method="post" action="{base}/admin/assume/{id}" class="inline">{csrf}<button class="secondary" type="submit">Assume</button></form>"#,
             base = e(base),
             id = e(&t.id),
         ));
     }
-    links.join(" ")
+    out
+}
+
+/// The tenant's own name, domains and availability, as sections for its Settings
+/// page. They post to the tenants page, which owns these operations, and carry
+/// the tenant in `BACK` so a successful change returns here rather than to the
+/// list.
+pub fn manage(base: &str, csrf: &str, t: &Tenant, domains: &[String], may_write: bool) -> String {
+    let url = tenants_url(base);
+    let hidden = format!(
+        r#"{csrf}<input type="hidden" name="{TENANT}" value="{id}"><input type="hidden" name="{BACK}" value="{id}">"#,
+        id = e(&t.id),
+    );
+    let domain_rows: String = domains
+        .iter()
+        .map(|d| {
+            let remove = if may_write {
+                format!(
+                    r#"<form method="post" action="{url}" class="inline">{hidden}<input type="hidden" name="{DOMAIN}" value="{domain}">
+<button class="danger" type="submit" name="{field}" value="{op}">Remove</button></form>"#,
+                    url = e(&url),
+                    domain = e(d),
+                    field = TenantOp::FIELD,
+                    op = TenantOp::DomainRemove.as_str(),
+                )
+            } else {
+                String::new()
+            };
+            format!("<tr><td>{}</td><td>{remove}</td></tr>", e(d))
+        })
+        .collect();
+    if !may_write {
+        return format!(r#"<h2>Verified domains</h2><table><tr><th>Domain</th><th></th></tr>{domain_rows}</table>"#);
+    }
+    let add_domain = view::expander(
+        "Add a domain",
+        &format!(
+            r#"<form method="post" action="{url}">{hidden}
+<label for="add_domain">Domain</label><input id="add_domain" name="{DOMAIN}" type="text" required>
+<p class="muted">Accounts in this tenant can then sign in with a name ending in it. A domain belongs to one tenant only.</p>
+<div class="actions"><button type="submit" name="{field}" value="{op}">Add domain</button></div></form>"#,
+            url = e(&url),
+            field = TenantOp::FIELD,
+            op = TenantOp::DomainAdd.as_str(),
+        ),
+        false,
+    );
+    // The root tenant is never offered a disable button: `tenant::set_enabled`
+    // refuses it, and offering what the domain layer would refuse is exactly what
+    // the console does not do.
+    let availability = if t.is_root {
+        r#"<p class="muted">This is the root tenant. It cannot be disabled.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<p>Disabling a tenant stops every sign-in to it and closes these pages. It can be enabled
+again from the list of tenants.</p>
+<form method="post" action="{url}">{hidden}
+<div class="actions"><button class="danger" type="submit" name="{field}" value="{op}">Disable this tenant</button></div></form>"#,
+            url = e(&url),
+            field = TenantOp::FIELD,
+            op = TenantOp::Disable.as_str(),
+        )
+    };
+    format!(
+        r#"<h2>Name</h2>
+<form method="post" action="{url}">{hidden}
+<label for="tenant_name">Tenant name</label><input id="tenant_name" name="{NAME}" type="text" value="{name}" required>
+<div class="actions"><button type="submit" name="{field}" value="{rename}">Rename</button></div></form>
+<h2>Verified domains</h2>
+<table><tr><th>Domain</th><th></th></tr>{domain_rows}</table>{add_domain}
+<h2>Availability</h2>{availability}"#,
+        url = e(&url),
+        name = e(&t.name),
+        field = TenantOp::FIELD,
+        rename = TenantOp::Rename.as_str(),
+    )
 }
 
 pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) -> Response {
@@ -301,7 +316,15 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) ->
     match apply(&st, op, &form).await {
         Ok((tenant_id, details)) => {
             audited(&st, &ctx, &tenant_id, op.event(), Some(&tenant_id), details).await;
-            view::see_other(&tenants_url(st.public_url.base()))
+            let base = st.public_url.base();
+            // Back to the tenant's Settings page when that is where it was asked
+            // from -- unless the tenant was just disabled, which closes that page.
+            let back = field(&form, BACK);
+            if !back.is_empty() && back == tenant_id && op != TenantOp::Disable {
+                view::see_other(&format!("{base}/admin/tenants/{tenant_id}/settings"))
+            } else {
+                view::see_other(&tenants_url(base))
+            }
         }
         Err(err) => render(&st, &ctx, Some(&err.to_string()), StatusCode::BAD_REQUEST).await,
     }

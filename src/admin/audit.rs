@@ -23,7 +23,7 @@ use axum::response::Response;
 use crate::AppState;
 use crate::admin::AUDIT_READ;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{Params, chrome};
+use crate::admin::routes::{At, Params, TenantTab, chrome};
 use crate::admin::view::{self, e};
 use crate::db::{self, AuditEntry, Event};
 use crate::tenant::Tenant;
@@ -98,7 +98,12 @@ shown here. Entries are kept until an operator prunes them.</p>"#,
         url = e(&audit_url(st.public_url.base(), tenant)),
         target = e(raw_target),
     );
-    view::page(&chrome(&st, &ctx), StatusCode::OK, "Audit log", &body)
+    view::page(
+        &chrome(&st, &ctx, At::Tenant(tenant, TenantTab::Audit)),
+        StatusCode::OK,
+        "Audit log",
+        &body,
+    )
 }
 
 fn row(entry: &AuditEntry) -> String {

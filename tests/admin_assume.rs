@@ -14,16 +14,23 @@ async fn a_platform_admin_can_assume_a_tenant_and_leave_it() {
     let page = b.post(&s.url(&format!("/admin/assume/{}", target.id)), &[]).await;
     assert_eq!(page.status, 303, "{}", page.body);
     let page = b.get(&s.url("/admin/tenants")).await;
+    // The corner names the assumed tenant and offers the way out of it.
     assert!(
-        page.body.contains("Acting in") && page.body.contains("Fabrikam"),
-        "the banner names the assumed tenant: {}",
+        page.body
+            .contains(r#"<span class="tenant">Tenant <strong>Fabrikam</strong></span>"#),
+        "the header names the assumed tenant: {}",
         page.body
     );
+    assert!(page.body.contains("/admin/leave"), "{}", page.body);
 
     let page = b.post(&s.url("/admin/leave"), &[]).await;
     assert_eq!(page.status, 303, "{}", page.body);
     let page = b.get(&s.url("/admin/tenants")).await;
-    assert!(!page.body.contains("Acting in"), "the banner is gone: {}", page.body);
+    assert!(
+        page.body.contains("No tenant selected") && !page.body.contains("/admin/leave"),
+        "no tenant is in view any more: {}",
+        page.body
+    );
 }
 
 #[tokio::test]

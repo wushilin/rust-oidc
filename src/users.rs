@@ -1,3 +1,4 @@
+use crate::admin::lockout;
 use crate::db::DbPool;
 use anyhow::{Context, anyhow, bail};
 use argon2::{Argon2, PasswordHasher};
@@ -333,6 +334,7 @@ pub async fn update_attributes(
 pub async fn set_enabled(pool: &DbPool, tenant_id: &str, user_id: &str, enabled: bool) -> anyhow::Result<bool> {
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
+    let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
         engine,
         "UPDATE users SET enabled = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
@@ -346,6 +348,7 @@ pub async fn set_enabled(pool: &DbPool, tenant_id: &str, user_id: &str, enabled:
     if !enabled {
         revoke_access(&mut tx, engine, user_id).await?;
     }
+    lockout::ensure_one_remains(&mut tx, engine, admins).await?;
     tx.commit().await?;
     Ok(done.rows_affected() > 0)
 }
@@ -357,6 +360,7 @@ pub async fn soft_delete(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyho
     let engine = crate::db::engine_of(pool);
     let ts = now();
     let mut tx = pool.begin().await?;
+    let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
         engine,
         "UPDATE users SET deleted_at = ?, enabled = ?, updated_at = ?
@@ -370,7 +374,26 @@ pub async fn soft_delete(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyho
     .execute(&mut *tx)
     .await?;
     revoke_access(&mut tx, engine, user_id).await?;
+    lockout::ensure_one_remains(&mut tx, engine, admins).await?;
     tx.commit().await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Bring a deleted account back, enabled, with the password, groups and roles it
+/// had. The way back from deleting somebody by mistake; `false` when no deleted
+/// account has that name.
+pub async fn restore(pool: &DbPool, tenant_id: &str, upn: &str) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::q(
+        pool,
+        "UPDATE users SET deleted_at = NULL, enabled = ?, updated_at = ?
+         WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NOT NULL",
+    ))
+    .bind(true)
+    .bind(now())
+    .bind(tenant_id)
+    .bind(crate::util::fold(upn))
+    .execute(pool)
+    .await?;
     Ok(done.rows_affected() > 0)
 }
 

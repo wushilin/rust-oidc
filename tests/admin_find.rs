@@ -145,15 +145,22 @@ async fn the_audit_log_names_actors_the_reader_may_see_and_no_others() {
 }
 
 #[tokio::test]
-async fn a_new_user_is_named_by_the_part_before_the_at_and_a_picked_domain() {
+async fn a_new_user_is_named_by_the_part_before_the_at_and_the_tenants_domain() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let b = signed_in_admin(&s, &f).await;
     let new = s.url(&format!("/admin/tenants/{}/users/new", f.tenant.id));
 
-    // The form offers the tenant's verified domains to pick from.
+    // The form shows the tenant's domain beside the name. There is one, so
+    // there is nothing to pick.
     let page = b.get(&new).await;
-    assert!(page.body.contains(r#"<option value="contoso.com""#), "{}", page.body);
+    assert!(page.body.contains("@ <strong>contoso.com</strong>"), "{}", page.body);
+    assert!(
+        page.body.contains(r#"name="upn_domain" value="contoso.com""#),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("<select name=\"upn_domain\""), "{}", page.body);
 
     // The part before the @, plus the picked domain. The email is left empty and
     // becomes the user name.

@@ -102,6 +102,11 @@ pub async fn delete(pool: &DbPool, actor: &[EffectiveBinding], binding_id: &str)
         // Gone between the check and the delete: the end state is the one asked
         // for, so this is not an error the caller needs to distinguish.
         Ok(false) => Ok(()),
+        // The rule about people rather than rows: the last account that can act
+        // as Global Administrator, held directly or through a group.
+        Err(err) if err.downcast_ref::<crate::admin::lockout::WouldLockOut>().is_some() => {
+            Err(RefusedReason::WouldLockOut)
+        }
         Err(_) => Err(RefusedReason::NotPermitted),
     }
 }

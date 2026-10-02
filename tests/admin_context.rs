@@ -134,7 +134,8 @@ async fn losing_group_membership_takes_effect_on_the_next_request() {
 #[tokio::test]
 async fn disabling_an_admin_ends_their_console_session() {
     let s = TestServer::start().await;
-    let f = admin_fixture(&s).await;
+    // A tenant's administrator: the last Global Administrator cannot be disabled.
+    let f = tenant_admin_fixture(&s).await;
     let b = signed_in_admin(&s, &f).await;
     assert_eq!(b.get(&s.url("/admin/tenants")).await.status, 200);
 

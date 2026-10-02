@@ -88,7 +88,8 @@ enum TenantCmd {
         domain: String,
     },
     List,
-    AddDomain {
+    /// Replace the tenant's domain and rename every account in it to match.
+    ChangeDomain {
         #[arg(long)]
         tenant: String,
         #[arg(long)]
@@ -125,6 +126,14 @@ enum UserCmd {
         upn: String,
         #[arg(long, env = "RUST_OIDC_PASSWORD", hide_env_values = true)]
         password: Option<String>,
+    },
+    /// Bring back a deleted account, enabled, with the password and roles it had.
+    /// The way back in when the console can no longer be signed in to.
+    Restore {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        upn: String,
     },
 }
 
@@ -483,16 +492,16 @@ async fn tenant_cmd(pool: &DbPool, cmd: TenantCmd) -> anyhow::Result<()> {
                 .collect();
             print_json(json!(list));
         }
-        TenantCmd::AddDomain { tenant: key, domain } => {
+        TenantCmd::ChangeDomain { tenant: key, domain } => {
             let t = tenant::find_for_admin(pool, &key).await?;
-            tenant::add_domain(pool, &t.id, &domain).await?;
+            let change = tenant::change_domain(pool, &t.id, &domain).await?;
             db::audit(
                 pool,
                 Some(&t.id),
                 Actor::Cli,
-                Event::TenantAddDomain,
+                Event::TenantChangeDomain,
                 Some(&t.id),
-                json!({ "domain": domain }),
+                json!({ "from": change.from, "to": change.to, "renamed": change.renamed }),
             )
             .await?;
             print_json(json!({ "tenantId": t.id, "domains": tenant::domains(pool, &t.id).await? }));
@@ -573,6 +582,14 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
                 json!({}),
             )
             .await?;
+        }
+        UserCmd::Restore { tenant: key, upn } => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            if !users::restore(pool, &t.id, &upn).await? {
+                bail!("no deleted account named '{upn}' in that tenant");
+            }
+            db::audit(pool, Some(&t.id), Actor::Cli, Event::UserRestore, Some(&upn), json!({})).await?;
+            print_json(json!({ "userPrincipalName": upn, "restored": true }));
         }
     }
     Ok(())

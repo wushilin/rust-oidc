@@ -137,10 +137,15 @@ pub async fn create(
 }
 
 pub async fn delete(pool: &DbPool, binding_id: &str) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::q(pool, "DELETE FROM role_bindings WHERE id = ?"))
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    let admins = crate::admin::lockout::global_administrators(&mut tx, engine).await?;
+    let done = sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM role_bindings WHERE id = ?"))
         .bind(binding_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    crate::admin::lockout::ensure_one_remains(&mut tx, engine, admins).await?;
+    tx.commit().await?;
     Ok(done.rows_affected() > 0)
 }
 

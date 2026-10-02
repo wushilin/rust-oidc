@@ -14,6 +14,7 @@ pub mod find;
 pub mod flow;
 pub mod groups;
 pub mod keys;
+pub mod lockout;
 pub mod platform_roles;
 pub mod roles;
 pub mod routes;

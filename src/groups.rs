@@ -1,3 +1,4 @@
+use crate::admin::lockout;
 use crate::db::DbPool;
 use anyhow::{Context, bail};
 
@@ -150,15 +151,63 @@ pub async fn remove_member(pool: &DbPool, tenant_id: &str, group_id: &str, user_
     if find_by_id(pool, tenant_id, group_id).await?.is_none() {
         return Ok(false);
     }
-    let done = sqlx::query(crate::db::q(
-        pool,
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    let admins = lockout::global_administrators(&mut tx, engine).await?;
+    let done = sqlx::query(crate::db::sql_stmt(
+        engine,
         "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",
     ))
     .bind(group_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    lockout::ensure_one_remains(&mut tx, engine, admins).await?;
+    tx.commit().await?;
     Ok(done.rows_affected() > 0)
+}
+
+/// Delete a group that has no members, along with the console roles and app
+/// roles granted to it. `false` when there is no such group in this tenant.
+///
+/// A group with members is refused: deleting it would silently take from each of
+/// them whatever the group gave, and the console has no "are you sure". Emptying
+/// it first makes each of those a deliberate step.
+pub async fn delete(pool: &DbPool, tenant_id: &str, group_id: &str) -> anyhow::Result<bool> {
+    if find_by_id(pool, tenant_id, group_id).await?.is_none() {
+        return Ok(false);
+    }
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    let (members,): (i64,) = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT COUNT(*) FROM group_members WHERE group_id = ?",
+    ))
+    .bind(group_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if members > 0 {
+        anyhow::bail!("this group still has {members} member(s); remove them first");
+    }
+    let group = crate::directory::PrincipalType::Group.as_str();
+    for sql in [
+        "DELETE FROM role_binding_tenants WHERE binding_id IN
+            (SELECT id FROM role_bindings WHERE principal_type = ? AND principal_id = ?)",
+        "DELETE FROM role_bindings WHERE principal_type = ? AND principal_id = ?",
+        "DELETE FROM app_role_assignments WHERE principal_type = ? AND principal_id = ?",
+    ] {
+        sqlx::query(crate::db::sql_stmt(engine, sql))
+            .bind(group)
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_groups WHERE id = ?"))
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// The id of a live account in this tenant, by user name.

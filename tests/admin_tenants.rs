@@ -95,64 +95,196 @@ async fn a_tenant_is_created_renamed_disabled_and_re_enabled() {
     }
 }
 
+/// A second domain put there by hand, as a tenant from before "one domain" has.
+async fn legacy_second_domain(s: &TestServer, tenant_id: &str, domain: &str) {
+    sqlx::query(rust_oidc::db::q(
+        &s.pool,
+        "INSERT INTO tenant_domains (domain, domain_folded, tenant_id, is_default, created_at) VALUES (?, ?, ?, ?, 0)",
+    ))
+    .bind(domain)
+    .bind(domain)
+    .bind(tenant_id)
+    .bind(false)
+    .execute(&s.pool)
+    .await
+    .unwrap();
+}
+
+async fn upns(s: &TestServer, tenant_id: &str) -> Vec<(String, Option<String>)> {
+    sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT upn, email FROM users WHERE tenant_id = ? ORDER BY upn",
+    ))
+    .bind(tenant_id)
+    .fetch_all(&s.pool)
+    .await
+    .unwrap()
+}
+
+/// A tenant has one domain. Changing it renames every account in the same step,
+/// and nothing else about them moves.
 #[tokio::test]
-async fn a_verified_domain_is_added_and_withdrawn() {
+async fn changing_the_domain_renames_every_account_with_it() {
     let s = TestServer::start().await;
-    let f = admin_fixture(&s).await;
+    let f = admin_fixture(&s).await; // alice@contoso.com, a Global Administrator
+    let tenant = tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    for (upn, email) in [
+        ("bob@contoso.com", Some("bob@contoso.com")), // the default: follows the name
+        ("carol@contoso.com", Some("carol@personal.example")), // a real address: left alone
+        ("Dave@Contoso.com", None),
+    ] {
+        users::create(
+            &s.pool,
+            &tenant,
+            NewUser {
+                upn,
+                password: "Correct-Horse-9",
+                display_name: None,
+                given_name: None,
+                family_name: None,
+                email,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let group = rust_oidc::groups::create(&s.pool, &tenant, "Staff", None)
+        .await
+        .unwrap();
+    rust_oidc::groups::add_member(&s.pool, &tenant, "Staff", "bob@contoso.com")
+        .await
+        .unwrap();
+    let ids_before: Vec<(String,)> = sqlx::query_as("SELECT id FROM users ORDER BY id")
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
     let b = signed_in_admin(&s, &f).await;
     let url = s.url("/admin/tenants");
 
-    let added = b
+    // The Settings page says what the domain is and offers to change it, not to add one.
+    let settings = b.get(&s.url(&format!("/admin/tenants/{}/settings", f.tenant.id))).await;
+    assert!(
+        settings.body.contains("<strong>@contoso.com</strong>"),
+        "{}",
+        settings.body
+    );
+    assert!(settings.body.contains(r#"value="domain_change""#), "{}", settings.body);
+    for gone in [r#"value="domain_add""#, r#"value="domain_remove""#] {
+        assert!(!settings.body.contains(gone), "{gone}: {}", settings.body);
+    }
+
+    let changed = b
         .post(
             &url,
             &[
-                ("op", "domain_add"),
+                ("op", "domain_change"),
                 ("tenant", &f.tenant.id),
-                ("domain", "contoso.example"),
+                ("domain", "Contoso.Example"),
             ],
         )
         .await;
-    assert_eq!(added.status, 303, "{}", added.body);
-    let domains = tenant::domains(&s.pool, &f.tenant.id).await.unwrap();
-    assert!(domains.contains(&"contoso.example".to_string()), "{domains:?}");
-    // A verified domain is an alias for the tenant everywhere, including in URLs.
+    assert_eq!(changed.status, 303, "{}", changed.body);
+
+    assert_eq!(
+        tenant::domains(&s.pool, &f.tenant.id).await.unwrap(),
+        ["contoso.example"]
+    );
+    assert!(
+        tenant::resolve(&s.pool, "contoso.com").await.unwrap().is_none(),
+        "the old one is released"
+    );
     assert_eq!(
         tenant::resolve(&s.pool, "contoso.example").await.unwrap().unwrap().id,
         f.tenant.id
     );
-
-    let removed = b
-        .post(
-            &url,
-            &[
-                ("op", "domain_remove"),
-                ("tenant", &f.tenant.id),
-                ("domain", "contoso.example"),
-            ],
-        )
-        .await;
-    assert_eq!(removed.status, 303, "{}", removed.body);
-    assert!(
-        !tenant::domains(&s.pool, &f.tenant.id)
-            .await
-            .unwrap()
-            .contains(&"contoso.example".to_string())
+    let after = upns(&s, &f.tenant.id).await;
+    let names: Vec<&str> = after.iter().map(|(u, _)| u.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "alice@contoso.example",
+            "bob@contoso.example",
+            "carol@contoso.example",
+            "Dave@contoso.example"
+        ]
     );
-    assert!(tenant::resolve(&s.pool, "contoso.example").await.unwrap().is_none());
+    let email_of = |upn: &str| after.iter().find(|(u, _)| u == upn).unwrap().1.clone();
+    assert_eq!(email_of("bob@contoso.example").as_deref(), Some("bob@contoso.example"));
+    assert_eq!(
+        email_of("carol@contoso.example").as_deref(),
+        Some("carol@personal.example")
+    );
+    assert_eq!(email_of("Dave@contoso.example"), None);
 
-    // A domain another tenant holds is not available.
+    // The same people: ids, group membership and roles are untouched.
+    let ids_after: Vec<(String,)> = sqlx::query_as("SELECT id FROM users ORDER BY id")
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+    assert_eq!(ids_after, ids_before);
+    let members = rust_oidc::groups::members(&s.pool, &group).await.unwrap();
+    assert_eq!(members.len(), 1);
+    // The administrator who did it is still signed in, and signs in next time
+    // with the new name and the same password.
+    assert_eq!(b.get(&url).await.status, 200);
+    let renamed = UserFixture {
+        upn: "alice@contoso.example".into(),
+        ..f
+    };
+    let again = signed_in_admin(&s, &renamed).await;
+    assert_eq!(again.get(&url).await.status, 200);
+    // New accounts go on the new domain, the old one is refused.
+    let tenant = tenant::find_for_admin(&s.pool, &renamed.tenant.id).await.unwrap();
+    assert!(users::validate_upn(&s.pool, &tenant, "eve@contoso.com").await.is_err());
+    assert!(
+        users::validate_upn(&s.pool, &tenant, "eve@contoso.example")
+            .await
+            .is_ok()
+    );
+
+    // One audit row, saying from what to what and how many were renamed.
+    let rows = audit_rows(&s, rust_oidc::db::Event::AdminTenantDomainChange.as_str()).await;
+    assert_eq!(rows.len(), 1);
+    let (details,): (String,) = sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT details FROM audit_log WHERE action = ?",
+    ))
+    .bind(rust_oidc::db::Event::AdminTenantDomainChange.as_str())
+    .fetch_one(&s.pool)
+    .await
+    .unwrap();
+    assert!(
+        details.contains("contoso.example") && details.contains("contoso.com") && details.contains("\"renamed\":4"),
+        "{details}"
+    );
+}
+
+#[tokio::test]
+async fn a_domain_change_that_cannot_be_made_changes_nothing() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
-    let taken = b
-        .post(
-            &url,
-            &[
-                ("op", "domain_add"),
-                ("tenant", &f.tenant.id),
-                ("domain", "fabrikam.test"),
-            ],
-        )
-        .await;
-    assert_eq!(taken.status, 400, "{}", taken.body);
+    let b = signed_in_admin(&s, &f).await;
+    let url = s.url("/admin/tenants");
+    let before = upns(&s, &f.tenant.id).await;
+
+    for (domain, why) in [
+        ("fabrikam.test", "already registered"), // another tenant's
+        ("contoso.com", "already this tenant"),  // its own
+        ("not a domain", "invalid domain"),
+        ("", "invalid domain"),
+    ] {
+        let page = b
+            .post(
+                &url,
+                &[("op", "domain_change"), ("tenant", &f.tenant.id), ("domain", domain)],
+            )
+            .await;
+        assert_eq!(page.status, 400, "{domain}: {}", page.body);
+        assert!(page.body.contains(why), "{domain}: {}", page.body);
+    }
+    assert_eq!(tenant::domains(&s.pool, &f.tenant.id).await.unwrap(), ["contoso.com"]);
+    assert_eq!(upns(&s, &f.tenant.id).await, before);
     assert_eq!(
         tenant::resolve(&s.pool, "fabrikam.test").await.unwrap().unwrap().id,
         other.id,
@@ -160,70 +292,104 @@ async fn a_verified_domain_is_added_and_withdrawn() {
     );
 }
 
-/// Both refusals that stop a domain withdrawal stranding an identity.
+/// A tenant that still has several domains, from before a tenant had one. The
+/// surplus ones can be withdrawn when nobody uses them, and changing the domain
+/// brings everyone onto one -- unless two accounts would get the same name, in
+/// which case nothing at all is changed.
 #[tokio::test]
-async fn a_domain_still_in_use_or_the_only_one_cannot_be_withdrawn() {
+async fn a_tenant_with_several_domains_is_brought_down_to_one() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let b = signed_in_admin(&s, &f).await;
     let url = s.url("/admin/tenants");
+    let remove = |domain: &'static str| {
+        let (b, url, id) = (&b, &url, f.tenant.id.clone());
+        async move {
+            b.post(url, &[("op", "domain_remove"), ("tenant", &id), ("domain", domain)])
+                .await
+        }
+    };
 
-    // The tenant's only domain, which every one of its accounts signs in with.
-    let only = b
+    // The only domain cannot be withdrawn.
+    let only = remove("contoso.com").await;
+    assert_eq!(only.status, 400, "{}", only.body);
+    assert!(only.body.contains("at least one"), "{}", only.body);
+
+    legacy_second_domain(&s, &f.tenant.id, "contoso.example").await;
+    legacy_second_domain(&s, &f.tenant.id, "unused.example").await;
+    let tenant = tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    for upn in ["bob@contoso.example", "alice@contoso.example"] {
+        users::create(
+            &s.pool,
+            &tenant,
+            NewUser {
+                upn,
+                password: "Correct-Horse-9",
+                display_name: None,
+                given_name: None,
+                family_name: None,
+                email: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    // The page lists them, with a way to withdraw each.
+    let settings = b.get(&s.url(&format!("/admin/tenants/{}/settings", f.tenant.id))).await;
+    assert!(settings.body.contains("more than one domain"), "{}", settings.body);
+    assert!(settings.body.contains(r#"value="domain_remove""#), "{}", settings.body);
+
+    // One in use stays; one nobody uses goes.
+    let in_use = remove("contoso.example").await;
+    assert_eq!(in_use.status, 400, "{}", in_use.body);
+    assert!(in_use.body.contains("still use"), "{}", in_use.body);
+    assert_eq!(remove("unused.example").await.status, 303);
+
+    // alice@contoso.com and alice@contoso.example cannot both become alice@new.
+    let before = upns(&s, &f.tenant.id).await;
+    let clash = b
         .post(
             &url,
             &[
-                ("op", "domain_remove"),
+                ("op", "domain_change"),
                 ("tenant", &f.tenant.id),
-                ("domain", "contoso.com"),
+                ("domain", "new.example"),
             ],
         )
         .await;
-    assert_eq!(only.status, 400, "{}", only.body);
-    assert!(only.body.contains("at least one"), "{}", only.body);
+    assert_eq!(clash.status, 400, "{}", clash.body);
     assert!(
-        tenant::domains(&s.pool, &f.tenant.id)
-            .await
-            .unwrap()
-            .contains(&"contoso.com".to_string())
+        clash.body.contains("alice@new.example"),
+        "it names the clash: {}",
+        clash.body
     );
+    assert_eq!(upns(&s, &f.tenant.id).await, before, "nobody was renamed");
+    assert_eq!(tenant::domains(&s.pool, &f.tenant.id).await.unwrap().len(), 2);
 
-    // A second domain, with an account whose user name uses it.
-    tenant::add_domain(&s.pool, &f.tenant.id, "contoso.example")
+    // With the clash out of the way, everyone lands on the one domain -- which
+    // may be one the tenant already had.
+    sqlx::query(rust_oidc::db::q(&s.pool, "DELETE FROM users WHERE upn_folded = ?"))
+        .bind("alice@contoso.example")
+        .execute(&s.pool)
         .await
         .unwrap();
-    let tenant = tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
-    users::create(
-        &s.pool,
-        &tenant,
-        NewUser {
-            upn: "bob@contoso.example",
-            password: "Correct-Horse-9",
-            display_name: None,
-            given_name: None,
-            family_name: None,
-            email: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let in_use = b
+    let merged = b
         .post(
             &url,
             &[
-                ("op", "domain_remove"),
+                ("op", "domain_change"),
                 ("tenant", &f.tenant.id),
                 ("domain", "contoso.example"),
             ],
         )
         .await;
-    assert_eq!(in_use.status, 400, "{}", in_use.body);
-    assert!(in_use.body.contains("still use"), "{}", in_use.body);
-    assert!(
-        tenant::resolve(&s.pool, "contoso.example").await.unwrap().is_some(),
-        "the domain bob signs in with is still verified"
+    assert_eq!(merged.status, 303, "{}", merged.body);
+    assert_eq!(
+        tenant::domains(&s.pool, &f.tenant.id).await.unwrap(),
+        ["contoso.example"]
     );
+    let names: Vec<String> = upns(&s, &f.tenant.id).await.into_iter().map(|(u, _)| u).collect();
+    assert_eq!(names, ["alice@contoso.example", "bob@contoso.example"]);
 }
 
 /// The root tenant holds the administrators who would have to undo it, and the
@@ -300,7 +466,7 @@ async fn a_tenant_admin_cannot_use_the_platform_tenant_routes() {
         vec![("op", "create"), ("name", "Mole"), ("domain", "mole.test")],
         vec![("op", "rename"), ("tenant", &other.id), ("name", "Taken over")],
         vec![("op", "disable"), ("tenant", &other.id)],
-        vec![("op", "domain_add"), ("tenant", &other.id), ("domain", "mole.test")],
+        vec![("op", "domain_change"), ("tenant", &other.id), ("domain", "mole.test")],
         vec![
             ("op", "domain_remove"),
             ("tenant", &other.id),
@@ -309,7 +475,11 @@ async fn a_tenant_admin_cannot_use_the_platform_tenant_routes() {
         // Their own tenant too: these routes are platform-scope, not "any tenant
         // you administer".
         vec![("op", "rename"), ("tenant", &f.tenant.id), ("name", "Renamed")],
-        vec![("op", "domain_add"), ("tenant", &f.tenant.id), ("domain", "mole.test")],
+        vec![
+            ("op", "domain_change"),
+            ("tenant", &f.tenant.id),
+            ("domain", "mole.test"),
+        ],
     ];
     for form in posts {
         let page = b.post(&url, &form).await;
@@ -332,7 +502,7 @@ async fn a_tenant_admin_cannot_use_the_platform_tenant_routes() {
     assert!(page.body.contains("Contoso"), "their own tenant is listed");
     assert!(!page.body.contains("Fabrikam"), "and nobody else's: {}", page.body);
     assert!(!page.body.contains(&other.id), "{}", page.body);
-    for offered in ["Create a tenant", r#"value="rename""#, r#"value="domain_add""#] {
+    for offered in ["Create a tenant", r#"value="rename""#, r#"value="domain_change""#] {
         assert!(!page.body.contains(offered), "{offered} is offered: {}", page.body);
     }
 }

@@ -29,16 +29,19 @@ use crate::tenant::Tenant;
 pub enum MemberOp {
     Add,
     Remove,
+    /// Delete the group itself. Only an empty one: see [`groups::delete`].
+    DeleteGroup,
 }
 
 impl MemberOp {
-    pub const ALL: &'static [MemberOp] = &[Self::Add, Self::Remove];
+    pub const ALL: &'static [MemberOp] = &[Self::Add, Self::Remove, Self::DeleteGroup];
     pub const FIELD: &'static str = "op";
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Add => "member_add",
             Self::Remove => "member_remove",
+            Self::DeleteGroup => "group_delete",
         }
     }
 
@@ -50,6 +53,7 @@ impl MemberOp {
         match self {
             Self::Add => Event::AdminGroupMemberAdd,
             Self::Remove => Event::AdminGroupMemberRemove,
+            Self::DeleteGroup => Event::AdminGroupDelete,
         }
     }
 }
@@ -246,10 +250,26 @@ somebody to one can give them administrative rights -- check the roles page if i
         r#"<p class="muted">Your roles allow seeing this group but not changing its membership.</p>"#.to_string()
     };
 
+    let delete = if !may_write {
+        String::new()
+    } else if members.is_empty() {
+        format!(
+            r#"<h2>Delete</h2><p>The group has no members. Deleting it also withdraws any console role or
+application role granted to it.</p>
+<form method="post" action="{url}">{csrf}
+<div class="actions"><button class="danger" type="submit" name="{field}" value="{op}">Delete this group</button></div></form>"#,
+            url = e(&url),
+            field = MemberOp::FIELD,
+            op = MemberOp::DeleteGroup.as_str(),
+        )
+    } else {
+        r#"<h2>Delete</h2><p class="muted">A group can be deleted once it has no members.</p>"#.to_string()
+    };
+
     let body = format!(
         r#"<h1>{name}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
 <p>{description}</p>
-<h2>Members</h2><table><tr><th>User name</th><th>Object id</th><th></th></tr>{rows}</table>{add}"#,
+<h2>Members</h2><table><tr><th>User name</th><th>Object id</th><th></th></tr>{rows}</table>{add}{delete}"#,
         name = e(&group.name),
         tenant_name = e(&tenant.name),
         id = e(&group.id),
@@ -295,7 +315,12 @@ pub async fn detail_post(
     match apply(&st, tenant, &group, op, &form).await {
         Ok(details) => {
             audited(&st, &ctx, &tenant.id, op.event(), Some(&group.id), details).await;
-            view::see_other(&group_url(st.public_url.base(), tenant, &group))
+            // A deleted group has no page to go back to.
+            if op == MemberOp::DeleteGroup {
+                view::see_other(&groups_url(st.public_url.base(), tenant))
+            } else {
+                view::see_other(&group_url(st.public_url.base(), tenant, &group))
+            }
         }
         Err(err) => {
             detail(
@@ -330,6 +355,10 @@ async fn apply(
                 anyhow::bail!("that account is not a member of this group");
             }
             Ok(json!({ "userId": user_id }))
+        }
+        MemberOp::DeleteGroup => {
+            groups::delete(&st.pool, &tenant.id, &group.id).await?;
+            Ok(json!({ "name": crate::routes::audit::clip(&group.name) }))
         }
     }
 }

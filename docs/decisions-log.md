@@ -1069,6 +1069,30 @@ Dry-run on copies of both live databases: nobody lost anything. **Not run on Pos
 or MySQL** (SQLite-only testing for now); the SQL is identical on all three and written
 to avoid MySQL's same-table subquery limit, but that is untested.
 
+**143. A tenant has one domain, and it is changed, not added to** (user's decision,
+2 Oct). `tenant::change_domain` swaps the domain and renames every account in one
+transaction (`alice@old` to `alice@new`); ids, passwords, groups, roles and assignments
+do not move. Mine: a contact email that was just the user name follows it, any other is
+left alone; soft-deleted accounts are renamed too (they still hold their name); it is a
+Global Administrator's operation, like the other tenant-level changes. No schema
+constraint enforces "one": the gateway's root tenant already has two, and a unique index
+would have stopped that database from starting. Such a tenant is shown its domains, can
+withdraw unused ones, and is brought to one by a change (refused if two accounts would
+collide). The old domain stops working as a tenant alias in URLs.
+
+**144. The last person who can act as Global Administrator cannot be removed, by any
+route** (after the user deleted the last one on the gateway). The old rule counted
+bindings; this one counts live, enabled root-tenant accounts holding the role directly
+or through a group, inside the transaction of every change that could take one away:
+deleting or disabling a user, revoking a binding, removing a group member
+(`admin::lockout`). Separately, the console refuses deleting or disabling the account
+one is signed in with. `rust-oidc user restore` un-deletes an account from the host,
+the way back in if it happens anyway.
+
+**145. An empty group can be deleted**, taking the console and app roles granted to it.
+One with members is refused: there is no confirmation step in a script-free console, so
+emptying it first is the confirmation.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

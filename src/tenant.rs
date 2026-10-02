@@ -228,13 +228,121 @@ pub async fn create(pool: &DbPool, name: &str, domain: &str, is_root: bool) -> a
     })
 }
 
-pub async fn add_domain(pool: &DbPool, tenant_id: &str, domain: &str) -> anyhow::Result<()> {
-    let domain = normalize_domain(domain)?;
+/// What changing a tenant's domain did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DomainChange {
+    /// The domains the tenant had before. One, except for a tenant that still
+    /// carried several from before a tenant had exactly one.
+    pub from: Vec<String>,
+    pub to: String,
+    /// How many accounts were given a new user name.
+    pub renamed: u64,
+}
+
+/// Give a tenant a new domain in place of the one it has, and rename every
+/// account in it to match: `alice@old` becomes `alice@new`.
+///
+/// A tenant has one domain. There is no adding a second, so this is the only way
+/// its domain changes, and the whole of it happens in one transaction: either the
+/// tenant and every account are on the new domain, or nothing moved.
+///
+/// - Object ids do not change, so `oid`, `sub`, group membership, role grants and
+///   app assignments are untouched. What changes is the name people sign in with.
+/// - A contact email that was just the user name follows it. One that was set to
+///   something else is somebody's real address and is left alone.
+/// - Refused if another tenant holds the domain, or if two accounts would end up
+///   with the same name (possible only for a tenant that had several domains).
+pub async fn change_domain(pool: &DbPool, tenant_id: &str, new_domain: &str) -> anyhow::Result<DomainChange> {
+    let to = normalize_domain(new_domain)?;
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
-    insert_domain(&mut tx, engine, tenant_id, &domain, false).await?;
+
+    let from: Vec<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain",
+    ))
+    .bind(tenant_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let from: Vec<String> = from.into_iter().map(|(d,)| d).collect();
+    if from.len() == 1 && fold(&from[0]) == to {
+        bail!("'{to}' is already this tenant's domain");
+    }
+    let holder: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?",
+    ))
+    .bind(&to)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if holder.is_some_and(|(t,)| t != tenant_id) {
+        bail!("domain '{to}' is already registered to a tenant");
+    }
+
+    // Soft-deleted accounts too: they still hold their name in the unique index.
+    let accounts: Vec<(String, String, Option<String>)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT id, upn, email FROM users WHERE tenant_id = ?",
+    ))
+    .bind(tenant_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut taken = std::collections::HashSet::new();
+    let mut renames = Vec::new();
+    for (id, upn, email) in accounts {
+        let local = upn.rsplit_once('@').map_or(upn.as_str(), |(local, _)| local);
+        let renamed = format!("{local}@{to}");
+        if !taken.insert(fold(&renamed)) {
+            bail!("two accounts would both become '{renamed}'; rename one of them first");
+        }
+        if renamed != upn {
+            let email = match email {
+                Some(e) if fold(&e) == fold(&upn) => Some(renamed.clone()),
+                other => other,
+            };
+            renames.push((id, renamed, email));
+        }
+    }
+    // Out of the way first, so no rename can collide with a name that is itself
+    // about to change (the unique index is checked row by row).
+    for (id, ..) in &renames {
+        sqlx::query(crate::db::sql_stmt(
+            engine,
+            "UPDATE users SET upn_folded = ? WHERE id = ?",
+        ))
+        .bind(format!("{id}@renaming.invalid"))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for (id, upn, email) in &renames {
+        sqlx::query(crate::db::sql_stmt(
+            engine,
+            "UPDATE users SET upn = ?, upn_folded = ?, email = ?, updated_at = ? WHERE id = ?",
+        ))
+        .bind(upn)
+        .bind(fold(upn))
+        .bind(email)
+        .bind(now())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM tenant_domains WHERE tenant_id = ?",
+    ))
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await?;
+    insert_domain(&mut tx, engine, tenant_id, &to, true).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(DomainChange {
+        from,
+        to,
+        renamed: renames.len() as u64,
+    })
 }
 
 async fn insert_domain(
@@ -342,7 +450,9 @@ pub async fn set_enabled(pool: &DbPool, tenant_id: &str, enabled: bool) -> anyho
     Ok(())
 }
 
-/// Withdraw a verified domain.
+/// Withdraw a surplus domain from a tenant that still has several, from before
+/// a tenant had exactly one. A tenant with one domain changes it with
+/// [`change_domain`]; nothing adds a second.
 ///
 /// Three refusals, each because the alternative is an identity that silently
 /// stops working:

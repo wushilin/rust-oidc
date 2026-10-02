@@ -44,7 +44,7 @@ async fn tenant_domains_and_group_names_fold_case_too() {
                 .is_some()
         );
         assert!(
-            rust_oidc::tenant::add_domain(&pool, &t.id, "Contoso.Test")
+            rust_oidc::tenant::create(&pool, "Second", "Contoso.Test", false)
                 .await
                 .is_err()
         );

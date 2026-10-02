@@ -214,6 +214,15 @@ async fn new_user_page(
             )
         })
         .collect();
+    // A tenant has one domain, so there is nothing to pick. One that still has
+    // several is offered them.
+    let suffix = match domains.as_slice() {
+        [only] => format!(
+            r#"<strong>{d}</strong><input type="hidden" name="{UPN_DOMAIN}" value="{d}">"#,
+            d = e(only)
+        ),
+        _ => format!(r#"<select name="{UPN_DOMAIN}" aria-label="Domain">{options}</select>"#),
+    };
     // `novalidate`: the user-name box carries a pattern that a full name (one with
     // an @) does not match, purely so the stylesheet can hide the domain beside
     // it. The browser must not refuse to submit on that account. Everything is
@@ -223,9 +232,8 @@ async fn new_user_page(
 <form method="post" action="{url}/new" novalidate>{csrf}
 <label for="upn">User name</label>
 <div class="upn"><input id="upn" name="upn" type="text" pattern="[^@]*" value="{upn}" autocomplete="off" autocapitalize="none" spellcheck="false" autofocus>
-<span class="suffix">@ <select name="{UPN_DOMAIN}" aria-label="Domain">{options}</select></span></div>
-<p class="muted">What the person signs in with. Type the part before the @ and pick the domain, or type
-the whole name. It must end in one of this tenant's verified domains.</p>
+<span class="suffix">@ {suffix}</span></div>
+<p class="muted">What the person signs in with. Type the part before the @; the tenant's domain is added.</p>
 <label for="password">Initial password</label><input id="password" name="password" type="password" autocomplete="new-password">
 <label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}">
 <div class="fields">
@@ -380,7 +388,11 @@ async fn detail(
         },
     );
 
-    let state = if may_write {
+    let state = if may_write && user.id == ctx.user.id {
+        r#"<h2>Sign-in</h2><p class="muted">This is the account you are signed in with, so it cannot be
+disabled or deleted from here. Another administrator can.</p>"#
+            .to_string()
+    } else if may_write {
         let (op, label) = if user.enabled {
             (UserOp::Disable, "Disable sign-in")
         } else {
@@ -492,7 +504,15 @@ pub async fn detail_post(
         }
     };
 
-    let outcome = apply(&st, tenant, &user, op, &form).await;
+    // Nobody deletes or disables the account they are signed in with: it ends
+    // their own session mid-click, and it is how the last administrator goes.
+    let outcome = if user.id == ctx.user.id && matches!(op, UserOp::Delete | UserOp::Disable) {
+        Err(anyhow::anyhow!(
+            "This is the account you are signed in with. Another administrator can disable or delete it."
+        ))
+    } else {
+        apply(&st, tenant, &user, op, &form).await
+    };
     match outcome {
         Ok(details) => {
             audited(&st, &ctx, &tenant.id, op.event(), Some(&user.id), details).await;

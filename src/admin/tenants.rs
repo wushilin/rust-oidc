@@ -37,7 +37,7 @@ pub enum TenantOp {
     Rename,
     Enable,
     Disable,
-    DomainAdd,
+    DomainChange,
     DomainRemove,
 }
 
@@ -47,7 +47,7 @@ impl TenantOp {
         Self::Rename,
         Self::Enable,
         Self::Disable,
-        Self::DomainAdd,
+        Self::DomainChange,
         Self::DomainRemove,
     ];
 
@@ -59,7 +59,7 @@ impl TenantOp {
             Self::Rename => "rename",
             Self::Enable => "enable",
             Self::Disable => "disable",
-            Self::DomainAdd => "domain_add",
+            Self::DomainChange => "domain_change",
             Self::DomainRemove => "domain_remove",
         }
     }
@@ -73,7 +73,7 @@ impl TenantOp {
     fn action(self) -> Action {
         match self {
             Self::Create => TENANT_CREATE,
-            Self::Rename | Self::Enable | Self::Disable | Self::DomainAdd | Self::DomainRemove => TENANT_WRITE,
+            Self::Rename | Self::Enable | Self::Disable | Self::DomainChange | Self::DomainRemove => TENANT_WRITE,
         }
     }
 
@@ -83,7 +83,7 @@ impl TenantOp {
             Self::Rename => Event::AdminTenantRename,
             Self::Enable => Event::AdminTenantEnable,
             Self::Disable => Event::AdminTenantDisable,
-            Self::DomainAdd => Event::AdminTenantDomainAdd,
+            Self::DomainChange => Event::AdminTenantDomainChange,
             Self::DomainRemove => Event::AdminTenantDomainRemove,
         }
     }
@@ -236,10 +236,14 @@ pub fn manage(base: &str, csrf: &str, t: &Tenant, domains: &[String], may_write:
         r#"{csrf}<input type="hidden" name="{TENANT}" value="{id}"><input type="hidden" name="{BACK}" value="{id}">"#,
         id = e(&t.id),
     );
+    // A tenant has one domain. One that still carries several, from before that
+    // was so, is shown them all and can withdraw the ones nobody uses; changing
+    // the domain brings it down to one.
+    let several = domains.len() > 1;
     let domain_rows: String = domains
         .iter()
         .map(|d| {
-            let remove = if may_write {
+            let remove = if may_write && several {
                 format!(
                     r#"<form method="post" action="{url}" class="inline">{hidden}<input type="hidden" name="{DOMAIN}" value="{domain}">
 <button class="danger" type="submit" name="{field}" value="{op}">Remove</button></form>"#,
@@ -254,19 +258,35 @@ pub fn manage(base: &str, csrf: &str, t: &Tenant, domains: &[String], may_write:
             format!("<tr><td>{}</td><td>{remove}</td></tr>", e(d))
         })
         .collect();
+    let domain_table = if several {
+        format!(
+            r#"<p class="muted">This tenant has more than one domain, from before a tenant had exactly one.
+Changing the domain moves every account onto the new one.</p>
+<table><tr><th>Domain</th><th></th></tr>{domain_rows}</table>"#
+        )
+    } else {
+        format!(
+            r#"<p>Every user name in this tenant ends in <strong>@{}</strong>.</p>"#,
+            e(domains.first().map(String::as_str).unwrap_or_default())
+        )
+    };
     if !may_write {
-        return format!(r#"<h2>Verified domains</h2><table><tr><th>Domain</th><th></th></tr>{domain_rows}</table>"#);
+        return format!(r#"<h2>Domain</h2>{domain_table}"#);
     }
-    let add_domain = view::expander(
-        "Add a domain",
+    let change_domain = view::expander(
+        "Change the domain",
         &format!(
             r#"<form method="post" action="{url}">{hidden}
-<label for="add_domain">Domain</label><input id="add_domain" name="{DOMAIN}" type="text" required>
-<p class="muted">Accounts in this tenant can then sign in with a name ending in it. A domain belongs to one tenant only.</p>
-<div class="actions"><button type="submit" name="{field}" value="{op}">Add domain</button></div></form>"#,
+<label for="new_tenant_domain">New domain</label><input id="new_tenant_domain" name="{DOMAIN}" type="text" required autocapitalize="none" spellcheck="false">
+<p class="muted">Every account is renamed in the same step: <em>alice@{old}</em> becomes <em>alice@</em> the new
+domain, and that is what people sign in with from then on. Passwords, groups, roles and application
+assignments are unaffected, and so are the ids applications see. Applications that address this tenant
+by its domain in a URL need the new one; those that use the tenant id do not.</p>
+<div class="actions"><button type="submit" name="{field}" value="{op}">Change domain and rename accounts</button></div></form>"#,
             url = e(&url),
+            old = e(domains.first().map(String::as_str).unwrap_or_default()),
             field = TenantOp::FIELD,
-            op = TenantOp::DomainAdd.as_str(),
+            op = TenantOp::DomainChange.as_str(),
         ),
         false,
     );
@@ -291,8 +311,7 @@ again from the list of tenants.</p>
 <form method="post" action="{url}">{hidden}
 <label for="tenant_name">Tenant name</label><input id="tenant_name" name="{NAME}" type="text" value="{name}" required>
 <div class="actions"><button type="submit" name="{field}" value="{rename}">Rename</button></div></form>
-<h2>Verified domains</h2>
-<table><tr><th>Domain</th><th></th></tr>{domain_rows}</table>{add_domain}
+<h2>Domain</h2>{domain_table}{change_domain}
 <h2>Availability</h2>{availability}"#,
         url = e(&url),
         name = e(&t.name),
@@ -358,10 +377,12 @@ async fn apply(st: &AppState, op: TenantOp, form: &Params) -> anyhow::Result<(St
             tenant::set_enabled(&st.pool, &target.id, enabled).await?;
             Ok((target.id, json!({ "enabled": enabled })))
         }
-        TenantOp::DomainAdd => {
-            let domain = field(form, DOMAIN);
-            tenant::add_domain(&st.pool, &target.id, domain).await?;
-            Ok((target.id, json!({ "domain": crate::routes::audit::clip(domain) })))
+        TenantOp::DomainChange => {
+            let change = tenant::change_domain(&st.pool, &target.id, field(form, DOMAIN)).await?;
+            Ok((
+                target.id,
+                json!({ "from": change.from, "to": change.to, "renamed": change.renamed }),
+            ))
         }
         TenantOp::DomainRemove => {
             let domain = field(form, DOMAIN);

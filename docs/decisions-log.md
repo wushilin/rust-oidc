@@ -991,6 +991,30 @@ no web fonts; a monospace stack for identifiers, which are machine strings. Tabl
 are sentence case. Left-aligned under the tabs rather than a centred column. Checked with
 screenshots in light, dark and at phone width.
 
+**130. A new user is named by the part before the @ and a picked domain.** The tenant's
+verified domains are offered beside the box. Typing a whole name works too, and then the
+picker hides itself: the box carries a pattern a name with an @ does not match, and the
+stylesheet hides the picker beside a non-matching box. No script. The form is `novalidate`
+so that pattern never blocks a submit; everything is checked again on the server, where a
+domain this tenant has not verified is refused whichever way it arrived.
+
+**131. A new user's email starts out as their user name.** Email is a contact address and
+is not required; left empty at creation it is set to the user name, and the form says it is
+not the sign-in name. Clearing it later on the edit page leaves it empty.
+
+**132. Find by id, limited to what the reader could open anyway.** A box in the header
+says what an id is: user, group, application (object id or client id), service principal,
+app role, scope or tenant. An object is reported only if its tenant is one the
+administrator's roles read with the action that kind needs; anything else gets the same
+answer as an id that does not exist, so the search is not a way round the tenant boundary.
+
+**133. The audit log shows names, under the same limit.** Actor and target are shown by
+name, linking to the find page, with the id as the tooltip. An actor from a tenant the
+reader cannot read, such as a platform administrator acting in theirs, stays an id.
+
+**134. The tenant ticks on the platform role form show only when they apply**, and
+**assuming a tenant goes into it** rather than back to the list.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

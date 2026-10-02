@@ -55,6 +55,7 @@ header.top { background:var(--band); border-bottom:1px solid var(--line); }
 .tenant strong { font-weight:650; }
 .tenant.none { background:transparent; border-style:dashed; border-color:var(--line); color:var(--muted); }
 .ctx button { padding:3px 10px; font-size:13px; }
+form.find input { width:210px; padding:3px 10px; font-size:13px; background:var(--surface); }
 nav.tabs { display:flex; gap:2px; align-items:flex-end; padding:0 24px; overflow-x:auto; }
 nav.tabs a { flex:none; padding:8px 14px; margin-bottom:-1px; font-size:14px; color:var(--muted); text-decoration:none; white-space:nowrap; border:1px solid transparent; border-bottom:none; border-radius:5px 5px 0 0; }
 nav.tabs a:hover { color:var(--ink); background:var(--hover); }
@@ -99,6 +100,20 @@ button.link { background:none; border:none; padding:0; color:var(--accent); font
 .actions { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-top:18px; }
 input + p.muted, select + p.muted, textarea + p.muted, label + p.muted { margin:5px 0 0; font-size:13px; }
 form > p.muted:last-child { margin-bottom:0; }
+/* A choice whose second option has detail: the detail shows only while that
+   option is chosen. No script; a browser without :has() just shows it always. */
+fieldset.choice { border:none; margin:14px 0 0; padding:0; }
+fieldset.choice legend { padding:0; font-size:13px; font-weight:600; margin-bottom:2px; }
+.when-some { margin:6px 0 0 24px; padding:2px 0 6px 14px; border-left:2px solid var(--line); }
+fieldset.choice:not(:has(input.some:checked)) .when-some { display:none; }
+/* User name: the part before the @, then the tenant's domain. A full name typed
+   in makes the input match no longer (its pattern excludes @), which is what
+   hides the domain beside it. */
+.upn { display:flex; flex-wrap:wrap; gap:8px; align-items:center; max-width:640px; }
+.upn input { flex:1 1 220px; max-width:none; }
+.upn .suffix { display:inline-flex; gap:8px; align-items:center; color:var(--muted); }
+.upn .suffix select { width:auto; max-width:260px; }
+.upn input:invalid ~ .suffix { display:none; }
 /* Short fields side by side, each under its own label. */
 .fields { display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:0 18px; max-width:980px; }
 .fields input, .fields select { max-width:none; }
@@ -234,7 +249,9 @@ pub fn page(c: &Chrome<'_>, status: StatusCode, title: &str, body: &str) -> Resp
     };
     let body = format!(
         r#"<header class="top"><div class="bar"><a class="brand" href="{base}/admin">{PRODUCT}</a>
-<div class="ctx">{tenant}<span>{upn}</span>
+<div class="ctx"><form class="find" method="get" action="{base}/admin/find" role="search">
+<input name="id" type="search" placeholder="Find by id" aria-label="Find an object by its id"></form>
+{tenant}<span>{upn}</span>
 <form method="post" action="{base}/admin/signout" class="inline">{csrf}<button class="secondary" type="submit">Sign out</button></form></div></div>
 <nav class="tabs" aria-label="Sections">{up}{tabs}</nav></header>
 <main>{body}</main>"#,

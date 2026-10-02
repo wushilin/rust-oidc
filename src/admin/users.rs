@@ -173,10 +173,25 @@ pub async fn new_page(ctx: AdminContext, State(st): State<AppState>, Path(key): 
     let Some(tenant) = ctx.tenant(&key) else {
         return view::not_found();
     };
-    new_user_page(&st, &ctx, tenant, &Params::new(), None, StatusCode::OK)
+    new_user_page(&st, &ctx, tenant, &Params::new(), None, StatusCode::OK).await
 }
 
-fn new_user_page(
+/// Form field for the domain picked beside the user name.
+const UPN_DOMAIN: &str = "upn_domain";
+
+/// The sign-in name a new-user form asks for: what was typed, completed with the
+/// domain picked beside it when it has no `@` of its own. Nothing is trusted
+/// here; `users::create` checks the result against the tenant's verified domains.
+fn submitted_upn(form: &Params) -> String {
+    let typed = field(form, "upn").trim();
+    if typed.is_empty() || typed.contains('@') {
+        typed.to_string()
+    } else {
+        format!("{typed}@{}", field(form, UPN_DOMAIN).trim())
+    }
+}
+
+async fn new_user_page(
     st: &AppState,
     ctx: &AdminContext,
     tenant: &Tenant,
@@ -187,17 +202,40 @@ fn new_user_page(
     let error = error
         .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
         .unwrap_or_default();
+    let domains = crate::tenant::domains(&st.pool, &tenant.id).await.unwrap_or_default();
+    let chosen = field(form, UPN_DOMAIN);
+    let options: String = domains
+        .iter()
+        .map(|d| {
+            format!(
+                r#"<option value="{d}"{sel}>{d}</option>"#,
+                d = e(d),
+                sel = if d == chosen { " selected" } else { "" },
+            )
+        })
+        .collect();
+    // `novalidate`: the user-name box carries a pattern that a full name (one with
+    // an @) does not match, purely so the stylesheet can hide the domain beside
+    // it. The browser must not refuse to submit on that account. Everything is
+    // checked again here, with a message that says what is wrong.
     let body = format!(
-        r#"<h1>New user</h1><p class="sub">in {tenant_name}. The user name's domain must be one this tenant has verified.</p>
-<form method="post" action="{url}/new">{csrf}
-<label for="upn">User name</label><input id="upn" name="upn" type="email" required value="{upn}" autofocus>
-<label for="password">Initial password</label><input id="password" name="password" type="password" required>
+        r#"<h1>New user</h1><p class="sub">An account that can sign in to this tenant.</p>
+<form method="post" action="{url}/new" novalidate>{csrf}
+<label for="upn">User name</label>
+<div class="upn"><input id="upn" name="upn" type="text" pattern="[^@]*" value="{upn}" autocomplete="off" autocapitalize="none" spellcheck="false" autofocus>
+<span class="suffix">@ <select name="{UPN_DOMAIN}" aria-label="Domain">{options}</select></span></div>
+<p class="muted">What the person signs in with. Type the part before the @ and pick the domain, or type
+the whole name. It must end in one of this tenant's verified domains.</p>
+<label for="password">Initial password</label><input id="password" name="password" type="password" autocomplete="new-password">
 <label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}">
-<label for="given_name">Given name</label><input id="given_name" name="given_name" type="text" value="{given}">
-<label for="family_name">Family name</label><input id="family_name" name="family_name" type="text" value="{family}">
-<label for="email">Email</label><input id="email" name="email" type="email" value="{email}">
-{error}<div class="actions"><button type="submit">Create</button><a href="{url}">Cancel</a></div></form>"#,
-        tenant_name = e(&tenant.name),
+<div class="fields">
+<div><label for="given_name">Given name</label><input id="given_name" name="given_name" type="text" value="{given}"></div>
+<div><label for="family_name">Family name</label><input id="family_name" name="family_name" type="text" value="{family}"></div>
+</div>
+<label for="email">Email address</label><input id="email" name="email" type="text" value="{email}">
+<p class="muted">A contact address, <strong>not the sign-in name</strong>: it can be anything, and changing it
+later does not change how the person signs in. Left empty, it is set to the user name.</p>
+{error}<div class="actions"><button type="submit">Create user</button><a href="{url}">Cancel</a></div></form>"#,
         url = e(&users_url(st.public_url.base(), tenant)),
         csrf = view::csrf_input(&ctx.csrf),
         upn = e(field(form, "upn")),
@@ -230,7 +268,11 @@ pub async fn create_user(
     let Some(tenant) = ctx.tenant(&key) else {
         return view::not_found();
     };
-    let upn = field(&form, "upn");
+    let upn = submitted_upn(&form);
+    let upn = upn.as_str();
+    // An email address is a contact detail and is not required. Left empty it
+    // starts out as the user name, which is the usual case and can be changed.
+    let email = optional(&form, "email").or(Some(upn)).filter(|v| !v.is_empty());
     // `users::create` validates the UPN against the tenant's verified domains and
     // the password's length; its message names the problem.
     let created = users::create(
@@ -242,7 +284,7 @@ pub async fn create_user(
             display_name: optional(&form, "display_name"),
             given_name: optional(&form, "given_name"),
             family_name: optional(&form, "family_name"),
-            email: optional(&form, "email"),
+            email,
         },
     )
     .await;
@@ -259,14 +301,17 @@ pub async fn create_user(
             .await;
             view::see_other(&format!("{}/{user_id}", users_url(st.public_url.base(), tenant)))
         }
-        Err(err) => new_user_page(
-            &st,
-            &ctx,
-            tenant,
-            &form,
-            Some(&err.to_string()),
-            StatusCode::BAD_REQUEST,
-        ),
+        Err(err) => {
+            new_user_page(
+                &st,
+                &ctx,
+                tenant,
+                &form,
+                Some(&err.to_string()),
+                StatusCode::BAD_REQUEST,
+            )
+            .await
+        }
     }
 }
 
@@ -316,7 +361,8 @@ async fn detail(
 <label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}"{disabled}>
 <label for="given_name">Given name</label><input id="given_name" name="given_name" type="text" value="{given}"{disabled}>
 <label for="family_name">Family name</label><input id="family_name" name="family_name" type="text" value="{family}"{disabled}>
-<label for="email">Email</label><input id="email" name="email" type="email" value="{email}"{disabled}>
+<label for="email">Email address</label><input id="email" name="email" type="text" value="{email}"{disabled}>
+<p class="muted">A contact address, not the sign-in name.</p>
 <label><input type="checkbox" name="email_verified"{verified}{disabled}> Email verified</label>
 {save}</form>"#,
         url = e(&url),

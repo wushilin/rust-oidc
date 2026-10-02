@@ -58,6 +58,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/admin", get(index))
         .route("/admin/home", get(home))
+        .route("/admin/find", get(crate::admin::find::page))
         .route("/admin/signin", post(signin))
         .route("/admin/signout", post(signout))
         // Platform pages. No `{tenant}` segment: a platform-scope grant covers
@@ -124,6 +125,8 @@ pub enum PlatformTab {
     Tenants,
     Keys,
     Roles,
+    /// The find-by-id page: at the platform level, but not one of its tabs.
+    Find,
 }
 
 /// A tab inside a tenant.
@@ -513,7 +516,11 @@ async fn assume(ctx: AdminContext, State(st): State<AppState>, Path(key): Path<S
         json!({ "tenant": target.name }),
     )
     .await;
-    view::see_other(&format!("{}/admin/tenants", st.public_url.base()))
+    // Assuming a tenant is going into it: land on its first section rather than
+    // back on the list with one more click to make.
+    let base = st.public_url.base();
+    let into = tenant_home(base, &ctx, target).unwrap_or_else(|| format!("{base}/admin/tenants"));
+    view::see_other(&into)
 }
 
 async fn leave(ctx: AdminContext, State(st): State<AppState>, body: Bytes) -> Response {

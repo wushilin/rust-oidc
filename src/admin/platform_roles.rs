@@ -109,12 +109,11 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
 <label for="account">Account</label><input id="account" name="{ACCOUNT}" type="email" required>
 <p class="muted">The account's sign-in name, such as <code>ana@contoso.com</code>. Its tenant is found from the part after the @.</p>
 <label for="role">Role</label><select id="role" name="{ROLE}">{roles}</select>
-<label for="scope">Where it applies</label><select id="scope" name="{SCOPE}">
-<option value="{all}">Every tenant, including ones added later</option>
-<option value="{some}">Only the tenants ticked below</option></select>
-<h3>Tenants</h3>{boxes}
-<p class="muted">The ticks are used only with "Only the tenants ticked below". To grant a role to a
-group, use the Roles tab inside the group's tenant.</p>
+<fieldset class="choice"><legend>Where it applies</legend>
+<label><input type="radio" name="{SCOPE}" value="{all}" checked> Every tenant, including ones added later</label>
+<label><input type="radio" name="{SCOPE}" value="{some}" class="some"> Only these tenants</label>
+<div class="when-some">{boxes}</div></fieldset>
+<p class="muted">To grant a role to a group, use the Roles tab inside the group's tenant.</p>
 <div class="actions"><button type="submit" name="{field}" value="{op}">Grant role</button></div></form>"#,
                 url = e(&url),
                 all = e(ScopeKind::All.as_str()),

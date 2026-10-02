@@ -72,7 +72,10 @@ pub fn router() -> Router<AppState> {
         .route("/admin/assume/{tenant}", post(assume))
         .route("/admin/leave", post(leave))
         // One tenant's sections.
-        .route("/admin/tenants/{tenant}/users", get(user_pages::list_page))
+        .route(
+            "/admin/tenants/{tenant}/users",
+            get(user_pages::list_page).post(user_pages::list_post),
+        )
         .route(
             "/admin/tenants/{tenant}/users/new",
             get(user_pages::new_page).post(user_pages::create_user),

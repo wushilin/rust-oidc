@@ -1106,6 +1106,17 @@ per role, in their own section of the page; granting one role the old way (CLI) 
 assigns. `0013_app_assignments` assigns everyone who already held a role; not run on
 Postgres or MySQL.
 
+**147. User and group operations work on many rows at once** (user's request). The
+users list, the groups list and a group's members each have a tick box per row and one
+in the heading meaning "every row listed", with buttons underneath: enable, disable,
+delete, add to a group; delete groups; remove members. A group takes several user names
+at once, and a user's groups are tick boxes saved together. No script: the boxes join a
+form by the `form` attribute, and the heading box is a field the server reads. Mine:
+each row goes through the same storage function, rules and audit entry as a single
+change, so some may be refused while others succeed and the page says which and why;
+bulk deletes need a "confirm" tick; "all" on the users list means the rows the current
+search listed.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

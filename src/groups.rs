@@ -144,6 +144,87 @@ pub async fn add_member_by_id(pool: &DbPool, tenant_id: &str, group_id: &str, up
     insert_member(pool, &group.id, &user_id).await
 }
 
+/// Add a member named by object id, as a list of ticked rows does. The group and
+/// the account are each looked up inside `tenant_id`.
+pub async fn add_member_id(pool: &DbPool, tenant_id: &str, group_id: &str, user_id: &str) -> anyhow::Result<()> {
+    let group = find_by_id(pool, tenant_id, group_id)
+        .await?
+        .with_context(|| format!("group '{group_id}' not found"))?;
+    let live: Option<(String,)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
+    ))
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    if live.is_none() {
+        bail!("no such account in this tenant");
+    }
+    insert_member(pool, &group.id, user_id).await
+}
+
+/// What [`set_for_user`] changed: the groups joined and the groups left.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MembershipChange {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// Make a user a member of exactly `group_ids` among this tenant's groups, in
+/// one transaction. Ids that are not groups of the tenant are ignored.
+pub async fn set_for_user(
+    pool: &DbPool,
+    tenant_id: &str,
+    user_id: &str,
+    group_ids: &[String],
+) -> anyhow::Result<MembershipChange> {
+    let all = list(pool, tenant_id).await?;
+    let held: Vec<String> = for_user(pool, user_id).await?.into_iter().map(|g| g.id).collect();
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    let live: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT id FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
+    ))
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        bail!("no such account in this tenant");
+    }
+    let admins = lockout::global_administrators(&mut tx, engine).await?;
+    let mut change = MembershipChange::default();
+    for group in &all {
+        let (wanted, has) = (group_ids.contains(&group.id), held.contains(&group.id));
+        if wanted && !has {
+            sqlx::query(crate::db::sql_stmt(
+                engine,
+                "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+            ))
+            .bind(&group.id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            change.added.push(group.id.clone());
+        } else if has && !wanted {
+            sqlx::query(crate::db::sql_stmt(
+                engine,
+                "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",
+            ))
+            .bind(&group.id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            change.removed.push(group.id.clone());
+        }
+    }
+    lockout::ensure_one_remains(&mut tx, engine, admins).await?;
+    tx.commit().await?;
+    Ok(change)
+}
+
 /// Remove a member. `false` when they were not one, so the caller can say so.
 pub async fn remove_member(pool: &DbPool, tenant_id: &str, group_id: &str, user_id: &str) -> anyhow::Result<bool> {
     // The tenant check first, as its own statement: MySQL refuses to delete from

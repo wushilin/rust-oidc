@@ -106,6 +106,18 @@ fieldset.choice { border:none; margin:14px 0 0; padding:0; }
 fieldset.choice legend { padding:0; font-size:13px; font-weight:600; margin-bottom:2px; }
 .when-some { margin:6px 0 0 24px; padding:2px 0 6px 14px; border-left:2px solid var(--line); }
 fieldset.choice:not(:has(input.some:checked)) .when-some { display:none; }
+/* Acting on many rows: a tick box per row, one in the heading for all. Ticking
+   the heading box marks every row, since without script it cannot tick them. */
+th.tick, td.tick { width:1%; padding-right:0; }
+table:has(input.all:checked) td { background:var(--hover); }
+table:has(input.all:checked) input.row { visibility:hidden; }
+.bulk { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; margin:0 0 14px; font-size:13px; color:var(--muted); }
+.bulk button { padding:5px 11px; font-size:13px; }
+.bulk select { width:auto; max-width:220px; padding:4px 8px; }
+.bulk .sep { width:1px; align-self:stretch; background:var(--line); }
+.bulk label.confirm, .bulk label.inline { display:inline-flex; gap:5px; align-items:center; margin:0; font-weight:400; font-size:13px; color:var(--muted); }
+fieldset.ticks { border:none; margin:0; padding:0; display:flex; flex-wrap:wrap; gap:4px 18px; }
+fieldset.ticks label { font-weight:400; margin:0; }
 details.inline-edit { display:inline-block; vertical-align:top; margin-left:6px; }
 details.inline-edit summary { cursor:pointer; color:var(--accent); font-size:13px; }
 details.inline-edit form { margin-top:6px; }

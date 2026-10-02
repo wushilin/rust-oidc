@@ -14,10 +14,11 @@ use axum::response::Response;
 use serde_json::json;
 
 use crate::AppState;
+use crate::admin::bulk;
 use crate::admin::context::{AdminContext, On};
 use crate::admin::routes::{At, Params, TenantTab, audited, checked, chrome, field, optional, parse_form};
 use crate::admin::view::{self, e};
-use crate::admin::{GROUP_READ, USER_READ, USER_RESET, USER_WRITE};
+use crate::admin::{GROUP_READ, GROUP_WRITE, USER_READ, USER_RESET, USER_WRITE};
 use crate::db::Event;
 use crate::tenant::Tenant;
 use crate::users::{self, User, UserAttributes};
@@ -32,10 +33,19 @@ pub enum UserOp {
     Disable,
     Reset,
     Delete,
+    /// Set which of the tenant's groups the account is in.
+    Groups,
 }
 
 impl UserOp {
-    pub const ALL: &'static [UserOp] = &[Self::Attributes, Self::Enable, Self::Disable, Self::Reset, Self::Delete];
+    pub const ALL: &'static [UserOp] = &[
+        Self::Attributes,
+        Self::Enable,
+        Self::Disable,
+        Self::Reset,
+        Self::Delete,
+        Self::Groups,
+    ];
 
     /// The form's `op` field.
     pub const FIELD: &'static str = "op";
@@ -47,6 +57,7 @@ impl UserOp {
             Self::Disable => "disable",
             Self::Reset => "reset",
             Self::Delete => "delete",
+            Self::Groups => "groups",
         }
     }
 
@@ -60,6 +71,8 @@ impl UserOp {
         match self {
             Self::Reset => USER_RESET,
             Self::Attributes | Self::Enable | Self::Disable | Self::Delete => USER_WRITE,
+            // Who is in a group is the group's to change.
+            Self::Groups => GROUP_WRITE,
         }
     }
 
@@ -70,6 +83,8 @@ impl UserOp {
             Self::Disable => Event::AdminUserDisable,
             Self::Reset => Event::AdminUserReset,
             Self::Delete => Event::AdminUserDelete,
+            // Recorded per group joined or left, not as one entry: see `detail_post`.
+            Self::Groups => Event::AdminGroupMemberAdd,
         }
     }
 }
@@ -82,6 +97,56 @@ fn users_url(base: &str, tenant: &Tenant) -> String {
 }
 
 // ---- list ----
+
+/// What the users list can do to the rows ticked on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserListOp {
+    Enable,
+    Disable,
+    Delete,
+    AddToGroup,
+}
+
+impl UserListOp {
+    pub const ALL: &'static [UserListOp] = &[Self::Enable, Self::Disable, Self::Delete, Self::AddToGroup];
+    pub const FIELD: &'static str = "op";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enable => "enable",
+            Self::Disable => "disable",
+            Self::Delete => "delete",
+            Self::AddToGroup => "add_to_group",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|o| o.as_str() == raw)
+    }
+
+    /// Membership is the group's to change, the rest are changes to the account.
+    fn action(self) -> crate::rbac::Action {
+        match self {
+            Self::Enable | Self::Disable | Self::Delete => USER_WRITE,
+            Self::AddToGroup => GROUP_WRITE,
+        }
+    }
+
+    /// How the page reports the rows it did.
+    fn done_as(self) -> &'static str {
+        match self {
+            Self::Enable => "enabled",
+            Self::Disable => "disabled",
+            Self::Delete => "deleted",
+            Self::AddToGroup => "added to the group",
+        }
+    }
+}
+
+/// The id of the form the tick boxes and buttons of the list belong to.
+const BULK_FORM: &str = "bulk-users";
+/// The group picked for "add to group".
+const GROUP: &str = "group";
 
 pub async fn list_page(
     ctx: AdminContext,
@@ -96,15 +161,30 @@ pub async fn list_page(
         return view::not_found();
     };
     let search = query.get(QUERY_PARAM).map(String::as_str).unwrap_or_default();
-    let found = users::list(
+    list(&st, &ctx, tenant, search, None, StatusCode::OK).await
+}
+
+/// The accounts the list shows for a search: what "all" means on that page.
+async fn listed(st: &AppState, tenant: &Tenant, search: &str) -> anyhow::Result<Vec<User>> {
+    users::list(
         &st.pool,
         &tenant.id,
         Some(search).filter(|s| !s.is_empty()),
         users::LIST_LIMIT,
         0,
     )
-    .await;
-    let found = match found {
+    .await
+}
+
+async fn list(
+    st: &AppState,
+    ctx: &AdminContext,
+    tenant: &Tenant,
+    search: &str,
+    error: Option<&str>,
+    status: StatusCode,
+) -> Response {
+    let found = match listed(st, tenant, search).await {
         Ok(v) => v,
         Err(err) => {
             tracing::error!("user list failed: {err}");
@@ -112,11 +192,19 @@ pub async fn list_page(
         }
     };
     let base = st.public_url.base();
+    let may_write = ctx.can_in(USER_WRITE, tenant);
+    let may_group = ctx.can_in(GROUP_WRITE, tenant);
+    let ticks = may_write || may_group;
     let rows: String = found
         .iter()
         .map(|u| {
             format!(
-                r#"<tr><td><a href="{url}/{id}">{upn}</a></td><td>{name}</td><td>{state}</td></tr>"#,
+                r#"<tr>{tick}<td><a href="{url}/{id}">{upn}</a></td><td>{name}</td><td>{state}</td></tr>"#,
+                tick = if ticks {
+                    bulk::cell(BULK_FORM, &u.id, &u.upn)
+                } else {
+                    String::new()
+                },
                 url = e(&users_url(base, tenant)),
                 id = e(&u.id),
                 upn = e(&u.upn),
@@ -131,7 +219,7 @@ pub async fn list_page(
         .collect();
     // The create link is emitted only where the action is permitted, so the
     // console never offers what the guard would refuse.
-    let create = if ctx.can_in(USER_WRITE, tenant) {
+    let create = if may_write {
         format!(
             r#"<a class="button" href="{}/new">New user</a>"#,
             e(&users_url(base, tenant))
@@ -147,21 +235,163 @@ pub async fn list_page(
     } else {
         String::new()
     };
+    // What can be done to the ticked rows. Each button is there only with the
+    // action that permits it.
+    let actions = if ticks && !found.is_empty() {
+        let button = |op: UserListOp, class: &str, label: &str| {
+            format!(
+                r#"<button class="{class}" type="submit" form="{BULK_FORM}" name="{field}" value="{op}">{label}</button>"#,
+                field = UserListOp::FIELD,
+                op = op.as_str(),
+            )
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if may_write {
+            parts.push(format!(
+                "{}{}",
+                button(UserListOp::Enable, "secondary", "Enable sign-in"),
+                button(UserListOp::Disable, "secondary", "Disable sign-in")
+            ));
+        }
+        if may_group {
+            let groups = crate::groups::list(&st.pool, &tenant.id).await.unwrap_or_default();
+            if !groups.is_empty() {
+                let options: String = groups
+                    .iter()
+                    .map(|g| format!(r#"<option value="{}">{}</option>"#, e(&g.id), e(&g.name)))
+                    .collect();
+                parts.push(format!(
+                    r#"<select name="{GROUP}" form="{BULK_FORM}" aria-label="Group">{options}</select>{}"#,
+                    button(UserListOp::AddToGroup, "secondary", "Add to group")
+                ));
+            }
+        }
+        if may_write {
+            parts.push(format!(
+                "{}{}",
+                bulk::confirm(BULK_FORM),
+                button(UserListOp::Delete, "danger", "Delete")
+            ));
+        }
+        format!(
+            r#"<form id="{BULK_FORM}" method="post" action="{url}">{csrf}<input type="hidden" name="{QUERY_PARAM}" value="{search}"></form>
+<div class="bulk"><span>With the ticked accounts:</span>{parts}</div>"#,
+            url = e(&users_url(base, tenant)),
+            csrf = view::csrf_input(&ctx.csrf),
+            search = e(search),
+            parts = parts.join(r#"<span class="sep"></span>"#),
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        r#"<h1>Users</h1><p class="sub">The accounts that can sign in to this tenant.</p>
+        r#"<h1>Users</h1><p class="sub">The accounts that can sign in to this tenant.</p>{error}
 <div class="toolbar"><form method="get" action="{url}">
 <input id="q" name="{QUERY_PARAM}" type="search" value="{search}" placeholder="Name or user name" aria-label="Search by name or user name">
 <button class="secondary" type="submit">Search</button></form>{create}</div>
-<table><tr><th>User name</th><th>Name</th><th>State</th></tr>{rows}</table>{full}"#,
+<table><tr>{head}<th>User name</th><th>Name</th><th>State</th></tr>{rows}</table>{actions}{full}"#,
+        error = view::error_block(error),
         url = e(&users_url(base, tenant)),
         search = e(search),
+        head = if ticks { bulk::head(BULK_FORM) } else { String::new() },
     );
     view::page(
-        &chrome(&st, &ctx, At::Tenant(tenant, TenantTab::Users)),
-        StatusCode::OK,
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Users)),
+        status,
         "Users",
         &body,
     )
+}
+
+/// Do one thing to every ticked account.
+pub async fn list_post(
+    ctx: AdminContext,
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    body: Bytes,
+) -> Response {
+    let form = parse_form(&body);
+    let Some(op) = UserListOp::parse(field(&form, UserListOp::FIELD)) else {
+        return view::bad_request("That is not an operation this page offers.");
+    };
+    if let Err(resp) = ctx.require(op.action(), On::Tenant(&key)) {
+        return resp;
+    }
+    if let Err(resp) = ctx.check_csrf(&form) {
+        return resp;
+    }
+    let Some(tenant) = ctx.tenant(&key) else {
+        return view::not_found();
+    };
+    let search = field(&form, QUERY_PARAM);
+    let found = match listed(&st, tenant, search).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!("user list failed: {err}");
+            return view::server_error();
+        }
+    };
+    let ticked = bulk::Selection::read(&body);
+    let chosen = ticked.among(&found, |u| u.id.as_str());
+    if chosen.is_empty() {
+        return list(
+            &st,
+            &ctx,
+            tenant,
+            search,
+            Some(bulk::NOTHING_TICKED),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    if op == UserListOp::Delete && !ticked.confirmed {
+        return list(
+            &st,
+            &ctx,
+            tenant,
+            search,
+            Some(bulk::NOT_CONFIRMED),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+
+    let group = field(&form, GROUP);
+    let mut tally = bulk::Tally::default();
+    for user in chosen {
+        // The same operations, rules and audit entries as on the account's own page.
+        let outcome = match op {
+            UserListOp::Enable => apply_checked(&st, &ctx, tenant, user, UserOp::Enable, &form, &[]).await,
+            UserListOp::Disable => apply_checked(&st, &ctx, tenant, user, UserOp::Disable, &form, &[]).await,
+            UserListOp::Delete => apply_checked(&st, &ctx, tenant, user, UserOp::Delete, &form, &[]).await,
+            UserListOp::AddToGroup => crate::groups::add_member_id(&st.pool, &tenant.id, group, &user.id)
+                .await
+                .map(|()| json!({ "upn": crate::routes::audit::clip(&user.upn) })),
+        };
+        match outcome {
+            Ok(details) => {
+                let (event, target) = match op {
+                    UserListOp::Enable => (Event::AdminUserEnable, user.id.as_str()),
+                    UserListOp::Disable => (Event::AdminUserDisable, user.id.as_str()),
+                    UserListOp::Delete => (Event::AdminUserDelete, user.id.as_str()),
+                    UserListOp::AddToGroup => (Event::AdminGroupMemberAdd, group),
+                };
+                audited(&st, &ctx, &tenant.id, event, Some(target), details).await;
+                tally.done += 1;
+            }
+            Err(err) => tally.refuse(&user.upn, err),
+        }
+    }
+    match tally.problem(op.done_as()) {
+        Some(problem) => list(&st, &ctx, tenant, search, Some(&problem), StatusCode::BAD_REQUEST).await,
+        None => view::see_other(&format!(
+            "{}?{}",
+            users_url(st.public_url.base(), tenant),
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair(QUERY_PARAM, search)
+                .finish()
+        )),
+    }
 }
 
 // ---- create ----
@@ -427,21 +657,44 @@ disabled or deleted from here. Another administrator can.</p>"#
     };
 
     let groups = if ctx.can_in(GROUP_READ, tenant) {
-        let names = crate::groups::names_for_user(&st.pool, &user.id)
-            .await
-            .unwrap_or_default();
-        let pills = if names.is_empty() {
-            r#"<span class="muted">None</span>"#.to_string()
-        } else {
-            names
+        let held = crate::groups::for_user(&st.pool, &user.id).await.unwrap_or_default();
+        let all = crate::groups::list(&st.pool, &tenant.id).await.unwrap_or_default();
+        if ctx.can_in(GROUP_WRITE, tenant) && !all.is_empty() {
+            // Every group of the tenant, the ones they are in ticked: membership is
+            // set in one go rather than group by group.
+            let boxes: String = all
                 .iter()
-                .map(|n| format!(r#"<span class="pill">{}</span>"#, e(n)))
-                .collect()
-        };
-        format!(
-            r#"<h2>Groups</h2><p>{pills}</p>
-<p class="muted">Membership is edited on the group's own page, under Groups.</p>"#
-        )
+                .map(|g| {
+                    format!(
+                        r#"<label><input type="checkbox" name="{GROUP}" value="{id}"{on}> {name}</label>"#,
+                        id = e(&g.id),
+                        name = e(&g.name),
+                        on = if held.iter().any(|h| h.id == g.id) {
+                            " checked"
+                        } else {
+                            ""
+                        },
+                    )
+                })
+                .collect();
+            format!(
+                r#"<h2>Groups</h2><form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+<fieldset class="ticks">{boxes}</fieldset>
+<div class="actions"><button type="submit">Save groups</button></div></form>"#,
+                url = e(&url),
+                op_field = UserOp::FIELD,
+                op = UserOp::Groups.as_str(),
+            )
+        } else {
+            let pills = if held.is_empty() {
+                r#"<span class="muted">None</span>"#.to_string()
+            } else {
+                held.iter()
+                    .map(|g| format!(r#"<span class="pill">{}</span>"#, e(&g.name)))
+                    .collect()
+            };
+            format!(r#"<h2>Groups</h2><p>{pills}</p>"#)
+        }
     } else {
         String::new()
     };
@@ -504,18 +757,35 @@ pub async fn detail_post(
         }
     };
 
-    // Nobody deletes or disables the account they are signed in with: it ends
-    // their own session mid-click, and it is how the last administrator goes.
-    let outcome = if user.id == ctx.user.id && matches!(op, UserOp::Delete | UserOp::Disable) {
-        Err(anyhow::anyhow!(
-            "This is the account you are signed in with. Another administrator can disable or delete it."
-        ))
-    } else {
-        apply(&st, tenant, &user, op, &form).await
-    };
+    // The group tick boxes repeat one field name, so they are read from the body.
+    let ticked: Vec<String> = url::form_urlencoded::parse(&body)
+        .filter(|(k, _)| k == GROUP)
+        .map(|(_, v)| v.into_owned())
+        .collect();
+    let outcome = apply_checked(&st, &ctx, tenant, &user, op, &form, &ticked).await;
     match outcome {
         Ok(details) => {
-            audited(&st, &ctx, &tenant.id, op.event(), Some(&user.id), details).await;
+            if op == UserOp::Groups {
+                // One entry per group, on the group, exactly as its own page records.
+                for (key, event) in [
+                    ("added", Event::AdminGroupMemberAdd),
+                    ("removed", Event::AdminGroupMemberRemove),
+                ] {
+                    for group in details[key].as_array().into_iter().flatten() {
+                        audited(
+                            &st,
+                            &ctx,
+                            &tenant.id,
+                            event,
+                            group.as_str(),
+                            json!({ "userId": user.id }),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                audited(&st, &ctx, &tenant.id, op.event(), Some(&user.id), details).await;
+            }
             let base = st.public_url.base();
             // A deleted user has no page to go back to.
             if op == UserOp::Delete {
@@ -538,6 +808,24 @@ pub async fn detail_post(
     }
 }
 
+/// [`apply`], after the one rule that is about who is asking: nobody deletes or
+/// disables the account they are signed in with. It ends their own session
+/// mid-click, and it is how the last administrator goes.
+async fn apply_checked(
+    st: &AppState,
+    ctx: &AdminContext,
+    tenant: &Tenant,
+    user: &User,
+    op: UserOp,
+    form: &Params,
+    groups: &[String],
+) -> anyhow::Result<serde_json::Value> {
+    if user.id == ctx.user.id && matches!(op, UserOp::Delete | UserOp::Disable) {
+        anyhow::bail!("This is the account you are signed in with. Another administrator can disable or delete it.");
+    }
+    apply(st, tenant, user, op, form, groups).await
+}
+
 /// Carry out one operation, returning what to record about it.
 async fn apply(
     st: &AppState,
@@ -545,6 +833,7 @@ async fn apply(
     user: &User,
     op: UserOp,
     form: &Params,
+    groups: &[String],
 ) -> anyhow::Result<serde_json::Value> {
     match op {
         UserOp::Attributes => {
@@ -572,6 +861,10 @@ async fn apply(
         UserOp::Delete => {
             users::soft_delete(&st.pool, &tenant.id, &user.id).await?;
             Ok(json!({ "upn": crate::routes::audit::clip(&user.upn) }))
+        }
+        UserOp::Groups => {
+            let change = crate::groups::set_for_user(&st.pool, &tenant.id, &user.id, groups).await?;
+            Ok(json!({ "added": change.added, "removed": change.removed }))
         }
     }
 }

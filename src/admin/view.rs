@@ -106,6 +106,9 @@ fieldset.choice { border:none; margin:14px 0 0; padding:0; }
 fieldset.choice legend { padding:0; font-size:13px; font-weight:600; margin-bottom:2px; }
 .when-some { margin:6px 0 0 24px; padding:2px 0 6px 14px; border-left:2px solid var(--line); }
 fieldset.choice:not(:has(input.some:checked)) .when-some { display:none; }
+details.inline-edit { display:inline-block; vertical-align:top; margin-left:6px; }
+details.inline-edit summary { cursor:pointer; color:var(--accent); font-size:13px; }
+details.inline-edit form { margin-top:6px; }
 dl.roles { margin:8px 0 0; font-size:13px; display:grid; grid-template-columns:max-content 1fr; gap:3px 14px; }
 dl.roles dt { font-weight:600; }
 dl.roles dd { margin:0; color:var(--muted); }

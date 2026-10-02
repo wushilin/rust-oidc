@@ -51,6 +51,10 @@ pub enum AppOp {
     IdentifierUriRemove,
     ScopeAdd,
     RoleAdd,
+    /// Assign a user or group, with the roles ticked; also how their roles change.
+    Assign,
+    Unassign,
+    /// Grant one role to a client application (an application permission).
     RoleAssign,
     RoleUnassign,
 }
@@ -68,6 +72,8 @@ impl AppOp {
         Self::IdentifierUriRemove,
         Self::ScopeAdd,
         Self::RoleAdd,
+        Self::Assign,
+        Self::Unassign,
         Self::RoleAssign,
         Self::RoleUnassign,
     ];
@@ -88,6 +94,8 @@ impl AppOp {
             Self::IdentifierUriRemove => "identifier_uri_remove",
             Self::ScopeAdd => "scope_add",
             Self::RoleAdd => "role_add",
+            Self::Assign => "assign",
+            Self::Unassign => "unassign",
             Self::RoleAssign => "role_assign",
             Self::RoleUnassign => "role_unassign",
         }
@@ -104,7 +112,7 @@ impl AppOp {
             // application without being able to mint a credential for it.
             Self::SecretAdd | Self::SecretRemove | Self::CertificateAdd | Self::CertificateRemove => APP_ROTATE,
             // Who holds a role is an assignment, not the registration.
-            Self::RoleAssign | Self::RoleUnassign => ASSIGNMENT_WRITE,
+            Self::Assign | Self::Unassign | Self::RoleAssign | Self::RoleUnassign => ASSIGNMENT_WRITE,
             Self::Flags
             | Self::RedirectUriAdd
             | Self::RedirectUriRemove
@@ -128,6 +136,8 @@ impl AppOp {
             Self::IdentifierUriRemove => Event::AdminAppIdentifierUriRemove,
             Self::ScopeAdd => Event::AdminAppScopeAdd,
             Self::RoleAdd => Event::AdminAppRoleAdd,
+            Self::Assign => Event::AdminAppAssign,
+            Self::Unassign => Event::AdminAppUnassign,
             Self::RoleAssign => Event::AdminAppRoleAssign,
             Self::RoleUnassign => Event::AdminAppRoleUnassign,
         }
@@ -371,10 +381,15 @@ flow needs before it runs anything.</p>"#,
     let scopes_html = scope_section(&url, &csrf, &scopes, may_write);
     let roles_html = role_section(&url, &csrf, &roles, may_write);
     let assignments = if may_read_assignments {
-        let listed = apps::role_assignments(&st.pool, &tenant.id, app)
+        let assigned = apps::assignments(&st.pool, &tenant.id, app).await.unwrap_or_default();
+        let granted = apps::role_assignments(&st.pool, &tenant.id, app)
             .await
             .unwrap_or_default();
-        assignment_section(&url, &csrf, &listed, &roles, tenant, may_assign)
+        format!(
+            "{}{}",
+            assignment_section(&url, &csrf, &assigned, &roles, tenant, may_assign),
+            application_roles_section(&url, &csrf, &granted, &roles, may_assign)
+        )
     } else {
         String::new()
     };
@@ -771,41 +786,80 @@ fn role_section(url: &str, csrf: &str, roles: &[apps::AppRole], may_write: bool)
     )
 }
 
+/// One tick box per role a user or group may hold, the held ones ticked.
+fn role_boxes(roles: &[&apps::AppRole], held: &[String]) -> String {
+    roles
+        .iter()
+        .map(|r| {
+            format!(
+                r#"<label><input type="checkbox" name="{ROLE}" value="{v}"{on}> {v}</label>"#,
+                v = e(&r.value),
+                on = if held.contains(&r.value) { " checked" } else { "" },
+            )
+        })
+        .collect()
+}
+
+/// Who is assigned to the application, and the roles each was given. A user or
+/// group is assigned first; roles are optional and are ticked, not assigned one
+/// at a time.
 fn assignment_section(
     url: &str,
     csrf: &str,
-    assignments: &[apps::StoredAssignment],
+    assignments: &[apps::Assignment],
     roles: &[apps::AppRole],
     tenant: &Tenant,
     may_assign: bool,
 ) -> String {
+    let user_roles: Vec<&apps::AppRole> = roles
+        .iter()
+        .filter(|r| r.enabled && r.allows(MemberType::User))
+        .collect();
     let rows: String = assignments
         .iter()
         .map(|a| {
+            let held = if a.roles.is_empty() {
+                r#"<span class="muted">no role</span>"#.to_string()
+            } else {
+                a.roles
+                    .iter()
+                    .map(|r| format!(r#"<span class="pill">{}</span> "#, e(r)))
+                    .collect()
+            };
+            // Changing roles is assigning again with a different set ticked.
+            let change = if may_assign && !user_roles.is_empty() {
+                format!(
+                    r#"<details class="inline-edit"><summary>Change roles</summary>
+<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+<input type="hidden" name="{PRINCIPAL_TYPE}" value="{kind}"><input type="hidden" name="{PRINCIPAL}" value="{who}">
+<fieldset class="choice">{boxes}</fieldset>
+<div class="actions"><button type="submit">Save roles</button></div></form></details>"#,
+                    url = e(url),
+                    op_field = AppOp::FIELD,
+                    op = AppOp::Assign.as_str(),
+                    kind = e(a.principal_type.as_str()),
+                    who = e(&a.principal_name),
+                    boxes = role_boxes(&user_roles, &a.roles),
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "<tr><td>{role}</td><td>{kind}</td><td>{who}</td><td>{remove}</td></tr>",
-                role = e(&a.role_value),
-                kind = e(a.principal_type.as_str()),
+                "<tr><td>{who}</td><td>{kind}</td><td>{held}{change}</td><td>{remove}</td></tr>",
                 who = e(&a.principal_name),
+                kind = e(a.principal_type.as_str()),
                 remove = if may_assign {
-                    remove_button(url, csrf, AppOp::RoleUnassign, ASSIGNMENT, &a.id, "Withdraw")
+                    remove_button(url, csrf, AppOp::Unassign, ASSIGNMENT, &a.id, "Remove")
                 } else {
                     String::new()
                 },
             )
         })
         .collect();
-    // Nothing can be assigned until a role exists, and an empty `<select>` would
-    // be a form that cannot succeed.
-    let add = if may_assign && !roles.is_empty() {
-        let role_options: String = roles
-            .iter()
-            .map(|r| format!(r#"<option value="{v}">{v}</option>"#, v = e(&r.value)))
-            .collect();
+    let add = if may_assign {
         let kind_options: String = [
             (PrincipalType::User, "User, by user name"),
             (PrincipalType::Group, "Group, by name"),
-            (PrincipalType::ServicePrincipal, "Application, by application id"),
         ]
         .iter()
         .map(|(t, label)| {
@@ -816,31 +870,103 @@ fn assignment_section(
             )
         })
         .collect();
+        let boxes = if user_roles.is_empty() {
+            r#"<p class="muted">This application defines no roles for users, so there is none to give.</p>"#.to_string()
+        } else {
+            format!(
+                r#"<fieldset class="choice"><legend>Roles</legend>{}</fieldset>
+<p class="muted">Optional. With none ticked they are assigned and hold no role.</p>"#,
+                role_boxes(&user_roles, &[])
+            )
+        };
         view::expander(
-            "Assign a role",
+            "Assign a user or group",
             &format!(
                 r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
-<label for="assign_role">Role</label><select id="assign_role" name="{ROLE}">{role_options}</select>
-<label for="assign_kind">Assign to</label>
+<label for="assign_kind">Assign</label>
 <select id="assign_kind" name="{PRINCIPAL_TYPE}">{kind_options}</select>
 <label for="assign_principal">Name in {tenant_name}</label>
-<input id="assign_principal" name="{PRINCIPAL}" type="text" required>
+<input id="assign_principal" name="{PRINCIPAL}" type="text" required autocapitalize="none" spellcheck="false">
+{boxes}
 <div class="actions"><button type="submit">Assign</button></div></form>"#,
                 url = e(url),
                 op_field = AppOp::FIELD,
-                op = AppOp::RoleAssign.as_str(),
+                op = AppOp::Assign.as_str(),
                 tenant_name = e(&tenant.name),
             ),
             false,
         )
-    } else if may_assign {
-        r#"<p class="muted">Define an app role first; there is nothing to assign yet.</p>"#.to_string()
     } else {
         String::new()
     };
     format!(
-        r#"<h2>Role assignments</h2><p class="sub">Who holds this application's roles.</p>
-<table><tr><th>Role</th><th>Type</th><th>Principal</th><th></th></tr>{rows}</table>{add}"#
+        r#"<h2>Users and groups</h2><p class="sub">Who is assigned to this application, and the roles they were
+given. When assignment is required, only these people can sign in to it; a group assigns its members.</p>
+<table><tr><th>Who</th><th>Type</th><th>Roles</th><th></th></tr>{rows}</table>{add}"#
+    )
+}
+
+/// Roles granted to client applications: what they get in `roles` when they call
+/// this one with their own credentials. Not an assignment of people.
+fn application_roles_section(
+    url: &str,
+    csrf: &str,
+    granted: &[apps::StoredAssignment],
+    roles: &[apps::AppRole],
+    may_assign: bool,
+) -> String {
+    let app_roles: Vec<&apps::AppRole> = roles
+        .iter()
+        .filter(|r| r.enabled && r.allows(MemberType::Application))
+        .collect();
+    let rows: String = granted
+        .iter()
+        .filter(|a| a.principal_type == PrincipalType::ServicePrincipal)
+        .map(|a| {
+            format!(
+                "<tr><td>{who}</td><td>{role}</td><td>{remove}</td></tr>",
+                who = e(&a.principal_name),
+                role = e(&a.role_value),
+                remove = if may_assign {
+                    remove_button(url, csrf, AppOp::RoleUnassign, ASSIGNMENT, &a.id, "Withdraw")
+                } else {
+                    String::new()
+                },
+            )
+        })
+        .collect();
+    // Nothing to show and nothing that could be granted: leave the section out.
+    if rows.is_empty() && app_roles.is_empty() {
+        return String::new();
+    }
+    let add = if may_assign && !app_roles.is_empty() {
+        let role_options: String = app_roles
+            .iter()
+            .map(|r| format!(r#"<option value="{v}">{v}</option>"#, v = e(&r.value)))
+            .collect();
+        view::expander(
+            "Grant a role to an application",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+<input type="hidden" name="{PRINCIPAL_TYPE}" value="{kind}">
+<label for="grant_app">Client application id</label>
+<input id="grant_app" name="{PRINCIPAL}" type="text" required>
+<label for="grant_role">Role</label><select id="grant_role" name="{ROLE}">{role_options}</select>
+<div class="actions"><button type="submit">Grant</button></div></form>"#,
+                url = e(url),
+                op_field = AppOp::FIELD,
+                op = AppOp::RoleAssign.as_str(),
+                kind = e(PrincipalType::ServicePrincipal.as_str()),
+            ),
+            false,
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<h2>Application permissions</h2><p class="sub">Roles granted to other applications, which they receive
+when they call this one with their own credentials.</p>
+<table><tr><th>Application</th><th>Role</th><th></th></tr>{rows}</table>{add}"#
     )
 }
 
@@ -885,7 +1011,14 @@ pub async fn detail_post(
         return view::not_found();
     };
 
-    match apply(&st, tenant, &app, op, &form).await {
+    // The role tick boxes repeat one field name, which the form map keeps only
+    // one value of, so they are read from the body.
+    let ticked: Vec<String> = url::form_urlencoded::parse(&body)
+        .filter(|(k, _)| k == ROLE)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    match apply(&st, tenant, &app, op, &form, &ticked).await {
         Ok(outcome) => {
             audited(&st, &ctx, &tenant.id, op.event(), Some(&app.app_id), outcome.details).await;
             match &outcome.reveal {
@@ -916,7 +1049,14 @@ pub async fn detail_post(
 
 /// Carry out one operation. Every branch calls into [`crate::apps`]; nothing
 /// about an application is decided here.
-async fn apply(st: &AppState, tenant: &Tenant, app: &Application, op: AppOp, form: &Params) -> anyhow::Result<Outcome> {
+async fn apply(
+    st: &AppState,
+    tenant: &Tenant,
+    app: &Application,
+    op: AppOp,
+    form: &Params,
+    ticked: &[String],
+) -> anyhow::Result<Outcome> {
     match op {
         AppOp::Flags => {
             let password = checked(form, ALLOW_PASSWORD_GRANT);
@@ -1013,17 +1153,39 @@ async fn apply(st: &AppState, tenant: &Tenant, app: &Application, op: AppOp, for
                 "allowedMemberTypes": types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             })))
         }
+        AppOp::Assign => {
+            let name = field(form, PRINCIPAL);
+            let (kind, principal) = match PrincipalType::parse(field(form, PRINCIPAL_TYPE)) {
+                Some(PrincipalType::User) => (PrincipalType::User, Principal::User(name.to_string())),
+                Some(PrincipalType::Group) => (PrincipalType::Group, Principal::Group(name.to_string())),
+                _ => anyhow::bail!("choose a user or a group"),
+            };
+            // `assign` resolves the principal within this tenant and checks each
+            // role, so neither is decided here.
+            let id = apps::assign(&st.pool, tenant, app, &principal, ticked).await?;
+            Ok(Outcome::plain(json!({
+                "assignmentId": id,
+                "principalType": kind.as_str(),
+                "principal": crate::routes::audit::clip(name),
+                "roles": ticked.iter().map(|r| crate::routes::audit::clip(r)).collect::<Vec<_>>(),
+            })))
+        }
+        AppOp::Unassign => {
+            let id = field(form, ASSIGNMENT);
+            if !apps::unassign(&st.pool, &tenant.id, app, id).await? {
+                anyhow::bail!("that assignment no longer exists");
+            }
+            Ok(Outcome::plain(json!({ "assignmentId": id })))
+        }
         AppOp::RoleAssign => {
             let role = field(form, ROLE);
             let name = field(form, PRINCIPAL);
-            let Some(kind) = PrincipalType::parse(field(form, PRINCIPAL_TYPE)) else {
-                anyhow::bail!("choose a user, a group or an application");
+            // People are assigned with `Assign`; this grants a role to a client
+            // application.
+            let Some(kind @ PrincipalType::ServicePrincipal) = PrincipalType::parse(field(form, PRINCIPAL_TYPE)) else {
+                anyhow::bail!("a role is granted this way to an application only; assign users and groups above");
             };
-            let principal = match kind {
-                PrincipalType::User => Principal::User(name.to_string()),
-                PrincipalType::Group => Principal::Group(name.to_string()),
-                PrincipalType::ServicePrincipal => Principal::App(name.to_string()),
-            };
+            let principal = Principal::App(name.to_string());
             // `assign_role` resolves the principal within this tenant and checks
             // the role's allowed member types, so neither is decided here.
             apps::assign_role(&st.pool, tenant, app, role, &principal).await?;

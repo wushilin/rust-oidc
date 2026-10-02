@@ -476,28 +476,14 @@ pub enum Principal {
     Group(String),
 }
 
-/// Assign app role `role_value` of `resource` to a principal in the same tenant.
-pub async fn assign_role(
+/// A named principal of this tenant, as its id, its kind, and the kind of app
+/// role it may hold.
+async fn resolve_principal(
     pool: &DbPool,
     tenant: &Tenant,
-    resource: &Application,
-    role_value: &str,
     principal: &Principal,
-) -> anyhow::Result<()> {
-    let Some(resource_sp) = service_principal(pool, &tenant.id, &resource.app_id).await? else {
-        bail!(
-            "app '{}' has no service principal in tenant '{}'",
-            resource.app_id,
-            tenant.name
-        );
-    };
-    let role = roles(pool, resource)
-        .await?
-        .into_iter()
-        .find(|r| r.value == role_value)
-        .with_context(|| format!("app '{}' has no role '{role_value}'", resource.display_name))?;
-
-    let (principal_id, principal_type, member_type) = match principal {
+) -> anyhow::Result<(String, PrincipalType, MemberType)> {
+    Ok(match principal {
         Principal::App(app_id) => {
             let sp = service_principal(pool, &tenant.id, app_id)
                 .await?
@@ -528,12 +514,267 @@ pub async fn assign_role(
             let (id,) = row.with_context(|| format!("group '{name}' not found"))?;
             (id, PrincipalType::Group, MemberType::User)
         }
+    })
+}
+
+/// The assignment of a user or group to an application's service principal,
+/// creating it if there is none. Returns its id.
+async fn ensure_assigned(
+    conn: &mut sqlx::AnyConnection,
+    engine: crate::db::Engine,
+    tenant_id: &str,
+    resource_sp_id: &str,
+    principal_id: &str,
+    principal_type: PrincipalType,
+) -> anyhow::Result<String> {
+    let existing: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT id FROM app_assignments WHERE resource_id = ? AND principal_id = ?",
+    ))
+    .bind(resource_sp_id)
+    .bind(principal_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+    let id = new_guid();
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "INSERT INTO app_assignments (id, tenant_id, resource_id, principal_id, principal_type, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    ))
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(resource_sp_id)
+    .bind(principal_id)
+    .bind(principal_type.as_str())
+    .bind(now())
+    .execute(&mut *conn)
+    .await?;
+    Ok(id)
+}
+
+/// A user or group assigned to an application, with the app roles they were
+/// given there. No roles is an ordinary assignment: it lets them sign in to an
+/// application that requires assignment and puts nothing in `roles`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub id: String,
+    pub principal_type: PrincipalType,
+    pub principal_id: String,
+    /// UPN or group name; the id when the principal has since been removed.
+    pub principal_name: String,
+    /// Role values, sorted.
+    pub roles: Vec<String>,
+}
+
+/// Assign a user or group to `resource` with exactly `role_values`, replacing
+/// whatever roles they held there. Assigning somebody already assigned is how
+/// their roles are changed. Returns the assignment's id.
+///
+/// One transaction: the assignment and its roles change together or not at all.
+pub async fn assign(
+    pool: &DbPool,
+    tenant: &Tenant,
+    resource: &Application,
+    principal: &Principal,
+    role_values: &[String],
+) -> anyhow::Result<String> {
+    let Some(resource_sp) = service_principal(pool, &tenant.id, &resource.app_id).await? else {
+        bail!(
+            "app '{}' has no service principal in tenant '{}'",
+            resource.app_id,
+            tenant.name
+        );
     };
+    let (principal_id, principal_type, member_type) = resolve_principal(pool, tenant, principal).await?;
+    if principal_type == PrincipalType::ServicePrincipal {
+        bail!("only a user or a group is assigned to an application");
+    }
+    let defined = roles(pool, resource).await?;
+    let mut picked: Vec<&AppRole> = Vec::new();
+    for value in role_values {
+        let role = defined
+            .iter()
+            .find(|r| &r.value == value)
+            .with_context(|| format!("app '{}' has no role '{value}'", resource.display_name))?;
+        if !role.allows(member_type) {
+            bail!("app role '{value}' cannot be given to users and groups");
+        }
+        if !picked.iter().any(|r| r.id == role.id) {
+            picked.push(role);
+        }
+    }
+
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    let id = ensure_assigned(
+        &mut tx,
+        engine,
+        &tenant.id,
+        &resource_sp.id,
+        &principal_id,
+        principal_type,
+    )
+    .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM app_role_assignments WHERE resource_id = ? AND principal_id = ?",
+    ))
+    .bind(&resource_sp.id)
+    .bind(&principal_id)
+    .execute(&mut *tx)
+    .await?;
+    for role in picked {
+        sqlx::query(crate::db::sql_stmt(
+            engine,
+            "INSERT INTO app_role_assignments
+                (id, tenant_id, resource_id, app_role_id, principal_id, principal_type, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(new_guid())
+        .bind(&tenant.id)
+        .bind(&resource_sp.id)
+        .bind(&role.id)
+        .bind(&principal_id)
+        .bind(principal_type.as_str())
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Everyone assigned to `resource` in `tenant_id`, users before groups, by name.
+pub async fn assignments(pool: &DbPool, tenant_id: &str, resource: &Application) -> anyhow::Result<Vec<Assignment>> {
+    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+        return Ok(Vec::new());
+    };
+    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, principal_type, principal_id FROM app_assignments WHERE tenant_id = ? AND resource_id = ?",
+    ))
+    .bind(tenant_id)
+    .bind(&sp.id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for (id, principal_type, principal_id) in rows {
+        let Some(principal_type) = PrincipalType::parse(&principal_type) else {
+            continue;
+        };
+        let held: Vec<(String,)> = sqlx::query_as(crate::db::q(
+            pool,
+            "SELECT r.value FROM app_role_assignments a JOIN app_roles r ON r.id = a.app_role_id
+             WHERE a.resource_id = ? AND a.principal_id = ? ORDER BY r.value",
+        ))
+        .bind(&sp.id)
+        .bind(&principal_id)
+        .fetch_all(pool)
+        .await?;
+        out.push(Assignment {
+            id,
+            principal_type,
+            principal_name: principal_name(pool, principal_type, &principal_id).await,
+            principal_id,
+            roles: held.into_iter().map(|(v,)| v).collect(),
+        });
+    }
+    out.sort_by(|a, b| {
+        (
+            a.principal_type != PrincipalType::User,
+            crate::util::fold(&a.principal_name),
+        )
+            .cmp(&(
+                b.principal_type != PrincipalType::User,
+                crate::util::fold(&b.principal_name),
+            ))
+    });
+    Ok(out)
+}
+
+/// Withdraw an assignment and the roles that came with it. Scoped by tenant and
+/// by the resource, so an id alone cannot reach another tenant's row.
+pub async fn unassign(
+    pool: &DbPool,
+    tenant_id: &str,
+    resource: &Application,
+    assignment_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+        return Ok(false);
+    };
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    let found: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT principal_id FROM app_assignments WHERE id = ? AND tenant_id = ? AND resource_id = ?",
+    ))
+    .bind(assignment_id)
+    .bind(tenant_id)
+    .bind(&sp.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((principal_id,)) = found else {
+        return Ok(false);
+    };
+    for sql in [
+        "DELETE FROM app_role_assignments WHERE resource_id = ? AND principal_id = ?",
+        "DELETE FROM app_assignments WHERE resource_id = ? AND principal_id = ?",
+    ] {
+        sqlx::query(crate::db::sql_stmt(engine, sql))
+            .bind(&sp.id)
+            .bind(&principal_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Assign app role `role_value` of `resource` to a principal in the same tenant.
+pub async fn assign_role(
+    pool: &DbPool,
+    tenant: &Tenant,
+    resource: &Application,
+    role_value: &str,
+    principal: &Principal,
+) -> anyhow::Result<()> {
+    let Some(resource_sp) = service_principal(pool, &tenant.id, &resource.app_id).await? else {
+        bail!(
+            "app '{}' has no service principal in tenant '{}'",
+            resource.app_id,
+            tenant.name
+        );
+    };
+    let role = roles(pool, resource)
+        .await?
+        .into_iter()
+        .find(|r| r.value == role_value)
+        .with_context(|| format!("app '{}' has no role '{role_value}'", resource.display_name))?;
+
+    let (principal_id, principal_type, member_type) = resolve_principal(pool, tenant, principal).await?;
     if !role.allows(member_type) {
         bail!(
             "app role '{role_value}' cannot be assigned to {} principals",
             member_type.as_str()
         );
+    }
+    // A user or group that holds a role is assigned to the application: the role
+    // row never exists without the assignment it belongs to.
+    if principal_type != PrincipalType::ServicePrincipal {
+        let mut conn = pool.acquire().await?;
+        ensure_assigned(
+            &mut conn,
+            crate::db::engine_of(pool),
+            &tenant.id,
+            &resource_sp.id,
+            &principal_id,
+            principal_type,
+        )
+        .await?;
     }
     // Re-assigning is a no-op: UNIQUE (resource_id, app_role_id, principal_id).
     crate::db::inserted(
@@ -784,7 +1025,7 @@ pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &s
 pub async fn user_is_assigned(pool: &DbPool, sp_id: &str, user_id: &str) -> anyhow::Result<bool> {
     let (n,): (i64,) = sqlx::query_as(crate::db::q(
         pool,
-        "SELECT COUNT(*) FROM app_role_assignments
+        "SELECT COUNT(*) FROM app_assignments
          WHERE resource_id = ?
            AND ((principal_type = ? AND principal_id = ?)
              OR (principal_type = ? AND principal_id IN

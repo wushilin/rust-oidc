@@ -232,36 +232,38 @@ async fn an_application_is_registered_and_configured_through_the_console() {
     assert!(app.allow_id_token_implicit);
     assert!(!app.allow_access_token_implicit);
 
-    // Assigning the role to a user, then withdrawing it.
+    // Assigning a user with the role ticked, then removing the assignment.
     assert_eq!(
         b.post(
             &url,
             &[
-                ("op", "role_assign"),
-                ("role", "Invoices.Approver"),
+                ("op", "assign"),
                 ("principal_type", "User"),
                 ("principal", &f.upn),
+                ("role", "Invoices.Approver"),
             ]
         )
         .await
         .status,
         303
     );
-    let assigned = apps::role_assignments(&s.pool, &f.tenant.id, &app).await.unwrap();
+    let assigned = apps::assignments(&s.pool, &f.tenant.id, &app).await.unwrap();
     assert_eq!(assigned.len(), 1);
-    assert_eq!(assigned[0].role_value, "Invoices.Approver");
+    assert_eq!(assigned[0].roles, ["Invoices.Approver"]);
     assert_eq!(assigned[0].principal_name, f.upn);
     assert_eq!(
-        b.post(&url, &[("op", "role_unassign"), ("assignment", &assigned[0].id)])
+        b.post(&url, &[("op", "unassign"), ("assignment", &assigned[0].id)])
             .await
             .status,
         303
     );
+    assert!(apps::assignments(&s.pool, &f.tenant.id, &app).await.unwrap().is_empty());
     assert!(
         apps::role_assignments(&s.pool, &f.tenant.id, &app)
             .await
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "the role went with the assignment"
     );
 
     // Every one of those is attributable to the administrator personally.
@@ -273,8 +275,8 @@ async fn an_application_is_registered_and_configured_through_the_console() {
         "admin.app.scope.add",
         "admin.app.role.add",
         "admin.app.flags",
-        "admin.app.role.assign",
-        "admin.app.role.unassign",
+        "admin.app.assign",
+        "admin.app.unassign",
     ] {
         let rows = audit_rows(&s, action).await;
         assert!(!rows.is_empty(), "{action} was not recorded at all");

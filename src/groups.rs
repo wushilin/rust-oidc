@@ -195,6 +195,7 @@ pub async fn delete(pool: &DbPool, tenant_id: &str, group_id: &str) -> anyhow::R
             (SELECT id FROM role_bindings WHERE principal_type = ? AND principal_id = ?)",
         "DELETE FROM role_bindings WHERE principal_type = ? AND principal_id = ?",
         "DELETE FROM app_role_assignments WHERE principal_type = ? AND principal_id = ?",
+        "DELETE FROM app_assignments WHERE principal_type = ? AND principal_id = ?",
     ] {
         sqlx::query(crate::db::sql_stmt(engine, sql))
             .bind(group)

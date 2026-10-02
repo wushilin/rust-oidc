@@ -1093,6 +1093,19 @@ the way back in if it happens anyway.
 One with members is refused: there is no confirmation step in a script-free console, so
 emptying it first is the confirmation.
 
+**146. Users and groups are assigned to an application, and roles are ticked on the
+assignment** (user's design, 2 Oct). Before, a person was "assigned" only by holding at
+least one app role, so an application with no roles could have nobody assigned. Now
+`app_assignments` holds who is assigned; `app_role_assignments` holds the roles they
+were given, which may be none. `apps::assign` sets the whole role set in one
+transaction, and assigning again is how roles are changed. "Assignment required" checks
+the assignment; the `roles` claim is unchanged. Entra's own model is the same idea with
+a "Default Access" role id standing for no role; a separate table says it without a
+magic id. Mine: roles for *client applications* (application permissions) stay one row
+per role, in their own section of the page; granting one role the old way (CLI) also
+assigns. `0013_app_assignments` assigns everyone who already held a role; not run on
+Postgres or MySQL.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

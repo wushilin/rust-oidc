@@ -633,7 +633,7 @@ async fn a_tenant_admin_cannot_flow_test_another_tenants_app() {
 #[tokio::test]
 async fn the_callback_refuses_a_tenant_the_administrator_may_no_longer_read() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
     // The flow signs a user in to the *other* tenant, so it needs an account there.
     let theirs = user_fixture_in(&s, other.clone(), "carol@fabrikam.test").await;

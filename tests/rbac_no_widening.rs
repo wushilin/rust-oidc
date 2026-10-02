@@ -77,7 +77,7 @@ fn holding_nothing_grants_nothing() {
 #[tokio::test]
 async fn removing_the_last_platform_binding_is_refused() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let id = bindings::create(
         &s.pool,
         PrincipalType::User,
@@ -127,7 +127,7 @@ async fn removing_the_last_platform_binding_is_refused() {
 #[tokio::test]
 async fn the_lockout_rule_does_not_block_other_bindings() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let plain = bindings::create(
         &s.pool,
         PrincipalType::User,
@@ -169,7 +169,7 @@ async fn the_lockout_rule_does_not_block_other_bindings() {
 #[tokio::test]
 async fn a_tenant_scoped_platform_binding_does_not_keep_the_platform_alive() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let load_bearing = bindings::create(
         &s.pool,
         PrincipalType::User,
@@ -213,7 +213,7 @@ async fn deleting_a_binding_that_does_not_exist_is_not_permitted() {
 #[tokio::test]
 async fn the_combined_delete_applies_both_rules() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
 
     // A binding in Fabrikam, and an actor who only holds Contoso.
@@ -250,7 +250,7 @@ async fn the_combined_delete_applies_both_rules() {
 #[tokio::test]
 async fn the_combined_delete_still_refuses_a_lockout() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let id = bindings::create(
         &s.pool,
         PrincipalType::User,

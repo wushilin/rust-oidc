@@ -152,7 +152,11 @@ async fn a_tenant_admin_cannot_touch_another_tenants_roles() {
 async fn a_tenant_admin_cannot_revoke_a_wider_binding() {
     let s = TestServer::start().await;
     let f = tenant_admin_fixture(&s).await;
-    let platform = user_fixture_in(&s, f.tenant.clone(), "boss@contoso.com").await;
+    // Reach over every tenant is held from the root tenant, never from this one.
+    let root = rust_oidc::tenant::create(&s.pool, "System", "system.test", true)
+        .await
+        .unwrap();
+    let platform = user_fixture_in(&s, root, "boss@system.test").await;
     let wide = bind(&s, &platform.user_id, RoleId::GlobalAdministrator, Scope::All).await;
     let b = signed_in_admin(&s, &f).await;
 
@@ -328,7 +332,8 @@ async fn a_tenant_admin_is_not_shown_the_platform_administrators() {
     )
     .await;
     // A binding that covers this tenant *and* another one.
-    let shared = user_fixture_in(&s, other.clone(), "shared@fabrikam.test").await;
+    // Only a root-tenant account can hold one.
+    let shared = user_fixture_in(&s, platform.tenant.clone(), "shared@contoso.com").await;
     bind(
         &s,
         &shared.user_id,

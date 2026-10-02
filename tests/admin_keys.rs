@@ -193,7 +193,7 @@ async fn a_tenant_admin_can_neither_see_nor_rotate_the_signing_keys() {
 #[tokio::test]
 async fn a_platform_reader_sees_the_keys_but_cannot_rotate_them() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     bind(&s, &f.user_id, RoleId::GlobalReader, Scope::All).await;
     let b = signed_in_admin(&s, &f).await;
     let url = s.url("/admin/keys");

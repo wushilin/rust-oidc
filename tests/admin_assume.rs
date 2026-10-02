@@ -140,7 +140,7 @@ async fn work_done_while_assuming_is_still_recorded_as_the_admin() {
 #[tokio::test]
 async fn assuming_does_not_widen_what_is_permitted() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
     // Platform administrator can assume, but holds no user-administration role.
     bind(
@@ -166,7 +166,7 @@ async fn assuming_does_not_widen_what_is_permitted() {
 #[tokio::test]
 async fn a_tenant_scoped_platform_binding_cannot_assume() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
     bind(
         &s,
@@ -189,4 +189,28 @@ async fn a_tenant_scoped_platform_binding_cannot_assume() {
         .await
         .unwrap();
     assert_eq!(session.0, None, "and no tenant was entered");
+}
+
+/// An assumed tenant has one way out: Leave. The "All tenants" link is for a
+/// tenant that was merely opened.
+#[tokio::test]
+async fn an_assumed_tenant_is_left_with_leave_not_by_a_link_back() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let target = s.tenant("Fabrikam", "fabrikam.test").await;
+    let b = signed_in_admin(&s, &f).await;
+    let users = s.url(&format!("/admin/tenants/{}/users", target.id));
+
+    let page = b.get(&users).await;
+    assert!(page.body.contains("All tenants"), "opened, not assumed: {}", page.body);
+    assert!(!page.body.contains("/admin/leave"), "{}", page.body);
+
+    b.post(&s.url(&format!("/admin/assume/{}", target.id)), &[]).await;
+    let page = b.get(&users).await;
+    assert!(!page.body.contains("All tenants"), "assumed: {}", page.body);
+    assert!(page.body.contains("/admin/leave"), "{}", page.body);
+
+    b.post(&s.url("/admin/leave"), &[]).await;
+    let page = b.get(&users).await;
+    assert!(page.body.contains("All tenants"), "left again: {}", page.body);
 }

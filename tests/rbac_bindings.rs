@@ -63,7 +63,7 @@ async fn a_group_binding_reaches_its_members() {
 #[tokio::test]
 async fn all_scope_round_trips_without_tenant_rows() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     bindings::create(
         &s.pool,
         PrincipalType::User,
@@ -90,7 +90,7 @@ async fn all_scope_round_trips_without_tenant_rows() {
 #[tokio::test]
 async fn a_binding_for_a_deleted_tenant_grants_nothing() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let doomed = s.tenant("Doomed", "doomed.test").await;
     bindings::create(
         &s.pool,
@@ -241,7 +241,7 @@ async fn deleting_a_binding_takes_effect_on_the_next_read() {
 #[tokio::test]
 async fn listings_see_all_scope_bindings_from_every_tenant() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let other = s.tenant("Fabrikam", "fabrikam.test").await;
     bindings::create(
         &s.pool,

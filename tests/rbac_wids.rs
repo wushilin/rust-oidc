@@ -35,7 +35,7 @@ async fn a_tenant_scoped_binding_appears_in_wids_for_that_tenant_only() {
 #[tokio::test]
 async fn an_all_scope_binding_appears_in_every_tenants_wids() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let other = s.tenant("Other", "other.test").await;
     bindings::create(
         &s.pool,
@@ -61,7 +61,7 @@ async fn an_all_scope_binding_appears_in_every_tenants_wids() {
 #[tokio::test]
 async fn platform_administrator_never_appears_in_wids() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     bindings::create(
         &s.pool,
         PrincipalType::User,

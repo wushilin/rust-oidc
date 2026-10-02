@@ -96,7 +96,7 @@ async fn revoking_a_binding_takes_effect_on_the_next_request() {
 #[tokio::test]
 async fn losing_group_membership_takes_effect_on_the_next_request() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let group_id = rust_oidc::groups::create(&s.pool, &f.tenant, "admins", None)
         .await
         .unwrap();

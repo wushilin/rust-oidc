@@ -239,7 +239,7 @@ async fn a_tenant_admin_never_sees_another_tenants_audit_rows() {
 #[tokio::test]
 async fn a_role_without_audit_read_is_refused_the_page() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     // Platform Administrator holds `Audit:Read`; this one deliberately does not,
     // so the test is about the action and not about the scope.
     bind(&s, &f.user_id, RoleId::PlatformAdministrator, Scope::All).await;

@@ -234,7 +234,10 @@ async fn the_root_tenant_cannot_be_disabled_and_no_second_one_can_be_created() {
     let f = admin_fixture(&s).await;
     let b = signed_in_admin(&s, &f).await;
     let url = s.url("/admin/tenants");
-    let root = tenant::create(&s.pool, "System", "system.test", true).await.unwrap();
+    // The administrator's own tenant is the root tenant: only its accounts can
+    // hold an every-tenant role, and there is exactly one root.
+    let root = f.tenant.clone();
+    assert!(root.is_root);
 
     let refused = b.post(&url, &[("op", "disable"), ("tenant", &root.id)]).await;
     assert_eq!(refused.status, 400, "{}", refused.body);
@@ -253,14 +256,14 @@ async fn the_root_tenant_cannot_be_disabled_and_no_second_one_can_be_created() {
     let page = b.get(&url).await;
     assert_eq!(page.status, 200);
     assert!(
-        page.body.contains("system.test"),
+        page.body.contains("contoso.com"),
         "the root tenant is listed: {}",
         page.body
     );
     let row = page
         .body
         .split("<tr>")
-        .find(|row| row.contains("system.test"))
+        .find(|row| row.contains("contoso.com"))
         .expect("the root tenant's row");
     assert!(
         !row.contains(r#"value="disable""#),

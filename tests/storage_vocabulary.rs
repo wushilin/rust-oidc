@@ -195,7 +195,7 @@ async fn the_schema_constrains_the_redirect_platform_but_not_the_grant_platform(
 #[tokio::test]
 async fn a_service_principal_cannot_hold_a_console_role() {
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
 
     let refused = bindings::create(
         &s.pool,

@@ -59,7 +59,7 @@ async fn sqlite_fresh_database_has_the_new_schema_and_no_old_table() {
 async fn effective_bindings_keep_two_roles_scopes_separate() {
     use rust_oidc::rbac::{RoleId, Scope};
     let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
+    let f = root_user_fixture(&s).await;
     let other = s.tenant("Other", "other.test").await;
     for (id, role, tenant) in [
         ("b-admin", RoleId::GlobalAdministrator, &f.tenant.id),

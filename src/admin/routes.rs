@@ -249,6 +249,7 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext, at: At<'a>) -> Chrome
             }
         }
         At::Tenant(tenant, active) => {
+            let assumed = ctx.acting_tenant.as_ref().is_some_and(|a| a.id == tenant.id);
             let tabs = TenantTab::ALL
                 .iter()
                 .filter(|t| ctx.can_in(t.action(), tenant))
@@ -263,8 +264,10 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext, at: At<'a>) -> Chrome
                 upn: &ctx.user.upn,
                 csrf: &ctx.csrf,
                 tenant: Some(&tenant.name),
-                assumed: ctx.acting_tenant.as_ref().is_some_and(|a| a.id == tenant.id),
-                up: Some(tenants_url),
+                assumed,
+                // An assumed tenant is left with Leave, beside its name; offering
+                // a second way out that keeps it assumed would only confuse.
+                up: (!assumed).then_some(tenants_url),
                 tabs,
             }
         }

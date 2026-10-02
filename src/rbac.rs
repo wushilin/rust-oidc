@@ -237,6 +237,35 @@ impl Scope {
             Self::Tenants(ids) => ids.iter().any(|t| t == tenant_id),
         }
     }
+
+    /// Whether a principal whose own tenant is `home` may hold this scope.
+    ///
+    /// Reach beyond one's own tenant belongs to the root tenant: that is where the
+    /// people who run the platform have their accounts. A principal of any other
+    /// tenant holds roles in its own tenant and nowhere else, so "administrator of
+    /// every tenant" is never an account one of those tenants owns, can rename, or
+    /// can reset the password of.
+    pub fn may_be_held_by(&self, home: &str, home_is_root: bool) -> bool {
+        home_is_root
+            || match self {
+                Self::All => false,
+                Self::Tenants(ids) => ids.iter().all(|id| id == home),
+            }
+    }
+
+    /// The part of this scope such a principal actually holds. What
+    /// [`Self::may_be_held_by`] refuses at write time, this removes at read time,
+    /// so a row that reached the table some other way still grants nothing beyond
+    /// the principal's own tenant.
+    pub fn held_by(self, home: &str, home_is_root: bool) -> Scope {
+        if home_is_root {
+            return self;
+        }
+        match self {
+            Self::All => Self::Tenants(vec![home.to_string()]),
+            Self::Tenants(ids) => Self::Tenants(ids.into_iter().filter(|id| id == home).collect()),
+        }
+    }
 }
 
 /// A role granted at a scope, after group expansion.

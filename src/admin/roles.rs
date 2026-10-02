@@ -146,7 +146,9 @@ async fn render(
             .collect();
         // The `all` option is offered only to someone who already holds the action
         // everywhere, because a grant at `all` scope would otherwise be a widening.
-        let all_option = if may_grant_everywhere {
+        // Offered only where it could be granted: by someone who holds it
+        // everywhere, to a principal of the root tenant.
+        let all_option = if may_grant_everywhere && tenant.is_root {
             format!(
                 r#"<option value="{}">Every tenant</option>"#,
                 e(ScopeKind::All.as_str())
@@ -222,6 +224,25 @@ fn scope_cell(scope: &Scope, tenant: &Tenant, platform_visible: bool) -> String 
 
 /// The UPN or group name behind a principal id, falling back to the id when the
 /// principal has been removed.
+/// A principal's name and the tenant it belongs to. The name alone does not say
+/// which "Administrators" group a binding is about.
+pub async fn principal(st: &AppState, b: &StoredBinding) -> (String, Option<String>) {
+    let sql = match b.principal_type {
+        PrincipalType::User => "SELECT upn, tenant_id FROM users WHERE id = ? AND deleted_at IS NULL",
+        PrincipalType::Group => "SELECT name, tenant_id FROM user_groups WHERE id = ?",
+        PrincipalType::ServicePrincipal => return (b.principal_id.clone(), None),
+    };
+    let found: Option<(String, String)> = sqlx::query_as(crate::db::q(&st.pool, sql))
+        .bind(&b.principal_id)
+        .fetch_optional(&st.pool)
+        .await
+        .unwrap_or(None);
+    match found {
+        Some((name, tenant_id)) => (name, Some(tenant_id)),
+        None => (b.principal_id.clone(), None),
+    }
+}
+
 pub async fn principal_name(st: &AppState, b: &StoredBinding) -> String {
     let sql = match b.principal_type {
         PrincipalType::User => "SELECT upn FROM users WHERE id = ? AND deleted_at IS NULL",

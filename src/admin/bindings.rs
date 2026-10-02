@@ -22,6 +22,56 @@ pub struct StoredBinding {
     pub scope: Scope,
 }
 
+/// Refusal of a grant that would give a principal outside the root tenant reach
+/// beyond its own tenant. See [`Scope::may_be_held_by`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Only accounts and groups in the root tenant can be given roles that reach beyond their own tenant. \
+     This one can be given roles in its own tenant, from that tenant's Roles tab."
+)]
+pub struct ReachRefused;
+
+#[derive(sqlx::FromRow)]
+struct Home {
+    tenant_id: String,
+    #[sqlx(try_from = "crate::db::Flag")]
+    is_root: bool,
+}
+
+/// The tenant a principal belongs to, and whether that is the root tenant.
+/// `None` when there is no such user or group.
+async fn home_of<'e, E>(
+    executor: E,
+    engine: crate::db::Engine,
+    principal_type: PrincipalType,
+    principal_id: &str,
+) -> anyhow::Result<Option<(String, bool)>>
+where
+    E: sqlx::Executor<'e, Database = crate::db::Db>,
+{
+    let sql = match principal_type {
+        PrincipalType::User => {
+            "SELECT t.id AS tenant_id, t.is_root FROM users u JOIN tenants t ON t.id = u.tenant_id
+             WHERE u.id = ? AND u.deleted_at IS NULL"
+        }
+        PrincipalType::Group => {
+            "SELECT t.id AS tenant_id, t.is_root FROM user_groups g JOIN tenants t ON t.id = g.tenant_id
+             WHERE g.id = ?"
+        }
+        PrincipalType::ServicePrincipal => return Ok(None),
+    };
+    let home: Option<Home> = sqlx::query_as(crate::db::sql_stmt(engine, sql))
+        .bind(principal_id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(home.map(|h| (h.tenant_id, h.is_root)))
+}
+
+/// The one way a role binding is written.
+///
+/// The rule that only the root tenant's principals reach beyond their own tenant
+/// is checked here, inside the transaction that writes the row, so no page, CLI
+/// command or future caller can grant around it.
 pub async fn create(
     pool: &DbPool,
     principal_type: PrincipalType,
@@ -40,6 +90,12 @@ pub async fn create(
     let id = new_guid();
     let engine = crate::db::engine_of(pool);
     let mut tx = pool.begin().await?;
+    let Some((home, home_is_root)) = home_of(&mut *tx, engine, principal_type, principal_id).await? else {
+        anyhow::bail!("no such user or group");
+    };
+    if !scope.may_be_held_by(&home, home_is_root) {
+        return Err(ReachRefused.into());
+    }
     sqlx::query(crate::db::sql_stmt(
         engine,
         "INSERT INTO role_bindings (id, principal_type, principal_id, role_id, scope_kind, created_at, created_by)
@@ -115,6 +171,13 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
     .fetch_all(pool)
     .await?;
 
+    // The read-side half of the rule `create` enforces: whatever a row says, a
+    // user outside the root tenant holds nothing beyond their own tenant.
+    let Some((home, home_is_root)) = home_of(pool, crate::db::engine_of(pool), PrincipalType::User, user_id).await?
+    else {
+        return Ok(Vec::new());
+    };
+
     let mut out = Vec::new();
     for row in rows {
         let id: String = row.get("id");
@@ -126,7 +189,7 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
         };
         out.push(EffectiveBinding {
             role,
-            scope: scope_of(pool, &id, kind).await?,
+            scope: scope_of(pool, &id, kind).await?.held_by(&home, home_is_root),
         });
     }
     Ok(out)

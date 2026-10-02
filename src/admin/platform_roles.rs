@@ -64,7 +64,20 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
 
     let mut rows = String::new();
     for b in &stored {
-        let who = crate::admin::roles::principal_name(st, b).await;
+        let (who, home_id) = crate::admin::roles::principal(st, b).await;
+        let home = home_id.as_ref().and_then(|id| tenants.iter().find(|t| &t.id == id));
+        let home_cell = match home {
+            Some(t) if t.is_root => format!(r#"{} <span class="pill">root</span>"#, e(&t.name)),
+            Some(t) => e(&t.name),
+            None => r#"<span class="muted">unknown</span>"#.to_string(),
+        };
+        // Granted before the rule existed, or by hand: kept, but pointed out.
+        let beyond = match home {
+            Some(t) if !b.scope.may_be_held_by(&t.id, t.is_root) => {
+                r#" <span class="pill bad" title="Only a principal of the root tenant can reach beyond its own tenant. This part of the binding grants nothing.">not in effect beyond its tenant</span>"#
+            }
+            _ => "",
+        };
         let revoke = if may_write {
             format!(
                 r#"<form method="post" action="{url}" class="inline">{csrf}
@@ -79,7 +92,7 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
             String::new()
         };
         rows.push_str(&format!(
-            "<tr><td>{who}</td><td>{kind}</td><td>{role}</td><td>{scope}</td><td>{revoke}</td></tr>",
+            "<tr><td>{who}</td><td>{home_cell}</td><td>{kind}</td><td>{role}</td><td>{scope}{beyond}</td><td>{revoke}</td></tr>",
             who = e(&who),
             kind = e(b.principal_type.as_str()),
             role = e(b.role.display_name()),
@@ -107,13 +120,14 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
             &format!(
                 r#"<form method="post" action="{url}">{csrf}
 <label for="account">Account</label><input id="account" name="{ACCOUNT}" type="email" required>
-<p class="muted">The account's sign-in name, such as <code>ana@contoso.com</code>. Its tenant is found from the part after the @.</p>
+<p class="muted">An account in the root tenant, by its sign-in name. Accounts of other tenants are given
+roles in their own tenant, from that tenant's Roles tab.</p>
 <label for="role">Role</label><select id="role" name="{ROLE}">{roles}</select>
 <fieldset class="choice"><legend>Where it applies</legend>
 <label><input type="radio" name="{SCOPE}" value="{all}" checked> Every tenant, including ones added later</label>
 <label><input type="radio" name="{SCOPE}" value="{some}" class="some"> Only these tenants</label>
 <div class="when-some">{boxes}</div></fieldset>
-<p class="muted">To grant a role to a group, use the Roles tab inside the group's tenant.</p>
+<p class="muted">To grant a role to a group, use the Roles tab inside the root tenant.</p>
 <div class="actions"><button type="submit" name="{field}" value="{op}">Grant role</button></div></form>"#,
                 url = e(&url),
                 all = e(ScopeKind::All.as_str()),
@@ -130,7 +144,7 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
     let body = format!(
         r#"<h1>Platform roles</h1><p class="sub">Who can administer what, across every tenant. A role says what someone
 may do; where it applies says in which tenants.</p>{error}
-<table><tr><th>Who</th><th>Type</th><th>Role</th><th>Where it applies</th><th></th></tr>{rows}</table>{grant}"#,
+<table><tr><th>Who</th><th>Their tenant</th><th>Type</th><th>Role</th><th>Where it applies</th><th></th></tr>{rows}</table>{grant}"#,
         error = view::error_block(error),
     );
     view::page(

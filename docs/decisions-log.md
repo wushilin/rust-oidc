@@ -1015,6 +1015,24 @@ reader cannot read, such as a platform administrator acting in theirs, stays an 
 **134. The tenant ticks on the platform role form show only when they apply**, and
 **assuming a tenant goes into it** rather than back to the list.
 
+**135. Only the root tenant's accounts and groups reach beyond their own tenant**
+(user's rule, 2 Oct). A principal of any other tenant can hold roles in its own tenant
+and nowhere else. It is enforced in two places, neither of them a page:
+`bindings::create` refuses the grant inside the transaction that writes the row
+(`ReachRefused`), and `bindings::effective_for_user` clips every scope to the user's own
+tenant on read (`Scope::held_by`), so a row that arrived some other way (older build,
+restore, hand edit) grants nothing extra. The rule itself is two functions on `Scope`
+in `src/rbac.rs`. Both halves are teeth-checked in `tests/rbac_reach.rs`. A grant to a
+principal that does not exist is now refused too. *Not done:* a database trigger or
+CHECK; the rule needs a join to `tenants` and would have to be written three times, once
+per engine. *To reverse:* make `may_be_held_by` return `true` and `held_by` return `self`.
+
+**136. The Platform roles page names each principal's tenant** in its own column, and
+marks any stored binding the rule above leaves without effect.
+
+**137. An assumed tenant is left with Leave only.** The "All tenants" link is shown for
+a tenant that was opened, not for one that is assumed.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

@@ -272,6 +272,13 @@ pub async fn user_fixture(s: &TestServer) -> UserFixture {
     user_fixture_in(s, tenant, "alice@contoso.com").await
 }
 
+/// [`user_fixture`], but in the root tenant: the only tenant whose accounts can
+/// hold a role that reaches beyond their own tenant.
+pub async fn root_user_fixture(s: &TestServer) -> UserFixture {
+    let tenant = tenant::create(&s.pool, "Contoso", "contoso.com", true).await.unwrap();
+    user_fixture_in(s, tenant, "alice@contoso.com").await
+}
+
 pub async fn user_fixture_in(s: &TestServer, tenant: Tenant, upn: &str) -> UserFixture {
     use rust_oidc::users;
     let password = "Correct-Horse-9".to_string();
@@ -596,7 +603,7 @@ pub async fn bind(s: &TestServer, user_id: &str, role: RoleId, scope: Scope) -> 
 /// can create and assume tenants. The shape of `admin@wushilin.net` on the
 /// deployed service.
 pub async fn admin_fixture(s: &TestServer) -> UserFixture {
-    let f = user_fixture(s).await;
+    let f = root_user_fixture(s).await;
     bind(s, &f.user_id, RoleId::GlobalAdministrator, Scope::All).await;
     bind(s, &f.user_id, RoleId::PlatformAdministrator, Scope::All).await;
     f
@@ -618,7 +625,7 @@ pub async fn tenant_admin_fixture(s: &TestServer) -> UserFixture {
 
 /// Read everything, change nothing.
 pub async fn reader_fixture(s: &TestServer) -> UserFixture {
-    let f = user_fixture(s).await;
+    let f = root_user_fixture(s).await;
     bind(s, &f.user_id, RoleId::GlobalReader, Scope::All).await;
     f
 }

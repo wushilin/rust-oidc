@@ -65,6 +65,7 @@ pub fn router() -> Router<AppState> {
         // every tenant, so there is no scope comparison for a URL key to reach.
         .route("/admin/tenants", get(tenant_pages::page).post(tenant_pages::post))
         .route("/admin/keys", get(key_pages::page).post(key_pages::post))
+        .route("/admin/configuration", get(crate::admin::configuration::page))
         .route(
             "/admin/bindings",
             get(crate::admin::platform_roles::page).post(crate::admin::platform_roles::post),
@@ -128,6 +129,7 @@ pub enum PlatformTab {
     Tenants,
     Keys,
     Roles,
+    Configuration,
     /// The find-by-id page: at the platform level, but not one of its tabs.
     Find,
 }
@@ -239,9 +241,16 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext, at: At<'a>) -> Chrome
             }
             if ctx.can(BINDING_READ, On::Platform) {
                 tabs.push(Tab {
-                    label: "All roles",
+                    label: "Global roles",
                     href: format!("{base}/admin/bindings"),
                     active: active == PlatformTab::Roles,
+                });
+            }
+            if ctx.can(TENANT_READ, On::Platform) {
+                tabs.push(Tab {
+                    label: "Configuration",
+                    href: format!("{base}/admin/configuration"),
+                    active: active == PlatformTab::Configuration,
                 });
             }
             Chrome {

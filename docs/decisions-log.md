@@ -1117,6 +1117,19 @@ change, so some may be refused while others succeed and the page says which and 
 bulk deletes need a "confirm" tick; "all" on the users list means the rows the current
 search listed.
 
+**148. Each role view shows only its own grants** (user's request). The global page
+("Global roles") lists and revokes only Global Administrators and grants only that; a
+tenant's Roles tab lists and revokes only what is bound to that tenant. A tenant role is
+therefore granted inside the tenant and no longer from the global page by account name.
+
+**149. A Configuration tab in the global view** (user's request): the addresses an
+outside application is configured with (with `{tenant}` as placeholder, and each
+tenant's own issuer and discovery link) and what the server supports. Mine: read-only,
+for a Global Administrator, and built from `routes::discovery::Endpoint` and the lists
+beside it, which the discovery document now uses too, so the two cannot disagree. I
+read "external integrations" as what a client needs; server settings (database, TLS,
+rate limits) are not on it.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

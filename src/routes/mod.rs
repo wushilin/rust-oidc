@@ -1,7 +1,7 @@
 pub mod audit;
 mod authorize;
 mod device;
-mod discovery;
+pub mod discovery;
 mod logout;
 mod token;
 mod user_grants;

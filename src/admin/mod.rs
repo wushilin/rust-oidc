@@ -10,6 +10,7 @@ pub mod audit;
 pub mod authz;
 pub mod bindings;
 pub mod bulk;
+pub mod configuration;
 pub mod context;
 pub mod find;
 pub mod flow;

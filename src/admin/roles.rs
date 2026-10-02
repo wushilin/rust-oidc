@@ -94,16 +94,10 @@ async fn render(
     };
     let url = roles_url(st.public_url.base(), tenant);
     let csrf = view::csrf_input(&ctx.csrf);
-    // A binding at `all` scope is the platform's, not this tenant's, and its
-    // principal may administer tenants this viewer cannot see. Only somebody who
-    // can read platform-wide is shown it; they have `/admin/bindings` for exactly
-    // that question.
-    let platform_visible = ctx.can(BINDING_READ, On::Platform);
+    // Only what is bound to this tenant. A Global Administrator is not a role of
+    // any tenant and is on the Global roles page, not repeated in each of them.
     let mut rows = String::new();
-    for b in listed
-        .iter()
-        .filter(|b| platform_visible || b.scope.kind() == ScopeKind::Tenants)
-    {
+    for b in listed.iter().filter(|b| b.scope.kind() == ScopeKind::Tenants) {
         // The revoke button appears only where the no-widening rule would allow
         // it; `authz::delete` checks it again, and the lock-out rule too.
         let revoke = if authz::may_write_binding(ctx.bindings(), &b.scope) {
@@ -250,7 +244,7 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
 
     let outcome = match op {
         RoleOp::Grant => grant(&st, &ctx, tenant, &form).await,
-        RoleOp::Revoke => revoke(&st, &ctx, &form).await,
+        RoleOp::Revoke => revoke(&st, &ctx, tenant, &form).await,
     };
     match outcome {
         Ok((target, details)) => {
@@ -296,7 +290,7 @@ async fn grant(
     };
     if role.scope_kind() != ScopeKind::Tenants {
         return Err(Refusal::Message(format!(
-            "{} is not a role of one tenant. It is granted from the All roles page.",
+            "{} is not a role of one tenant. It is granted from the Global roles page.",
             role.display_name()
         )));
     }
@@ -341,8 +335,22 @@ async fn grant(
     ))
 }
 
-async fn revoke(st: &AppState, ctx: &AdminContext, form: &Params) -> Result<(String, serde_json::Value), Refusal> {
+async fn revoke(
+    st: &AppState,
+    ctx: &AdminContext,
+    tenant: &Tenant,
+    form: &Params,
+) -> Result<(String, serde_json::Value), Refusal> {
     let id = field(form, BINDING).to_string();
+    // Only a binding of this tenant: anything else is revoked where it is listed.
+    let own = bindings::list_for_tenant(&st.pool, &tenant.id)
+        .await
+        .map_err(|_| Refusal::Forbidden)?
+        .into_iter()
+        .any(|b| b.id == id && b.scope.kind() == ScopeKind::Tenants);
+    if !own {
+        return Err(Refusal::Forbidden);
+    }
     // One call, both rules: no widening, and no locking the platform out.
     authz::delete(&st.pool, ctx.bindings(), &id)
         .await

@@ -253,7 +253,8 @@ async fn the_console_derives_where_a_role_applies_from_the_account() {
     let fabrikam = s.tenant("Fabrikam", "fabrikam.test").await;
     let outsider = user_in(&s, &fabrikam, "zed@fabrikam.test").await;
     let b = signed_in_admin(&s, &f).await;
-    // From the page of every role: no tenant named, the account's own is used.
+    // The global page grants Global Administrator and nothing else: a tenant role
+    // asked for there is refused, and sent to the tenant.
     let page = b
         .post(
             &s.url("/admin/bindings"),
@@ -264,11 +265,9 @@ async fn the_console_derives_where_a_role_applies_from_the_account() {
             ],
         )
         .await;
-    assert_eq!(page.status, 303, "{}", page.body);
-    assert_eq!(
-        held(&s, &outsider).await,
-        [(RoleId::TenantViewer, Scope::Tenants(vec![fabrikam.id.clone()]))]
-    );
+    assert_eq!(page.status, 400, "{}", page.body);
+    assert!(page.body.contains("that tenant's Roles tab"), "{}", page.body);
+    assert!(held(&s, &outsider).await.is_empty());
 
     // Global Administrator for an account outside the root tenant is refused,
     // in the words the storage layer uses.
@@ -323,20 +322,45 @@ async fn the_console_derives_where_a_role_applies_from_the_account() {
         )
         .await;
     assert_eq!(page.status, 303, "{}", page.body);
-    assert_eq!(held(&s, &outsider).await.len(), 2);
+    assert_eq!(
+        held(&s, &outsider).await,
+        [(RoleId::UserAdministrator, Scope::Tenants(vec![fabrikam.id.clone()]))],
+        "in the account's own tenant, without it being asked for"
+    );
 
-    // The page of every role says whose account it is and where the role applies.
+    // Each view shows its own grants and not the other's. The tenant's page has
+    // the tenant role and not the Global Administrator...
+    let page = b.get(&roles).await;
+    assert!(page.body.contains("zed@fabrikam.test"), "{}", page.body);
+    assert!(!page.body.contains(&format!("<td>{}</td>", f.upn)), "{}", page.body);
+    assert!(!page.body.contains("Global Administrator</td>"), "{}", page.body);
+    // ...and the global page has the Global Administrator, whose tenant it names,
+    // and nothing that is bound to a tenant.
     let page = b.get(&s.url("/admin/bindings")).await;
     assert!(page.body.contains("<th>Their tenant</th>"), "{}", page.body);
+    assert!(page.body.contains(&format!("<td>{}</td>", f.upn)), "{}", page.body);
+    assert!(page.body.contains(r#"<span class="pill">root</span>"#), "{}", page.body);
+    assert!(!page.body.contains("zed@fabrikam.test"), "{}", page.body);
+    assert!(!page.body.contains("User Administrator"), "{}", page.body);
     assert!(
-        page.body.contains("<td>zed@fabrikam.test</td><td>Fabrikam</td>"),
-        "{}",
+        !page.body.contains("<select"),
+        "there is one role here and no tenant to pick: {}",
         page.body
     );
-    assert!(page.body.contains(r#"<span class="pill">root</span>"#), "{}", page.body);
-    assert!(
-        !page.body.contains(r#"type="checkbox""#),
-        "no tenant is picked: {}",
-        page.body
+
+    // Nor does either revoke the other's: each binding is revoked where it is listed.
+    let all = bindings::list_all(&s.pool).await.unwrap();
+    let global = &all.iter().find(|x| x.scope == Scope::All).unwrap().id;
+    let scoped = &all.iter().find(|x| x.scope != Scope::All).unwrap().id;
+    let wrong = b.post(&roles, &[("op", "revoke"), ("binding", global)]).await;
+    assert_eq!(wrong.status, 403, "{}", wrong.body);
+    let wrong = b
+        .post(&s.url("/admin/bindings"), &[("op", "revoke"), ("binding", scoped)])
+        .await;
+    assert_eq!(wrong.status, 403, "{}", wrong.body);
+    assert_eq!(bindings::list_all(&s.pool).await.unwrap().len(), 2);
+    assert_eq!(
+        b.post(&roles, &[("op", "revoke"), ("binding", scoped)]).await.status,
+        303
     );
 }

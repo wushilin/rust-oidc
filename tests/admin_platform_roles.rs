@@ -47,11 +47,11 @@ async fn global_administrator_is_granted_and_revoked_again() {
 
     let page = b.get(&s.url(PAGE)).await;
     assert_eq!(page.status, 200, "{}", page.body);
-    assert!(page.body.contains("Grant a role"), "{}", page.body);
-    // Every role is explained where it is granted.
-    for role in RoleId::ALL {
-        assert!(page.body.contains(role.display_name()), "{role:?}: {}", page.body);
-    }
+    assert!(
+        page.body.contains("Make somebody a Global Administrator"),
+        "{}",
+        page.body
+    );
 
     let granted = b
         .post(
@@ -70,7 +70,7 @@ async fn global_administrator_is_granted_and_revoked_again() {
     // It is listed, by name, with where it applies in words.
     let page = b.get(&s.url(PAGE)).await;
     assert!(page.body.contains("bea@contoso.com"), "{}", page.body);
-    assert!(page.body.contains(">everything<"), "{}", page.body);
+    assert!(page.body.contains("<td>Global Administrator</td>"), "{}", page.body);
 
     let id = bindings::list_all(&s.pool)
         .await
@@ -85,41 +85,41 @@ async fn global_administrator_is_granted_and_revoked_again() {
     assert_eq!(audit_rows(&s, Event::AdminRoleRevoke.as_str()).await.len(), 1);
 }
 
-/// No tenant is ever picked: a tenant role applies to the account's own tenant,
-/// whatever the form is made to say.
+/// Only what is not bound to a tenant is here: a tenant's roles are neither
+/// listed nor granted on this page, whatever the form is made to say.
 #[tokio::test]
-async fn a_tenant_role_applies_to_the_accounts_own_tenant() {
+async fn tenant_roles_are_neither_listed_nor_granted_here() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let fabrikam = s.tenant("Fabrikam", "fabrikam.test").await;
     let theirs = user_fixture_in(&s, fabrikam.clone(), "zed@fabrikam.test").await;
+    bind_in_own_tenant(&s, &theirs, RoleId::TenantAdministrator).await;
     let b = signed_in_admin(&s, &f).await;
 
-    let granted = b
+    let page = b.get(&s.url(PAGE)).await;
+    assert!(page.body.contains(&f.upn), "the Global Administrator: {}", page.body);
+    assert!(!page.body.contains("zed@fabrikam.test"), "{}", page.body);
+    assert!(!page.body.contains("Tenant Administrator"), "{}", page.body);
+
+    let refused = b
         .post(
             &s.url(PAGE),
             &[
                 ("op", "grant"),
                 ("account", "zed@fabrikam.test"),
                 ("role", RoleId::UserAdministrator.as_str()),
-                // Stale or forged fields from the old form change nothing.
+                // Fields of the form this page used to have change nothing.
                 ("scope", "all"),
                 ("tenant", f.tenant.id.as_str()),
             ],
         )
         .await;
-    assert_eq!(granted.status, 303, "{}", granted.body);
-    assert_eq!(
-        scopes_of(&s, &theirs.user_id, RoleId::UserAdministrator).await,
-        [Scope::Tenants(vec![fabrikam.id.clone()])]
-    );
-
-    // The page names the tenant rather than printing its id.
-    let page = b.get(&s.url(PAGE)).await;
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(refused.body.contains("that tenant's Roles tab"), "{}", refused.body);
     assert!(
-        page.body.contains(r#"<span class="pill">Fabrikam</span>"#),
-        "{}",
-        page.body
+        scopes_of(&s, &theirs.user_id, RoleId::UserAdministrator)
+            .await
+            .is_empty()
     );
 }
 
@@ -134,20 +134,8 @@ async fn what_cannot_be_granted_is_refused_with_a_reason() {
 
     for (form, why) in [
         (
-            vec![
-                ("op", "grant"),
-                ("account", "nobody@contoso.com"),
-                ("role", "TenantViewer"),
-            ],
+            vec![("op", "grant"), ("account", "nobody@contoso.com")],
             "no account named",
-        ),
-        (
-            vec![
-                ("op", "grant"),
-                ("account", "zed@fabrikam.test"),
-                ("role", "PlatformAdministrator"),
-            ],
-            "Choose a role",
         ),
         (
             vec![
@@ -247,7 +235,7 @@ async fn where_an_administrator_lands_depends_on_their_reach() {
             page.body
         );
     }
-    for tab in [">Tenants<", ">Signing keys<", ">All roles<"] {
+    for tab in [">Tenants<", ">Signing keys<", ">Global roles<", ">Configuration<"] {
         assert!(page.body.contains(tab), "{tab} missing: {}", page.body);
     }
 

@@ -1,14 +1,12 @@
-//! All roles: every role binding on the deployment, and granting or revoking them
-//! the ones that reach across tenants.
+//! Global roles: who is a Global Administrator, and making or unmaking one.
 //!
-//! A tenant's own Roles page grants within that tenant. This page is where an
-//! account is made an administrator of every tenant, or of a chosen few -- the
-//! `[*]` and `['a', 'b']` scopes of the binding model.
+//! Only what is not bound to a tenant is here. A role inside a tenant is that
+//! tenant's business and is on its own Roles tab, and nowhere else.
 //!
-//! As on the tenant page, the rules that make delegation safe are not implemented
-//! here. They are [`authz::may_write_binding`] (nobody grants reach they do not
-//! hold) and [`authz::delete`] (no widening, and no revoking the last binding
-//! that can administer the platform). This module decides nothing on its own.
+//! The rules that make this safe are not implemented here. They are
+//! [`authz::may_write_binding`] (nobody grants reach they do not hold),
+//! [`bindings::create`] (the role is held from the root tenant) and
+//! [`authz::delete`] (the last Global Administrator stays).
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -46,7 +44,7 @@ pub async fn page(ctx: AdminContext, State(st): State<AppState>) -> Response {
 }
 
 async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: StatusCode) -> Response {
-    let (stored, tenants) = match (bindings::list_all(&st.pool).await, tenant::list(&st.pool).await) {
+    let (stored, tenants) = match (global_bindings(st).await, tenant::list(&st.pool).await) {
         (Ok(b), Ok(t)) => (b, t),
         (Err(err), _) | (_, Err(err)) => {
             tracing::error!("platform roles could not be listed: {err}");
@@ -68,13 +66,6 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
             Some(t) => e(&t.name),
             None => r#"<span class="muted">unknown</span>"#.to_string(),
         };
-        // Kept from before the rule, or written by hand: shown, and pointed out.
-        let beyond = match home {
-            Some(t) if b.role.scope_held_by(&t.id, t.is_root).as_ref() != Some(&b.scope) => {
-                r#" <span class="pill bad" title="A role applies to the tenant its holder belongs to; only Global Administrator, held from the root tenant, covers more. Whatever this binding says beyond that grants nothing.">not in effect as written</span>"#
-            }
-            _ => "",
-        };
         let revoke = if may_write {
             format!(
                 r#"<form method="post" action="{url}" class="inline">{csrf}
@@ -89,73 +80,57 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
             String::new()
         };
         rows.push_str(&format!(
-            "<tr><td>{who}</td><td>{home_cell}</td><td>{kind}</td><td>{role}</td><td>{scope}{beyond}</td><td>{revoke}</td></tr>",
+            "<tr><td>{who}</td><td>{home_cell}</td><td>{kind}</td><td>{role}</td><td>{revoke}</td></tr>",
             who = e(&who),
             kind = e(b.principal_type.as_str()),
             role = e(b.role.display_name()),
-            scope = scope_cell(b, &tenants),
         ));
     }
 
     let grant = if may_write {
-        let roles: String = RoleId::ALL
-            .iter()
-            .map(|r| format!(r#"<option value="{}">{}</option>"#, e(r.as_str()), e(r.display_name())))
-            .collect();
-        let explained: String = RoleId::ALL
-            .iter()
-            .map(|r| format!("<dt>{}</dt><dd>{}</dd>", e(r.display_name()), e(r.summary())))
-            .collect();
         view::expander(
-            "Grant a role",
+            "Make somebody a Global Administrator",
             &format!(
                 r#"<form method="post" action="{url}">{csrf}
 <label for="account">Account</label><input id="account" name="{ACCOUNT}" type="email" required>
-<p class="muted">The account's full sign-in name. The part after the @ says which tenant it belongs to,
-and that is the tenant the role applies to. Only Global Administrator covers more, and only an account
-in the root tenant can hold it.</p>
-<label for="role">Role</label><select id="role" name="{ROLE}">{roles}</select>
-<dl class="roles">{explained}</dl>
-<p class="muted">To grant a role to a group, use the Roles tab inside the group's tenant.</p>
-<div class="actions"><button type="submit" name="{field}" value="{op}">Grant role</button></div></form>"#,
+<p class="muted">The full sign-in name of an account in the root tenant. {summary}</p>
+<p class="muted">To give the role to a group, or to grant a role inside one tenant, use the Roles tab of
+that tenant.</p>
+<div class="actions"><button type="submit" name="{field}" value="{op}">Grant</button></div></form>"#,
                 url = e(&url),
+                summary = e(RoleId::GlobalAdministrator.summary()),
                 field = RoleOp::FIELD,
                 op = RoleOp::Grant.as_str(),
             ),
             error.is_some(),
         )
     } else {
-        r#"<p class="muted">Your roles allow seeing who administers the platform but not changing it.</p>"#.to_string()
+        r#"<p class="muted">Your roles allow seeing who administers the deployment but not changing it.</p>"#
+            .to_string()
     };
 
     let body = format!(
-        r#"<h1>All roles</h1><p class="sub">Every role granted on this deployment. A Global Administrator can do
-everything; every other role applies to the tenant its holder belongs to.</p>{error}
-<table><tr><th>Who</th><th>Their tenant</th><th>Type</th><th>Role</th><th>Applies to</th><th></th></tr>{rows}</table>{grant}"#,
+        r#"<h1>Global roles</h1><p class="sub">Who can do everything on this deployment: tenants, signing keys, and
+everything inside every tenant. Roles inside a tenant are on that tenant's Roles tab.</p>{error}
+<table><tr><th>Who</th><th>Their tenant</th><th>Type</th><th>Role</th><th></th></tr>{rows}</table>{grant}"#,
         error = view::error_block(error),
     );
     view::page(
         &chrome(st, ctx, At::Platform(PlatformTab::Roles)),
         status,
-        "All roles",
+        "Global roles",
         &body,
     )
 }
 
-/// Where a binding applies, by tenant name. A tenant that no longer exists grants
-/// nothing and is shown as such rather than as a bare id.
-fn scope_cell(b: &StoredBinding, tenants: &[&Tenant]) -> String {
-    match &b.scope {
-        Scope::All => r#"<span class="pill good">everything</span>"#.to_string(),
-        Scope::Tenants(ids) if ids.is_empty() => r#"<span class="muted">no live tenant</span>"#.to_string(),
-        Scope::Tenants(ids) => ids
-            .iter()
-            .map(|id| match tenants.iter().find(|t| &t.id == id) {
-                Some(t) => format!(r#"<span class="pill">{}</span>"#, e(&t.name)),
-                None => format!(r#"<span class="pill">{}</span>"#, e(id)),
-            })
-            .collect(),
-    }
+/// The bindings that are not bound to a tenant: the only ones this page shows,
+/// and the only ones it will revoke.
+async fn global_bindings(st: &AppState) -> anyhow::Result<Vec<StoredBinding>> {
+    Ok(bindings::list_all(&st.pool)
+        .await?
+        .into_iter()
+        .filter(|b| b.scope == Scope::All)
+        .collect())
 }
 
 /// Why a write did not happen.
@@ -190,6 +165,15 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) ->
         RoleOp::Grant => grant(&st, &ctx, &body).await,
         RoleOp::Revoke => {
             let id = field(&form, BINDING).to_string();
+            // Only what this page lists: a tenant's binding is revoked in that tenant.
+            match global_bindings(&st).await {
+                Ok(listed) if listed.iter().any(|b| b.id == id) => {}
+                Ok(_) => return view::forbidden(),
+                Err(err) => {
+                    tracing::error!("global roles could not be listed: {err}");
+                    return view::server_error();
+                }
+            }
             // One call, both rules: no widening, and no locking the platform out.
             authz::delete(&st.pool, ctx.bindings(), &id)
                 .await
@@ -229,9 +213,14 @@ async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String
             .unwrap_or_default()
     };
     let account = one(ACCOUNT);
-    let Some(role) = RoleId::parse(one(ROLE)) else {
-        return Err(Refusal::Message("Choose a role.".into()));
-    };
+    // The one role this page grants. A form that names another is asking for a
+    // tenant role, which is granted in the tenant.
+    let role = RoleId::GlobalAdministrator;
+    if !matches!(one(ROLE), "" | "GlobalAdministrator") {
+        return Err(Refusal::Message(
+            "A role inside a tenant is granted from that tenant's Roles tab.".into(),
+        ));
+    }
     // The account's tenant is the one that owns the part after the @.
     let Some((_, domain)) = account.rsplit_once('@') else {
         return Err(Refusal::Message(

@@ -174,13 +174,15 @@ async fn a_tenant_admin_cannot_revoke_a_wider_binding() {
     );
 }
 
-/// The lock-out rule, through the UI: the last platform binding cannot be revoked,
-/// and the console says why rather than failing silently.
+/// A Global Administrator is not a role of any tenant: a tenant's Roles page does
+/// not list it and will not revoke it, even for somebody who could elsewhere.
 #[tokio::test]
-async fn revoking_the_last_platform_binding_is_refused_with_a_reason() {
+async fn a_tenants_page_neither_lists_nor_revokes_a_global_administrator() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
-    let platform: (String,) = sqlx::query_as(rust_oidc::db::q(
+    let helper = user_fixture_in(&s, f.tenant.clone(), "helper@contoso.com").await;
+    bind_in_own_tenant(&s, &helper, RoleId::UserAdministrator).await;
+    let global: (String,) = sqlx::query_as(rust_oidc::db::q(
         &s.pool,
         "SELECT id FROM role_bindings WHERE role_id = ? AND scope_kind = ?",
     ))
@@ -191,18 +193,22 @@ async fn revoking_the_last_platform_binding_is_refused_with_a_reason() {
     .unwrap();
     let b = signed_in_admin(&s, &f).await;
 
+    let page = b.get(&roles_url(&s, &f.tenant.id)).await;
+    assert!(
+        page.body.contains("helper@contoso.com"),
+        "this tenant's own: {}",
+        page.body
+    );
+    assert!(!page.body.contains(&format!("<td>{}</td>", f.upn)), "{}", page.body);
+    assert!(!page.body.contains(&global.0), "{}", page.body);
+
     let page = b
         .post(
             &roles_url(&s, &f.tenant.id),
-            &[("op", "revoke"), ("binding", platform.0.as_str())],
+            &[("op", "revoke"), ("binding", global.0.as_str())],
         )
         .await;
-    assert_eq!(page.status, 400, "{}", page.body);
-    assert!(
-        page.body.contains("last Global Administrator"),
-        "the page says why: {}",
-        page.body
-    );
+    assert_eq!(page.status, 403, "{}", page.body);
     // Still there, and the console still works.
     assert!(
         b.post(&s.url(&format!("/admin/assume/{}", f.tenant.id)), &[])
@@ -375,7 +381,7 @@ async fn global_administrator_is_not_granted_from_a_tenants_page() {
             )
             .await;
         assert_eq!(page.status, 400, "{}", page.body);
-        assert!(page.body.contains("All roles page"), "{}", page.body);
+        assert!(page.body.contains("Global roles page"), "{}", page.body);
     }
     assert!(effective_for_user(&s.pool, &helper.user_id).await.unwrap().is_empty());
     let page = b.get(&roles_url(&s, &f.tenant.id)).await;

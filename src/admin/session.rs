@@ -3,7 +3,7 @@
 //! Deliberately separate from [`crate::session`]: that one is a browser's
 //! sign-in *to a tenant*, keyed by tenant, and is handed out to any relying
 //! party's authorize request. This one is the console's, is not tenant-scoped,
-//! and records which tenant a platform administrator has assumed. Mixing the two
+//! and is not handed to any application. Mixing the two
 //! would mean an OIDC sign-in to any application silently granted console access.
 //!
 //! The cookie is `SameSite=Lax`, not the `None` the OIDC cookies need for silent
@@ -96,8 +96,6 @@ pub struct AdminSession {
     pub user_id: String,
     /// The tenant the administrator's own account lives in.
     pub home_tenant: String,
-    /// The tenant a platform administrator is acting in, if any.
-    pub acting_tenant: Option<String>,
 }
 
 /// The CSRF token for the session whose cookie value is `cookie`.
@@ -136,34 +134,20 @@ pub async fn find(pool: &DbPool, headers: &HeaderMap) -> anyhow::Result<Option<A
         return Ok(None);
     };
     let hash = sha256_hex(cookie.as_bytes());
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(crate::db::q(
+    let row: Option<(String, String)> = sqlx::query_as(crate::db::q(
         pool,
-        "SELECT user_id, home_tenant, acting_tenant FROM admin_sessions
+        "SELECT user_id, home_tenant FROM admin_sessions
          WHERE cookie_hash = ? AND expires_at > ?",
     ))
     .bind(&hash)
     .bind(now())
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(user_id, home_tenant, acting_tenant)| AdminSession {
+    Ok(row.map(|(user_id, home_tenant)| AdminSession {
         cookie_hash: hash,
         user_id,
         home_tenant,
-        acting_tenant,
     }))
-}
-
-/// Enter (`Some`) or leave (`None`) an assumed tenant.
-pub async fn set_acting_tenant(pool: &DbPool, cookie_hash: &str, tenant_id: Option<&str>) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(
-        pool,
-        "UPDATE admin_sessions SET acting_tenant = ? WHERE cookie_hash = ?",
-    ))
-    .bind(tenant_id)
-    .bind(cookie_hash)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 pub async fn end(pool: &DbPool, headers: &HeaderMap) -> anyhow::Result<()> {

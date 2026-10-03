@@ -164,14 +164,19 @@ the tenant regardless of case.</p></form>"#,
     let actions = if may_write && !listed.is_empty() {
         format!(
             r#"<form id="{BULK_GROUPS}" method="post" action="{url}">{csrf}</form>
-<div class="bulk"><span>With the ticked groups:</span>{confirm}
-<button class="danger" type="submit" form="{BULK_GROUPS}" name="{field}" value="{op}">Delete</button>
-<span>A group is deleted only once it has no members.</span></div>"#,
+<div class="bulk">{delete}</div>"#,
             url = e(&groups_url(base, tenant)),
             csrf = view::csrf_input(&ctx.csrf),
-            confirm = bulk::confirm(BULK_GROUPS),
-            field = GroupListOp::FIELD,
-            op = GroupListOp::Delete.as_str(),
+            delete = bulk::ask(
+                BULK_GROUPS,
+                GroupListOp::FIELD,
+                GroupListOp::Delete.as_str(),
+                "danger",
+                "Delete\u{2026}",
+                "Delete the ticked groups?",
+                r#"<p>Only groups with no members are deleted; the others are left and listed. Roles granted to a deleted group go with it.</p>"#,
+                "Delete",
+            ),
         )
     } else {
         String::new()
@@ -254,9 +259,6 @@ async fn delete_ticked(st: &AppState, ctx: &AdminContext, tenant: &Tenant, body:
     if chosen.is_empty() {
         return list(st, ctx, tenant, Some(bulk::NOTHING_TICKED), StatusCode::BAD_REQUEST).await;
     }
-    if !ticked.confirmed {
-        return list(st, ctx, tenant, Some(bulk::NOT_CONFIRMED), StatusCode::BAD_REQUEST).await;
-    }
     let mut tally = bulk::Tally::default();
     for group in chosen {
         match groups::delete(&st.pool, &tenant.id, &group.id).await {
@@ -335,11 +337,18 @@ async fn detail(
     let remove = if may_write && !members.is_empty() {
         format!(
             r#"<form id="{BULK_MEMBERS}" method="post" action="{url}">{csrf}</form>
-<div class="bulk"><span>With the ticked members:</span>
-<button class="danger" type="submit" form="{BULK_MEMBERS}" name="{field}" value="{op}">Remove from group</button></div>"#,
+<div class="bulk">{remove}</div>"#,
             url = e(&url),
-            field = MemberOp::FIELD,
-            op = MemberOp::Remove.as_str(),
+            remove = bulk::ask(
+                BULK_MEMBERS,
+                MemberOp::FIELD,
+                MemberOp::Remove.as_str(),
+                "danger",
+                "Remove from group\u{2026}",
+                "Remove the ticked members from this group?",
+                r#"<p>They lose whatever this group gives them: roles, and access to applications assigned to it.</p>"#,
+                "Remove",
+            ),
         )
     } else {
         String::new()
@@ -372,11 +381,18 @@ Users page and added from there.</p></form>"#,
         format!(
             r#"<h2>Delete</h2><p>The group has no members. Deleting it also withdraws any console role or
 application role granted to it.</p>
-<form method="post" action="{url}">{csrf}
-<div class="actions"><button class="danger" type="submit" name="{field}" value="{op}">Delete this group</button></div></form>"#,
-            url = e(&url),
-            field = MemberOp::FIELD,
-            op = MemberOp::DeleteGroup.as_str(),
+{button}"#,
+            button = view::confirm_post(
+                "delete-group",
+                "Delete this group\u{2026}",
+                &format!("Delete the group {}?", group.name),
+                "Roles granted to it go with it.",
+                &url,
+                &csrf,
+                MemberOp::FIELD,
+                MemberOp::DeleteGroup.as_str(),
+                "Delete",
+            ),
         )
     } else {
         r#"<h2>Delete</h2><p class="muted">A group can be deleted once it has no members.</p>"#.to_string()

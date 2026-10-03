@@ -274,10 +274,11 @@ async fn the_console_assigns_with_roles_ticked_and_changes_them_in_place() {
     groups::create(&s.pool, &f.tenant, "group1", None).await.unwrap();
     let b = signed_in_admin(&s, &f).await;
     let url = s.url(&format!("/admin/tenants/{}/apps/{}", f.tenant.id, f.web.app_id));
+    let url_users = format!("{url}/users");
 
     // The form offers the roles users may hold as tick boxes, and not the
     // application-only one.
-    let page = b.get(&url).await;
+    let page = b.get(&url_users).await;
     assert!(page.body.contains("Assign a user or group"), "{}", page.body);
     for role in ["role1", "role2", "role3"] {
         assert!(
@@ -320,7 +321,7 @@ async fn the_console_assigns_with_roles_ticked_and_changes_them_in_place() {
     assert!(listed[0].roles.is_empty());
     assert_eq!(listed[1].roles, ["role1", "role2", "role3"]);
 
-    let page = b.get(&url).await;
+    let page = b.get(&url_users).await;
     assert!(
         page.body.contains(r#"<span class="muted">no role</span>"#),
         "{}",
@@ -399,7 +400,7 @@ async fn the_console_assigns_with_roles_ticked_and_changes_them_in_place() {
     bind_in_own_tenant(&s2, &v, rust_oidc::rbac::RoleId::ApplicationViewer).await;
     let vb = signed_in_admin(&s2, &v).await;
     let vurl = s2.url(&format!("/admin/tenants/{}/apps/{}", v.tenant.id, v.web.app_id));
-    let page = vb.get(&vurl).await;
+    let page = vb.get(&format!("{vurl}/users")).await;
     assert!(page.body.contains("Users and groups"), "{}", page.body);
     assert!(!page.body.contains("Assign a user or group"), "{}", page.body);
     let refused = vb

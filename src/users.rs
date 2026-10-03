@@ -397,6 +397,23 @@ pub async fn restore(pool: &DbPool, tenant_id: &str, upn: &str) -> anyhow::Resul
     Ok(done.rows_affected() > 0)
 }
 
+/// [`restore`] by object id, as Find by id offers it. `false` when that id is not
+/// a deleted account of this tenant.
+pub async fn restore_id(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::q(
+        pool,
+        "UPDATE users SET deleted_at = NULL, enabled = ?, updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND deleted_at IS NOT NULL",
+    ))
+    .bind(true)
+    .bind(now())
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// End every live credential a user holds: browser sessions, console sessions and
 /// refresh tokens. One definition, so disabling and deleting cannot diverge.
 async fn revoke_access(tx: &mut sqlx::AnyConnection, engine: crate::db::Engine, user_id: &str) -> anyhow::Result<()> {

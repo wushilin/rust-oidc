@@ -25,7 +25,6 @@ pub enum Verb {
     Create,
     Reset,
     Rotate,
-    Assume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +89,6 @@ const CHANGE_TENANT: &[Action] = &[
 /// What is about the deployment rather than any tenant.
 const OUTSIDE_TENANTS: &[Action] = &[
     Action::new(Tenant, Create),
-    Action::new(Tenant, Assume),
     Action::new(Key, Read),
     Action::new(Key, Rotate),
 ];

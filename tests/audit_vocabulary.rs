@@ -95,6 +95,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("AdminGroupMemberAdd", "admin.group.member.add"),
     ("AdminGroupMemberRemove", "admin.group.member.remove"),
     ("AdminGroupDelete", "admin.group.delete"),
+    ("AdminUserRestore", "admin.user.restore"),
     ("AdminFlowTestStart", "admin.flow_test.start"),
     ("AdminFlowTestResult", "admin.flow_test.result"),
 ];

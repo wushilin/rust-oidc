@@ -210,12 +210,7 @@ async fn a_tenants_page_neither_lists_nor_revokes_a_global_administrator() {
         .await;
     assert_eq!(page.status, 403, "{}", page.body);
     // Still there, and the console still works.
-    assert!(
-        b.post(&s.url(&format!("/admin/assume/{}", f.tenant.id)), &[])
-            .await
-            .status
-            == 303
-    );
+    assert_eq!(b.get(&s.url("/admin/bindings")).await.status, 200);
 }
 
 #[tokio::test]

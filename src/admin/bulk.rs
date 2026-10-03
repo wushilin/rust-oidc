@@ -16,14 +16,11 @@ use crate::admin::view::e;
 pub const ITEM: &str = "item";
 /// The heading box: every row the page listed.
 pub const ALL: &str = "all";
-/// The box that must be ticked beside a button that deletes.
-pub const CONFIRM: &str = "confirm";
 
 /// What was ticked.
 pub struct Selection {
     all: bool,
     items: Vec<String>,
-    pub confirmed: bool,
 }
 
 impl Selection {
@@ -31,12 +28,10 @@ impl Selection {
         let mut out = Self {
             all: false,
             items: Vec::new(),
-            confirmed: false,
         };
         for (key, value) in url::form_urlencoded::parse(body) {
             match key.as_ref() {
                 ALL => out.all = true,
-                CONFIRM => out.confirmed = true,
                 ITEM if !out.items.iter().any(|i| i == value.as_ref()) => out.items.push(value.into_owned()),
                 _ => {}
             }
@@ -55,7 +50,6 @@ impl Selection {
 }
 
 pub const NOTHING_TICKED: &str = "Tick the rows to change, or the box in the heading for all of them.";
-pub const NOT_CONFIRMED: &str = "Tick \u{201c}confirm\u{201d} beside the delete button to delete what is selected.";
 
 /// What became of each row.
 #[derive(Default)]
@@ -103,10 +97,45 @@ pub fn cell(form: &str, id: &str, label: &str) -> String {
     )
 }
 
-/// The confirm box that goes beside a delete button.
-pub fn confirm(form: &str) -> String {
+/// A plain button acting on the ticked rows.
+pub fn button(form: &str, op_field: &str, op: &str, class: &str, label: &str) -> String {
     format!(
-        r#"<label class="confirm"><input type="checkbox" name="{CONFIRM}" form="{form}"> confirm</label>"#,
-        form = e(form)
+        r#"<button class="{class}" type="submit" form="{form}" name="{op_field}" value="{op}">{label}</button>"#,
+        class = e(class),
+        form = e(form),
+        op_field = e(op_field),
+        op = e(op),
+        label = e(label),
+    )
+}
+
+/// A button acting on the ticked rows that asks first, in a dialog that says how
+/// many are ticked. `extra` is anything else the dialog asks for (a group to add
+/// them to, say); its fields name `form` so they are posted with the rows.
+#[allow(clippy::too_many_arguments)]
+pub fn ask(
+    form: &str,
+    op_field: &str,
+    op: &str,
+    class: &str,
+    opener: &str,
+    question: &str,
+    extra: &str,
+    confirm_label: &str,
+) -> String {
+    let id = crate::admin::view::dom_id(&[form, op]);
+    let confirm = format!(
+        r#"<span class="when-ticked">{}</span>"#,
+        button(form, op_field, op, class, confirm_label)
+    );
+    crate::admin::view::ask_first(
+        &id,
+        opener,
+        "secondary",
+        question,
+        &format!(
+            r#"<p class="when-ticked">Ticked: <span class="ticked"></span></p><p class="when-none-ticked muted">Nothing is ticked yet. Tick the rows first, or the box in the heading for all of them.</p>{extra}{actions}"#,
+            actions = crate::admin::view::dialog_actions(&id, &confirm),
+        ),
     )
 }

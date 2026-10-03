@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -22,9 +22,7 @@ use crate::admin::context::{AdminContext, On};
 use crate::admin::session;
 use crate::admin::users as user_pages;
 use crate::admin::view::{self, Chrome, Tab};
-use crate::admin::{
-    APP_READ, APP_WRITE, AUDIT_READ, BINDING_READ, GROUP_READ, KEY_READ, TENANT_ASSUME, TENANT_READ, USER_READ,
-};
+use crate::admin::{APP_READ, APP_WRITE, AUDIT_READ, BINDING_READ, GROUP_READ, KEY_READ, TENANT_READ, USER_READ};
 use crate::admin::{apps as app_pages, audit as audit_pages, flow as flow_pages, groups as group_pages};
 use crate::admin::{keys as key_pages, settings as settings_pages, tenants as tenant_pages};
 use crate::db::{Actor, Event};
@@ -58,7 +56,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/admin", get(index))
         .route("/admin/home", get(home))
-        .route("/admin/find", get(crate::admin::find::page))
+        .route(
+            "/admin/find",
+            get(crate::admin::find::page).post(crate::admin::find::post),
+        )
         .route("/admin/signin", post(signin))
         .route("/admin/signout", post(signout))
         // Platform pages. No `{tenant}` segment: a platform-scope grant covers
@@ -70,8 +71,6 @@ pub fn router() -> Router<AppState> {
             "/admin/bindings",
             get(crate::admin::platform_roles::page).post(crate::admin::platform_roles::post),
         )
-        .route("/admin/assume/{tenant}", post(assume))
-        .route("/admin/leave", post(leave))
         // One tenant's sections.
         .route(
             "/admin/tenants/{tenant}/users",
@@ -100,6 +99,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/admin/tenants/{tenant}/apps/{app}",
             get(app_pages::detail_page).post(app_pages::detail_post),
+        )
+        .route(
+            "/admin/tenants/{tenant}/apps/{app}/{section}",
+            get(app_pages::section_page),
         )
         .route(
             "/admin/tenants/{tenant}/roles",
@@ -202,7 +205,7 @@ impl TenantTab {
 /// Where a page is, which decides the tabs around it and the tenant shown.
 #[derive(Clone, Copy)]
 pub enum At<'a> {
-    /// A page about the deployment. No tenant is in view unless one is assumed.
+    /// A page about the deployment. No tenant is in view.
     Platform(PlatformTab),
     /// A page about one tenant: its tabs, and its name in the corner.
     Tenant(&'a Tenant, TenantTab),
@@ -257,14 +260,12 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext, at: At<'a>) -> Chrome
                 base,
                 upn: &ctx.user.upn,
                 csrf: &ctx.csrf,
-                tenant: ctx.acting_tenant.as_ref().map(|t| t.name.as_str()),
-                assumed: ctx.acting_tenant.is_some(),
+                tenant: None,
                 up: None,
                 tabs,
             }
         }
         At::Tenant(tenant, active) => {
-            let assumed = ctx.acting_tenant.as_ref().is_some_and(|a| a.id == tenant.id);
             let tabs = TenantTab::ALL
                 .iter()
                 .filter(|t| ctx.can_in(t.action(), tenant))
@@ -279,10 +280,7 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext, at: At<'a>) -> Chrome
                 upn: &ctx.user.upn,
                 csrf: &ctx.csrf,
                 tenant: Some(&tenant.name),
-                assumed,
-                // An assumed tenant is left with Leave, beside its name; offering
-                // a second way out that keeps it assumed would only confuse.
-                up: (!assumed).then_some(tenants_url),
+                up: Some(tenants_url),
                 tabs,
             }
         }
@@ -335,11 +333,7 @@ fn sign_in_page(st: &AppState, upn: &str, error: Option<&str>) -> Response {
 async fn home(ctx: AdminContext, State(st): State<AppState>) -> Response {
     let base = st.public_url.base();
     let platform_wide = ctx.can(TENANT_READ, On::Platform);
-    let own = if platform_wide {
-        ctx.acting_tenant.as_ref()
-    } else {
-        Some(&ctx.home_tenant)
-    };
+    let own = (!platform_wide).then_some(&ctx.home_tenant);
     let target = own
         .and_then(|t| tenant_home(base, &ctx, t))
         .unwrap_or_else(|| format!("{base}/admin/tenants"));
@@ -503,65 +497,6 @@ async fn signout(ctx: AdminContext, State(st): State<AppState>, headers: HeaderM
     resp.headers_mut()
         .append(header::SET_COOKIE, session::clear_cookie(&st.public_url));
     resp
-}
-
-// ---- assume and leave ----
-
-async fn assume(ctx: AdminContext, State(st): State<AppState>, Path(key): Path<String>, body: Bytes) -> Response {
-    // Authorization first: an administrator who may not assume learns nothing
-    // about which tenants exist, so a disabled, deleted and imaginary tenant all
-    // look the same to them.
-    if let Err(resp) = ctx.require(TENANT_ASSUME, On::Platform) {
-        return resp;
-    }
-    let form = parse_form(&body);
-    if let Err(resp) = ctx.check_csrf(&form) {
-        return resp;
-    }
-    let Some(target) = ctx.tenant(&key) else {
-        return view::not_found();
-    };
-    if let Err(e) = session::set_acting_tenant(&st.pool, &ctx.cookie_hash, Some(&target.id)).await {
-        tracing::error!("assume failed: {e}");
-        return view::server_error();
-    }
-    audited(
-        &st,
-        &ctx,
-        &target.id,
-        Event::AdminTenantAssume,
-        Some(&target.id),
-        json!({ "tenant": target.name }),
-    )
-    .await;
-    // Assuming a tenant is going into it: land on its first section rather than
-    // back on the list with one more click to make.
-    let base = st.public_url.base();
-    let into = tenant_home(base, &ctx, target).unwrap_or_else(|| format!("{base}/admin/tenants"));
-    view::see_other(&into)
-}
-
-async fn leave(ctx: AdminContext, State(st): State<AppState>, body: Bytes) -> Response {
-    let form = parse_form(&body);
-    if let Err(resp) = ctx.check_csrf(&form) {
-        return resp;
-    }
-    if let Some(left) = &ctx.acting_tenant {
-        if let Err(e) = session::set_acting_tenant(&st.pool, &ctx.cookie_hash, None).await {
-            tracing::error!("leave failed: {e}");
-            return view::server_error();
-        }
-        audited(
-            &st,
-            &ctx,
-            &left.id,
-            Event::AdminTenantLeave,
-            Some(&left.id),
-            json!({ "tenant": left.name }),
-        )
-        .await;
-    }
-    view::see_other(&format!("{}/admin/tenants", st.public_url.base()))
 }
 
 // ---- who the administrators are ----

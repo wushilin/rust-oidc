@@ -25,7 +25,7 @@ use crate::AppState;
 use crate::admin::context::{AdminContext, On};
 use crate::admin::routes::{At, Params, PlatformTab, audited, chrome, field, parse_form};
 use crate::admin::view::{self, e};
-use crate::admin::{TENANT_ASSUME, TENANT_CREATE, TENANT_READ, TENANT_WRITE};
+use crate::admin::{TENANT_CREATE, TENANT_READ, TENANT_WRITE};
 use crate::db::Event;
 use crate::rbac::Action;
 use crate::tenant::{self, Tenant};
@@ -115,7 +115,6 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
     let base = st.public_url.base();
     let url = tenants_url(base);
     let csrf = view::csrf_input(&ctx.csrf);
-    let may_assume = ctx.can(TENANT_ASSUME, On::Platform);
     let may_write = ctx.can(TENANT_WRITE, On::Platform);
     let may_create = ctx.can(TENANT_CREATE, On::Platform);
 
@@ -148,7 +147,7 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
                     r#"<span class="pill bad">disabled</span>"#
                 },
                 id = e(&t.id),
-                actions = row_actions(base, &url, &csrf, ctx, t, may_assume, may_write),
+                actions = row_actions(&url, &csrf, t, may_write),
             )
         })
         .collect();
@@ -194,16 +193,8 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
 }
 
 /// What can be done to a tenant from the list itself: bring a disabled one back
-/// (it has no pages of its own to do that from), or assume it.
-fn row_actions(
-    base: &str,
-    url: &str,
-    csrf: &str,
-    ctx: &AdminContext,
-    t: &Tenant,
-    may_assume: bool,
-    may_write: bool,
-) -> String {
+/// (it has no pages of its own to do that from).
+fn row_actions(url: &str, csrf: &str, t: &Tenant, may_write: bool) -> String {
     let mut out = String::new();
     if !t.enabled && may_write {
         out.push_str(&format!(
@@ -214,13 +205,6 @@ fn row_actions(
             id = e(&t.id),
             field = TenantOp::FIELD,
             op = TenantOp::Enable.as_str(),
-        ));
-    }
-    if t.enabled && may_assume && ctx.acting_tenant.as_ref().is_none_or(|a| a.id != t.id) {
-        out.push_str(&format!(
-            r#"<form method="post" action="{base}/admin/assume/{id}" class="inline">{csrf}<button class="secondary" type="submit">Assume</button></form>"#,
-            base = e(base),
-            id = e(&t.id),
         ));
     }
     out
@@ -299,11 +283,18 @@ by its domain in a URL need the new one; those that use the tenant id do not.</p
         format!(
             r#"<p>Disabling a tenant stops every sign-in to it and closes these pages. It can be enabled
 again from the list of tenants.</p>
-<form method="post" action="{url}">{hidden}
-<div class="actions"><button class="danger" type="submit" name="{field}" value="{op}">Disable this tenant</button></div></form>"#,
-            url = e(&url),
-            field = TenantOp::FIELD,
-            op = TenantOp::Disable.as_str(),
+{button}"#,
+            button = view::confirm_post(
+                "disable-tenant",
+                "Disable this tenant\u{2026}",
+                &format!("Disable {}?", t.name),
+                "Nobody can sign in to it or to its applications until it is enabled again.",
+                &url,
+                &hidden,
+                TenantOp::FIELD,
+                TenantOp::Disable.as_str(),
+                "Disable",
+            ),
         )
     };
     format!(

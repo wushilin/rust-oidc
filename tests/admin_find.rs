@@ -226,19 +226,96 @@ async fn a_new_user_is_named_by_the_part_before_the_at_and_the_tenants_domain() 
     );
 }
 
-/// Assuming a tenant goes into it.
+/// A deleted user, application or group is still found, marked as deleted and
+/// read-only, so an id in an old audit entry still says something. A deleted
+/// user can be restored from there.
 #[tokio::test]
-async fn assuming_a_tenant_lands_inside_it() {
+async fn deleted_objects_are_found_read_only_and_a_user_can_be_restored() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
-    let target = s.tenant("Fabrikam", "fabrikam.test").await;
+    let tenant = rust_oidc::tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    let gone = user_fixture_in(&s, f.tenant.clone(), "gone@contoso.com").await;
+    let group = rust_oidc::groups::create(&s.pool, &tenant, "Old team", None)
+        .await
+        .unwrap();
     let b = signed_in_admin(&s, &f).await;
-    let page = b.post(&s.url(&format!("/admin/assume/{}", target.id)), &[]).await;
-    assert_eq!(page.status, 303, "{}", page.body);
-    assert!(
-        page.location
-            .unwrap()
-            .ends_with(&format!("/admin/tenants/{}/users", target.id)),
-        "assume enters the tenant"
+    assert_eq!(
+        b.post(
+            &s.url(&format!("/admin/tenants/{}/users/{}", f.tenant.id, gone.user_id)),
+            &[("op", "delete")]
+        )
+        .await
+        .status,
+        303
     );
+    assert!(rust_oidc::groups::delete(&s.pool, &f.tenant.id, &group).await.unwrap());
+
+    let page = b.get(&s.url(&format!("/admin/find?id={}", gone.user_id))).await;
+    assert!(page.body.contains("gone@contoso.com"), "{}", page.body);
+    assert!(page.body.contains("deleted "), "{}", page.body);
+    assert!(
+        !page.body.contains(&format!(
+            r#"href="{}"#,
+            s.url(&format!("/admin/tenants/{}/users/{}", f.tenant.id, gone.user_id))
+        )),
+        "no link to a page it no longer has: {}",
+        page.body
+    );
+    assert!(page.body.contains(r#"value="restore""#), "{}", page.body);
+
+    let page = b.get(&s.url(&format!("/admin/find?id={group}"))).await;
+    assert!(page.body.contains("Old team"), "{}", page.body);
+    assert!(page.body.contains("deleted "), "{}", page.body);
+    assert!(
+        !page.body.contains(r#"value="restore""#),
+        "a group is not restored: {}",
+        page.body
+    );
+    // Its name is free again at once.
+    rust_oidc::groups::create(&s.pool, &tenant, "Old team", None)
+        .await
+        .unwrap();
+
+    // The audit log names them, as deleted, rather than printing bare ids.
+    let audit = b.get(&s.url(&format!("/admin/tenants/{}/audit", f.tenant.id))).await;
+    assert!(audit.body.contains("gone@contoso.com (deleted)"), "{}", audit.body);
+
+    // Restore: the account is back, enabled, at its own page.
+    let restored = b
+        .post(
+            &s.url("/admin/find"),
+            &[
+                ("op", "restore"),
+                ("id", gone.user_id.as_str()),
+                ("tenant", f.tenant.id.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(restored.status, 303, "{}", restored.body);
+    assert!(
+        restored
+            .location
+            .unwrap()
+            .ends_with(&format!("/users/{}", gone.user_id))
+    );
+    let back = rust_oidc::users::find(&s.pool, &f.tenant.id, &gone.user_id)
+        .await
+        .unwrap()
+        .expect("restored");
+    assert!(back.enabled);
+    // Restoring needs what deleting needed: a viewer is refused.
+    let s2 = TestServer::start().await;
+    let v = reader_fixture(&s2).await;
+    let vb = signed_in_admin(&s2, &v).await;
+    let refused = vb
+        .post(
+            &s2.url("/admin/find"),
+            &[
+                ("op", "restore"),
+                ("id", v.user_id.as_str()),
+                ("tenant", v.tenant.id.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(refused.status, 403);
 }

@@ -106,6 +106,37 @@ fieldset.choice { border:none; margin:14px 0 0; padding:0; }
 fieldset.choice legend { padding:0; font-size:13px; font-weight:600; margin-bottom:2px; }
 .when-some { margin:6px 0 0 24px; padding:2px 0 6px 14px; border-left:2px solid var(--line); }
 fieldset.choice:not(:has(input.some:checked)) .when-some { display:none; }
+/* A choice between a user and a group: only the chosen one's field shows. */
+form.pick-principal:has(input.is-group:checked) .when-user,
+form.pick-principal:not(:has(input.is-group:checked)) .when-group { display:none; }
+/* An object's own sections, under the tenant's tabs. */
+nav.subtabs { display:flex; flex-wrap:wrap; gap:2px 4px; border-bottom:1px solid var(--line); margin:4px 0 22px; }
+nav.subtabs a { padding:7px 12px; border-radius:4px 4px 0 0; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; margin-bottom:-1px; }
+nav.subtabs a:hover { color:var(--ink); background:var(--hover); }
+nav.subtabs a.active { color:var(--ink); border-bottom-color:var(--accent); font-weight:600; }
+p.crumb { margin:0 0 4px; font-size:13px; }
+/* The overview's tiles: one per section, saying what is in it. */
+.tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:12px; margin:18px 0; }
+a.tile { display:flex; flex-direction:column; gap:4px; padding:14px 16px; background:var(--surface); border:1px solid var(--line); border-radius:6px; color:var(--ink); text-decoration:none; }
+a.tile:hover { border-color:var(--accent); }
+a.tile span { color:var(--muted); font-size:13.5px; }
+a.tile .pill { align-self:flex-start; margin-top:4px; }
+/* Dialogs: the browser's popover, centred over a dimmed page. */
+[popover].dialog { margin:auto; inset:0; max-width:460px; width:calc(100% - 32px); height:fit-content; border:1px solid var(--line); border-radius:8px; padding:20px 22px; background:var(--surface); color:var(--ink); box-shadow:0 16px 48px rgba(0,0,0,.28); }
+[popover].dialog::backdrop { background:rgba(10,16,20,.45); }
+[popover].dialog h3 { margin:0 0 10px; font-size:17px; }
+[popover].dialog p { margin:0 0 10px; }
+[popover].dialog .actions { margin-top:16px; }
+td [popover].dialog { text-align:left; white-space:normal; }
+/* How many rows are ticked, counted by the stylesheet for a dialog to show:
+   each ticked box, or every row when the heading box is ticked. */
+body { counter-reset:ticked; }
+input.row:checked { counter-increment:ticked; }
+table:has(input.all:checked) td.tick { counter-increment:ticked; }
+table:has(input.all:checked) input.row:checked { counter-increment:none; }
+.ticked::after { content:counter(ticked); font-weight:600; }
+body:has(input.row:checked, input.all:checked) .when-none-ticked { display:none; }
+body:not(:has(input.row:checked, input.all:checked)) .when-ticked { display:none; }
 /* Acting on many rows: a tick box per row, one in the heading for all. Ticking
    the heading box marks every row, since without script it cannot tick them. */
 th.tick, td.tick { width:1%; padding-right:0; }
@@ -114,8 +145,6 @@ table:has(input.all:checked) input.row { visibility:hidden; }
 .bulk { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; margin:0 0 14px; font-size:13px; color:var(--muted); }
 .bulk button { padding:5px 11px; font-size:13px; }
 .bulk select { width:auto; max-width:220px; padding:4px 8px; }
-.bulk .sep { width:1px; align-self:stretch; background:var(--line); }
-.bulk label.confirm, .bulk label.inline { display:inline-flex; gap:5px; align-items:center; margin:0; font-weight:400; font-size:13px; color:var(--muted); }
 fieldset.ticks { border:none; margin:0; padding:0; display:flex; flex-wrap:wrap; gap:4px 18px; }
 fieldset.ticks label { font-weight:400; margin:0; }
 details.inline-edit { display:inline-block; vertical-align:top; margin-left:6px; }
@@ -216,10 +245,8 @@ pub struct Chrome<'a> {
     pub base: &'a str,
     pub upn: &'a str,
     pub csrf: &'a str,
-    /// The tenant in view: the one the page is about, or the one assumed.
+    /// The tenant in view: the one the page is about.
     pub tenant: Option<&'a str>,
-    /// Whether that tenant is the assumed one, which is what Leave undoes.
-    pub assumed: bool,
     /// Back to the list of tenants, from inside one.
     pub up: Option<String>,
     pub tabs: Vec<Tab>,
@@ -249,19 +276,7 @@ pub fn page(c: &Chrome<'_>, status: StatusCode, title: &str, body: &str) -> Resp
         .collect();
     let tenant = match c.tenant {
         Some(name) => {
-            let leave = if c.assumed {
-                format!(
-                    r#"<form method="post" action="{base}/admin/leave" class="inline">{csrf}<button class="secondary" type="submit">Leave</button></form>"#,
-                    base = e(c.base),
-                    csrf = csrf_input(c.csrf),
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                r#"<span class="tenant">Tenant <strong>{}</strong></span>{leave}"#,
-                e(name)
-            )
+            format!(r#"<span class="tenant">Tenant <strong>{}</strong></span>"#, e(name))
         }
         None => r#"<span class="tenant none">No tenant selected</span>"#.to_string(),
     };
@@ -427,6 +442,79 @@ pub fn error_block(error: Option<&str>) -> String {
     error
         .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
         .unwrap_or_default()
+}
+
+/// An id for an element, from parts that may hold any characters: what an id
+/// attribute and a `popovertarget` can both carry.
+pub fn dom_id(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|p| {
+            p.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// An action that asks first: a button that opens a dialog, and the dialog,
+/// which holds the question, whatever else it needs to know, and the button that
+/// does it. No script: the browser's popover attributes open and close it.
+///
+/// `body` is the dialog's content after its heading, normally ending in
+/// [`dialog_actions`]. A browser without popover support shows the dialog in
+/// place, which still works.
+pub fn ask_first(id: &str, opener_label: &str, opener_class: &str, question: &str, body: &str) -> String {
+    format!(
+        r#"<button type="button" class="{opener_class}" popovertarget="{id}">{opener}</button><div id="{id}" popover class="dialog" role="dialog" aria-labelledby="{id}-q"><h3 id="{id}-q">{question}</h3>{body}</div>"#,
+        id = e(id),
+        opener_class = e(opener_class),
+        opener = e(opener_label),
+        question = e(question),
+    )
+}
+
+/// The buttons at the foot of a dialog: the one that does it, then Cancel.
+pub fn dialog_actions(id: &str, confirm: &str) -> String {
+    format!(
+        r#"<div class="actions">{confirm}<button type="button" class="secondary" popovertarget="{id}" popovertargetaction="hide">Cancel</button></div>"#,
+        id = e(id),
+    )
+}
+
+/// A one-row action that asks first: the form (its hidden fields and its submit
+/// button) lives inside the dialog, so nothing is posted until it is confirmed.
+#[allow(clippy::too_many_arguments)]
+pub fn confirm_post(
+    id: &str,
+    opener_label: &str,
+    question: &str,
+    detail: &str,
+    url: &str,
+    hidden: &str,
+    op_field: &str,
+    op: &str,
+    confirm_label: &str,
+) -> String {
+    let confirm = format!(
+        r#"<button class="danger" type="submit" name="{op_field}" value="{op}">{label}</button>"#,
+        op_field = e(op_field),
+        op = e(op),
+        label = e(confirm_label),
+    );
+    ask_first(
+        id,
+        opener_label,
+        "danger",
+        question,
+        &format!(
+            r#"<form method="post" action="{url}">{hidden}<p>{detail}</p>{actions}</form>"#,
+            url = e(url),
+            detail = e(detail),
+            actions = dialog_actions(id, &confirm),
+        ),
+    )
 }
 
 /// A value shown exactly once, because it is not stored anywhere it could be

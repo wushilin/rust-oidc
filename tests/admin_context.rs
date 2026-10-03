@@ -25,13 +25,6 @@ async fn an_admin_session_round_trips_and_can_be_ended() {
     let found = session::find(&s.pool, &headers).await.unwrap().unwrap();
     assert_eq!(found.user_id, f.user_id);
     assert_eq!(found.home_tenant, f.tenant.id);
-    assert!(found.acting_tenant.is_none());
-
-    session::set_acting_tenant(&s.pool, &found.cookie_hash, Some(&f.tenant.id))
-        .await
-        .unwrap();
-    let again = session::find(&s.pool, &headers).await.unwrap().unwrap();
-    assert_eq!(again.acting_tenant.as_deref(), Some(f.tenant.id.as_str()));
 
     session::end(&s.pool, &headers).await.unwrap();
     assert!(session::find(&s.pool, &headers).await.unwrap().is_none());

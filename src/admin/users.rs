@@ -238,19 +238,22 @@ async fn list(
     // What can be done to the ticked rows. Each button is there only with the
     // action that permits it.
     let actions = if ticks && !found.is_empty() {
-        let button = |op: UserListOp, class: &str, label: &str| {
-            format!(
-                r#"<button class="{class}" type="submit" form="{BULK_FORM}" name="{field}" value="{op}">{label}</button>"#,
-                field = UserListOp::FIELD,
-                op = op.as_str(),
-            )
-        };
+        let field = UserListOp::FIELD;
         let mut parts: Vec<String> = Vec::new();
         if may_write {
-            parts.push(format!(
-                "{}{}",
-                button(UserListOp::Enable, "secondary", "Enable sign-in"),
-                button(UserListOp::Disable, "secondary", "Disable sign-in")
+            parts.push(bulk::button(
+                BULK_FORM,
+                field,
+                UserListOp::Enable.as_str(),
+                "secondary",
+                "Enable sign-in",
+            ));
+            parts.push(bulk::button(
+                BULK_FORM,
+                field,
+                UserListOp::Disable.as_str(),
+                "secondary",
+                "Disable sign-in",
             ));
         }
         if may_group {
@@ -260,26 +263,39 @@ async fn list(
                     .iter()
                     .map(|g| format!(r#"<option value="{}">{}</option>"#, e(&g.id), e(&g.name)))
                     .collect();
-                parts.push(format!(
-                    r#"<select name="{GROUP}" form="{BULK_FORM}" aria-label="Group">{options}</select>{}"#,
-                    button(UserListOp::AddToGroup, "secondary", "Add to group")
+                parts.push(bulk::ask(
+                    BULK_FORM,
+                    field,
+                    UserListOp::AddToGroup.as_str(),
+                    "",
+                    "Add to group\u{2026}",
+                    "Add the ticked accounts to a group",
+                    &format!(
+                        r#"<label for="bulk-group">Group</label><select id="bulk-group" name="{GROUP}" form="{BULK_FORM}">{options}</select>"#
+                    ),
+                    "Add to group",
                 ));
             }
         }
         if may_write {
-            parts.push(format!(
-                "{}{}",
-                bulk::confirm(BULK_FORM),
-                button(UserListOp::Delete, "danger", "Delete")
+            parts.push(bulk::ask(
+                BULK_FORM,
+                field,
+                UserListOp::Delete.as_str(),
+                "danger",
+                "Delete\u{2026}",
+                "Delete the ticked accounts?",
+                r#"<p>They can no longer sign in, and their sessions end. An administrator can restore a deleted account.</p>"#,
+                "Delete",
             ));
         }
         format!(
             r#"<form id="{BULK_FORM}" method="post" action="{url}">{csrf}<input type="hidden" name="{QUERY_PARAM}" value="{search}"></form>
-<div class="bulk"><span>With the ticked accounts:</span>{parts}</div>"#,
+<div class="bulk">{parts}</div>"#,
             url = e(&users_url(base, tenant)),
             csrf = view::csrf_input(&ctx.csrf),
             search = e(search),
-            parts = parts.join(r#"<span class="sep"></span>"#),
+            parts = parts.concat(),
         )
     } else {
         String::new()
@@ -340,17 +356,6 @@ pub async fn list_post(
             tenant,
             search,
             Some(bulk::NOTHING_TICKED),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-    }
-    if op == UserListOp::Delete && !ticked.confirmed {
-        return list(
-            &st,
-            &ctx,
-            tenant,
-            search,
-            Some(bulk::NOT_CONFIRMED),
             StatusCode::BAD_REQUEST,
         )
         .await;
@@ -631,12 +636,21 @@ disabled or deleted from here. Another administrator can.</p>"#
         format!(
             r#"<h2>Sign-in</h2><form method="post" action="{url}" class="inline">{csrf}
 <button class="secondary" type="submit" name="{op_field}" value="{op}">{label}</button></form>
-<form method="post" action="{url}" class="inline">{csrf}
-<button class="danger" type="submit" name="{op_field}" value="{delete}">Delete user</button></form>"#,
+{delete}"#,
             url = e(&url),
             op_field = UserOp::FIELD,
             op = op.as_str(),
-            delete = UserOp::Delete.as_str(),
+            delete = view::confirm_post(
+                "delete-user",
+                "Delete user\u{2026}",
+                &format!("Delete {}?", user.upn),
+                "They can no longer sign in, and their sessions end. An administrator can restore a deleted account.",
+                &url,
+                &csrf,
+                UserOp::FIELD,
+                UserOp::Delete.as_str(),
+                "Delete",
+            ),
         )
     } else {
         String::new()

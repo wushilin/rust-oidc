@@ -98,24 +98,27 @@ async fn render(
     // any tenant and is on the Global roles page, not repeated in each of them.
     let mut rows = String::new();
     for b in listed.iter().filter(|b| b.scope.kind() == ScopeKind::Tenants) {
+        let who = principal_name(st, b).await;
         // The revoke button appears only where the no-widening rule would allow
         // it; `authz::delete` checks it again, and the lock-out rule too.
         let revoke = if authz::may_write_binding(ctx.bindings(), &b.scope) {
-            format!(
-                r#"<form method="post" action="{url}" class="inline">{csrf}
-<input type="hidden" name="{BINDING}" value="{id}">
-<button class="danger" type="submit" name="{op_field}" value="{revoke}">Revoke</button></form>"#,
-                url = e(&url),
-                id = e(&b.id),
-                op_field = RoleOp::FIELD,
-                revoke = RoleOp::Revoke.as_str(),
+            view::confirm_post(
+                &view::dom_id(&["revoke", &b.id]),
+                "Revoke\u{2026}",
+                &format!("Revoke {} from {}?", b.role.display_name(), who),
+                "It takes effect on their next request.",
+                &url,
+                &format!(r#"{csrf}<input type="hidden" name="{BINDING}" value="{}">"#, e(&b.id)),
+                RoleOp::FIELD,
+                RoleOp::Revoke.as_str(),
+                "Revoke",
             )
         } else {
             String::new()
         };
         rows.push_str(&format!(
             "<tr><td>{who}</td><td>{kind}</td><td>{role}</td><td>{scope}</td><td>{revoke}</td></tr>",
-            who = e(&principal_name(st, b).await),
+            who = e(&who),
             kind = e(b.principal_type.as_str()),
             role = e(b.role.display_name()),
             scope = scope_cell(&b.scope),

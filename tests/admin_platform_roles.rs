@@ -251,3 +251,61 @@ async fn where_an_administrator_lands_depends_on_their_reach() {
         "their own tenant"
     );
 }
+
+/// A group of the root tenant can be made Global Administrator, named by its name
+/// alone; a user by the part before the @, the root domain being implied.
+#[tokio::test]
+async fn global_administrator_is_granted_to_a_group_or_by_short_user_name() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let tenant = rust_oidc::tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    let ops = rust_oidc::groups::create(&s.pool, &tenant, "Operators", None)
+        .await
+        .unwrap();
+    let bea = another_user(&s, &f, "bea@contoso.com").await;
+    let fabrikam = s.tenant("Fabrikam", "fabrikam.test").await;
+    rust_oidc::groups::create(&s.pool, &fabrikam, "Outsiders", None)
+        .await
+        .unwrap();
+    let b = signed_in_admin(&s, &f).await;
+
+    let page = b.get(&s.url(PAGE)).await;
+    assert!(page.body.contains(r#"value="Group" class="is-group""#), "{}", page.body);
+    assert!(page.body.contains("@ <strong>contoso.com</strong>"), "{}", page.body);
+
+    let group = b
+        .post(
+            &s.url(PAGE),
+            &[("op", "grant"), ("principal_type", "Group"), ("group", "operators")],
+        )
+        .await;
+    assert_eq!(group.status, 303, "{}", group.body);
+    let user = b
+        .post(
+            &s.url(PAGE),
+            &[("op", "grant"), ("principal_type", "User"), ("account", "bea")],
+        )
+        .await;
+    assert_eq!(user.status, 303, "{}", user.body);
+    let held: Vec<(String, Scope)> = bindings::list_all(&s.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.principal_id == ops || b.principal_id == bea)
+        .map(|b| (b.principal_id, b.scope))
+        .collect();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert!(held.iter().all(|(_, scope)| *scope == Scope::All));
+
+    // The page lists the group, and a group of another tenant is not found.
+    let page = b.get(&s.url(PAGE)).await;
+    assert!(page.body.contains("<td>Operators</td>"), "{}", page.body);
+    let outsider = b
+        .post(
+            &s.url(PAGE),
+            &[("op", "grant"), ("principal_type", "Group"), ("group", "Outsiders")],
+        )
+        .await;
+    assert_eq!(outsider.status, 400);
+    assert!(outsider.body.contains("no group named"), "{}", outsider.body);
+}

@@ -1130,6 +1130,17 @@ beside it, which the discovery document now uses too, so the two cannot disagree
 read "external integrations" as what a client needs; server settings (database, TLS,
 rate limits) are not on it.
 
+**150. UI round (user's list, 3 Oct).** Assume tenant is removed: opening a tenant is
+how one works in it (the session column stays, unused). Destructive actions ask first
+in a dialog built on the HTML popover attributes, so the console stays script-free;
+bulk dialogs show how many rows are ticked by CSS counters. The application page is
+split into Entra's sections with an overview of tiles. Global Administrator can be
+granted to a group of the root tenant, and a user by the part before the @. Find by id
+shows deleted users, applications and groups read-only, and restores users. Mine:
+groups are still deleted outright, and a `deleted_groups` row records what they were,
+because the original `UNIQUE (tenant_id, name)` on every engine would make a
+soft-deleted group's name unusable; a deleted group is not restorable.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

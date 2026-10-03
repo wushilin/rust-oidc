@@ -37,6 +37,71 @@ use crate::util::now;
 ///
 /// An enum rather than a bare string so a new operation cannot be added without
 /// deciding which action authorizes it and which event records it.
+/// How close to expiry a client secret is flagged on the overview: 30 days.
+const SECRET_EXPIRY_WARNING_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// A part of an application's page, each at its own address. The same split as
+/// Entra's app registration blades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppSection {
+    Overview,
+    Authentication,
+    Credentials,
+    Api,
+    Roles,
+    Assignments,
+    Permissions,
+}
+
+impl AppSection {
+    pub const ALL: &'static [AppSection] = &[
+        Self::Overview,
+        Self::Authentication,
+        Self::Credentials,
+        Self::Api,
+        Self::Roles,
+        Self::Assignments,
+        Self::Permissions,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Authentication => "Authentication",
+            Self::Credentials => "Certificates & secrets",
+            Self::Api => "Expose an API",
+            Self::Roles => "App roles",
+            Self::Assignments => "Users and groups",
+            Self::Permissions => "Application permissions",
+        }
+    }
+
+    /// The last part of its address; the overview is the application's own.
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Overview => "",
+            Self::Authentication => "authentication",
+            Self::Credentials => "credentials",
+            Self::Api => "api",
+            Self::Roles => "roles",
+            Self::Assignments => "users",
+            Self::Permissions => "permissions",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|s| s.path() == raw)
+    }
+
+    /// What it takes to open it, beyond seeing the application.
+    fn action(self) -> Action {
+        match self {
+            Self::Assignments | Self::Permissions => ASSIGNMENT_READ,
+            _ => APP_READ,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppOp {
     /// `allow_password_grant` and the two implicit toggles, saved together.
@@ -60,6 +125,21 @@ pub enum AppOp {
 }
 
 impl AppOp {
+    /// The section the operation belongs to: where its form is, and where the
+    /// page goes back to after it.
+    fn section(self) -> AppSection {
+        match self {
+            Self::Flags | Self::RedirectUriAdd | Self::RedirectUriRemove => AppSection::Authentication,
+            Self::SecretAdd | Self::SecretRemove | Self::CertificateAdd | Self::CertificateRemove => {
+                AppSection::Credentials
+            }
+            Self::IdentifierUriAdd | Self::IdentifierUriRemove | Self::ScopeAdd => AppSection::Api,
+            Self::RoleAdd => AppSection::Roles,
+            Self::Assign | Self::Unassign => AppSection::Assignments,
+            Self::RoleAssign | Self::RoleUnassign => AppSection::Permissions,
+        }
+    }
+
     pub const ALL: &'static [AppOp] = &[
         Self::Flags,
         Self::SecretAdd,
@@ -173,6 +253,13 @@ const DEFAULT_SECRET_DAYS: i64 = 180;
 
 fn apps_url(base: &str, tenant: &Tenant) -> String {
     format!("{base}/admin/tenants/{}/apps", tenant.id)
+}
+
+fn section_url(base: &str, tenant: &Tenant, app: &Application, section: AppSection) -> String {
+    match section {
+        AppSection::Overview => app_url(base, tenant, app),
+        other => format!("{}/{}", app_url(base, tenant, app), other.path()),
+    }
 }
 
 fn app_url(base: &str, tenant: &Tenant, app: &Application) -> String {
@@ -323,7 +410,40 @@ pub async fn detail_page(
     let Ok(app) = apps::find_in_tenant(&st.pool, tenant, &app_key).await else {
         return view::not_found();
     };
-    detail(&st, &ctx, tenant, &app, Page::default(), StatusCode::OK).await
+    detail(
+        &st,
+        &ctx,
+        tenant,
+        &app,
+        AppSection::Overview,
+        Page::default(),
+        StatusCode::OK,
+    )
+    .await
+}
+
+/// One section of an application's page.
+pub async fn section_page(
+    ctx: AdminContext,
+    State(st): State<AppState>,
+    Path((key, app_key, section)): Path<(String, String, String)>,
+) -> Response {
+    let Some(section) = AppSection::parse(&section).filter(|s| *s != AppSection::Overview) else {
+        return view::not_found();
+    };
+    if let Err(resp) = ctx.require(APP_READ, On::Tenant(&key)) {
+        return resp;
+    }
+    if let Err(resp) = ctx.require(section.action(), On::Tenant(&key)) {
+        return resp;
+    }
+    let Some(tenant) = ctx.tenant(&key) else {
+        return view::not_found();
+    };
+    let Ok(app) = apps::find_in_tenant(&st.pool, tenant, &app_key).await else {
+        return view::not_found();
+    };
+    detail(&st, &ctx, tenant, &app, section, Page::default(), StatusCode::OK).await
 }
 
 /// What a render of the application page needs beyond the application itself.
@@ -339,6 +459,7 @@ async fn detail(
     ctx: &AdminContext,
     tenant: &Tenant,
     app: &Application,
+    section: AppSection,
     page: Page<'_>,
     status: StatusCode,
 ) -> Response {
@@ -348,50 +469,58 @@ async fn detail(
     let may_write = ctx.can_in(APP_WRITE, tenant);
     let may_rotate = ctx.can_in(APP_ROTATE, tenant);
     let may_assign = ctx.can_in(ASSIGNMENT_WRITE, tenant);
-    let may_read_assignments = ctx.can_in(ASSIGNMENT_READ, tenant);
 
-    let secrets = apps::secrets(&st.pool, app).await.unwrap_or_default();
-    let certificates = apps::key_credentials(&st.pool, app).await.unwrap_or_default();
-    let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
-    let identifier_uris = apps::identifier_uris(&st.pool, app).await.unwrap_or_default();
-    let scopes = apps::scopes(&st.pool, app).await.unwrap_or_default();
-    let roles = apps::roles(&st.pool, app).await.unwrap_or_default();
-
-    let facts = format!(
-        r#"<dl class="facts"><dt>Application (client) id</dt><dd>{app_id}</dd>
-<dt>Object id</dt><dd>{id}</dd><dt>Tenant</dt><dd>{tenant_name}</dd></dl>
-<p class="muted"><a href="{flow}">Test a sign-in flow with this application</a>, which says what the
-flow needs before it runs anything.</p>"#,
-        app_id = e(&app.app_id),
-        id = e(&app.id),
-        tenant_name = e(&tenant.name),
-        flow = e(&format!(
-            "{base}/admin/tenants/{}/flow?{}={}",
-            tenant.id,
-            crate::flowtest::APP_FIELD,
-            app.app_id
-        )),
-    );
-
-    let flags = flags_form(&url, &csrf, app, may_write);
-    let secrets = secrets_section(&url, &csrf, &secrets, may_rotate);
-    let certificates = certificates_section(&url, &csrf, &certificates, may_rotate);
-    let redirects = redirect_section(&url, &csrf, &redirect_uris, may_write);
-    let identifiers = identifier_section(&url, &csrf, &identifier_uris, may_write);
-    let scopes_html = scope_section(&url, &csrf, &scopes, may_write);
-    let roles_html = role_section(&url, &csrf, &roles, may_write);
-    let assignments = if may_read_assignments {
-        let assigned = apps::assignments(&st.pool, &tenant.id, app).await.unwrap_or_default();
-        let granted = apps::role_assignments(&st.pool, &tenant.id, app)
-            .await
-            .unwrap_or_default();
-        format!(
-            "{}{}",
-            assignment_section(&url, &csrf, &assigned, &roles, tenant, may_assign),
-            application_roles_section(&url, &csrf, &granted, &roles, may_assign)
-        )
-    } else {
-        String::new()
+    let content = match section {
+        AppSection::Overview => overview(st, ctx, tenant, app).await,
+        AppSection::Authentication => {
+            let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
+            format!(
+                "{}{}",
+                redirect_section(&url, &csrf, &redirect_uris, may_write),
+                flags_form(&url, &csrf, app, may_write)
+            )
+        }
+        AppSection::Credentials => {
+            let secrets = apps::secrets(&st.pool, app).await.unwrap_or_default();
+            let certificates = apps::key_credentials(&st.pool, app).await.unwrap_or_default();
+            format!(
+                "{}{}",
+                secrets_section(&url, &csrf, &secrets, may_rotate),
+                certificates_section(&url, &csrf, &certificates, may_rotate)
+            )
+        }
+        AppSection::Api => {
+            let identifier_uris = apps::identifier_uris(&st.pool, app).await.unwrap_or_default();
+            let scopes = apps::scopes(&st.pool, app).await.unwrap_or_default();
+            format!(
+                "{}{}",
+                identifier_section(&url, &csrf, &identifier_uris, may_write),
+                scope_section(&url, &csrf, &scopes, may_write)
+            )
+        }
+        AppSection::Roles => {
+            let roles = apps::roles(&st.pool, app).await.unwrap_or_default();
+            role_section(&url, &csrf, &roles, may_write)
+        }
+        AppSection::Assignments => {
+            let roles = apps::roles(&st.pool, app).await.unwrap_or_default();
+            let assigned = apps::assignments(&st.pool, &tenant.id, app).await.unwrap_or_default();
+            assignment_section(&url, &csrf, &assigned, &roles, tenant, may_assign)
+        }
+        AppSection::Permissions => {
+            let roles = apps::roles(&st.pool, app).await.unwrap_or_default();
+            let granted = apps::role_assignments(&st.pool, &tenant.id, app)
+                .await
+                .unwrap_or_default();
+            let section = application_roles_section(&url, &csrf, &granted, &roles, may_assign);
+            if section.is_empty() {
+                r#"<h2>Application permissions</h2><p class="empty">This application defines no role that
+other applications may hold. Add one under App roles, with the Application member type, to grant it here.</p>"#
+                    .to_string()
+            } else {
+                section
+            }
+        }
     };
 
     let reveal = page
@@ -406,9 +535,28 @@ flow needs before it runs anything.</p>"#,
         })
         .unwrap_or_default();
 
+    // The application's own row of tabs, under the tenant's.
+    let subtabs: String = AppSection::ALL
+        .iter()
+        .filter(|s| ctx.can_in(s.action(), tenant))
+        .map(|s| {
+            let href = e(&section_url(base, tenant, app, *s));
+            if *s == section {
+                format!(
+                    r#"<a class="active" aria-current="page" href="{href}">{}</a>"#,
+                    e(s.label())
+                )
+            } else {
+                format!(r#"<a href="{href}">{}</a>"#, e(s.label()))
+            }
+        })
+        .collect();
+
     let body = format!(
-        r#"<h1>{name}</h1><p class="sub">{tenant_name} &middot; application registration</p>
-{reveal}{error}{facts}{flags}{secrets}{certificates}{redirects}{identifiers}{scopes_html}{roles_html}{assignments}"#,
+        r#"<p class="crumb"><a href="{list}">Applications</a></p><h1>{name}</h1><p class="sub">{tenant_name} &middot; application registration</p>
+<nav class="subtabs" aria-label="Application">{subtabs}</nav>
+{reveal}{error}{content}"#,
+        list = e(&format!("{base}/admin/tenants/{}/apps", tenant.id)),
         name = e(&app.display_name),
         tenant_name = e(&tenant.name),
         error = view::error_block(page.error),
@@ -416,9 +564,118 @@ flow needs before it runs anything.</p>"#,
     view::page(
         &chrome(st, ctx, At::Tenant(tenant, TenantTab::Apps)),
         status,
-        &app.display_name,
+        &format!("{} \u{b7} {}", app.display_name, section.label()),
         &body,
     )
+}
+
+/// The overview: what the application is, and a card per section saying what is
+/// in it and whether anything needs attention.
+async fn overview(st: &AppState, ctx: &AdminContext, tenant: &Tenant, app: &Application) -> String {
+    let base = st.public_url.base();
+    let facts = format!(
+        r#"<dl class="facts"><dt>Application (client) id</dt><dd>{app_id}</dd>
+<dt>Object id</dt><dd>{id}</dd><dt>Tenant</dt><dd>{tenant_name}</dd></dl>"#,
+        app_id = e(&app.app_id),
+        id = e(&app.id),
+        tenant_name = e(&tenant.name),
+    );
+    let count = |n: usize, one: &str, many: &str| match n {
+        0 => format!("No {many}"),
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    };
+    let now = now();
+    let secrets = apps::secrets(&st.pool, app).await.unwrap_or_default();
+    let expiring = secrets
+        .iter()
+        .filter(|s| s.is_current(now) && s.end_at - now < SECRET_EXPIRY_WARNING_SECS)
+        .count();
+    let certificates = apps::key_credentials(&st.pool, app).await.unwrap_or_default();
+    let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
+    let scopes = apps::scopes(&st.pool, app).await.unwrap_or_default();
+    let identifier_uris = apps::identifier_uris(&st.pool, app).await.unwrap_or_default();
+    let roles = apps::roles(&st.pool, app).await.unwrap_or_default();
+
+    let mut cards: Vec<(AppSection, String, Option<String>)> = vec![
+        (
+            AppSection::Authentication,
+            count(redirect_uris.len(), "redirect URI", "redirect URIs"),
+            None,
+        ),
+        (
+            AppSection::Credentials,
+            format!(
+                "{}, {}",
+                count(secrets.len(), "client secret", "client secrets"),
+                count(certificates.len(), "certificate", "certificates").to_lowercase()
+            ),
+            (expiring > 0).then(|| count(expiring, "secret expires soon", "secrets expire soon")),
+        ),
+        (
+            AppSection::Api,
+            if identifier_uris.is_empty() {
+                "Not exposed as an API".to_string()
+            } else {
+                count(scopes.len(), "scope", "scopes")
+            },
+            None,
+        ),
+        (AppSection::Roles, count(roles.len(), "role", "roles"), None),
+    ];
+    if ctx.can_in(ASSIGNMENT_READ, tenant) {
+        let assigned = apps::assignments(&st.pool, &tenant.id, app).await.unwrap_or_default();
+        let granted = apps::role_assignments(&st.pool, &tenant.id, app)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.principal_type == PrincipalType::ServicePrincipal)
+            .count();
+        cards.push((
+            AppSection::Assignments,
+            count(assigned.len(), "user or group assigned", "users and groups assigned"),
+            None,
+        ));
+        cards.push((
+            AppSection::Permissions,
+            count(
+                granted,
+                "role granted to an application",
+                "roles granted to applications",
+            ),
+            None,
+        ));
+    }
+    let cards: String = cards
+        .iter()
+        .map(|(section, summary, warning)| {
+            format!(
+                r#"<a class="tile" href="{href}"><strong>{label}</strong><span>{summary}</span>{warning}</a>"#,
+                href = e(&section_url(base, tenant, app, *section)),
+                label = e(section.label()),
+                summary = e(summary),
+                warning = warning
+                    .as_ref()
+                    .map(|w| format!(r#"<span class="pill bad">{}</span>"#, e(w)))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    let flow = if ctx.can_in(APP_WRITE, tenant) {
+        format!(
+            r#"<p class="muted"><a href="{}">Test a sign-in flow with this application</a>, which says what the
+flow needs before it runs anything.</p>"#,
+            e(&format!(
+                "{base}/admin/tenants/{}/flow?{}={}",
+                tenant.id,
+                crate::flowtest::APP_FIELD,
+                app.app_id
+            ))
+        )
+    } else {
+        String::new()
+    };
+    format!(r#"{facts}<div class="tiles">{cards}</div>{flow}"#)
 }
 
 fn flags_form(url: &str, csrf: &str, app: &Application, may_write: bool) -> String {
@@ -479,6 +736,32 @@ fn remove_button(url: &str, csrf: &str, op: AppOp, field_name: &str, value: &str
     )
 }
 
+/// [`remove_button`] for what cannot be undone: it asks first, in a dialog.
+fn confirm_remove(
+    url: &str,
+    csrf: &str,
+    op: AppOp,
+    field_name: &str,
+    value: &str,
+    question: &str,
+    detail: &str,
+) -> String {
+    view::confirm_post(
+        &view::dom_id(&[op.as_str(), value]),
+        "Delete\u{2026}",
+        question,
+        detail,
+        url,
+        &format!(
+            r#"{csrf}<input type="hidden" name="{field_name}" value="{value}">"#,
+            value = e(value)
+        ),
+        AppOp::FIELD,
+        op.as_str(),
+        "Delete",
+    )
+}
+
 fn secrets_section(url: &str, csrf: &str, secrets: &[apps::StoredSecret], may_rotate: bool) -> String {
     let at = now();
     let rows: String = secrets
@@ -495,7 +778,7 @@ fn secrets_section(url: &str, csrf: &str, secrets: &[apps::StoredSecret], may_ro
                     r#"<span class="pill">expired</span>"#
                 },
                 remove = if may_rotate {
-                    remove_button(url, csrf, AppOp::SecretRemove, KEY_ID, &s.key_id, "Delete")
+                    confirm_remove(url, csrf, AppOp::SecretRemove, KEY_ID, &s.key_id, "Delete this client secret?", "Anything still using it can no longer sign in.")
                 } else {
                     String::new()
                 },
@@ -543,7 +826,7 @@ fn certificates_section(url: &str, csrf: &str, certs: &[apps::KeyCredential], ma
                     r#"<span class="pill">not current</span>"#
                 },
                 remove = if may_rotate {
-                    remove_button(url, csrf, AppOp::CertificateRemove, KEY_ID, &c.key_id, "Delete")
+                    confirm_remove(url, csrf, AppOp::CertificateRemove, KEY_ID, &c.key_id, "Delete this certificate?", "Assertions signed with its key are refused from now on.")
                 } else {
                     String::new()
                 },
@@ -1031,9 +1314,9 @@ pub async fn detail_post(
                     };
                     // Re-read the application: the flags may have changed.
                     let app = apps::find_in_tenant(&st.pool, tenant, &app_key).await.unwrap_or(app);
-                    detail(&st, &ctx, tenant, &app, page, StatusCode::OK).await
+                    detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::OK).await
                 }
-                None => view::see_other(&app_url(st.public_url.base(), tenant, &app)),
+                None => view::see_other(&section_url(st.public_url.base(), tenant, &app, op.section())),
             }
         }
         Err(err) => {
@@ -1042,7 +1325,7 @@ pub async fn detail_post(
                 error: Some(&message),
                 reveal: None,
             };
-            detail(&st, &ctx, tenant, &app, page, StatusCode::BAD_REQUEST).await
+            detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::BAD_REQUEST).await
         }
     }
 }

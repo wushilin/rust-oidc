@@ -286,17 +286,21 @@ async fn an_application_is_registered_and_configured_through_the_console() {
         }
     }
 
-    // The page shows what was configured.
-    let page = b.get(&url).await;
-    assert_eq!(page.status, 200);
-    for expected in [
-        "Invoices API",
-        "https://invoices.example.com/callback",
-        "api://invoices.example.com",
-        "Invoices.Read",
-        "Invoices.Approver",
+    // Each section shows what was configured in it.
+    for (section, expected) in [
+        ("", "Invoices API"),
+        ("/authentication", "https://invoices.example.com/callback"),
+        ("/api", "api://invoices.example.com"),
+        ("/api", "Invoices.Read"),
+        ("/roles", "Invoices.Approver"),
     ] {
-        assert!(page.body.contains(expected), "{expected} is missing: {}", page.body);
+        let page = b.get(&format!("{url}{section}")).await;
+        assert_eq!(page.status, 200, "{section}");
+        assert!(
+            page.body.contains(expected),
+            "{expected} is missing from {section}: {}",
+            page.body
+        );
     }
 }
 
@@ -352,7 +356,7 @@ async fn a_new_client_secret_is_shown_exactly_once_and_recorded_nowhere() {
     );
 
     // Asked for again, the page has the hint and not the value.
-    let again = b.get(&url).await;
+    let again = b.get(&format!("{url}/credentials")).await;
     assert_eq!(again.status, 200);
     assert!(!again.body.contains(&secret), "the secret came back: {}", again.body);
     assert!(
@@ -475,11 +479,16 @@ async fn an_application_viewer_sees_an_app_and_changes_nothing() {
     assert_eq!(apps::secrets(&s.pool, &app).await.unwrap().len(), before);
     assert!(apps::key_credentials(&s.pool, &app).await.unwrap().is_empty());
 
-    let page = b.get(&url).await;
-    assert_eq!(page.status, 200);
-    for offered in ["Add a client secret", "Upload a certificate", "Add a redirect URI"] {
+    for (section, offered) in [
+        ("/credentials", "Add a client secret"),
+        ("/credentials", "Upload a certificate"),
+        ("/authentication", "Add a redirect URI"),
+    ] {
+        let page = b.get(&format!("{url}{section}")).await;
+        assert_eq!(page.status, 200);
         assert!(!page.body.contains(offered), "{offered}: {}", page.body);
     }
+    let page = b.get(&url).await;
     // Their tabs are the applications and nothing else: no flow tester, no users.
     assert!(
         !page.body.contains("Flow tester") && !page.body.contains(">Users<"),
@@ -582,4 +591,59 @@ async fn a_tenant_admin_cannot_reach_another_tenants_applications() {
     let own = b.get(&s.url(&format!("/admin/tenants/{}/apps", f.tenant.id))).await;
     assert_eq!(own.status, 200, "{}", own.body);
     assert!(own.body.contains("web-app"), "{}", own.body);
+}
+
+/// The page is split into sections, each at its own address, with an overview
+/// that says what is in each. A write goes back to the section it belongs to.
+#[tokio::test]
+async fn the_application_page_is_split_into_sections() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let url = s.url(&format!("/admin/tenants/{}/apps/{}", f.tenant.id, f.web.app_id));
+
+    let overview = b.get(&url).await;
+    assert_eq!(overview.status, 200);
+    for section in ["authentication", "credentials", "api", "roles", "users", "permissions"] {
+        assert!(
+            overview.body.contains(&format!(r#"href="{url}/{section}""#)),
+            "{section}: {}",
+            overview.body
+        );
+        assert_eq!(b.get(&format!("{url}/{section}")).await.status, 200, "{section}");
+    }
+    assert!(overview.body.contains(r#"class="tile""#), "{}", overview.body);
+    // The overview says what is there without showing the forms.
+    assert!(overview.body.contains("1 client secret"), "{}", overview.body);
+    assert!(!overview.body.contains("Add a client secret"), "{}", overview.body);
+    assert_eq!(b.get(&format!("{url}/nonsense")).await.status, 404);
+
+    let added = b
+        .post(
+            &url,
+            &[
+                ("op", "redirect_uri_add"),
+                ("platform", "web"),
+                ("uri", "https://more.example.com/cb"),
+            ],
+        )
+        .await;
+    assert_eq!(added.status, 303);
+    assert!(
+        added.location.unwrap().ends_with("/authentication"),
+        "back to its section"
+    );
+
+    // Deleting a secret asks first: the button opens a dialog holding the form.
+    let page = b.get(&format!("{url}/credentials")).await;
+    assert!(page.body.contains("popovertarget="), "{}", page.body);
+    assert!(page.body.contains("Delete this client secret?"), "{}", page.body);
+
+    // Sections the administrator cannot see are not offered.
+    let s2 = TestServer::start().await;
+    let v = user_fixture(&s2).await;
+    bind_in_own_tenant(&s2, &v, RoleId::ApplicationAdministrator).await;
+    let vb = signed_in_admin(&s2, &v).await;
+    let vurl = s2.url(&format!("/admin/tenants/{}/apps/{}", v.tenant.id, v.web.app_id));
+    assert_eq!(vb.get(&format!("{vurl}/users")).await.status, 200);
 }

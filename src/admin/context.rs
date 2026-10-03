@@ -47,11 +47,6 @@ const TENANT_PARAM: &str = "tenant";
 pub struct AdminContext {
     pub user: User,
     pub home_tenant: Tenant,
-    /// The tenant a platform administrator has assumed. Display and defaults only:
-    /// it never widens or narrows what is permitted, because the `All`-scope
-    /// binding that allowed the assume already covers the tenant.
-    pub acting_tenant: Option<Tenant>,
-    /// Token every form in this session must echo.
     pub csrf: String,
     /// Identifies the session row, for `set_acting_tenant`.
     pub cookie_hash: String,
@@ -96,10 +91,10 @@ impl AdminContext {
         self.resolved.get(key)
     }
 
-    /// The tenant whose pages the chrome should link to: the assumed one if any,
-    /// else the administrator's own.
+    /// The tenant a page about no particular tenant links into: the
+    /// administrator's own.
     pub fn default_tenant(&self) -> &Tenant {
-        self.acting_tenant.as_ref().unwrap_or(&self.home_tenant)
+        &self.home_tenant
     }
 
     /// Double-submit check: the form must echo the token derived from the session
@@ -164,12 +159,6 @@ impl FromRequestParts<AppState> for AdminContext {
             return Err(view::no_access(st.public_url.base(), &user.upn, &csrf));
         }
 
-        // An assumed tenant that has gone away simply stops applying.
-        let acting_tenant = match &sess.acting_tenant {
-            Some(id) => tenant::resolve(&st.pool, id).await.unwrap_or_default(),
-            None => None,
-        };
-
         let mut resolved = HashMap::new();
         if let Ok(params) = RawPathParams::from_request_parts(parts, st).await {
             for (name, value) in params.iter() {
@@ -184,7 +173,6 @@ impl FromRequestParts<AppState> for AdminContext {
         Ok(Self {
             user,
             home_tenant,
-            acting_tenant,
             csrf,
             cookie_hash: sess.cookie_hash,
             bindings,

@@ -284,6 +284,17 @@ pub async fn delete(pool: &DbPool, tenant_id: &str, group_id: &str) -> anyhow::R
             .execute(&mut *tx)
             .await?;
     }
+    // What it was, for the audit log and Find by id: its id is in old tokens and
+    // audit entries, and would otherwise name nothing at all.
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "INSERT INTO deleted_groups (id, tenant_id, name, description, deleted_at)
+         SELECT id, tenant_id, name, description, ? FROM user_groups WHERE id = ?",
+    ))
+    .bind(now())
+    .bind(group_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_groups WHERE id = ?"))
         .bind(group_id)
         .execute(&mut *tx)

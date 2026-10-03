@@ -29,6 +29,9 @@ use crate::tenant::{self, Tenant};
 
 /// Form field names, named once.
 const ACCOUNT: &str = "account";
+/// Whether a user or a group is being made a Global Administrator.
+const PRINCIPAL_TYPE: &str = "principal_type";
+const GROUP_NAME: &str = "group";
 const ROLE: &str = "role";
 const BINDING: &str = "binding";
 
@@ -67,14 +70,16 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
             None => r#"<span class="muted">unknown</span>"#.to_string(),
         };
         let revoke = if may_write {
-            format!(
-                r#"<form method="post" action="{url}" class="inline">{csrf}
-<input type="hidden" name="{BINDING}" value="{id}">
-<button class="danger" type="submit" name="{field}" value="{op}">Revoke</button></form>"#,
-                url = e(&url),
-                id = e(&b.id),
-                field = RoleOp::FIELD,
-                op = RoleOp::Revoke.as_str(),
+            view::confirm_post(
+                &view::dom_id(&["revoke", &b.id]),
+                "Revoke\u{2026}",
+                &format!("Revoke {} from {}?", b.role.display_name(), who),
+                "It takes effect on their next request.",
+                &url,
+                &format!(r#"{csrf}<input type="hidden" name="{BINDING}" value="{}">"#, e(&b.id)),
+                RoleOp::FIELD,
+                RoleOp::Revoke.as_str(),
+                "Revoke",
             )
         } else {
             String::new()
@@ -88,16 +93,38 @@ async fn render(st: &AppState, ctx: &AdminContext, error: Option<&str>, status: 
     }
 
     let grant = if may_write {
+        // The root tenant is where the role is held, so the user name ends in its
+        // domain and the group is one of its groups: neither needs choosing.
+        let root = tenant::root(&st.pool).await.ok().flatten();
+        let root_name = root.as_ref().map(|t| t.name.clone()).unwrap_or_default();
+        let root_domain = match &root {
+            Some(t) => tenant::domains(&st.pool, &t.id)
+                .await
+                .ok()
+                .and_then(|d| d.into_iter().next())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
         view::expander(
             "Make somebody a Global Administrator",
             &format!(
-                r#"<form method="post" action="{url}">{csrf}
-<label for="account">Account</label><input id="account" name="{ACCOUNT}" type="email" required>
-<p class="muted">The full sign-in name of an account in the root tenant. {summary}</p>
-<p class="muted">To give the role to a group, or to grant a role inside one tenant, use the Roles tab of
-that tenant.</p>
+                r#"<form method="post" action="{url}" class="pick-principal" novalidate>{csrf}
+<fieldset class="choice"><legend>Who</legend>
+<label><input type="radio" name="{PRINCIPAL_TYPE}" value="{user}" checked> A user</label>
+<label><input type="radio" name="{PRINCIPAL_TYPE}" value="{group}" class="is-group"> A group</label></fieldset>
+<div class="when-user"><label for="account">User name</label>
+<div class="upn"><input id="account" name="{ACCOUNT}" type="text" pattern="[^@]*" autocomplete="off" autocapitalize="none" spellcheck="false">
+<span class="suffix">@ <strong>{root_domain}</strong></span></div></div>
+<div class="when-group"><label for="group">Group name in {root_name}</label>
+<input id="group" name="{GROUP_NAME}" type="text" autocomplete="off" spellcheck="false">
+<p class="muted">Everyone in the group is a Global Administrator for as long as they are a member.</p></div>
+<p class="muted">{summary} Only users and groups of the root tenant can hold it.</p>
 <div class="actions"><button type="submit" name="{field}" value="{op}">Grant</button></div></form>"#,
                 url = e(&url),
+                user = e(PrincipalType::User.as_str()),
+                group = e(PrincipalType::Group.as_str()),
+                root_domain = e(&root_domain),
+                root_name = e(&root_name),
                 summary = e(RoleId::GlobalAdministrator.summary()),
                 field = RoleOp::FIELD,
                 op = RoleOp::Grant.as_str(),
@@ -212,7 +239,6 @@ async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String
             .map(|(_, v)| v.trim())
             .unwrap_or_default()
     };
-    let account = one(ACCOUNT);
     // The one role this page grants. A form that names another is asking for a
     // tenant role, which is granted in the tenant.
     let role = RoleId::GlobalAdministrator;
@@ -221,23 +247,66 @@ async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String
             "A role inside a tenant is granted from that tenant's Roles tab.".into(),
         ));
     }
-    // The account's tenant is the one that owns the part after the @.
-    let Some((_, domain)) = account.rsplit_once('@') else {
-        return Err(Refusal::Message(
-            "Enter the account's full sign-in name, including the @ part.".into(),
-        ));
-    };
-    let home = tenant::resolve(&st.pool, domain)
+    // A user (the default, and what older forms sent) or a group, each of the
+    // root tenant, which is where the role is held.
+    let Some(root) = tenant::root(&st.pool)
         .await
-        .map_err(|_| Refusal::Message("That account could not be looked up.".into()))?;
-    let user = match &home {
-        Some(t) => crate::users::find_by_upn(&st.pool, &t.id, account)
-            .await
-            .map_err(|_| Refusal::Message("That account could not be looked up.".into()))?,
-        None => None,
+        .map_err(|_| Refusal::Message("The root tenant could not be looked up.".into()))?
+    else {
+        return Err(Refusal::Message("There is no root tenant.".into()));
     };
-    let Some(user) = user else {
-        return Err(Refusal::Message(format!("There is no account named '{account}'.")));
+    let lookup_failed = |_| Refusal::Message("That could not be looked up.".to_string());
+    let (principal_type, principal_id, home) = match PrincipalType::parse(one(PRINCIPAL_TYPE)) {
+        None | Some(PrincipalType::User) => {
+            let typed = one(ACCOUNT);
+            if typed.is_empty() {
+                return Err(Refusal::Message("Enter a user name.".into()));
+            }
+            // The part before the @ is completed with the root tenant's domain;
+            // a full name is taken as typed, and its domain decides its tenant.
+            let account = if typed.contains('@') {
+                typed.to_string()
+            } else {
+                let domain = tenant::domains(&st.pool, &root.id)
+                    .await
+                    .map_err(lookup_failed)?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                format!("{typed}@{domain}")
+            };
+            let (_, domain) = account.rsplit_once('@').unwrap_or_default();
+            let home = tenant::resolve(&st.pool, domain).await.map_err(lookup_failed)?;
+            let user = match &home {
+                Some(t) => crate::users::find_by_upn(&st.pool, &t.id, &account)
+                    .await
+                    .map_err(lookup_failed)?,
+                None => None,
+            };
+            let Some(user) = user else {
+                return Err(Refusal::Message(format!("There is no account named '{account}'.")));
+            };
+            (PrincipalType::User, user.id, home)
+        }
+        Some(PrincipalType::Group) => {
+            let name = one(GROUP_NAME);
+            if name.is_empty() {
+                return Err(Refusal::Message("Enter a group name.".into()));
+            }
+            let Some(id) = crate::groups::find(&st.pool, &root.id, name)
+                .await
+                .map_err(lookup_failed)?
+            else {
+                return Err(Refusal::Message(format!(
+                    "There is no group named '{name}' in {}.",
+                    root.name
+                )));
+            };
+            (PrincipalType::Group, id, Some(root.clone()))
+        }
+        Some(PrincipalType::ServicePrincipal) => {
+            return Err(Refusal::Message("Choose a user or a group.".into()));
+        }
     };
 
     // Where the role applies follows from the role and the account's tenant.
@@ -250,7 +319,7 @@ async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String
         return Err(Refusal::Forbidden);
     }
 
-    let id = bindings::create(&st.pool, PrincipalType::User, &user.id, role, &scope, &ctx.user.id)
+    let id = bindings::create(&st.pool, principal_type, &principal_id, role, &scope, &ctx.user.id)
         .await
         .map_err(|e| Refusal::Message(e.to_string()))?;
     Ok((
@@ -258,8 +327,8 @@ async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String
         json!({
             "role": role.as_str(),
             "scopeKind": scope.kind().as_str(),
-            "principalType": PrincipalType::User.as_str(),
-            "principalId": user.id,
+            "principalType": principal_type.as_str(),
+            "principalId": principal_id,
         }),
     ))
 }

@@ -33,7 +33,6 @@ pub const TENANT_CREATE: Action = Action::new(Resource::Tenant, Verb::Create);
 /// Renaming, enabling and disabling a tenant, its verified domains, and its
 /// settings. The design spec's wording: "change tenant settings and domains".
 pub const TENANT_WRITE: Action = Action::new(Resource::Tenant, Verb::Write);
-pub const TENANT_ASSUME: Action = Action::new(Resource::Tenant, Verb::Assume);
 pub const USER_READ: Action = Action::new(Resource::User, Verb::Read);
 pub const USER_WRITE: Action = Action::new(Resource::User, Verb::Write);
 pub const USER_RESET: Action = Action::new(Resource::User, Verb::Reset);

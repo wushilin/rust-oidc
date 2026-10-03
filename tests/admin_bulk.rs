@@ -81,7 +81,6 @@ async fn ticked_users_are_disabled_enabled_and_deleted_together() {
     // Nothing ticked, and a delete without its confirm box: nothing happens.
     for (form, why) in [
         (vec![("op", "enable")], "Tick the rows"),
-        (vec![("op", "delete"), ("item", bob.as_str())], "confirm"),
         // An id the page did not list selects nothing.
         (
             vec![("op", "disable"), ("item", "11111111-2222-3333-4444-555555555555")],
@@ -227,9 +226,11 @@ async fn ticked_groups_are_deleted_together_except_those_with_members() {
         "{}",
         page.body
     );
-    let unconfirmed = b.post(&url, &[("op", "delete"), ("all", "on")]).await;
-    assert_eq!(unconfirmed.status, 400);
-    assert_eq!(groups::list(&s.pool, &f.tenant.id).await.unwrap().len(), 3);
+    // Deleting asks first, in a dialog that counts what is ticked: there is no
+    // tick box to confirm with.
+    assert!(page.body.contains("Delete the ticked groups?"), "{}", page.body);
+    assert!(page.body.contains(r#"class="ticked""#), "{}", page.body);
+    assert!(!page.body.contains(r#"name="confirm""#), "{}", page.body);
 
     let done = b
         .post(&url, &[("op", "delete"), ("all", "on"), ("confirm", "on")])

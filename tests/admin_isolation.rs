@@ -198,7 +198,7 @@ async fn the_nav_offers_only_permitted_actions() {
 }
 
 /// A role that is narrow by *action* rather than by scope must also be confined:
-/// a user administrator can manage people but must not be able to read or assume
+/// a user administrator can manage people but must not be able to read
 /// tenants.
 #[tokio::test]
 async fn a_user_administrator_holds_only_the_user_pages() {
@@ -211,7 +211,7 @@ async fn a_user_administrator_holds_only_the_user_pages() {
         Scope::Tenants(vec![f.tenant.id.clone()]),
     )
     .await;
-    let other = s.tenant("Fabrikam", "fabrikam.test").await;
+    let _other = s.tenant("Fabrikam", "fabrikam.test").await;
     let b = signed_in_admin(&s, &f).await;
 
     assert_eq!(
@@ -219,10 +219,6 @@ async fn a_user_administrator_holds_only_the_user_pages() {
             .await
             .status,
         200
-    );
-    assert_eq!(
-        b.post(&s.url(&format!("/admin/assume/{}", other.id)), &[]).await.status,
-        403
     );
     assert_eq!(b.get(&s.url("/admin/bindings")).await.status, 403);
     let tenants = b.get(&s.url("/admin/tenants")).await;

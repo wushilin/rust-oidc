@@ -1333,3 +1333,15 @@ transaction (`keys::NewKey::generate`) and published as the new `next` inside it
 `next` to promote (only a hand-edited table) the new key signs at once rather than leaving
 nothing active. The console's audit row stays on the administrator's own tenant. The CLI's
 `key rotate` / `key prune` are not converted yet: they still write `key.rotate`.
+
+**37. The command line runs the console's transactions, with three shapes of its
+own.** `bootstrap` is one transaction kind (root tenant, first account, its Global
+Administrator role), so a failure part-way leaves no root tenant without an
+administrator. `user create --directory-role` is a batch of `CreateUser` and
+`GrantRole`; the grant names the account by user name, which resolves inside the
+batch to the account just created. `app implicit` and `app password-grant` read the
+application's five sign-in switches and save them all with `SaveAppFlags`, changing
+the one asked for; a console save of another switch at the same instant can be
+overwritten by the value read (accepted: these are operator commands). Assignment
+required became its own kind (`admin.app.assignment_required`); the CLI's
+`add-identifier-uri` used to write no audit row at all.

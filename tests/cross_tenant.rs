@@ -293,6 +293,14 @@ async fn the_password_grant_and_mfa_follow_the_accounts_own_tenant() {
     );
     let page = w.browser_sign_in(&Browser::new()).await;
     assert!(page.body.contains("Set up your authenticator"), "{}", page.body);
+    // The authenticator is zed's, so it is listed under zed's tenant, not the
+    // application's.
+    assert!(
+        page.body.contains("<strong>Fabrikam: zed@fabrikam.test</strong>"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("Contoso: zed"), "{}", page.body);
 }
 
 /// Check sign-in: every check, the real assignments, and nothing about an

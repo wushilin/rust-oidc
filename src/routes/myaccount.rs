@@ -152,6 +152,7 @@ fn step_page(
             ticket,
             qr_svg: &mfa::qr_svg(&mfa::otpauth_uri(secret, &tenant.name, upn)),
             secret,
+            issuer: &tenant.name,
             error,
         }),
         (Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa, _) => {

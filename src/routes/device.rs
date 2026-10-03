@@ -455,16 +455,10 @@ async fn start_mfa(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &
             } else {
                 None
             };
-            mfa_page(
-                st,
-                tenant,
-                pending,
-                &user.upn,
-                purpose,
-                &ticket,
-                secret.as_deref(),
-                None,
-            )
+            let home = access::home_of(&st.pool, &user).await.ok().flatten();
+            let issuer = home.as_ref().map_or(tenant.name.as_str(), |t| t.name.as_str());
+            let enroll = secret.as_deref().map(|s| (s, issuer));
+            mfa_page(st, tenant, pending, &user.upn, purpose, &ticket, enroll, None)
         }
         Err(e) => html::error(Some(&tenant.name), &AadError::from(e).description()),
     }
@@ -478,7 +472,9 @@ fn mfa_page(
     upn: &str,
     purpose: Purpose,
     ticket: &str,
-    secret: Option<&str>,
+    // The secret being set up, and the name of the account's own tenant, which
+    // the authenticator app lists it under.
+    enroll: Option<(&str, &str)>,
     error: Option<&str>,
 ) -> Response {
     let csrf = session::new_token();
@@ -488,8 +484,8 @@ fn mfa_page(
         html::escape(&pending.user_code)
     );
     let action = deviceauth_url(st, &tenant.id);
-    let mut resp = match (purpose, secret) {
-        (Purpose::Enroll, Some(secret)) => html::mfa_enroll(&html::MfaEnroll {
+    let mut resp = match (purpose, enroll) {
+        (Purpose::Enroll, Some((secret, issuer))) => html::mfa_enroll(&html::MfaEnroll {
             tenant_name: &tenant.name,
             upn,
             action: &action,
@@ -497,8 +493,9 @@ fn mfa_page(
             op_field: "op",
             op: html::LoginOp::MfaEnroll.as_str(),
             ticket,
-            qr_svg: &mfa::qr_svg(&mfa::otpauth_uri(secret, &tenant.name, upn)),
+            qr_svg: &mfa::qr_svg(&mfa::otpauth_uri(secret, issuer, upn)),
             secret,
+            issuer: issuer,
             error,
         }),
         _ => html::mfa_verify(&html::MfaVerify {
@@ -637,7 +634,7 @@ async fn second_step(
                         &user.upn,
                         Purpose::Enroll,
                         &ticket,
-                        Some(&secret),
+                        Some((&secret, &home.name)),
                         Some(MFA_WRONG),
                     ),
                     _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),

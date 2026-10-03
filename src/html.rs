@@ -326,6 +326,8 @@ pub struct MfaEnroll<'a> {
     /// The QR code, as inline SVG made by this server.
     pub qr_svg: &'a str,
     pub secret: &'a str,
+    /// The tenant the account belongs to: what the app lists it under.
+    pub issuer: &'a str,
     pub error: Option<&'a str>,
 }
 
@@ -345,12 +347,13 @@ pub fn mfa_enroll(p: &MfaEnroll) -> Response {
         r#"<h1>Set up your authenticator</h1><p class="sub">A second step for signing in as {upn}.</p>
 <ol class="steps"><li>Install an authenticator app on your phone, such as Microsoft Authenticator or Google Authenticator.</li>
 <li>Scan this code with it:<div class="qr">{qr}</div>or enter this key: <div class="key">{key}</div></li>
-<li>Enter the six-digit code the app shows.</li></ol>
+<li>Enter the six-digit code the app shows. It lists this account as <strong>{issuer}: {upn}</strong>.</li></ol>
 <form method="post" action="{action}">{hidden}<input type="hidden" name="{op_field}" value="{op}"><input type="hidden" name="{MFA_TICKET}" value="{ticket}">
 <label for="code">Code</label><input id="code" name="{MFA_CODE}" type="text" inputmode="numeric" autocomplete="one-time-code" required autofocus>
 {error}<div class="actions"><button type="submit">Confirm</button></div></form>"#,
         upn = escape(p.upn),
         qr = p.qr_svg,
+        issuer = escape(p.issuer),
         key = escape(&grouped.join(" ")),
         action = escape(p.action),
         hidden = p.hidden,

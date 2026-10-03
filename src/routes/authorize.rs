@@ -902,7 +902,10 @@ async fn start_mfa(st: &AppState, v: &Validated, request: &str, user: &User, ste
                     .and_then(|p| p.enroll_secret),
                 _ => None,
             };
-            mfa_page(st, v, request, &user.upn, purpose, &ticket, secret.as_deref(), None)
+            let home = access::home_of(&st.pool, user).await.ok().flatten();
+            let issuer = home.as_ref().map_or(v.tenant.name.as_str(), |t| t.name.as_str());
+            let enroll = secret.as_deref().map(|s| (s, issuer));
+            mfa_page(st, v, request, &user.upn, purpose, &ticket, enroll, None)
         }
         Err(e) => html::error(Some(&v.tenant.name), &AadError::from(e).description()),
     }
@@ -975,7 +978,9 @@ fn mfa_page(
     upn: &str,
     purpose: Purpose,
     ticket: &str,
-    secret: Option<&str>,
+    // The secret being set up, and the name of the account's own tenant, which
+    // the authenticator app lists it under.
+    enroll: Option<(&str, &str)>,
     error: Option<&str>,
 ) -> Response {
     let csrf = session::new_token();
@@ -985,9 +990,9 @@ fn mfa_page(
         html::escape(request)
     );
     let action = form_action(st, v);
-    let mut resp = match (purpose, secret) {
-        (Purpose::Enroll, Some(secret)) => {
-            let uri = mfa::otpauth_uri(secret, &v.tenant.name, upn);
+    let mut resp = match (purpose, enroll) {
+        (Purpose::Enroll, Some((secret, issuer))) => {
+            let uri = mfa::otpauth_uri(secret, issuer, upn);
             html::mfa_enroll(&html::MfaEnroll {
                 tenant_name: &v.tenant.name,
                 upn,
@@ -998,6 +1003,7 @@ fn mfa_page(
                 ticket,
                 qr_svg: &mfa::qr_svg(&uri),
                 secret,
+                issuer: issuer,
                 error,
             })
         }
@@ -1138,7 +1144,7 @@ async fn second_step(
                         &user.upn,
                         Purpose::Enroll,
                         &ticket,
-                        Some(&secret),
+                        Some((&secret, &home.name)),
                         Some(MFA_WRONG),
                     ),
                     _ => login_page(st, v, request, "", Some(MFA_EXPIRED)),

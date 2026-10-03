@@ -471,6 +471,7 @@ fn console_mfa_page(
             ticket,
             qr_svg: &crate::mfa::qr_svg(&crate::mfa::otpauth_uri(secret, &home.name, upn)),
             secret,
+            issuer: &home.name,
             error,
         }),
         _ => crate::html::mfa_verify(&crate::html::MfaVerify {

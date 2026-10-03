@@ -13,19 +13,17 @@
 //! administrator can do it for any tenant because an `all`-scope binding covers
 //! every one.
 
+use crate::AppState;
+use crate::admin::context::{AdminContext, On};
+use crate::admin::routes::{At, Settled, TenantTab, checked, chrome, field, parse_form, settle};
+use crate::admin::view::{self, e};
+use crate::admin::{TENANT_READ, TENANT_WRITE};
+use crate::tenant::{Tenant, TenantSettings};
+use crate::txn::{self, ops::tenants::SaveTenantSettings};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
-
-use crate::AppState;
-use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, TenantTab, audited, checked, chrome, field, parse_form};
-use crate::admin::view::{self, e};
-use crate::admin::{TENANT_READ, TENANT_WRITE};
-use crate::db::Event;
-use crate::tenant::{self, Tenant, TenantSettings};
 
 /// Form field names, spelled once. They match the struct's field names, which is
 /// what makes the form and the type obviously the same three values.
@@ -240,35 +238,27 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
         }
     };
 
-    // `save_settings` validates before it stores, so the bounds are enforced in
-    // one place whatever calls it.
-    if let Err(err) = tenant::save_settings(&st.pool, &tenant.id, &proposed).await {
-        return render(
-            &st,
-            &ctx,
-            tenant,
-            &tenant.settings,
-            Some(&err.to_string()),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
+    // The storage layer validates before it stores, so the bounds are enforced
+    // in one place whatever calls it.
+    let save = SaveTenantSettings {
+        tenant_id: tenant.id.clone(),
+        settings: proposed,
+    };
+    match settle(txn::run(&st.pool, &ctx.actor(), &save).await) {
+        Settled::Done(()) => view::see_other(&settings_url(st.public_url.base(), tenant)),
+        Settled::Refused(message) => {
+            render(
+                &st,
+                &ctx,
+                tenant,
+                &tenant.settings,
+                Some(&message),
+                StatusCode::BAD_REQUEST,
+            )
+            .await
+        }
+        Settled::Respond(resp) => resp,
     }
-    // Lifetimes are configuration, not anyone's personal data, so the values
-    // themselves are safe to record and are what makes the row useful.
-    audited(
-        &st,
-        &ctx,
-        &tenant.id,
-        Event::AdminTenantSettings,
-        Some(&tenant.id),
-        json!({
-            "accessTokenLifetimeSecs": proposed.access_token_lifetime_secs,
-            "sessionLifetimeSecs": proposed.session_lifetime_secs,
-            "refreshTokenLifetimeSecs": proposed.refresh_token_lifetime_secs,
-        }),
-    )
-    .await;
-    view::see_other(&settings_url(st.public_url.base(), tenant))
 }
 
 #[cfg(test)]

@@ -374,4 +374,11 @@ transactions! {
     DeleteGroup(ops::groups::DeleteGroup),
     AddGroupMember(ops::groups::AddGroupMember),
     RemoveGroupMember(ops::groups::RemoveGroupMember),
+    CreateTenant(ops::tenants::CreateTenant),
+    RenameTenant(ops::tenants::RenameTenant),
+    EnableTenant(ops::tenants::EnableTenant),
+    DisableTenant(ops::tenants::DisableTenant),
+    ChangeTenantDomain(ops::tenants::ChangeTenantDomain),
+    RemoveTenantDomain(ops::tenants::RemoveTenantDomain),
+    SaveTenantSettings(ops::tenants::SaveTenantSettings),
 }

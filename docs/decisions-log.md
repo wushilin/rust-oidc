@@ -1277,3 +1277,14 @@ row) per name, as with every bulk button.
 the same transaction as the console's, so it records the same event (`admin.user.create`
 rather than `user.create`), with actor `cli`. The old CLI names stay in `Event` so old
 rows still read back.
+
+**34. Tenant transactions: the tenants page's changes are authorized at platform scope
+in the engine too, and name the tenant by id.** Create, rename, enable, disable, change
+domain and remove domain run as `Scope::Platform` transactions (an every-tenant grant),
+the same rule the page has always applied (`On::Platform`), rather than
+`Scope::Tenant`, which would let a tenant's own administrator rename or re-domain their
+tenant through any other caller of the engine. Saving settings stays
+`Scope::Tenant`. These transactions take the tenant's id only (the lock is on that
+row); a domain in its place is refused as not found. Disabling declares the
+administrators lock, since it can take administrators away. *To reverse:* change
+`scope()` in `src/txn/ops/tenants.rs`.

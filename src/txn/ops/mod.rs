@@ -5,6 +5,7 @@
 //! `_in` functions, and aborts only through the context.
 
 pub mod apps;
+pub mod bootstrap;
 pub mod flow;
 pub mod groups;
 pub mod keys;

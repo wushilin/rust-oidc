@@ -348,3 +348,21 @@ async fn an_account_named_by_user_name_is_restored() {
     assert_eq!(id, f.user_id);
     assert!(users::find(&s.pool, &f.tenant.id, &f.user_id).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn a_user_name_in_use_is_refused_deleted_or_not() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let outcome = txn::run(&s.pool, &Actor::Cli, &create(&f.tenant.id, &f.upn)).await;
+    assert!(
+        matches!(outcome, Outcome::Refused(Refusal::Invalid(_))),
+        "{:?}",
+        outcome.map_done()
+    );
+    users::soft_delete(&s.pool, &f.tenant.id, &f.user_id).await.unwrap();
+    let outcome = txn::run(&s.pool, &Actor::Cli, &create(&f.tenant.id, &f.upn)).await;
+    match outcome {
+        Outcome::Refused(Refusal::Invalid(m)) => assert!(m.contains("restore"), "{m}"),
+        other => panic!("{:?}", other.map_done()),
+    }
+}

@@ -80,6 +80,21 @@ pub(crate) async fn create_in(
     password: &NewPassword,
 ) -> anyhow::Result<String> {
     let upn = validate_upn_in(&mut *conn, tenant, user.upn).await?;
+    // Looked for first, deleted accounts included (they keep their name): inside
+    // a transaction the unique index would be a database failure, not a refusal.
+    let taken: Option<(Option<i64>,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT deleted_at FROM users WHERE tenant_id = ? AND upn_folded = ?",
+    ))
+    .bind(&tenant.id)
+    .bind(crate::util::fold(&upn))
+    .fetch_optional(&mut *conn)
+    .await?;
+    match taken {
+        Some((None,)) => bail!("user '{upn}' already exists"),
+        Some((Some(_),)) => bail!("a deleted account is named '{upn}'; restore it instead"),
+        None => {}
+    }
     let id = new_guid();
     let ts = now();
     sqlx::query(crate::db::qc(

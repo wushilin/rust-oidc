@@ -4,13 +4,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use rust_oidc::db::{Actor, DbPool, Event};
+use rust_oidc::db::DbPool;
 use serde_json::json;
 
-use rust_oidc::admin::bindings::{self as role_bindings, PrincipalType};
 use rust_oidc::apps::{self, MemberType, Principal, RedirectPlatform, ScopeConsent};
 use rust_oidc::config::PublicUrl;
-use rust_oidc::rbac::{RoleId, Scope};
+use rust_oidc::rbac::RoleId;
 use rust_oidc::server::{self, TlsArgs};
 use rust_oidc::txn::{self, Actor as TxnActor};
 use rust_oidc::{AppState, db, directory, groups, keys, routes, tenant, users};
@@ -422,43 +421,16 @@ async fn main() -> anyhow::Result<()> {
             admin_upn,
             password,
         } => {
-            if tenant::root(&pool).await?.is_some() {
-                bail!("already bootstrapped: a root tenant exists");
-            }
-            let password = password_or_stdin(password)?;
-            let t = tenant::create(&pool, &name, &domain, true).await?;
-            let user_id = users::create(
-                &pool,
-                &t,
-                users::NewUser {
-                    upn: &admin_upn,
-                    password: &password,
-                    display_name: Some("Administrator"),
-                    given_name: None,
-                    family_name: None,
-                    email: None,
-                },
-            )
-            .await?;
-            role_bindings::create(
-                &pool,
-                PrincipalType::User,
-                &user_id,
-                RoleId::GlobalAdministrator,
-                &Scope::All,
-                "bootstrap",
-            )
-            .await?;
+            let password = users::NewPassword::for_new_account(&password_or_stdin(password)?)?;
+            let bootstrap = txn::ops::bootstrap::Bootstrap {
+                name,
+                domain,
+                admin_upn,
+                password,
+            };
+            let done = txn::run(&pool, &CLI, &bootstrap).await.into_result()?;
             keys::ensure(&pool).await?;
-            db::audit(
-                &pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::Bootstrap,
-                Some(&user_id),
-                json!({ "upn": admin_upn }),
-            )
-            .await?;
+            let (t, user_id) = (tenant::find_for_admin(&pool, &done.tenant_id).await?, done.user_id);
             print_json(json!({ "tenantId": t.id, "adminObjectId": user_id }));
         }
         Command::Tenant(cmd) => tenant_cmd(&pool, cmd).await?,
@@ -528,7 +500,10 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
                 family_name,
                 email,
             };
-            let id = txn::run(pool, &CLI, &create).await.into_result()?.id;
+            // With a directory role, the account and its role are one batch:
+            // both or neither. The role names the account by user name, which
+            // resolves to the one the batch just created.
+            let mut batch: Vec<txn::Txn> = vec![create.into()];
             if let Some(role) = directory_role {
                 let Some(found) = directory::find(&role) else {
                     bail!("unknown directory role '{role}'");
@@ -536,16 +511,20 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
                 let Some(role_id) = RoleId::for_template_in_tenant(found.template_id) else {
                     bail!("directory role '{role}' has no RBAC role");
                 };
-                role_bindings::create(
-                    pool,
-                    PrincipalType::User,
-                    &id,
-                    role_id,
-                    &Scope::Tenants(vec![t.id.clone()]),
-                    "cli",
-                )
-                .await?;
+                let grant = txn::ops::roles::GrantRole {
+                    page: txn::ops::roles::RolePage::Tenant(t.id.clone()),
+                    principal: txn::ops::roles::Principal::User(upn.clone()),
+                    role: role_id,
+                };
+                batch.push(grant.into());
             }
+            let id = match txn::run_batch(pool, &CLI, &batch).await {
+                txn::BatchOutcome::Done(outputs) => match outputs.into_iter().next() {
+                    Some(txn::TxnOutput::CreateUser(created)) => created.id,
+                    _ => bail!("the batch did not create the account"),
+                },
+                txn::BatchOutcome::Aborted { outcome, .. } => return outcome.into_result(),
+            };
             print_json(json!({ "id": id, "userPrincipalName": upn }));
         }
         UserCmd::SetPassword {
@@ -986,12 +965,16 @@ async fn key_cmd(pool: &DbPool, cmd: KeyCmd) -> anyhow::Result<()> {
             print_json(json!(list));
         }
         KeyCmd::Rotate => {
-            keys::rotate(pool).await?;
-            db::audit(pool, None, Actor::Cli, Event::KeyRotate, None, json!({})).await?;
+            // Generated before the transaction: RSA key generation is slow.
+            let rotate = txn::ops::keys::RotateKeys {
+                fresh: keys::NewKey::generate()?,
+            };
+            txn::run(pool, &CLI, &rotate).await.into_result()?;
             println!("rotated; running servers pick up the change within 30 seconds");
         }
         KeyCmd::Prune { older_than_days } => {
-            let n = keys::prune(pool, older_than_days * 86_400).await?;
+            let prune = txn::ops::keys::PruneKeys { older_than_days };
+            let n = txn::run(pool, &CLI, &prune).await.into_result()?.deleted;
             println!("deleted {n} retired key(s)");
         }
     }

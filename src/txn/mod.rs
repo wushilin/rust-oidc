@@ -408,4 +408,5 @@ transactions! {
     PruneKeys(ops::keys::PruneKeys),
     AddFlowCallback(ops::flow::AddFlowCallback),
     CreateFlowTestClient(ops::flow::CreateFlowTestClient),
+    Bootstrap(ops::bootstrap::Bootstrap),
 }

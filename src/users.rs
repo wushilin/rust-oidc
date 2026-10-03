@@ -66,6 +66,9 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, user: NewUser<'_>) -> anyhow
     .bind(ts)
     .execute(pool)
     .await?;
+    let engine = crate::db::engine_of(pool);
+    let mut conn = pool.acquire().await?;
+    remember_password(&mut conn, engine, &id, &hash_password(user.password)?).await?;
     Ok(id)
 }
 
@@ -207,46 +210,180 @@ fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default().verify_password(password.as_bytes(), hash).is_ok()
 }
 
-pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<()> {
+/// Who is setting a password, which decides what it is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordSetBy {
+    /// An administrator's temporary password: the user must replace it at their
+    /// next sign-in. Not held to the history rule; the replacement is.
+    AdminTemporary,
+    /// An administrator setting a password the user keeps.
+    Admin,
+    /// The user, choosing their own.
+    User,
+}
+
+/// The most passwords a tenant may remember, and how many are kept per user.
+pub const MAX_PASSWORD_HISTORY: i64 = 24;
+
+/// Refusal of a password that is one of the user's last few.
+#[derive(Debug, thiserror::Error)]
+#[error("That password was used recently. Choose one that is not among the last {0} used for this account.")]
+pub struct PasswordReused(pub i64);
+
+/// Set a user's password, held to the tenant's rules for who is setting it.
+///
+/// Like Entra, any new password revokes the user's refresh tokens and ends their
+/// sessions. A temporary password also marks the account as having to choose
+/// its own at the next sign-in; any other clears that mark.
+pub async fn change_password(
+    pool: &DbPool,
+    tenant: &Tenant,
+    user_id: &str,
+    password: &str,
+    by: PasswordSetBy,
+) -> anyhow::Result<()> {
     if password.chars().count() < 8 {
         bail!("password must be at least 8 characters");
     }
-    let res = sqlx::query(crate::db::q(
+    let current: Option<(String,)> = sqlx::query_as(crate::db::q(
         pool,
-        "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
-         WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
+        "SELECT password_hash FROM users WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
-    .bind(hash_password(password)?)
-    .bind(now())
+    .bind(user_id)
     .bind(&tenant.id)
-    .bind(crate::util::fold(upn))
+    .fetch_optional(pool)
+    .await?;
+    let Some((current,)) = current else {
+        bail!("no such account in this tenant");
+    };
+    let remembered = tenant.settings.password_history.clamp(0, MAX_PASSWORD_HISTORY);
+    if by != PasswordSetBy::AdminTemporary && remembered > 0 {
+        let mut recent: Vec<String> = sqlx::query_as::<_, (String,)>(crate::db::q(
+            pool,
+            "SELECT password_hash FROM password_history WHERE user_id = ? ORDER BY created_at DESC",
+        ))
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(h,)| h)
+        .take(remembered as usize)
+        .collect();
+        // An account from before history was kept still remembers its current one.
+        if recent.is_empty() {
+            recent.push(current);
+        }
+        if recent.iter().any(|hash| verify_password(password, hash)) {
+            return Err(PasswordReused(remembered).into());
+        }
+    }
+
+    let hash = hash_password(password)?;
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, must_change_password = ?,
+                          updated_at = ?
+         WHERE id = ?",
+    ))
+    .bind(&hash)
+    .bind(by == PasswordSetBy::AdminTemporary)
+    .bind(now())
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    remember_password(&mut tx, engine, user_id, &hash).await?;
+    // As in Entra, a new password revokes the user's refresh tokens and sessions.
+    revoke_access(&mut tx, engine, user_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Record a password in the user's history, keeping the newest few only.
+async fn remember_password(
+    conn: &mut sqlx::AnyConnection,
+    engine: crate::db::Engine,
+    user_id: &str,
+    hash: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "INSERT INTO password_history (id, user_id, password_hash, created_at) VALUES (?, ?, ?, ?)",
+    ))
+    .bind(new_guid())
+    .bind(user_id)
+    .bind(hash)
+    .bind(now())
+    .execute(&mut *conn)
+    .await?;
+    let ids: Vec<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        engine,
+        "SELECT id FROM password_history WHERE user_id = ? ORDER BY created_at DESC, id",
+    ))
+    .bind(user_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (id,) in ids.into_iter().skip(MAX_PASSWORD_HISTORY as usize) {
+        sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM password_history WHERE id = ?"))
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Whether the user must choose a new password before anything is issued to them.
+pub async fn must_change_password(pool: &DbPool, user_id: &str) -> anyhow::Result<bool> {
+    let row: Option<(crate::db::Flag,)> = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT must_change_password FROM users WHERE id = ?",
+    ))
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some_and(|(f,)| f.into()))
+}
+
+/// Mark or unmark an account as having to choose its own password at the next
+/// sign-in, without changing the password.
+pub async fn set_must_change_password(pool: &DbPool, user_id: &str, must: bool) -> anyhow::Result<()> {
+    sqlx::query(crate::db::q(
+        pool,
+        "UPDATE users SET must_change_password = ? WHERE id = ?",
+    ))
+    .bind(must)
+    .bind(user_id)
     .execute(pool)
     .await?;
-    if res.rows_affected() == 0 {
-        bail!("user '{upn}' not found");
-    }
-    // As in Entra, a password reset revokes the user's refresh tokens and sessions.
-    let user: (String,) = sqlx::query_as(crate::db::q(
+    Ok(())
+}
+
+/// [`change_password`] by an administrator, for an account named by its user
+/// name, as the command line names it.
+pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<()> {
+    set_password_as(pool, tenant, upn, password, PasswordSetBy::Admin).await
+}
+
+pub async fn set_password_as(
+    pool: &DbPool,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+    by: PasswordSetBy,
+) -> anyhow::Result<()> {
+    let user: Option<(String,)> = sqlx::query_as(crate::db::q(
         pool,
         "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
     ))
     .bind(&tenant.id)
     .bind(crate::util::fold(upn))
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
-    sqlx::query(crate::db::q(
-        pool,
-        "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
-    ))
-    .bind(now())
-    .bind(&user.0)
-    .execute(pool)
-    .await?;
-    sqlx::query(crate::db::q(pool, "DELETE FROM sessions WHERE user_id = ?"))
-        .bind(&user.0)
-        .execute(pool)
-        .await?;
-    Ok(())
+    let Some((id,)) = user else {
+        bail!("user '{upn}' not found");
+    };
+    change_password(pool, tenant, &id, password, by).await
 }
 
 /// Largest page the console will ask for, so a tenant with many users cannot
@@ -412,6 +549,16 @@ pub async fn restore_id(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow
     .execute(pool)
     .await?;
     Ok(done.rows_affected() > 0)
+}
+
+/// End every session and refresh token a user holds, as disabling them does,
+/// without changing anything else about the account.
+pub async fn end_sessions(pool: &DbPool, user_id: &str) -> anyhow::Result<()> {
+    let engine = crate::db::engine_of(pool);
+    let mut tx = pool.begin().await?;
+    revoke_access(&mut tx, engine, user_id).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// End every live credential a user holds: browser sessions, console sessions and

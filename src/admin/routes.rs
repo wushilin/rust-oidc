@@ -361,9 +361,14 @@ async fn signin(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> 
     if !session::login_nonce_ok(&headers, field(&form, session::CSRF_FIELD)) {
         return sign_in_page(&st, "", Some(SIGN_IN_EXPIRED));
     }
+    if let Some(
+        op @ (crate::html::LoginOp::MfaVerify | crate::html::LoginOp::MfaEnroll | crate::html::LoginOp::ChangePassword),
+    ) = crate::html::LoginOp::parse(field(&form, OP_FIELD))
+    {
+        return console_second_step(&st, &form, op).await;
+    }
     let upn = field(&form, "upn");
     let password = field(&form, "password");
-    let base = st.public_url.base();
 
     // The account's own tenant is the one owning its UPN suffix. A suffix no
     // tenant has verified cannot be an account here, and writes nothing: there is
@@ -394,6 +399,281 @@ async fn signin(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> 
         return sign_in_page(&st, upn, Some(SIGN_IN_FAILED));
     };
 
+    // A second step, where the account or the console needs one.
+    match crate::mfa::step(&st.pool, &home, &user.id, crate::mfa::At::Console).await {
+        Ok(crate::mfa::Step::Done) => console_finish(&st, &home, &user, false).await,
+        Ok(step) => console_start_mfa(&st, &home, &user, step).await,
+        Err(e) => {
+            tracing::error!("MFA lookup failed during console sign-in: {e}");
+            view::server_error()
+        }
+    }
+}
+
+/// The form field naming what a sign-in form asks for.
+const OP_FIELD: &str = "op";
+/// The tenant a console second step belongs to: the administrator's own.
+const MFA_TENANT_FIELD: &str = "tenant";
+
+async fn console_start_mfa(st: &AppState, home: &Tenant, user: &users::User, step: crate::mfa::Step) -> Response {
+    use crate::mfa::Purpose;
+    let purpose = if step == crate::mfa::Step::Enroll {
+        Purpose::Enroll
+    } else {
+        Purpose::Verify
+    };
+    match crate::mfa::begin(&st.pool, &home.id, &user.id, purpose).await {
+        Ok(ticket) => {
+            let secret = if purpose == Purpose::Enroll {
+                crate::mfa::pending(&st.pool, &ticket, &home.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.enroll_secret)
+            } else {
+                None
+            };
+            console_mfa_page(st, home, &user.upn, purpose, &ticket, secret.as_deref(), None)
+        }
+        Err(e) => {
+            tracing::error!("MFA could not start during console sign-in: {e}");
+            view::server_error()
+        }
+    }
+}
+
+/// The second-step page of a console sign-in, carrying a fresh login nonce: the
+/// form is posted before there is a session to derive a CSRF token from.
+fn console_mfa_page(
+    st: &AppState,
+    home: &Tenant,
+    upn: &str,
+    purpose: crate::mfa::Purpose,
+    ticket: &str,
+    secret: Option<&str>,
+    error: Option<&str>,
+) -> Response {
+    let (cookie, token) = session::new_login_nonce();
+    let hidden = format!(
+        r#"{}<input type="hidden" name="{MFA_TENANT_FIELD}" value="{}">"#,
+        view::csrf_input(&token),
+        view::e(&home.id)
+    );
+    let action = format!("{}/admin/signin", st.public_url.base());
+    let mut resp = match (purpose, secret) {
+        (crate::mfa::Purpose::Enroll, Some(secret)) => crate::html::mfa_enroll(&crate::html::MfaEnroll {
+            tenant_name: &home.name,
+            upn,
+            action: &action,
+            hidden: &hidden,
+            op_field: OP_FIELD,
+            op: crate::html::LoginOp::MfaEnroll.as_str(),
+            ticket,
+            qr_svg: &crate::mfa::qr_svg(&crate::mfa::otpauth_uri(secret, &home.name, upn)),
+            secret,
+            error,
+        }),
+        _ => crate::html::mfa_verify(&crate::html::MfaVerify {
+            tenant_name: &home.name,
+            upn,
+            action: &action,
+            hidden: &hidden,
+            op_field: OP_FIELD,
+            op: crate::html::LoginOp::MfaVerify.as_str(),
+            ticket,
+            error,
+        }),
+    };
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        session::set_login_nonce(&st.public_url, &cookie, session::LOGIN_NONCE_LIFETIME_SECS),
+    );
+    resp
+}
+
+const MFA_EXPIRED: &str = "That sign-in has expired or had too many wrong codes. Please sign in again.";
+const MFA_WRONG: &str = "That code didn't work. Check the time on your phone, wait for a new code and try again.";
+
+async fn console_second_step(st: &AppState, form: &Params, op: crate::html::LoginOp) -> Response {
+    use crate::mfa::Purpose;
+    let ticket = field(form, crate::html::MFA_TICKET);
+    let typed = field(form, crate::html::MFA_CODE);
+    let home = match tenant::resolve(&st.pool, field(form, MFA_TENANT_FIELD)).await {
+        Ok(Some(t)) => t,
+        _ => return sign_in_page(st, "", Some(MFA_EXPIRED)),
+    };
+    let Ok(Some(waiting)) = crate::mfa::pending(&st.pool, ticket, &home.id).await else {
+        return sign_in_page(st, "", Some(MFA_EXPIRED));
+    };
+    let user = match users::find(&st.pool, &home.id, &waiting.user_id).await {
+        Ok(Some(u)) if u.enabled => u,
+        _ => return sign_in_page(st, "", Some(MFA_EXPIRED)),
+    };
+    let fits = match op {
+        crate::html::LoginOp::MfaEnroll => waiting.purpose == Purpose::Enroll,
+        crate::html::LoginOp::ChangePassword => {
+            matches!(
+                waiting.purpose,
+                Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa
+            )
+        }
+        _ => waiting.purpose == Purpose::Verify,
+    };
+    if !fits {
+        return sign_in_page(st, "", Some(MFA_EXPIRED));
+    }
+    match waiting.purpose {
+        Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa => {
+            let new = field(form, crate::html::NEW_PASSWORD);
+            let confirm = field(form, crate::html::CONFIRM_PASSWORD);
+            let refused = if new != confirm {
+                Some("The passwords don't match.".to_string())
+            } else {
+                users::change_password(&st.pool, &home, &user.id, new, users::PasswordSetBy::User)
+                    .await
+                    .err()
+                    .map(|e| e.to_string())
+            };
+            if let Some(message) = refused {
+                return console_change_page(st, &home, &user.upn, ticket, Some(&message));
+            }
+            let _ = crate::mfa::finish(&st.pool, ticket).await;
+            audit::record(
+                st,
+                &home.id,
+                Actor::Id(&user.id),
+                crate::db::Event::PasswordChanged,
+                Some(&user.id),
+                json!({ "via": Channel::Console.as_str() }),
+            )
+            .await;
+            console_session(st, &home, &user).await
+        }
+        Purpose::Verify => match crate::mfa::check(&st.pool, &user.id, typed).await {
+            Ok(Some(factor)) => {
+                let _ = crate::mfa::finish(&st.pool, ticket).await;
+                audit::record(
+                    st,
+                    &home.id,
+                    Actor::Id(&user.id),
+                    crate::db::Event::MfaVerified,
+                    Some(&user.id),
+                    json!({ "via": Channel::Console.as_str(), "factor": factor.as_str() }),
+                )
+                .await;
+                console_finish(st, &home, &user, true).await
+            }
+            Ok(None) => {
+                audit::record(
+                    st,
+                    &home.id,
+                    Actor::Id(&user.id),
+                    crate::db::Event::MfaFailed,
+                    Some(&user.id),
+                    json!({ "via": Channel::Console.as_str() }),
+                )
+                .await;
+                match crate::mfa::failed_attempt(&st.pool, ticket).await {
+                    Ok(true) => console_mfa_page(st, &home, &user.upn, Purpose::Verify, ticket, None, Some(MFA_WRONG)),
+                    _ => sign_in_page(st, &user.upn, Some(MFA_EXPIRED)),
+                }
+            }
+            Err(e) => {
+                tracing::error!("MFA check failed during console sign-in: {e}");
+                view::server_error()
+            }
+        },
+        Purpose::Enroll => {
+            let secret = waiting.enroll_secret.unwrap_or_default();
+            if !crate::mfa::verify_new(&secret, typed) {
+                return match crate::mfa::failed_attempt(&st.pool, ticket).await {
+                    Ok(true) => console_mfa_page(
+                        st,
+                        &home,
+                        &user.upn,
+                        Purpose::Enroll,
+                        ticket,
+                        Some(&secret),
+                        Some(MFA_WRONG),
+                    ),
+                    _ => sign_in_page(st, &user.upn, Some(MFA_EXPIRED)),
+                };
+            }
+            let codes = match crate::mfa::enroll(&st.pool, &user.id, &secret).await {
+                Ok(codes) => codes,
+                Err(e) => {
+                    tracing::error!("MFA enrolment failed during console sign-in: {e}");
+                    return view::server_error();
+                }
+            };
+            let _ = crate::mfa::finish(&st.pool, ticket).await;
+            let _ = users::end_sessions(&st.pool, &user.id).await;
+            audit::record(
+                st,
+                &home.id,
+                Actor::Id(&user.id),
+                crate::db::Event::MfaEnrolled,
+                Some(&user.id),
+                json!({ "via": Channel::Console.as_str() }),
+            )
+            .await;
+            let mut resp = crate::html::mfa_enrolled(&home.name, &codes, &format!("{}/admin", st.public_url.base()));
+            resp.headers_mut()
+                .append(header::SET_COOKIE, session::clear_login_nonce(&st.public_url));
+            resp
+        }
+    }
+}
+
+/// After the password (and second factor, if any): a new password first if the
+/// account must choose one, then the console session.
+async fn console_finish(st: &AppState, home: &Tenant, user: &users::User, after_mfa: bool) -> Response {
+    if users::must_change_password(&st.pool, &user.id).await.unwrap_or(false) {
+        return match crate::mfa::begin(
+            &st.pool,
+            &home.id,
+            &user.id,
+            crate::mfa::Purpose::change_password(after_mfa),
+        )
+        .await
+        {
+            Ok(ticket) => console_change_page(st, home, &user.upn, &ticket, None),
+            Err(e) => {
+                tracing::error!("password change could not start during console sign-in: {e}");
+                view::server_error()
+            }
+        };
+    }
+    console_session(st, home, user).await
+}
+
+fn console_change_page(st: &AppState, home: &Tenant, upn: &str, ticket: &str, error: Option<&str>) -> Response {
+    let (cookie, token) = session::new_login_nonce();
+    let hidden = format!(
+        r#"{}<input type="hidden" name="{MFA_TENANT_FIELD}" value="{}">"#,
+        view::csrf_input(&token),
+        view::e(&home.id)
+    );
+    let mut resp = crate::html::change_password(&crate::html::ChangePassword {
+        tenant_name: &home.name,
+        upn,
+        action: &format!("{}/admin/signin", st.public_url.base()),
+        hidden: &hidden,
+        op_field: OP_FIELD,
+        op: crate::html::LoginOp::ChangePassword.as_str(),
+        ticket,
+        error,
+    });
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        session::set_login_nonce(&st.public_url, &cookie, session::LOGIN_NONCE_LIFETIME_SECS),
+    );
+    resp
+}
+
+/// The console session for an administrator who has signed in, all steps done.
+async fn console_session(st: &AppState, home: &Tenant, user: &users::User) -> Response {
+    let base = st.public_url.base();
     let cookie = match session::create(&st.pool, &user.id, &home.id).await {
         Ok(c) => c,
         Err(e) => {
@@ -402,7 +682,7 @@ async fn signin(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> 
         }
     };
     audit::record(
-        &st,
+        st,
         &home.id,
         Actor::Id(&user.id),
         Event::AdminSignIn,

@@ -240,6 +240,7 @@ const PRINCIPAL: &str = "principal";
 const PRINCIPAL_TYPE: &str = "principal_type";
 const ASSIGNMENT: &str = "assignment";
 const ALLOW_PASSWORD_GRANT: &str = "allow_password_grant";
+const REQUIRE_MFA: &str = "require_mfa";
 const ALLOW_ID_TOKEN: &str = "allow_id_token_implicit";
 const ALLOW_ACCESS_TOKEN: &str = "allow_access_token_implicit";
 /// One checkbox per [`MemberType`], named by the type itself.
@@ -474,10 +475,15 @@ async fn detail(
         AppSection::Overview => overview(st, ctx, tenant, app).await,
         AppSection::Authentication => {
             let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
+            let mfa_required = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|sp| sp.mfa_required);
             format!(
                 "{}{}",
                 redirect_section(&url, &csrf, &redirect_uris, may_write),
-                flags_form(&url, &csrf, app, may_write)
+                flags_form(&url, &csrf, app, mfa_required, may_write)
             )
         }
         AppSection::Credentials => {
@@ -678,7 +684,7 @@ flow needs before it runs anything.</p>"#,
     format!(r#"{facts}<div class="tiles">{cards}</div>{flow}"#)
 }
 
-fn flags_form(url: &str, csrf: &str, app: &Application, may_write: bool) -> String {
+fn flags_form(url: &str, csrf: &str, app: &Application, mfa_required: bool, may_write: bool) -> String {
     let checkbox = |name: &str, on: bool, label: &str, note: &str| {
         format!(
             r#"<label><input type="checkbox" name="{name}"{on}{disabled}> {label}</label>
@@ -690,12 +696,19 @@ fn flags_form(url: &str, csrf: &str, app: &Application, may_write: bool) -> Stri
         )
     };
     format!(
-        r#"<h2>Grants</h2><form method="post" action="{url}">{csrf}
+        r#"<h2>Sign-in and grants</h2><form method="post" action="{url}">{csrf}
 <input type="hidden" name="{op_field}" value="{op}">
-{password}{id_token}{access_token}{save}</form>"#,
+{mfa}{password}{id_token}{access_token}{save}</form>"#,
         url = e(url),
         op_field = AppOp::FIELD,
         op = AppOp::Flags.as_str(),
+        mfa = checkbox(
+            REQUIRE_MFA,
+            mfa_required,
+            "Require multi-factor authentication",
+            "Everyone signing in to this application must use MFA, whatever their own or the tenant's setting. \
+             Whoever has not set up an authenticator does so at that sign-in.",
+        ),
         password = checkbox(
             ALLOW_PASSWORD_GRANT,
             app.allow_password_grant,
@@ -1347,7 +1360,12 @@ async fn apply(
             let access_token = checked(form, ALLOW_ACCESS_TOKEN);
             apps::set_password_grant_allowed(&st.pool, app, password).await?;
             apps::set_implicit_allowed(&st.pool, app, id_token, access_token).await?;
+            let mfa = checked(form, REQUIRE_MFA);
+            if let Some(sp) = apps::service_principal(&st.pool, &tenant.id, &app.app_id).await? {
+                apps::set_mfa_required(&st.pool, &sp.id, mfa).await?;
+            }
             Ok(Outcome::plain(json!({
+                "requireMfa": mfa,
                 "allowPasswordGrant": password,
                 "allowIdTokenImplicit": id_token,
                 "allowAccessTokenImplicit": access_token,

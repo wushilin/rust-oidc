@@ -1141,6 +1141,30 @@ groups are still deleted outright, and a `deleted_groups` row records what they 
 because the original `UNIQUE (tenant_id, name)` on every engine would make a
 soft-deleted group's name unusable; a deleted group is not restorable.
 
+**151. MFA with an authenticator app (TOTP, RFC 6238)** as agreed on 3 Oct: secrets
+stored as is in `user_totp` (the user's decision), recovery codes hashed, ten at a
+time, each once; a user setting (Default / Required / Not required) over a tenant
+switch, plus per-application "Require MFA" and a per-tenant console switch. Anyone
+enrolled is asked at every sign-in; anyone required but not enrolled sets one up at
+that sign-in and is then signed out. Mine: codes are accepted one 30-second step either
+side and never twice (the last step is stored); five wrong codes end the sign-in; the
+second step is a ticket in `mfa_pending` (ten minutes) rather than a half-made session,
+so nothing is signed in before the second factor; an existing session without `mfa`
+is stepped up for an app or user that needs it, without the password again;
+`prompt=none` answers `interaction_required` with AADSTS50076/50079; the password grant
+and refresh tokens are refused with `invalid_grant` and the same numbers when the
+sign-in they carry had no second factor; `amr` becomes `["pwd","mfa"]`. "Require MFA"
+on an application is checked for the client being signed in to, not for the API in
+the scope. An admin reset removes the authenticator and codes and ends the sessions.
+
+**152. "Must choose a new password at next sign-in"**: an admin reset sets it by
+default (a ticked box), as does creating an account in the console; the CLI has
+`--require-change`. The change page comes after the password and any second factor and
+before any session or token; the password grant gets AADSTS50055. **Password history**:
+per tenant, default 3, 0-24, kept as Argon2 hashes (24 per user); an admin's temporary
+password is exempt, every other new password is checked. Mine: any new password ends
+the user's sessions and refresh tokens, as resets already did.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

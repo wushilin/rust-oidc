@@ -16,6 +16,7 @@ getrandom = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }
 # A real HTTP client, in the binary and not only in the tests: the console's flow
 # tester redeems its authorization code against our own token endpoint over HTTP
@@ -29,7 +30,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs
 rustls-acme = { version = "0.15.4", features = ["axum"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha1 = "0.11.0"
+sha1 = "0.11"
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres", "mysql", "migrate", "macros"] }
 subtle = "2.6.1"

@@ -45,7 +45,7 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
 }
 
 /// Random string drawn uniformly from `alphabet` (rejection sampling, no modulo bias).
-fn random_string(alphabet: &[u8], len: usize) -> String {
+pub fn random_string(alphabet: &[u8], len: usize) -> String {
     let limit = 256 - (256 % alphabet.len());
     let mut out = String::with_capacity(len);
     while out.len() < len {

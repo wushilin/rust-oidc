@@ -35,6 +35,10 @@ pub enum UserOp {
     Delete,
     /// Set which of the tenant's groups the account is in.
     Groups,
+    /// Their own MFA setting: Default, Required or Not required.
+    MfaPolicy,
+    /// Remove their authenticator and recovery codes.
+    MfaReset,
 }
 
 impl UserOp {
@@ -45,6 +49,8 @@ impl UserOp {
         Self::Reset,
         Self::Delete,
         Self::Groups,
+        Self::MfaPolicy,
+        Self::MfaReset,
     ];
 
     /// The form's `op` field.
@@ -58,6 +64,8 @@ impl UserOp {
             Self::Reset => "reset",
             Self::Delete => "delete",
             Self::Groups => "groups",
+            Self::MfaPolicy => "mfa_policy",
+            Self::MfaReset => "mfa_reset",
         }
     }
 
@@ -69,7 +77,9 @@ impl UserOp {
     /// because a help desk can hold it without being able to edit the directory.
     fn action(self) -> crate::rbac::Action {
         match self {
-            Self::Reset => USER_RESET,
+            // Removing an authenticator is a reset of a credential, like a password.
+            Self::Reset | Self::MfaReset => USER_RESET,
+            Self::MfaPolicy => USER_WRITE,
             Self::Attributes | Self::Enable | Self::Disable | Self::Delete => USER_WRITE,
             // Who is in a group is the group's to change.
             Self::Groups => GROUP_WRITE,
@@ -85,9 +95,17 @@ impl UserOp {
             Self::Delete => Event::AdminUserDelete,
             // Recorded per group joined or left, not as one entry: see `detail_post`.
             Self::Groups => Event::AdminGroupMemberAdd,
+            Self::MfaPolicy => Event::AdminUserMfaPolicy,
+            Self::MfaReset => Event::AdminUserMfaReset,
         }
     }
 }
+
+/// Whether a password an administrator sets must be replaced at next sign-in.
+const REQUIRE_CHANGE: &str = "require_change";
+
+/// The user's MFA setting on their page.
+const MFA_POLICY: &str = "mfa_policy";
 
 /// The search box's query parameter.
 const QUERY_PARAM: &str = "q";
@@ -470,6 +488,7 @@ async fn new_user_page(
 <span class="suffix">@ {suffix}</span></div>
 <p class="muted">What the person signs in with. Type the part before the @; the tenant's domain is added.</p>
 <label for="password">Initial password</label><input id="password" name="password" type="password" autocomplete="new-password">
+<label><input type="checkbox" name="{REQUIRE_CHANGE}" checked> Require them to choose their own password at first sign-in</label>
 <label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}">
 <div class="fields">
 <div><label for="given_name">Given name</label><input id="given_name" name="given_name" type="text" value="{given}"></div>
@@ -531,6 +550,12 @@ pub async fn create_user(
         },
     )
     .await;
+    let created = match created {
+        Ok(user_id) if checked(&form, REQUIRE_CHANGE) => users::set_must_change_password(&st.pool, &user_id, true)
+            .await
+            .map(|()| user_id),
+        other => other,
+    };
     match created {
         Ok(user_id) => {
             audited(
@@ -660,14 +685,88 @@ disabled or deleted from here. Another administrator can.</p>"#
         format!(
             r#"<h2>Password</h2><form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{reset}">
 <label for="password">New password</label><input id="password" name="password" type="password" required>
+<label><input type="checkbox" name="{REQUIRE_CHANGE}" checked> Require them to choose a new password at their next sign-in</label>
 <div class="actions"><button type="submit">Reset password</button></div>
-<p class="muted">A reset signs the user out everywhere and revokes their refresh tokens.</p></form>"#,
+<p class="muted">A reset signs the user out everywhere and revokes their refresh tokens.{pending}</p></form>"#,
             url = e(&url),
             op_field = UserOp::FIELD,
             reset = UserOp::Reset.as_str(),
+            pending = if users::must_change_password(&st.pool, &user.id).await.unwrap_or(false) {
+                " They have yet to choose their own password since the last reset."
+            } else {
+                ""
+            },
         )
     } else {
         String::new()
+    };
+
+    let mfa = {
+        let enrolled = crate::mfa::enrolled_at(&st.pool, &user.id).await.unwrap_or(None);
+        let left = crate::mfa::recovery_codes_left(&st.pool, &user.id).await.unwrap_or(0);
+        let policy = crate::mfa::policy(&st.pool, &user.id)
+            .await
+            .unwrap_or(crate::mfa::MfaPolicy::Default);
+        let status = match enrolled {
+            Some(at) => format!(
+                "Authenticator set up {}. {left} unused recovery code{}.",
+                view::ts(at),
+                if left == 1 { "" } else { "s" }
+            ),
+            None => "No authenticator set up.".to_string(),
+        };
+        let tenant_rule = if tenant.settings.require_mfa {
+            "This tenant requires MFA of everyone."
+        } else {
+            "This tenant does not require MFA of everyone."
+        };
+        let setting = if may_write {
+            let options: String = crate::mfa::MfaPolicy::ALL
+                .iter()
+                .map(|p| {
+                    format!(
+                        r#"<option value="{v}"{sel}>{label}</option>"#,
+                        v = e(p.as_str()),
+                        sel = if *p == policy { " selected" } else { "" },
+                        label = e(p.label()),
+                    )
+                })
+                .collect();
+            format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+<label for="mfa_policy">Requirement</label><select id="mfa_policy" name="{MFA_POLICY}">{options}</select>
+<p class="muted">{tenant_rule} An application can also require it.</p>
+<div class="actions"><button type="submit">Save</button></div></form>"#,
+                url = e(&url),
+                op_field = UserOp::FIELD,
+                op = UserOp::MfaPolicy.as_str(),
+            )
+        } else {
+            format!(
+                r#"<p>Requirement: {}. <span class="muted">{tenant_rule}</span></p>"#,
+                e(policy.label())
+            )
+        };
+        let reset = if may_reset && enrolled.is_some() {
+            view::confirm_post(
+                "mfa-reset",
+                "Reset MFA\u{2026}",
+                &format!("Remove the authenticator of {}?", user.upn),
+                "Their authenticator and recovery codes are removed and they are signed out everywhere. \
+                 If MFA is required of them, they set up a new authenticator at their next sign-in.",
+                &url,
+                &csrf,
+                UserOp::FIELD,
+                UserOp::MfaReset.as_str(),
+                "Reset MFA",
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            r#"<h2>Multi-factor authentication</h2><p>{}</p>{setting}{reset}"#,
+            e(&status)
+        )
     };
 
     let groups = if ctx.can_in(GROUP_READ, tenant) {
@@ -728,7 +827,7 @@ disabled or deleted from here. Another administrator can.</p>"#
 
     let body = format!(
         r#"<h1>{upn}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
-<h2>Attributes</h2>{attributes}{state}{reset}{groups}{history}"#,
+<h2>Attributes</h2>{attributes}{state}{reset}{mfa}{groups}{history}"#,
         upn = e(&user.upn),
         tenant_name = e(&tenant.name),
         id = e(&user.id),
@@ -869,12 +968,31 @@ async fn apply(
             Ok(json!({ "enabled": enabled }))
         }
         UserOp::Reset => {
-            users::set_password(&st.pool, tenant, &user.upn, field(form, "password")).await?;
-            Ok(json!({}))
+            let temporary = checked(form, REQUIRE_CHANGE);
+            let by = if temporary {
+                users::PasswordSetBy::AdminTemporary
+            } else {
+                users::PasswordSetBy::Admin
+            };
+            users::change_password(&st.pool, tenant, &user.id, field(form, "password"), by).await?;
+            Ok(json!({ "requireChange": temporary }))
         }
         UserOp::Delete => {
             users::soft_delete(&st.pool, &tenant.id, &user.id).await?;
             Ok(json!({ "upn": crate::routes::audit::clip(&user.upn) }))
+        }
+        UserOp::MfaPolicy => {
+            let Some(policy) = crate::mfa::MfaPolicy::parse(field(form, MFA_POLICY)) else {
+                anyhow::bail!("choose a setting");
+            };
+            crate::mfa::set_policy(&st.pool, &tenant.id, &user.id, policy).await?;
+            Ok(json!({ "mfaPolicy": policy.as_str() }))
+        }
+        UserOp::MfaReset => {
+            if !crate::mfa::reset(&st.pool, &tenant.id, &user.id).await? {
+                anyhow::bail!("this account has no authenticator to remove");
+            }
+            Ok(json!({}))
         }
         UserOp::Groups => {
             let change = crate::groups::set_for_user(&st.pool, &tenant.id, &user.id, groups).await?;

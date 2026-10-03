@@ -23,6 +23,7 @@ const ERRORS: &[&str] = &[
     "unsupported_response",
     "access_denied",
     "login_required",
+    "interaction_required",
     "request_not_supported",
     "request_uri_not_supported",
     "server_error",

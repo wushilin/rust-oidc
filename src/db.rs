@@ -439,6 +439,14 @@ pub enum Event {
     // -- browser and API sign-in --
     SignIn,
     SignInFailed,
+    /// The second step of a sign-in passed: an authenticator or recovery code.
+    MfaVerified,
+    /// A wrong code at the second step.
+    MfaFailed,
+    /// An authenticator was set up.
+    MfaEnrolled,
+    /// The user chose a new password: at a forced change, or in My Account.
+    PasswordChanged,
     Lockout,
     SessionCreate,
     SessionEnd,
@@ -535,6 +543,8 @@ pub enum Event {
     AdminGroupMemberRemove,
     AdminGroupDelete,
     AdminUserRestore,
+    AdminUserMfaReset,
+    AdminUserMfaPolicy,
     /// An administrator sent an authorize request from the console's flow tester.
     /// The row records who, against which application, and with what response
     /// type -- never the state, the nonce or the PKCE verifier it generated.
@@ -547,6 +557,10 @@ impl Event {
     pub const ALL: &'static [Event] = &[
         Self::SignIn,
         Self::SignInFailed,
+        Self::MfaVerified,
+        Self::MfaFailed,
+        Self::MfaEnrolled,
+        Self::PasswordChanged,
         Self::Lockout,
         Self::SessionCreate,
         Self::SessionEnd,
@@ -628,6 +642,8 @@ impl Event {
         Self::AdminGroupMemberRemove,
         Self::AdminGroupDelete,
         Self::AdminUserRestore,
+        Self::AdminUserMfaReset,
+        Self::AdminUserMfaPolicy,
         Self::AdminFlowTestStart,
         Self::AdminFlowTestResult,
     ];
@@ -636,6 +652,10 @@ impl Event {
         match self {
             Self::SignIn => "auth.sign_in",
             Self::SignInFailed => "auth.sign_in_failed",
+            Self::MfaVerified => "auth.mfa_verified",
+            Self::MfaFailed => "auth.mfa_failed",
+            Self::MfaEnrolled => "auth.mfa_enrolled",
+            Self::PasswordChanged => "auth.password_changed",
             Self::Lockout => "auth.lockout",
             Self::SessionCreate => "session.create",
             Self::SessionEnd => "session.end",
@@ -720,6 +740,8 @@ impl Event {
             Self::AdminGroupMemberRemove => "admin.group.member.remove",
             Self::AdminGroupDelete => "admin.group.delete",
             Self::AdminUserRestore => "admin.user.restore",
+            Self::AdminUserMfaReset => "admin.user.mfa_reset",
+            Self::AdminUserMfaPolicy => "admin.user.mfa_policy",
             Self::AdminFlowTestStart => "admin.flow_test.start",
             Self::AdminFlowTestResult => "admin.flow_test.result",
         }

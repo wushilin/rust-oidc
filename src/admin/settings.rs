@@ -21,7 +21,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, TenantTab, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, TenantTab, audited, checked, chrome, field, parse_form};
 use crate::admin::view::{self, e};
 use crate::admin::{TENANT_READ, TENANT_WRITE};
 use crate::db::Event;
@@ -29,6 +29,9 @@ use crate::tenant::{self, Tenant, TenantSettings};
 
 /// Form field names, spelled once. They match the struct's field names, which is
 /// what makes the form and the type obviously the same three values.
+const REQUIRE_MFA: &str = "require_mfa";
+const PASSWORD_HISTORY: &str = "password_history";
+const REQUIRE_CONSOLE_MFA: &str = "require_console_mfa";
 const ACCESS_TOKEN: &str = "access_token_lifetime_secs";
 const SESSION: &str = "session_lifetime_secs";
 const REFRESH: &str = "refresh_token_lifetime_secs";
@@ -78,10 +81,20 @@ async fn render(
         )
     };
     let body = format!(
-        r#"<h1>Settings</h1><p class="sub">How long what this tenant issues lasts, and the tenant itself.</p>{error}
+        r#"<h1>Settings</h1><p class="sub">How long what this tenant issues lasts, who must use MFA, and the tenant itself.</p>{error}
 <h2>Lifetimes</h2>
 <form method="post" action="{url}">{csrf}
 {access}{session}{refresh}
+<h2>Passwords</h2>
+<label for="{PASSWORD_HISTORY}">Remembered passwords</label><input id="{PASSWORD_HISTORY}" name="{PASSWORD_HISTORY}" type="text" value="{history}"{disabled}>
+<p class="muted">A new password may not be one of the account's last this many. Between 0 (off) and {max_history}.
+A temporary password set by an administrator is exempt; the one the user then chooses is not.</p>
+<h2>Multi-factor authentication</h2>
+<label><input type="checkbox" name="{REQUIRE_MFA}"{mfa}{disabled}> Require MFA of everyone signing in to this tenant's applications</label>
+<p class="muted">A user's own setting, on their page, can make an exception either way. Whoever has not set
+up an authenticator does so at their next sign-in, and then signs in again with it.</p>
+<label><input type="checkbox" name="{REQUIRE_CONSOLE_MFA}"{console_mfa}{disabled}> Require MFA of this tenant's administrators signing in to the console</label>
+<p class="muted">Applies whatever their own setting says.{root_note}</p>
 {save}</form>
 <p class="muted">A change applies to tokens and sessions issued from now on. Those already
 issued are self-contained and cannot be shortened after the fact.</p>{manage}"#,
@@ -89,6 +102,15 @@ issued are self-contained and cannot be shortened after the fact.</p>{manage}"#,
         manage = manage,
         url = e(&settings_url(st.public_url.base(), tenant)),
         csrf = view::csrf_input(&ctx.csrf),
+        mfa = if settings.require_mfa { " checked" } else { "" },
+        history = settings.password_history,
+        max_history = TenantSettings::MAX_PASSWORD_HISTORY,
+        console_mfa = if settings.require_console_mfa { " checked" } else { "" },
+        root_note = if tenant.is_root {
+            " This is the root tenant, so it covers the Global Administrators."
+        } else {
+            ""
+        },
         access = row(
             ACCESS_TOKEN,
             "Access token lifetime (seconds)",
@@ -166,6 +188,26 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
             access_token_lifetime_secs: access,
             session_lifetime_secs: session,
             refresh_token_lifetime_secs: refresh,
+            // Left out of the form, it keeps what the tenant has.
+            password_history: match field(&form, PASSWORD_HISTORY).trim() {
+                "" => tenant.settings.password_history,
+                raw => match raw.parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return render(
+                            &st,
+                            &ctx,
+                            tenant,
+                            &tenant.settings,
+                            Some("the number of remembered passwords must be a whole number"),
+                            StatusCode::BAD_REQUEST,
+                        )
+                        .await;
+                    }
+                },
+            },
+            require_mfa: checked(&form, REQUIRE_MFA),
+            require_console_mfa: checked(&form, REQUIRE_CONSOLE_MFA),
         },
         (access, session, refresh) => {
             let message = [access.err(), session.err(), refresh.err()]

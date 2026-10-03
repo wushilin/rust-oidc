@@ -89,12 +89,16 @@ impl Azpacr {
 pub enum Amr {
     /// Password.
     Pwd,
+    /// A second factor: here, an authenticator app code or a recovery code.
+    /// Entra writes `["pwd","mfa"]` after a multi-factor sign-in.
+    Mfa,
 }
 
 impl Amr {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pwd => "pwd",
+            Self::Mfa => "mfa",
         }
     }
 }

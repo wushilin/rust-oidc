@@ -15,6 +15,10 @@ use rust_oidc::db::{Actor, Event};
 const EXPECTED: &[(&str, &str)] = &[
     ("SignIn", "auth.sign_in"),
     ("SignInFailed", "auth.sign_in_failed"),
+    ("MfaVerified", "auth.mfa_verified"),
+    ("MfaFailed", "auth.mfa_failed"),
+    ("MfaEnrolled", "auth.mfa_enrolled"),
+    ("PasswordChanged", "auth.password_changed"),
     ("Lockout", "auth.lockout"),
     ("SessionCreate", "session.create"),
     ("SessionEnd", "session.end"),
@@ -96,6 +100,8 @@ const EXPECTED: &[(&str, &str)] = &[
     ("AdminGroupMemberRemove", "admin.group.member.remove"),
     ("AdminGroupDelete", "admin.group.delete"),
     ("AdminUserRestore", "admin.user.restore"),
+    ("AdminUserMfaReset", "admin.user.mfa_reset"),
+    ("AdminUserMfaPolicy", "admin.user.mfa_policy"),
     ("AdminFlowTestStart", "admin.flow_test.start"),
     ("AdminFlowTestResult", "admin.flow_test.result"),
 ];

@@ -41,6 +41,11 @@ button.link { background:none; border:none; color:var(--accent); padding:0; }
 ul.consent { list-style:none; padding:0; margin:12px 0; }
 ul.consent li { border:1px solid var(--border); padding:10px 14px; margin:8px 0; }
 .code { color:var(--muted); font-size:12px; word-break:break-all; margin-top:18px; }
+ol.steps { padding-left:20px; margin:12px 0; } ol.steps li { margin:10px 0; }
+.qr { display:flex; justify-content:center; margin:12px 0; } .qr svg { width:200px; height:200px; background:#fff; padding:6px; border-radius:4px; }
+.key { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.06em; word-break:break-all; background:var(--bg); padding:6px 8px; border-radius:4px; }
+ul.codes { list-style:none; padding:0; margin:12px 0; display:grid; grid-template-columns:1fr 1fr; gap:6px 18px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:15px; }
+a.button { display:inline-block; padding:9px 18px; border-radius:4px; background:var(--accent); color:#fff; text-decoration:none; }
 "#;
 
 fn page(title: &str, tenant_name: Option<&str>, body: &str) -> String {
@@ -122,10 +127,24 @@ pub enum LoginOp {
     ConsentAccept,
     /// Refuse them.
     ConsentDeny,
+    /// The code at the second step of a sign-in.
+    MfaVerify,
+    /// The code that confirms a new authenticator.
+    MfaEnroll,
+    /// A new password, chosen at sign-in because the old one must be replaced.
+    ChangePassword,
 }
 
 impl LoginOp {
-    pub const ALL: &'static [LoginOp] = &[Self::Continue, Self::Other, Self::ConsentAccept, Self::ConsentDeny];
+    pub const ALL: &'static [LoginOp] = &[
+        Self::Continue,
+        Self::Other,
+        Self::ConsentAccept,
+        Self::ConsentDeny,
+        Self::MfaVerify,
+        Self::MfaEnroll,
+        Self::ChangePassword,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -133,6 +152,9 @@ impl LoginOp {
             Self::Other => "other",
             Self::ConsentAccept => "consent_accept",
             Self::ConsentDeny => "consent_deny",
+            Self::MfaVerify => "mfa_verify",
+            Self::MfaEnroll => "mfa_enroll",
+            Self::ChangePassword => "change_password",
         }
     }
 
@@ -235,6 +257,175 @@ pub fn account_picker(p: &AccountPicker) -> Response {
 }
 
 /// Error shown when we must not redirect (unknown client, bad redirect URI, ...).
+/// The form field a second-step page carries its ticket in.
+pub const MFA_TICKET: &str = "mfa_ticket";
+/// The form field for the code typed at a second step.
+pub const MFA_CODE: &str = "code";
+
+/// The second step of a sign-in: a code from the authenticator, or a recovery
+/// code. `hidden` is the page's own hidden fields (CSRF, the request it belongs
+/// to), already escaped; the ticket and `op` are added here.
+pub struct MfaVerify<'a> {
+    pub tenant_name: &'a str,
+    pub upn: &'a str,
+    pub action: &'a str,
+    pub hidden: &'a str,
+    pub op_field: &'a str,
+    pub op: &'a str,
+    pub ticket: &'a str,
+    pub error: Option<&'a str>,
+}
+
+pub fn mfa_verify(p: &MfaVerify) -> Response {
+    let error = p
+        .error
+        .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, escape(e)))
+        .unwrap_or_default();
+    let body = format!(
+        r#"<h1>Enter code</h1><p class="sub">{upn}</p>
+<form method="post" action="{action}">{hidden}<input type="hidden" name="{op_field}" value="{op}"><input type="hidden" name="{MFA_TICKET}" value="{ticket}">
+<label for="code">Code from your authenticator app</label><input id="code" name="{MFA_CODE}" type="text" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required autofocus>
+<p class="sub" style="margin-top:8px">Lost your phone? Enter one of your recovery codes instead.</p>
+{error}<div class="actions"><button type="submit">Verify</button></div></form>"#,
+        upn = escape(p.upn),
+        action = escape(p.action),
+        hidden = p.hidden,
+        op_field = escape(p.op_field),
+        op = escape(p.op),
+        ticket = escape(p.ticket),
+    );
+    let status = if p.error.is_some() {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::OK
+    };
+    respond(status, page("Enter code", Some(p.tenant_name), &body), CSP_DEFAULT)
+}
+
+/// Setting up an authenticator: the QR code, the key for typing in, and the box
+/// for the first code, which confirms it.
+pub struct MfaEnroll<'a> {
+    pub tenant_name: &'a str,
+    pub upn: &'a str,
+    pub action: &'a str,
+    pub hidden: &'a str,
+    pub op_field: &'a str,
+    pub op: &'a str,
+    pub ticket: &'a str,
+    /// The QR code, as inline SVG made by this server.
+    pub qr_svg: &'a str,
+    pub secret: &'a str,
+    pub error: Option<&'a str>,
+}
+
+pub fn mfa_enroll(p: &MfaEnroll) -> Response {
+    let error = p
+        .error
+        .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, escape(e)))
+        .unwrap_or_default();
+    // The key in groups of four, as authenticator apps print it.
+    let grouped: Vec<String> = p
+        .secret
+        .as_bytes()
+        .chunks(4)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect();
+    let body = format!(
+        r#"<h1>Set up your authenticator</h1><p class="sub">{upn} must use a second step to sign in.</p>
+<ol class="steps"><li>Install an authenticator app on your phone, such as Microsoft Authenticator or Google Authenticator.</li>
+<li>Scan this code with it:<div class="qr">{qr}</div>or enter this key: <div class="key">{key}</div></li>
+<li>Enter the six-digit code the app shows.</li></ol>
+<form method="post" action="{action}">{hidden}<input type="hidden" name="{op_field}" value="{op}"><input type="hidden" name="{MFA_TICKET}" value="{ticket}">
+<label for="code">Code</label><input id="code" name="{MFA_CODE}" type="text" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+{error}<div class="actions"><button type="submit">Confirm</button></div></form>"#,
+        upn = escape(p.upn),
+        qr = p.qr_svg,
+        key = escape(&grouped.join(" ")),
+        action = escape(p.action),
+        hidden = p.hidden,
+        op_field = escape(p.op_field),
+        op = escape(p.op),
+        ticket = escape(p.ticket),
+    );
+    let status = if p.error.is_some() {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::OK
+    };
+    respond(
+        status,
+        page("Set up your authenticator", Some(p.tenant_name), &body),
+        CSP_DEFAULT,
+    )
+}
+
+/// The authenticator is set up: the recovery codes, shown this once, and the way
+/// back in. The user has been signed out and signs in again with it.
+pub fn mfa_enrolled(tenant_name: &str, codes: &[String], again_href: &str) -> Response {
+    let codes: String = codes.iter().map(|c| format!("<li>{}</li>", escape(c))).collect();
+    let body = format!(
+        r#"<h1>Your authenticator is set up</h1>
+<p>Save these recovery codes somewhere safe. Each one signs you in once if you lose your phone. They
+are shown only now.</p>
+<ul class="codes">{codes}</ul>
+<p class="sub">You have been signed out. Sign in again with your password and a code from the app.</p>
+<div class="actions"><a class="button" href="{href}">Sign in again</a></div>"#,
+        href = escape(again_href),
+    );
+    respond(
+        StatusCode::OK,
+        page("Authenticator set up", Some(tenant_name), &body),
+        CSP_DEFAULT,
+    )
+}
+
+/// The form fields of the change-password page.
+pub const NEW_PASSWORD: &str = "new_password";
+pub const CONFIRM_PASSWORD: &str = "confirm_password";
+
+/// Choosing a new password at sign-in: the old one was set by an administrator,
+/// or has to be replaced. Carried by a second-step ticket like the MFA pages.
+pub struct ChangePassword<'a> {
+    pub tenant_name: &'a str,
+    pub upn: &'a str,
+    pub action: &'a str,
+    pub hidden: &'a str,
+    pub op_field: &'a str,
+    pub op: &'a str,
+    pub ticket: &'a str,
+    pub error: Option<&'a str>,
+}
+
+pub fn change_password(p: &ChangePassword) -> Response {
+    let error = p
+        .error
+        .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, escape(e)))
+        .unwrap_or_default();
+    let body = format!(
+        r#"<h1>Update your password</h1><p class="sub">{upn} needs a new password before signing in.</p>
+<form method="post" action="{action}">{hidden}<input type="hidden" name="{op_field}" value="{op}"><input type="hidden" name="{MFA_TICKET}" value="{ticket}">
+<label for="new_password">New password</label><input id="new_password" name="{NEW_PASSWORD}" type="password" autocomplete="new-password" required autofocus>
+<label for="confirm_password">Confirm new password</label><input id="confirm_password" name="{CONFIRM_PASSWORD}" type="password" autocomplete="new-password" required>
+{error}<div class="actions"><button type="submit">Sign in</button></div></form>"#,
+        upn = escape(p.upn),
+        action = escape(p.action),
+        hidden = p.hidden,
+        op_field = escape(p.op_field),
+        op = escape(p.op),
+        ticket = escape(p.ticket),
+    );
+    let status = if p.error.is_some() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    respond(
+        status,
+        page("Update your password", Some(p.tenant_name), &body),
+        CSP_DEFAULT,
+    )
+}
+
 pub fn error(tenant_name: Option<&str>, message: &str) -> Response {
     let body = format!(
         r#"<h1>Sorry, but we're having trouble signing you in.</h1><p class="code">{}</p>"#,

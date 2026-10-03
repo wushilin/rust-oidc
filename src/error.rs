@@ -48,6 +48,9 @@ pub enum OAuthError {
     UnsupportedResponse,
     AccessDenied,
     LoginRequired,
+    /// The user must do something interactive first: here, multi-factor
+    /// authentication. Entra's code for a silent or password request that needs it.
+    InteractionRequired,
     RequestNotSupported,
     RequestUriNotSupported,
     ServerError,
@@ -76,6 +79,7 @@ impl OAuthError {
         Self::UnsupportedResponse,
         Self::AccessDenied,
         Self::LoginRequired,
+        Self::InteractionRequired,
         Self::RequestNotSupported,
         Self::RequestUriNotSupported,
         Self::ServerError,
@@ -99,6 +103,7 @@ impl OAuthError {
             Self::UnsupportedResponse => "unsupported_response",
             Self::AccessDenied => "access_denied",
             Self::LoginRequired => "login_required",
+            Self::InteractionRequired => "interaction_required",
             Self::RequestNotSupported => "request_not_supported",
             Self::RequestUriNotSupported => "request_uri_not_supported",
             Self::ServerError => "server_error",
@@ -186,6 +191,14 @@ pub enum Aadsts {
     /// number Entra documents for a declined consent, not verified against a
     /// live tenant.
     ConsentDeclined,
+    /// Multi-factor authentication is required and was not done: the password
+    /// grant, a refresh without it, or a silent request.
+    MfaRequired,
+    /// Multi-factor authentication is required and the user has no authenticator
+    /// yet, so they must set one up in a browser.
+    MfaRegistrationRequired,
+    /// The account must choose a new password before anything is issued to it.
+    PasswordExpired,
 
     // ---- grants ----
     UnsupportedGrantType,
@@ -265,6 +278,9 @@ impl Aadsts {
         Self::SilentSignInFailed,
         Self::NotAssigned,
         Self::ConsentDeclined,
+        Self::MfaRequired,
+        Self::MfaRegistrationRequired,
+        Self::PasswordExpired,
         Self::UnsupportedGrantType,
         Self::PasswordGrantNotAllowed,
         Self::GrantRevoked,
@@ -317,6 +333,9 @@ impl Aadsts {
             Self::SilentSignInFailed => 50058,
             Self::NotAssigned => 50105,
             Self::ConsentDeclined => 65004,
+            Self::MfaRequired => 50076,
+            Self::MfaRegistrationRequired => 50079,
+            Self::PasswordExpired => 50055,
             Self::UnsupportedGrantType => 70003,
             Self::PasswordGrantNotAllowed => 700034,
             Self::GrantRevoked => 50173,

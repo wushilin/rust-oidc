@@ -14,6 +14,14 @@ pub struct TenantSettings {
     pub session_lifetime_secs: i64,
     /// Refresh token inactivity lifetime (Entra: 90 days).
     pub refresh_token_lifetime_secs: i64,
+    /// Require MFA of everyone signing in to this tenant's applications, unless a
+    /// user's own setting says otherwise.
+    pub require_mfa: bool,
+    /// Require MFA of this tenant's administrators signing in to the console.
+    pub require_console_mfa: bool,
+    /// How many of a user's own recent passwords a new one may not repeat. Zero
+    /// turns the rule off.
+    pub password_history: i64,
 }
 
 impl Default for TenantSettings {
@@ -22,6 +30,9 @@ impl Default for TenantSettings {
             access_token_lifetime_secs: 3599,
             session_lifetime_secs: 86_400,
             refresh_token_lifetime_secs: 90 * 86_400,
+            require_mfa: false,
+            require_console_mfa: false,
+            password_history: Self::DEFAULT_PASSWORD_HISTORY,
         }
     }
 }
@@ -45,6 +56,10 @@ impl TenantSettings {
     /// ninety days, which is this type's default.
     pub const MIN_REFRESH_SECS: i64 = 3_600;
     pub const MAX_REFRESH_SECS: i64 = 365 * 86_400;
+    /// Remembered passwords: three by default, the user's choice (2026-10-03);
+    /// up to 24, Windows Server's own maximum.
+    pub const DEFAULT_PASSWORD_HISTORY: i64 = 3;
+    pub const MAX_PASSWORD_HISTORY: i64 = crate::users::MAX_PASSWORD_HISTORY;
 
     /// Refuse a combination that cannot work, rather than storing it and issuing
     /// tokens nobody can use.
@@ -74,6 +89,12 @@ impl TenantSettings {
             Self::MIN_REFRESH_SECS,
             Self::MAX_REFRESH_SECS,
         )?;
+        if !(0..=Self::MAX_PASSWORD_HISTORY).contains(&self.password_history) {
+            bail!(
+                "the number of remembered passwords must be between 0 and {}",
+                Self::MAX_PASSWORD_HISTORY
+            );
+        }
         // A refresh token that expires before the access token it mints is a
         // credential with nothing to refresh.
         if self.refresh_token_lifetime_secs < self.access_token_lifetime_secs {
@@ -542,6 +563,7 @@ mod tests {
             access_token_lifetime_secs: 7_200,
             session_lifetime_secs: 86_400,
             refresh_token_lifetime_secs: 3_600,
+            ..TenantSettings::default()
         };
         assert!(s.validate().is_err());
     }

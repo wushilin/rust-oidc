@@ -19,6 +19,7 @@ use crate::AppState;
 use crate::apps::{self, Application};
 use crate::claims::Amr;
 use crate::error::{AadError, Aadsts, no_store};
+use crate::mfa::{self, Purpose};
 use crate::ratelimit::{Hit, Limit};
 use crate::session::{self, CSRF_COOKIE};
 use crate::tenant::{self, Tenant};
@@ -79,6 +80,12 @@ enum DeviceOp {
     Login,
     Approve,
     Deny,
+    /// The code at the second step of the sign-in.
+    MfaVerify,
+    /// The code that confirms a new authenticator.
+    MfaEnroll,
+    /// A new password, chosen because the old one must be replaced.
+    ChangePassword,
 }
 
 impl DeviceOp {
@@ -88,6 +95,9 @@ impl DeviceOp {
             Some("login") => Some(Self::Login),
             Some("approve") => Some(Self::Approve),
             Some("deny") => Some(Self::Deny),
+            Some(raw) if raw == html::LoginOp::MfaVerify.as_str() => Some(Self::MfaVerify),
+            Some(raw) if raw == html::LoginOp::MfaEnroll.as_str() => Some(Self::MfaEnroll),
+            Some(raw) if raw == html::LoginOp::ChangePassword.as_str() => Some(Self::ChangePassword),
             _ => None,
         }
     }
@@ -324,6 +334,9 @@ pub async fn deviceauth_post(
             Ok(resp) => resp,
             Err(resp) => resp,
         },
+        Some(op @ (DeviceOp::MfaVerify | DeviceOp::MfaEnroll | DeviceOp::ChangePassword)) => {
+            second_step(&st, &tenant, &headers, &form, &user_code, op).await
+        }
         Some(DeviceOp::Approve) => decide(&st, &tenant, &headers, &user_code, DeviceStatus::Approved).await,
         Some(DeviceOp::Deny) => decide(&st, &tenant, &headers, &user_code, DeviceStatus::Denied).await,
         None => code_entry(&st, &tenant, None, &user_code),
@@ -356,8 +369,265 @@ async fn step_after_code(st: &AppState, tenant: &Tenant, headers: &HeaderMap, us
         Err(_) => return html::error(Some(&tenant.name), "Something went wrong. Please try again."),
     };
     match session::find(&st.pool, headers, &tenant.id).await {
-        Ok(Some(s)) => approval_page(st, tenant, &pending, &s.user_id).await,
+        Ok(Some(s)) => match second_step_needed(st, tenant, &pending, &s.user_id, &s.amr).await {
+            Some(step) => start_mfa(st, tenant, &pending, &s.user_id, step).await,
+            None => approval_page(st, tenant, &pending, &s.user_id).await,
+        },
         _ => login_page(st, tenant, &pending, "", None),
+    }
+}
+
+/// The second step this user still needs before approving for this client, if
+/// any: none once the session has one.
+async fn second_step_needed(
+    st: &AppState,
+    tenant: &Tenant,
+    pending: &Pending,
+    user_id: &str,
+    amr: &[String],
+) -> Option<mfa::Step> {
+    if amr.iter().any(|m| m == Amr::Mfa.as_str()) {
+        return None;
+    }
+    let sp = apps::service_principal(&st.pool, &tenant.id, &pending.client.app_id)
+        .await
+        .ok()
+        .flatten()?;
+    match mfa::step(&st.pool, tenant, user_id, mfa::At::App(&sp)).await {
+        Ok(mfa::Step::Done) | Err(_) => None,
+        Ok(step) => Some(step),
+    }
+}
+
+async fn start_mfa(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &str, step: mfa::Step) -> Response {
+    let purpose = if step == mfa::Step::Enroll {
+        Purpose::Enroll
+    } else {
+        Purpose::Verify
+    };
+    let user = match users::find(&st.pool, &tenant.id, user_id).await {
+        Ok(Some(u)) => u,
+        _ => return login_page(st, tenant, pending, "", None),
+    };
+    match mfa::begin(&st.pool, &tenant.id, user_id, purpose).await {
+        Ok(ticket) => {
+            let secret = if purpose == Purpose::Enroll {
+                mfa::pending(&st.pool, &ticket, &tenant.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.enroll_secret)
+            } else {
+                None
+            };
+            mfa_page(
+                st,
+                tenant,
+                pending,
+                &user.upn,
+                purpose,
+                &ticket,
+                secret.as_deref(),
+                None,
+            )
+        }
+        Err(e) => html::error(Some(&tenant.name), &AadError::from(e).description()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mfa_page(
+    st: &AppState,
+    tenant: &Tenant,
+    pending: &Pending,
+    upn: &str,
+    purpose: Purpose,
+    ticket: &str,
+    secret: Option<&str>,
+    error: Option<&str>,
+) -> Response {
+    let csrf = session::new_token();
+    let hidden = format!(
+        r#"<input type="hidden" name="csrf" value="{}"><input type="hidden" name="request" value="{}">"#,
+        html::escape(&csrf),
+        html::escape(&pending.user_code)
+    );
+    let action = deviceauth_url(st, &tenant.id);
+    let mut resp = match (purpose, secret) {
+        (Purpose::Enroll, Some(secret)) => html::mfa_enroll(&html::MfaEnroll {
+            tenant_name: &tenant.name,
+            upn,
+            action: &action,
+            hidden: &hidden,
+            op_field: "op",
+            op: html::LoginOp::MfaEnroll.as_str(),
+            ticket,
+            qr_svg: &mfa::qr_svg(&mfa::otpauth_uri(secret, &tenant.name, upn)),
+            secret,
+            error,
+        }),
+        _ => html::mfa_verify(&html::MfaVerify {
+            tenant_name: &tenant.name,
+            upn,
+            action: &action,
+            hidden: &hidden,
+            op_field: "op",
+            op: html::LoginOp::MfaVerify.as_str(),
+            ticket,
+            error,
+        }),
+    };
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        session::set_cookie(&st.public_url, CSRF_COOKIE, &csrf, 3600),
+    );
+    resp
+}
+
+const MFA_EXPIRED: &str = "That sign-in has expired or had too many wrong codes. Please sign in again.";
+const MFA_WRONG: &str = "That code didn't work. Check the time on your phone, wait for a new code and try again.";
+
+async fn second_step(
+    st: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    form: &Params,
+    user_code: &str,
+    op: DeviceOp,
+) -> Response {
+    let pending = match load_pending(st, tenant, user_code).await {
+        Ok(Some(p)) => p,
+        _ => return code_entry(st, tenant, Some("That code is not valid or has expired."), ""),
+    };
+    let ticket = get(form, html::MFA_TICKET).unwrap_or_default().to_string();
+    let typed = get(form, html::MFA_CODE).unwrap_or_default().to_string();
+    let Ok(Some(waiting)) = mfa::pending(&st.pool, &ticket, &tenant.id).await else {
+        return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED));
+    };
+    let user = match users::find(&st.pool, &tenant.id, &waiting.user_id).await {
+        Ok(Some(u)) if u.enabled => u,
+        _ => return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
+    };
+    let fits = match op {
+        DeviceOp::MfaEnroll => waiting.purpose == Purpose::Enroll,
+        DeviceOp::ChangePassword => {
+            matches!(
+                waiting.purpose,
+                Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa
+            )
+        }
+        _ => waiting.purpose == Purpose::Verify,
+    };
+    if !fits {
+        return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED));
+    }
+    match waiting.purpose {
+        Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa => {
+            let new = get(form, html::NEW_PASSWORD).unwrap_or_default();
+            let confirm = get(form, html::CONFIRM_PASSWORD).unwrap_or_default();
+            let refused = if new != confirm {
+                Some("The passwords don't match.".to_string())
+            } else {
+                users::change_password(&st.pool, tenant, &user.id, new, users::PasswordSetBy::User)
+                    .await
+                    .err()
+                    .map(|e| e.to_string())
+            };
+            if let Some(message) = refused {
+                return change_page(st, tenant, &pending, &user.upn, &ticket, Some(&message));
+            }
+            let _ = mfa::finish(&st.pool, &ticket).await;
+            audit::record(
+                st,
+                &tenant.id,
+                Actor::Id(&user.id),
+                Event::PasswordChanged,
+                Some(&user.id),
+                json!({ "via": Channel::Device.as_str() }),
+            )
+            .await;
+            let mut amr = vec![Amr::Pwd.as_str()];
+            if waiting.purpose == Purpose::ChangePasswordAfterMfa {
+                amr.push(Amr::Mfa.as_str());
+            }
+            establish(st, tenant, headers, &pending, &user, &amr)
+                .await
+                .unwrap_or_else(|r| r)
+        }
+        Purpose::Verify => match mfa::check(&st.pool, &user.id, &typed).await {
+            Ok(Some(factor)) => {
+                let _ = mfa::finish(&st.pool, &ticket).await;
+                audit::record(
+                    st,
+                    &tenant.id,
+                    Actor::Id(&user.id),
+                    Event::MfaVerified,
+                    Some(&user.id),
+                    json!({ "via": Channel::Device.as_str(), "factor": factor.as_str() }),
+                )
+                .await;
+                finish_sign_in(st, tenant, headers, &pending, &user, true)
+                    .await
+                    .unwrap_or_else(|r| r)
+            }
+            Ok(None) => {
+                super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::Device).await;
+                match mfa::failed_attempt(&st.pool, &ticket).await {
+                    Ok(true) => mfa_page(
+                        st,
+                        tenant,
+                        &pending,
+                        &user.upn,
+                        Purpose::Verify,
+                        &ticket,
+                        None,
+                        Some(MFA_WRONG),
+                    ),
+                    _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
+                }
+            }
+            Err(e) => html::error(Some(&tenant.name), &AadError::from(e).description()),
+        },
+        Purpose::Enroll => {
+            let secret = waiting.enroll_secret.unwrap_or_default();
+            if !mfa::verify_new(&secret, &typed) {
+                return match mfa::failed_attempt(&st.pool, &ticket).await {
+                    Ok(true) => mfa_page(
+                        st,
+                        tenant,
+                        &pending,
+                        &user.upn,
+                        Purpose::Enroll,
+                        &ticket,
+                        Some(&secret),
+                        Some(MFA_WRONG),
+                    ),
+                    _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
+                };
+            }
+            let codes = match mfa::enroll(&st.pool, &user.id, &secret).await {
+                Ok(codes) => codes,
+                Err(e) => return html::error(Some(&tenant.name), &AadError::from(e).description()),
+            };
+            let _ = mfa::finish(&st.pool, &ticket).await;
+            let _ = users::end_sessions(&st.pool, &user.id).await;
+            audit::record(
+                st,
+                &tenant.id,
+                Actor::Id(&user.id),
+                Event::MfaEnrolled,
+                Some(&user.id),
+                json!({ "via": Channel::Device.as_str() }),
+            )
+            .await;
+            let again = format!("{}?user_code={}", deviceauth_url(st, &tenant.id), pending.user_code);
+            let mut resp = html::mfa_enrolled(&tenant.name, &codes, &again);
+            resp.headers_mut().append(
+                header::SET_COOKIE,
+                session::clear_cookie(&st.public_url, session::SESSION_COOKIE),
+            );
+            resp
+        }
     }
 }
 
@@ -471,10 +741,80 @@ async fn sign_in(
         }
     };
 
+    // A second step, where one is needed, before there is any session.
+    if let Some(step) = second_step_needed(st, tenant, &pending, &user.id, &[]).await {
+        return Ok(start_mfa(st, tenant, &pending, &user.id, step).await);
+    }
+    finish_sign_in(st, tenant, headers, &pending, &user, false).await
+}
+
+/// After the password (and second factor, if any): a new password first if the
+/// account must choose one, then the session and the approval page.
+async fn finish_sign_in(
+    st: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    pending: &Pending,
+    user: &users::User,
+    after_mfa: bool,
+) -> Result<Response, Response> {
+    if users::must_change_password(&st.pool, &user.id).await.unwrap_or(false) {
+        return match mfa::begin(&st.pool, &tenant.id, &user.id, Purpose::change_password(after_mfa)).await {
+            Ok(ticket) => Ok(change_page(st, tenant, pending, &user.upn, &ticket, None)),
+            Err(e) => Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
+        };
+    }
+    let amr: &[&str] = if after_mfa {
+        &[Amr::Pwd.as_str(), Amr::Mfa.as_str()]
+    } else {
+        &[Amr::Pwd.as_str()]
+    };
+    establish(st, tenant, headers, pending, user, amr).await
+}
+
+fn change_page(
+    st: &AppState,
+    tenant: &Tenant,
+    pending: &Pending,
+    upn: &str,
+    ticket: &str,
+    error: Option<&str>,
+) -> Response {
+    let csrf = session::new_token();
+    let hidden = format!(
+        r#"<input type="hidden" name="csrf" value="{}"><input type="hidden" name="request" value="{}">"#,
+        html::escape(&csrf),
+        html::escape(&pending.user_code)
+    );
+    let mut resp = html::change_password(&html::ChangePassword {
+        tenant_name: &tenant.name,
+        upn,
+        action: &deviceauth_url(st, &tenant.id),
+        hidden: &hidden,
+        op_field: "op",
+        op: html::LoginOp::ChangePassword.as_str(),
+        ticket,
+        error,
+    });
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        session::set_cookie(&st.public_url, CSRF_COOKIE, &csrf, 3600),
+    );
+    resp
+}
+
+/// Start a browser session for the signed-in user and show the approval page.
+async fn establish(
+    st: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    pending: &Pending,
+    user: &users::User,
+    amr: &[&str],
+) -> Result<Response, Response> {
     // Start a browser session so the next code does not ask again.
     let lifetime = tenant.settings.session_lifetime_secs;
-    let amr = [Amr::Pwd.as_str()];
-    let cookie = session::create(&st.pool, headers, &tenant.id, &user.id, &amr, lifetime)
+    let cookie = session::create(&st.pool, headers, &tenant.id, &user.id, amr, lifetime)
         .await
         .map_err(|e| html::error(Some(&tenant.name), &AadError::from(e).description()))?;
     let details = json!({ "via": Channel::Device.as_str(), "clientId": pending.client.app_id });
@@ -505,7 +845,7 @@ async fn sign_in(
             axum::http::HeaderValue::from_str(&format!("{}={cookie}", session::SESSION_COOKIE)).expect("ascii"),
         );
     }
-    let mut resp = approval_page(st, tenant, &pending, &user.id).await;
+    let mut resp = approval_page(st, tenant, pending, &user.id).await;
     let h = resp.headers_mut();
     h.append(
         header::SET_COOKIE,
@@ -528,6 +868,11 @@ async fn decide(
     let Ok(Some(s)) = session::find(&st.pool, headers, &tenant.id).await else {
         return login_page(st, tenant, &pending, "", None);
     };
+    if status == DeviceStatus::Approved
+        && let Some(step) = second_step_needed(st, tenant, &pending, &s.user_id, &s.amr).await
+    {
+        return start_mfa(st, tenant, &pending, &s.user_id, step).await;
+    }
     let client_id = pending.client.app_id.as_str();
     if status == DeviceStatus::Denied {
         let denied = sqlx::query(crate::db::q(

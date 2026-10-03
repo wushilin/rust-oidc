@@ -90,7 +90,8 @@ pub async fn lookup(st: &AppState, ctx: &AdminContext, id: &str) -> Vec<Found> {
     let mut found = Vec::new();
 
     // (kind, tenant id, name, detail, path under the tenant, deleted at)
-    let mut hits: Vec<(Kind, String, String, String, Option<String>, Option<i64>)> = Vec::new();
+    type Hit = (Kind, String, String, String, Option<String>, Option<i64>);
+    let mut hits: Vec<Hit> = Vec::new();
 
     type Row3 = (String, String, String);
     type Row4 = (String, String, String, String);
@@ -379,7 +380,7 @@ async fn render(st: &AppState, ctx: &AdminContext, id: &str, error: Option<&str>
         r#"<p class="empty">Paste an id from a token, the audit log or an error message to see what it is.</p>"#
             .to_string()
     } else {
-        let found = lookup(&st, ctx, id).await;
+        let found = lookup(st, ctx, id).await;
         if found.is_empty() {
             // One answer for "does not exist" and "not yours to see".
             format!(
@@ -443,7 +444,7 @@ async fn render(st: &AppState, ctx: &AdminContext, id: &str, error: Option<&str>
         error = view::error_block(error),
     );
     view::page(
-        &chrome(&st, ctx, At::Platform(PlatformTab::Find)),
+        &chrome(st, ctx, At::Platform(PlatformTab::Find)),
         status,
         "Find by id",
         &body,

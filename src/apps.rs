@@ -36,6 +36,9 @@ pub struct ServicePrincipal {
     pub enabled: bool,
     #[sqlx(try_from = "crate::db::Flag")]
     pub app_role_assignment_required: bool,
+    /// Everyone signing in to it must use MFA.
+    #[sqlx(try_from = "crate::db::Flag")]
+    pub mfa_required: bool,
 }
 
 pub struct CreatedApp {
@@ -142,7 +145,7 @@ pub async fn service_principal(
 ) -> anyhow::Result<Option<ServicePrincipal>> {
     Ok(sqlx::query_as(crate::db::q(
         pool,
-        "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required FROM service_principals
+        "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required, mfa_required FROM service_principals
          WHERE tenant_id = ? AND app_id = ?",
     ))
     .bind(tenant_id)
@@ -1049,6 +1052,19 @@ pub fn not_assigned_message(app: &Application) -> String {
         "Your administrator has configured the application {} ('{}') to block users unless they are specifically granted ('assigned') access to the application.",
         app.display_name, app.app_id
     )
+}
+
+/// Require MFA of everyone signing in to this application in its tenant.
+pub async fn set_mfa_required(pool: &DbPool, sp_id: &str, required: bool) -> anyhow::Result<()> {
+    sqlx::query(crate::db::q(
+        pool,
+        "UPDATE service_principals SET mfa_required = ? WHERE id = ?",
+    ))
+    .bind(required)
+    .bind(sp_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn set_assignment_required(pool: &DbPool, sp_id: &str, required: bool) -> anyhow::Result<()> {

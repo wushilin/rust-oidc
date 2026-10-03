@@ -126,6 +126,9 @@ enum UserCmd {
         upn: String,
         #[arg(long, env = "RUST_OIDC_PASSWORD", hide_env_values = true)]
         password: Option<String>,
+        /// The user must choose their own password at their next sign-in.
+        #[arg(long)]
+        require_change: bool,
     },
     /// Bring back a deleted account, enabled, with the password and roles it had.
     /// The way back in when the console can no longer be signed in to.
@@ -569,10 +572,16 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
             tenant: key,
             upn,
             password,
+            require_change,
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let password = password_or_stdin(password)?;
-            users::set_password(pool, &t, &upn, &password).await?;
+            let by = if require_change {
+                users::PasswordSetBy::AdminTemporary
+            } else {
+                users::PasswordSetBy::Admin
+            };
+            users::set_password_as(pool, &t, &upn, &password, by).await?;
             db::audit(
                 pool,
                 Some(&t.id),

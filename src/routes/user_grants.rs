@@ -398,6 +398,34 @@ pub(super) async fn issue(
             apps::not_assigned_message(&client),
         ));
     }
+    // An account that must choose a new password gets nothing until it has, in
+    // a browser: the password grant cannot show the page.
+    if users::must_change_password(&st.pool, &user.id).await? {
+        return Err(AadError::invalid_grant(
+            Aadsts::PasswordExpired,
+            "The password is expired. The user must sign in interactively and choose a new one.",
+        ));
+    }
+    // Multi-factor authentication likewise: a grant whose sign-in had no second
+    // factor does not get a token where one is needed now -- the password grant
+    // never has one, and a refresh token carries the methods of its sign-in.
+    if !family.amr.iter().any(|m| m == Amr::Mfa.as_str()) {
+        let (code, verb) = match crate::mfa::step(&st.pool, tenant, &user.id, crate::mfa::At::App(&sp)).await? {
+            crate::mfa::Step::Done => (None, ""),
+            crate::mfa::Step::Verify => (Some(Aadsts::MfaRequired), "use"),
+            crate::mfa::Step::Enroll => (Some(Aadsts::MfaRegistrationRequired), "enroll in"),
+        };
+        if let Some(code) = code {
+            return Err(AadError::invalid_grant(
+                code,
+                format!(
+                    "Due to a configuration change made by your administrator, or because you moved to a new \
+                     location, you must {verb} multi-factor authentication to access '{}'.",
+                    client.display_name
+                ),
+            ));
+        }
+    }
     let sign_in = SignIn {
         tenant: tenant.clone(),
         user: user.clone(),

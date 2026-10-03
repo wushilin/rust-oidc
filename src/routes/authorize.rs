@@ -1003,7 +1003,7 @@ fn mfa_page(
                 ticket,
                 qr_svg: &mfa::qr_svg(&uri),
                 secret,
-                issuer: issuer,
+                issuer,
                 error,
             })
         }

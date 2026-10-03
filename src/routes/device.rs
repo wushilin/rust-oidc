@@ -495,7 +495,7 @@ fn mfa_page(
             ticket,
             qr_svg: &mfa::qr_svg(&mfa::otpauth_uri(secret, issuer, upn)),
             secret,
-            issuer: issuer,
+            issuer,
             error,
         }),
         _ => html::mfa_verify(&html::MfaVerify {

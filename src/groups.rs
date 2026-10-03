@@ -25,6 +25,12 @@ pub(crate) async fn create_in(
     if name.trim().is_empty() {
         bail!("group name must not be empty");
     }
+    // Looked for first: inside a transaction a broken unique constraint is a
+    // database failure (and on Postgres aborts the whole transaction), not a
+    // refusal the administrator can act on.
+    if find_in(&mut *conn, &tenant.id, name.trim()).await?.is_some() {
+        bail!("group '{}' already exists", name.trim());
+    }
     let id = new_guid();
     sqlx::query(crate::db::qc(
         &conn,
@@ -445,9 +451,21 @@ async fn user_id_in(conn: &mut crate::db::Conn, tenant_id: &str, upn: &str) -> a
     Ok(id)
 }
 
-/// Record a membership. Already a member is success: the primary key
-/// `(group_id, user_id)` makes it a no-op.
+/// Record a membership. Already a member is success, and is looked for first:
+/// inside a transaction a broken primary key would fail it (on Postgres, abort
+/// it), so the key is the backstop against a race, not the check.
 async fn insert_member_in(conn: &mut crate::db::Conn, group_id: &str, user_id: &str) -> anyhow::Result<()> {
+    let held: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT group_id FROM group_members WHERE group_id = ? AND user_id = ?",
+    ))
+    .bind(group_id)
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if held.is_some() {
+        return Ok(());
+    }
     crate::db::inserted(
         sqlx::query(crate::db::qc(
             &conn,

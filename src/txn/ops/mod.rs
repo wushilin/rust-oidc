@@ -43,8 +43,13 @@ pub(crate) async fn user(cx: &mut Cx<'_>, tenant_id: &str, account: &Account) ->
         Account::Id(id) => crate::users::find_in(cx.conn(), tenant_id, id).await,
         Account::Upn(upn) => crate::users::find_by_upn_in(cx.conn(), tenant_id, upn).await,
     };
-    match cx.check(found)? {
-        Some(u) => Ok(u),
-        None => Err(cx.fail(Refusal::NotFound(NO_SUCH_ACCOUNT.into()))),
+    match (cx.check(found)?, account) {
+        (Some(u), _) => Ok(u),
+        // Named by the person asking, so the refusal names it back.
+        (None, Account::Upn(upn)) => Err(cx.fail(Refusal::NotFound(format!(
+            "User '{}' not found in this tenant.",
+            crate::routes::audit::clip(upn)
+        )))),
+        (None, Account::Id(_)) => Err(cx.fail(Refusal::NotFound(NO_SUCH_ACCOUNT.into()))),
     }
 }

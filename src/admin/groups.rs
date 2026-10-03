@@ -13,17 +13,17 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
 
 use crate::AppState;
 use crate::admin::bulk;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, TenantTab, audited, chrome, field, optional, parse_form};
+use crate::admin::routes::{At, Params, Settled, TenantTab, chrome, field, optional, parse_form, row_problem, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{GROUP_READ, GROUP_WRITE};
-use crate::db::Event;
 use crate::groups::{self, Group};
 use crate::tenant::Tenant;
+use crate::txn::ops::groups::{AddGroupMember, CreateGroup, DeleteGroup, RemoveGroupMember};
+use crate::txn::{self, ops::Account};
 
 /// What a post to a group's page asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,14 +48,6 @@ impl MemberOp {
 
     pub fn parse(raw: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|o| o.as_str() == raw)
-    }
-
-    fn event(self) -> Event {
-        match self {
-            Self::Add => Event::AdminGroupMemberAdd,
-            Self::Remove => Event::AdminGroupMemberRemove,
-            Self::DeleteGroup => Event::AdminGroupDelete,
-        }
     }
 }
 
@@ -227,21 +219,15 @@ pub async fn create_group(
     if op == GroupListOp::Delete {
         return delete_ticked(&st, &ctx, tenant, &body).await;
     }
-    let name = field(&form, NAME);
-    match groups::create(&st.pool, tenant, name, optional(&form, DESCRIPTION)).await {
-        Ok(id) => {
-            audited(
-                &st,
-                &ctx,
-                &tenant.id,
-                Event::AdminGroupCreate,
-                Some(&id),
-                json!({ "name": crate::routes::audit::clip(name) }),
-            )
-            .await;
-            view::see_other(&format!("{}/{id}", groups_url(st.public_url.base(), tenant)))
-        }
-        Err(err) => list(&st, &ctx, tenant, Some(&err.to_string()), StatusCode::BAD_REQUEST).await,
+    let create = CreateGroup {
+        tenant_id: tenant.id.clone(),
+        name: field(&form, NAME).to_string(),
+        description: optional(&form, DESCRIPTION).map(str::to_string),
+    };
+    match settle(txn::run(&st.pool, &ctx.actor(), &create).await) {
+        Settled::Done(id) => view::see_other(&format!("{}/{id}", groups_url(st.public_url.base(), tenant))),
+        Settled::Refused(message) => list(&st, &ctx, tenant, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
@@ -261,20 +247,13 @@ async fn delete_ticked(st: &AppState, ctx: &AdminContext, tenant: &Tenant, body:
     }
     let mut tally = bulk::Tally::default();
     for group in chosen {
-        match groups::delete(&st.pool, &tenant.id, &group.id).await {
-            Ok(_) => {
-                audited(
-                    st,
-                    ctx,
-                    &tenant.id,
-                    Event::AdminGroupDelete,
-                    Some(&group.id),
-                    json!({ "name": crate::routes::audit::clip(&group.name) }),
-                )
-                .await;
-                tally.done += 1;
-            }
-            Err(err) => tally.refuse(&group.name, err),
+        let delete = DeleteGroup {
+            tenant_id: tenant.id.clone(),
+            group_id: group.id.clone(),
+        };
+        match row_problem(&txn::run(&st.pool, &ctx.actor(), &delete).await) {
+            None => tally.done += 1,
+            Some(why) => tally.refuse(&group.name, why),
         }
     }
     match tally.problem("deleted") {
@@ -449,9 +428,8 @@ pub async fn detail_post(
         }
     };
 
-    match apply(&st, tenant, &group, op, &form, &body).await {
-        Ok(details) => {
-            audited(&st, &ctx, &tenant.id, op.event(), Some(&group.id), details).await;
+    match apply(&st, &ctx, tenant, &group, op, &form, &body).await {
+        Ok(()) => {
             // A deleted group has no page to go back to.
             if op == MemberOp::DeleteGroup {
                 view::see_other(&groups_url(st.public_url.base(), tenant))
@@ -459,28 +437,11 @@ pub async fn detail_post(
                 view::see_other(&group_url(st.public_url.base(), tenant, &group))
             }
         }
-        Err(err) => {
-            if let Some(partial) = err.downcast_ref::<Partial>() {
-                audited(
-                    &st,
-                    &ctx,
-                    &tenant.id,
-                    op.event(),
-                    Some(&group.id),
-                    partial.details.clone(),
-                )
-                .await;
-            }
-            detail(
-                &st,
-                &ctx,
-                tenant,
-                &group,
-                Some(&err.to_string()),
-                StatusCode::BAD_REQUEST,
-            )
-            .await
+        Err(Settled::Refused(message)) => {
+            detail(&st, &ctx, tenant, &group, Some(&message), StatusCode::BAD_REQUEST).await
         }
+        Err(Settled::Respond(resp)) => resp,
+        Err(Settled::Done(())) => unreachable!("a done outcome is Ok"),
     }
 }
 
@@ -496,14 +457,21 @@ fn names(raw: &str) -> Vec<&str> {
     out
 }
 
+/// Carry out one operation on the group: a transaction per member added or
+/// removed, so each completes or is refused on its own and the page lists the
+/// refusals. `Err` is what to show instead of going back to the group.
 async fn apply(
     st: &AppState,
+    ctx: &AdminContext,
     tenant: &Tenant,
     group: &Group,
     op: MemberOp,
     form: &Params,
     body: &[u8],
-) -> anyhow::Result<serde_json::Value> {
+) -> Result<(), Settled<()>> {
+    let actor = ctx.actor();
+    let refused = |m: &str| Err(Settled::Refused(m.to_string()));
+    let mut tally = bulk::Tally::default();
     match op {
         MemberOp::Add => {
             // The box for several, or the single field older forms sent.
@@ -513,33 +481,29 @@ async fn apply(
             };
             let wanted = names(typed);
             if wanted.is_empty() {
-                anyhow::bail!("enter at least one user name");
+                return refused("Enter at least one user name.");
             }
-            let mut tally = bulk::Tally::default();
-            let mut added = Vec::new();
             for upn in wanted {
-                match groups::add_member_by_id(&st.pool, &tenant.id, &group.id, upn).await {
-                    Ok(()) => {
-                        tally.done += 1;
-                        added.push(crate::routes::audit::clip(upn));
-                    }
-                    Err(err) => tally.refuse(upn, err),
+                let add = AddGroupMember {
+                    tenant_id: tenant.id.clone(),
+                    group_id: group.id.clone(),
+                    account: Account::Upn(upn.to_string()),
+                };
+                match row_problem(&txn::run(&st.pool, &actor, &add).await) {
+                    None => tally.done += 1,
+                    Some(why) => tally.refuse(upn, why),
                 }
             }
-            match tally.problem("added") {
-                // Nothing was added at all: the whole request failed.
-                Some(problem) if tally.done == 0 => anyhow::bail!(problem),
-                // Some were: they stay added, and the rest are reported.
-                Some(problem) => Err(Partial {
-                    problem,
-                    details: json!({ "upns": added }),
-                }
-                .into()),
-                None => Ok(json!({ "upns": added })),
-            }
+            tally.problem("added").map_or(Ok(()), |p| refused(&p))
         }
         MemberOp::Remove => {
-            let members = groups::members(&st.pool, &group.id).await?;
+            let members = match groups::members(&st.pool, &group.id).await {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::error!("group members lookup failed: {err}");
+                    return Err(Settled::Respond(view::server_error()));
+                }
+            };
             let ticked = bulk::Selection::read(body);
             let mut chosen: Vec<&groups::Member> = ticked.among(&members, |m| m.user_id.as_str());
             // The single field a one-row form sends.
@@ -551,45 +515,35 @@ async fn apply(
             }
             if chosen.is_empty() {
                 if one.is_empty() {
-                    anyhow::bail!(bulk::NOTHING_TICKED);
+                    return refused(bulk::NOTHING_TICKED);
                 }
-                anyhow::bail!("that account is not a member of this group");
+                return refused("That account is not a member of this group.");
             }
-            let mut tally = bulk::Tally::default();
-            let mut removed = Vec::new();
             for member in chosen {
-                match groups::remove_member(&st.pool, &tenant.id, &group.id, &member.user_id).await {
-                    Ok(_) => {
-                        tally.done += 1;
-                        removed.push(member.user_id.clone());
-                    }
-                    Err(err) => tally.refuse(&member.upn, err),
+                let remove = RemoveGroupMember {
+                    tenant_id: tenant.id.clone(),
+                    group_id: group.id.clone(),
+                    user_id: member.user_id.clone(),
+                };
+                match row_problem(&txn::run(&st.pool, &actor, &remove).await) {
+                    None => tally.done += 1,
+                    Some(why) => tally.refuse(&member.upn, why),
                 }
             }
-            match tally.problem("removed") {
-                Some(problem) if tally.done == 0 => anyhow::bail!(problem),
-                Some(problem) => Err(Partial {
-                    problem,
-                    details: json!({ "userIds": removed }),
-                }
-                .into()),
-                None => Ok(json!({ "userIds": removed })),
-            }
+            tally.problem("removed").map_or(Ok(()), |p| refused(&p))
         }
         MemberOp::DeleteGroup => {
-            groups::delete(&st.pool, &tenant.id, &group.id).await?;
-            Ok(json!({ "name": crate::routes::audit::clip(&group.name) }))
+            let delete = DeleteGroup {
+                tenant_id: tenant.id.clone(),
+                group_id: group.id.clone(),
+            };
+            match settle(txn::run(&st.pool, &actor, &delete).await) {
+                Settled::Done(_) => Ok(()),
+                Settled::Refused(m) => Err(Settled::Refused(m)),
+                Settled::Respond(r) => Err(Settled::Respond(r)),
+            }
         }
     }
-}
-
-/// Some of the rows were done and some were not. What was done is recorded like
-/// any other change; the page reports the rest.
-#[derive(Debug, thiserror::Error)]
-#[error("{problem}")]
-struct Partial {
-    problem: String,
-    details: serde_json::Value,
 }
 
 #[cfg(test)]
@@ -602,7 +556,6 @@ mod tests {
         for op in MemberOp::ALL {
             assert!(seen.insert(op.as_str()), "two operations are both {}", op.as_str());
             assert_eq!(MemberOp::parse(op.as_str()), Some(*op));
-            assert!(seen.insert(op.event().as_str()), "{op:?} shares an event");
         }
         assert_eq!(MemberOp::parse("add"), None);
     }

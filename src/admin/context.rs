@@ -62,6 +62,14 @@ impl AdminContext {
         &self.bindings
     }
 
+    /// The signed-in administrator, as the transaction engine authorizes them.
+    pub fn actor(&self) -> crate::txn::Actor {
+        crate::txn::Actor::Admin {
+            user_id: self.user.id.clone(),
+            bindings: self.bindings.clone(),
+        }
+    }
+
     /// Whether the action is permitted. The only interpretation of a grant.
     pub fn can(&self, action: Action, on: On<'_>) -> bool {
         match on {

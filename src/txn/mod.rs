@@ -370,4 +370,8 @@ transactions! {
     SetUserCrossTenantPolicy(ops::users::SetUserCrossTenantPolicy),
     ResetUserMfa(ops::users::ResetUserMfa),
     SetUserGroups(ops::users::SetUserGroups),
+    CreateGroup(ops::groups::CreateGroup),
+    DeleteGroup(ops::groups::DeleteGroup),
+    AddGroupMember(ops::groups::AddGroupMember),
+    RemoveGroupMember(ops::groups::RemoveGroupMember),
 }

@@ -287,6 +287,40 @@ pub fn chrome<'a>(st: &'a AppState, ctx: &'a AdminContext, at: At<'a>) -> Chrome
     }
 }
 
+/// What a page does with a transaction's outcome. Every console page settles an
+/// [`Outcome`](crate::txn::Outcome) this one way: done, it has the output;
+/// refused, it shows the page again with the reason (or 403 when the roles do
+/// not allow it); failed, it is a 500.
+pub enum Settled<T> {
+    Done(T),
+    /// Show the page again, with this message.
+    Refused(String),
+    /// Answer with this, as it is.
+    Respond(Response),
+}
+
+pub fn settle<T>(outcome: crate::txn::Outcome<T>) -> Settled<T> {
+    use crate::txn::{Outcome, Refusal};
+    match outcome {
+        Outcome::Done(v) => Settled::Done(v),
+        Outcome::Refused(Refusal::NotPermitted) => Settled::Respond(view::forbidden()),
+        Outcome::Refused(r) => Settled::Refused(r.to_string()),
+        Outcome::Failed(_) => Settled::Respond(view::server_error()),
+    }
+}
+
+/// What a list page's bulk buttons tell the administrator about a row that did
+/// not complete. Each row is its own transaction, so one row's refusal or
+/// failure leaves the others as they are.
+pub fn row_problem<T>(outcome: &crate::txn::Outcome<T>) -> Option<String> {
+    use crate::txn::Outcome;
+    match outcome {
+        Outcome::Done(_) => None,
+        Outcome::Refused(r) => Some(r.to_string()),
+        Outcome::Failed(_) => Some("something went wrong on our side; nothing was changed".into()),
+    }
+}
+
 /// Audit a console mutation. The actor is always the signed-in administrator,
 /// never the assumed tenant's identity: that is the whole point of recording an
 /// assume as its own event.

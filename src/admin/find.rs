@@ -20,7 +20,7 @@ use axum::response::Response;
 
 use crate::AppState;
 use crate::admin::context::AdminContext;
-use crate::admin::routes::{At, PlatformTab, chrome, field, parse_form};
+use crate::admin::routes::{At, PlatformTab, Settled, chrome, field, parse_form, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{APP_READ, GROUP_READ, TENANT_READ, USER_READ, USER_WRITE};
 use crate::rbac::Action;
@@ -342,34 +342,18 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: axum::bod
     if let Err(resp) = ctx.check_csrf(&form) {
         return resp;
     }
-    match crate::users::restore_id(&st.pool, &tenant.id, &id).await {
-        Ok(true) => {
-            crate::admin::routes::audited(
-                &st,
-                &ctx,
-                &tenant.id,
-                crate::db::Event::AdminUserRestore,
-                Some(&id),
-                serde_json::json!({}),
-            )
-            .await;
-            view::see_other(&format!(
-                "{}/admin/tenants/{}/users/{id}",
-                st.public_url.base(),
-                tenant.id
-            ))
-        }
-        Ok(false) => {
-            render(
-                &st,
-                &ctx,
-                &id,
-                Some("That account is not deleted, or is not in that tenant."),
-                StatusCode::BAD_REQUEST,
-            )
-            .await
-        }
-        Err(err) => render(&st, &ctx, &id, Some(&err.to_string()), StatusCode::BAD_REQUEST).await,
+    let restore = crate::txn::ops::users::RestoreUser {
+        tenant_id: tenant.id.clone(),
+        account: crate::txn::ops::Account::Id(id.clone()),
+    };
+    match settle(crate::txn::run(&st.pool, &ctx.actor(), &restore).await) {
+        Settled::Done(_) => view::see_other(&format!(
+            "{}/admin/tenants/{}/users/{id}",
+            st.public_url.base(),
+            tenant.id
+        )),
+        Settled::Refused(message) => render(&st, &ctx, &id, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Respond(resp) => resp,
     }
 }
 

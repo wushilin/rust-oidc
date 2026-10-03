@@ -11,17 +11,24 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
 
 use crate::AppState;
 use crate::admin::bulk;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, TenantTab, audited, checked, chrome, field, optional, parse_form};
+use crate::admin::routes::{
+    At, Params, Settled, TenantTab, checked, chrome, field, optional, parse_form, row_problem, settle,
+};
 use crate::admin::view::{self, e};
 use crate::admin::{GROUP_READ, GROUP_WRITE, USER_READ, USER_RESET, USER_WRITE};
-use crate::db::Event;
 use crate::tenant::Tenant;
-use crate::users::{self, User, UserAttributes};
+use crate::txn::ops::Account;
+use crate::txn::ops::groups::AddGroupMember;
+use crate::txn::ops::users::{
+    CreateUser, DeleteUser, DisableUser, EnableUser, Profile, ResetPassword, ResetUserMfa, SetUserCrossTenantPolicy,
+    SetUserGroups, SetUserMfaPolicy, UpdateUserAttributes,
+};
+use crate::txn::{self, Outcome, Refusal};
+use crate::users::{self, NewPassword, User};
 
 /// What a post to the user detail page asks for. An enum rather than a bare
 /// string so a new operation cannot be added without deciding which action
@@ -87,21 +94,6 @@ impl UserOp {
             Self::Attributes | Self::Enable | Self::Disable | Self::Delete => USER_WRITE,
             // Who is in a group is the group's to change.
             Self::Groups => GROUP_WRITE,
-        }
-    }
-
-    fn event(self) -> Event {
-        match self {
-            Self::Attributes => Event::AdminUserUpdate,
-            Self::Enable => Event::AdminUserEnable,
-            Self::Disable => Event::AdminUserDisable,
-            Self::Reset => Event::AdminUserReset,
-            Self::Delete => Event::AdminUserDelete,
-            // Recorded per group joined or left, not as one entry: see `detail_post`.
-            Self::Groups => Event::AdminGroupMemberAdd,
-            Self::MfaPolicy => Event::AdminUserMfaPolicy,
-            Self::MfaReset => Event::AdminUserMfaReset,
-            Self::CrossTenant => Event::AdminUserCrossTenantPolicy,
         }
     }
 }
@@ -390,27 +382,23 @@ pub async fn list_post(
     let group = field(&form, GROUP);
     let mut tally = bulk::Tally::default();
     for user in chosen {
-        // The same operations, rules and audit entries as on the account's own page.
+        // One transaction per row, each the same as on the account's own page.
         let outcome = match op {
-            UserListOp::Enable => apply_checked(&st, &ctx, tenant, user, UserOp::Enable, &form, &[]).await,
-            UserListOp::Disable => apply_checked(&st, &ctx, tenant, user, UserOp::Disable, &form, &[]).await,
-            UserListOp::Delete => apply_checked(&st, &ctx, tenant, user, UserOp::Delete, &form, &[]).await,
-            UserListOp::AddToGroup => crate::groups::add_member_id(&st.pool, &tenant.id, group, &user.id)
-                .await
-                .map(|()| json!({ "upn": crate::routes::audit::clip(&user.upn) })),
-        };
-        match outcome {
-            Ok(details) => {
-                let (event, target) = match op {
-                    UserListOp::Enable => (Event::AdminUserEnable, user.id.as_str()),
-                    UserListOp::Disable => (Event::AdminUserDisable, user.id.as_str()),
-                    UserListOp::Delete => (Event::AdminUserDelete, user.id.as_str()),
-                    UserListOp::AddToGroup => (Event::AdminGroupMemberAdd, group),
+            UserListOp::Enable => run_op(&st, &ctx, tenant, user, UserOp::Enable, &form, &[]).await,
+            UserListOp::Disable => run_op(&st, &ctx, tenant, user, UserOp::Disable, &form, &[]).await,
+            UserListOp::Delete => run_op(&st, &ctx, tenant, user, UserOp::Delete, &form, &[]).await,
+            UserListOp::AddToGroup => {
+                let add = AddGroupMember {
+                    tenant_id: tenant.id.clone(),
+                    group_id: group.to_string(),
+                    account: Account::Id(user.id.clone()),
                 };
-                audited(&st, &ctx, &tenant.id, event, Some(target), details).await;
-                tally.done += 1;
+                txn::run(&st.pool, &ctx.actor(), &add).await.map_done()
             }
-            Err(err) => tally.refuse(&user.upn, err),
+        };
+        match row_problem(&outcome) {
+            None => tally.done += 1,
+            Some(why) => tally.refuse(&user.upn, why),
         }
     }
     match tally.problem(op.done_as()) {
@@ -539,55 +527,40 @@ pub async fn create_user(
         return view::not_found();
     };
     let upn = submitted_upn(&form);
-    let upn = upn.as_str();
     // An email address is a contact detail and is not required. Left empty it
     // starts out as the user name, which is the usual case and can be changed.
-    let email = optional(&form, "email").or(Some(upn)).filter(|v| !v.is_empty());
-    // `users::create` validates the UPN against the tenant's verified domains and
-    // the password's length; its message names the problem.
-    let created = users::create(
-        &st.pool,
-        tenant,
-        users::NewUser {
-            upn,
-            password: field(&form, "password"),
-            display_name: optional(&form, "display_name"),
-            given_name: optional(&form, "given_name"),
-            family_name: optional(&form, "family_name"),
-            email,
-        },
-    )
-    .await;
-    let created = match created {
-        Ok(user_id) if checked(&form, REQUIRE_CHANGE) => users::set_must_change_password(&st.pool, &user_id, true)
-            .await
-            .map(|()| user_id),
-        other => other,
+    let email = optional(&form, "email").or(Some(&upn)).filter(|v| !v.is_empty());
+    let by = if checked(&form, REQUIRE_CHANGE) {
+        users::PasswordSetBy::AdminTemporary
+    } else {
+        users::PasswordSetBy::Admin
     };
-    match created {
-        Ok(user_id) => {
-            audited(
-                &st,
-                &ctx,
-                &tenant.id,
-                Event::AdminUserCreate,
-                Some(&user_id),
-                json!({ "upn": crate::routes::audit::clip(upn) }),
-            )
-            .await;
-            view::see_other(&format!("{}/{user_id}", users_url(st.public_url.base(), tenant)))
+    // Checked and hashed before the transaction: hashing is slow.
+    let outcome = match NewPassword::for_new_account_as(field(&form, "password"), by) {
+        Ok(password) => {
+            let create = CreateUser {
+                tenant_id: tenant.id.clone(),
+                upn: upn.clone(),
+                password,
+                display_name: optional(&form, "display_name").map(str::to_string),
+                given_name: optional(&form, "given_name").map(str::to_string),
+                family_name: optional(&form, "family_name").map(str::to_string),
+                email: email.map(str::to_string),
+            };
+            txn::run(&st.pool, &ctx.actor(), &create).await
         }
-        Err(err) => {
-            new_user_page(
-                &st,
-                &ctx,
-                tenant,
-                &form,
-                Some(&err.to_string()),
-                StatusCode::BAD_REQUEST,
-            )
-            .await
+        Err(err) => Outcome::from_error(&err),
+    };
+    // The storage layer validates the UPN against the tenant's verified domains;
+    // its message names the problem.
+    match settle(outcome) {
+        Settled::Done(created) => {
+            view::see_other(&format!("{}/{}", users_url(st.public_url.base(), tenant), created.id))
         }
+        Settled::Refused(message) => {
+            new_user_page(&st, &ctx, tenant, &form, Some(&message), StatusCode::BAD_REQUEST).await
+        }
+        Settled::Respond(resp) => resp,
     }
 }
 
@@ -920,30 +893,9 @@ pub async fn detail_post(
         .filter(|(k, _)| k == GROUP)
         .map(|(_, v)| v.into_owned())
         .collect();
-    let outcome = apply_checked(&st, &ctx, tenant, &user, op, &form, &ticked).await;
-    match outcome {
-        Ok(details) => {
-            if op == UserOp::Groups {
-                // One entry per group, on the group, exactly as its own page records.
-                for (key, event) in [
-                    ("added", Event::AdminGroupMemberAdd),
-                    ("removed", Event::AdminGroupMemberRemove),
-                ] {
-                    for group in details[key].as_array().into_iter().flatten() {
-                        audited(
-                            &st,
-                            &ctx,
-                            &tenant.id,
-                            event,
-                            group.as_str(),
-                            json!({ "userId": user.id }),
-                        )
-                        .await;
-                    }
-                }
-            } else {
-                audited(&st, &ctx, &tenant.id, op.event(), Some(&user.id), details).await;
-            }
+    let outcome = run_op(&st, &ctx, tenant, &user, op, &form, &ticked).await;
+    match settle(outcome) {
+        Settled::Done(()) => {
             let base = st.public_url.base();
             // A deleted user has no page to go back to.
             if op == UserOp::Delete {
@@ -952,24 +904,14 @@ pub async fn detail_post(
                 view::see_other(&format!("{}/{}", users_url(base, tenant), user.id))
             }
         }
-        Err(err) => {
-            detail(
-                &st,
-                &ctx,
-                tenant,
-                &user,
-                Some(&err.to_string()),
-                StatusCode::BAD_REQUEST,
-            )
-            .await
-        }
+        Settled::Refused(message) => detail(&st, &ctx, tenant, &user, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
-/// [`apply`], after the one rule that is about who is asking: nobody deletes or
-/// disables the account they are signed in with. It ends their own session
-/// mid-click, and it is how the last administrator goes.
-async fn apply_checked(
+/// Carry out one operation on an account, as the signed-in administrator: one
+/// transaction, which checks, changes and records it, or does none of that.
+async fn run_op(
     st: &AppState,
     ctx: &AdminContext,
     tenant: &Tenant,
@@ -977,78 +919,85 @@ async fn apply_checked(
     op: UserOp,
     form: &Params,
     groups: &[String],
-) -> anyhow::Result<serde_json::Value> {
-    if user.id == ctx.user.id && matches!(op, UserOp::Delete | UserOp::Disable) {
-        anyhow::bail!("This is the account you are signed in with. Another administrator can disable or delete it.");
-    }
-    apply(st, tenant, user, op, form, groups).await
-}
-
-/// Carry out one operation, returning what to record about it.
-async fn apply(
-    st: &AppState,
-    tenant: &Tenant,
-    user: &User,
-    op: UserOp,
-    form: &Params,
-    groups: &[String],
-) -> anyhow::Result<serde_json::Value> {
+) -> Outcome<()> {
+    let actor = ctx.actor();
+    let (tenant_id, user_id) = (tenant.id.clone(), user.id.clone());
+    let choose = || Outcome::Refused(Refusal::Invalid("Choose a setting.".into()));
     match op {
         UserOp::Attributes => {
-            let attrs = UserAttributes {
-                display_name: optional(form, "display_name"),
-                given_name: optional(form, "given_name"),
-                family_name: optional(form, "family_name"),
-                email: optional(form, "email"),
+            let profile = Profile {
+                display_name: optional(form, "display_name").map(str::to_string),
+                given_name: optional(form, "given_name").map(str::to_string),
+                family_name: optional(form, "family_name").map(str::to_string),
+                email: optional(form, "email").map(str::to_string),
                 email_verified: checked(form, "email_verified"),
             };
-            users::update_attributes(&st.pool, &tenant.id, &user.id, &attrs).await?;
-            // Values, not before-and-after: an audit row is shipped to log systems
-            // and the attributes are the user's own data.
-            Ok(json!({ "fields": ["displayName", "givenName", "surname", "mail", "mailVerified"] }))
+            let t = UpdateUserAttributes {
+                tenant_id,
+                user_id,
+                profile,
+            };
+            txn::run(&st.pool, &actor, &t).await
         }
-        UserOp::Enable | UserOp::Disable => {
-            let enabled = op == UserOp::Enable;
-            users::set_enabled(&st.pool, &tenant.id, &user.id, enabled).await?;
-            Ok(json!({ "enabled": enabled }))
-        }
+        UserOp::Enable => txn::run(&st.pool, &actor, &EnableUser { tenant_id, user_id }).await,
+        UserOp::Disable => txn::run(&st.pool, &actor, &DisableUser { tenant_id, user_id }).await,
+        UserOp::Delete => txn::run(&st.pool, &actor, &DeleteUser { tenant_id, user_id })
+            .await
+            .map_done(),
         UserOp::Reset => {
-            let temporary = checked(form, REQUIRE_CHANGE);
-            let by = if temporary {
+            let by = if checked(form, REQUIRE_CHANGE) {
                 users::PasswordSetBy::AdminTemporary
             } else {
                 users::PasswordSetBy::Admin
             };
-            users::change_password(&st.pool, tenant, &user.id, field(form, "password"), by).await?;
-            Ok(json!({ "requireChange": temporary }))
-        }
-        UserOp::Delete => {
-            users::soft_delete(&st.pool, &tenant.id, &user.id).await?;
-            Ok(json!({ "upn": crate::routes::audit::clip(&user.upn) }))
+            // Checked against the history and hashed before the transaction.
+            let password = match users::prepare_password(&st.pool, tenant, &user.id, field(form, "password"), by).await
+            {
+                Ok(p) => p,
+                Err(err) => return Outcome::from_error(&err),
+            };
+            let account = Account::Id(user_id);
+            let t = ResetPassword {
+                tenant_id,
+                account,
+                password,
+            };
+            txn::run(&st.pool, &actor, &t).await.map_done()
         }
         UserOp::MfaPolicy => {
             let Some(policy) = crate::mfa::MfaPolicy::parse(field(form, MFA_POLICY)) else {
-                anyhow::bail!("choose a setting");
+                return choose();
             };
-            crate::mfa::set_policy(&st.pool, &tenant.id, &user.id, policy).await?;
-            Ok(json!({ "mfaPolicy": policy.as_str() }))
+            txn::run(
+                &st.pool,
+                &actor,
+                &SetUserMfaPolicy {
+                    tenant_id,
+                    user_id,
+                    policy,
+                },
+            )
+            .await
         }
         UserOp::CrossTenant => {
             let Some(policy) = crate::access::CrossTenantPolicy::parse(field(form, CROSS_TENANT)) else {
-                anyhow::bail!("choose a setting");
+                return choose();
             };
-            crate::access::set_policy(&st.pool, &tenant.id, &user.id, policy).await?;
-            Ok(json!({ "crossTenantPolicy": policy.as_str() }))
+            let t = SetUserCrossTenantPolicy {
+                tenant_id,
+                user_id,
+                policy,
+            };
+            txn::run(&st.pool, &actor, &t).await
         }
-        UserOp::MfaReset => {
-            if !crate::mfa::reset(&st.pool, &tenant.id, &user.id).await? {
-                anyhow::bail!("this account has no authenticator to remove");
-            }
-            Ok(json!({}))
-        }
+        UserOp::MfaReset => txn::run(&st.pool, &actor, &ResetUserMfa { tenant_id, user_id }).await,
         UserOp::Groups => {
-            let change = crate::groups::set_for_user(&st.pool, &tenant.id, &user.id, groups).await?;
-            Ok(json!({ "added": change.added, "removed": change.removed }))
+            let t = SetUserGroups {
+                tenant_id,
+                user_id,
+                group_ids: groups.to_vec(),
+            };
+            txn::run(&st.pool, &actor, &t).await.map_done()
         }
     }
 }

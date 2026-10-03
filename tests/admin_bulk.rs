@@ -287,8 +287,10 @@ async fn a_users_groups_are_set_together_on_their_page() {
         .await;
     assert_eq!(saved.status, 303, "{}", saved.body);
     assert_eq!(groups::names_for_user(&s.pool, bob).await.unwrap(), ["Beta", "Gamma"]);
-    assert_eq!(audit_rows(&s, Event::AdminGroupMemberAdd.as_str()).await.len(), 2);
-    assert_eq!(audit_rows(&s, Event::AdminGroupMemberRemove.as_str()).await.len(), 1);
+    // One change, one audit row: on the account, naming the groups joined and left.
+    let rows = audit_rows(&s, Event::AdminUserGroups.as_str()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1.as_deref(), Some(bob.as_str()));
     // None ticked: out of all of them.
     assert_eq!(b.post(&url, &[("op", "groups")]).await.status, 303);
     assert!(groups::names_for_user(&s.pool, bob).await.unwrap().is_empty());

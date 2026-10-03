@@ -627,16 +627,20 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
     match cmd {
         AppCmd::Create { tenant: key, name } => {
             let t = tenant::find_for_admin(pool, &key).await?;
-            let created = apps::create(pool, &t, &name).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppCreate,
-                Some(&created.application.app_id),
-                json!({ "name": name }),
-            )
-            .await?;
+            let create = txn::ops::apps::CreateApp {
+                tenant_id: t.id.clone(),
+                display_name: name,
+            };
+            let application = txn::run(pool, &CLI, &create).await.into_result()?;
+            let sp = apps::service_principal(pool, &t.id, &application.app_id)
+                .await?
+                .context("no service principal")?;
+            let identifier_uri = apps::identifier_uris(pool, &application).await?.into_iter().next();
+            let created = apps::CreatedApp {
+                service_principal_id: sp.id,
+                identifier_uri: identifier_uri.unwrap_or_default(),
+                application,
+            };
             print_json(json!({
                 "appId": created.application.app_id,
                 "id": created.application.id,
@@ -679,7 +683,12 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         AppCmd::AddIdentifierUri { tenant: key, app, uri } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            apps::add_identifier_uri(pool, &a, &uri).await?;
+            let add = txn::ops::apps::AddIdentifierUri {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                uri,
+            };
+            txn::run(pool, &CLI, &add).await.into_result()?;
             print_json(json!({ "appId": a.app_id, "identifierUris": apps::identifier_uris(pool, &a).await? }));
         }
         AppCmd::AddRedirectUri {
@@ -690,16 +699,13 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            apps::add_redirect_uri(pool, &a, platform, &uri).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppRedirectUriAdd,
-                Some(&a.app_id),
-                json!({ "platform": platform.as_str(), "uri": uri }),
-            )
-            .await?;
+            let add = txn::ops::apps::AddRedirectUri {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                platform,
+                uri,
+            };
+            txn::run(pool, &CLI, &add).await.into_result()?;
         }
         AppCmd::AddScope {
             tenant: key,
@@ -710,17 +716,14 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            let display = display_name.unwrap_or_else(|| value.clone());
-            let id = apps::add_scope(pool, &a, &value, &display, r#type).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppScopeAdd,
-                Some(&a.app_id),
-                json!({ "value": value }),
-            )
-            .await?;
+            let add = txn::ops::apps::AddAppScope {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                value: value.clone(),
+                consent: r#type,
+                display_name,
+            };
+            let id = txn::run(pool, &CLI, &add).await.into_result()?;
             print_json(json!({ "id": id, "value": value }));
         }
         AppCmd::AssignmentRequired {
@@ -730,10 +733,12 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            let sp = apps::service_principal(pool, &t.id, &a.app_id)
-                .await?
-                .context("no service principal")?;
-            apps::set_assignment_required(pool, &sp.id, required).await?;
+            let set = txn::ops::apps::SetAssignmentRequired {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                required,
+            };
+            txn::run(pool, &CLI, &set).await.into_result()?;
         }
         AppCmd::Secret(SecretCmd::Add {
             tenant: key,
@@ -743,16 +748,14 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         }) => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            let s = apps::add_secret(pool, &a, name.as_deref(), days).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppSecretAdd,
-                Some(&a.app_id),
-                json!({ "keyId": s.key_id }),
-            )
-            .await?;
+            let add = txn::ops::apps::AddAppSecret {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                secret: apps::PreparedSecret::generate(),
+                valid_days: days,
+                display_name: name,
+            };
+            let s = txn::run(pool, &CLI, &add).await.into_result()?;
             let end = time::OffsetDateTime::from_unix_timestamp(s.end_at)?
                 .format(&time::format_description::well_known::Rfc3339)?;
             print_json(
@@ -767,16 +770,13 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            apps::set_implicit_allowed(pool, &a, id_tokens, access_tokens).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppImplicit,
-                Some(&a.app_id),
-                json!({ "idTokens": id_tokens, "accessTokens": access_tokens }),
-            )
-            .await?;
+            let flags = AppFlags::read(pool, &t, &a).await?;
+            let save = txn::ops::apps::SaveAppFlags {
+                allow_id_token_implicit: id_tokens,
+                allow_access_token_implicit: access_tokens,
+                ..flags.save(&t, &a)
+            };
+            txn::run(pool, &CLI, &save).await.into_result()?;
             println!("id_tokens={id_tokens} access_tokens={access_tokens} for {}", a.app_id);
         }
         AppCmd::PasswordGrant {
@@ -786,16 +786,12 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            apps::set_password_grant_allowed(pool, &a, allowed).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppPasswordGrant,
-                Some(&a.app_id),
-                json!({ "allowed": allowed }),
-            )
-            .await?;
+            let flags = AppFlags::read(pool, &t, &a).await?;
+            let save = txn::ops::apps::SaveAppFlags {
+                allow_password_grant: allowed,
+                ..flags.save(&t, &a)
+            };
+            txn::run(pool, &CLI, &save).await.into_result()?;
             print_json(json!({ "appId": a.app_id, "allowPasswordGrant": allowed }));
         }
         AppCmd::Key(AppKeyCmd::Add {
@@ -814,19 +810,14 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             } else {
                 std::fs::read_to_string(&cert).with_context(|| format!("reading {cert}"))?
             };
-            if pem.contains("PRIVATE KEY") {
-                anyhow::bail!("that file contains a private key; register only the certificate");
-            }
-            let key_id = apps::add_key_credential(pool, &a, &pem, name.as_deref()).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppKeyAdd,
-                Some(&a.app_id),
-                json!({ "keyId": key_id }),
-            )
-            .await?;
+            // The transaction refuses a private key.
+            let add = txn::ops::apps::AddAppCertificate {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                certificate_pem: pem,
+                display_name: name,
+            };
+            let key_id = txn::run(pool, &CLI, &add).await.into_result()?;
             print_json(json!({ "keyId": key_id }));
         }
         AppCmd::Key(AppKeyCmd::List { tenant: key, app }) => {
@@ -854,18 +845,12 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         }) => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            if !apps::remove_key_credential(pool, &a, &key_id).await? {
-                anyhow::bail!("no certificate with thumbprint {key_id} on app {}", a.app_id);
-            }
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppKeyRemove,
-                Some(&a.app_id),
-                json!({ "keyId": key_id }),
-            )
-            .await?;
+            let remove = txn::ops::apps::RemoveAppCertificate {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                key_id: key_id.clone(),
+            };
+            txn::run(pool, &CLI, &remove).await.into_result()?;
             print_json(json!({ "removed": key_id }));
         }
         AppCmd::Secret(SecretCmd::Remove {
@@ -875,16 +860,12 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         }) => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            apps::remove_secret(pool, &a, &key_id).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppSecretRemove,
-                Some(&a.app_id),
-                json!({ "keyId": key_id }),
-            )
-            .await?;
+            let remove = txn::ops::apps::RemoveAppSecret {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                key_id,
+            };
+            txn::run(pool, &CLI, &remove).await.into_result()?;
         }
         AppCmd::Role(RoleCmd::Add {
             tenant: key,
@@ -896,17 +877,15 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         }) => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let a = apps::find_in_tenant(pool, &t, &app).await?;
-            let display = display_name.unwrap_or_else(|| value.clone());
-            let id = apps::add_role(pool, &a, &value, &display, description.as_deref(), &member_types).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppRoleAdd,
-                Some(&a.app_id),
-                json!({ "value": value }),
-            )
-            .await?;
+            let add = txn::ops::apps::AddAppRole {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                value: value.clone(),
+                member_types: member_types.clone(),
+                display_name,
+                description,
+            };
+            let id = txn::run(pool, &CLI, &add).await.into_result()?;
             let types: Vec<&str> = member_types.iter().map(|m| m.as_str()).collect();
             print_json(json!({ "id": id, "value": value, "allowedMemberTypes": types }));
         }
@@ -920,25 +899,74 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
         }) => {
             let t = tenant::find_for_admin(pool, &key).await?;
             let resource_app = apps::find_in_tenant(pool, &t, &resource).await?;
-            let principal = match (app, user, group) {
-                (Some(a), None, None) => Principal::App(a),
-                (None, Some(u), None) => Principal::User(u),
-                (None, None, Some(g)) => Principal::Group(g),
+            // An application is granted the role as an application permission;
+            // a user or group is assigned to the application with it.
+            let outcome = match (app, user, group) {
+                (Some(client_app_id), None, None) => {
+                    let grant = txn::ops::apps::GrantAppRole {
+                        tenant_id: t.id.clone(),
+                        app_id: resource_app.app_id.clone(),
+                        role,
+                        client_app_id,
+                    };
+                    txn::run(pool, &CLI, &grant).await.map_done()
+                }
+                (None, Some(u), None) => assign(pool, &t, &resource_app, Principal::User(u), role).await,
+                (None, None, Some(g)) => assign(pool, &t, &resource_app, Principal::Group(g), role).await,
                 _ => bail!("give exactly one of --app, --user, --group"),
             };
-            apps::assign_role(pool, &t, &resource_app, &role, &principal).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::AppRoleAssign,
-                Some(&resource_app.app_id),
-                json!({ "role": role }),
-            )
-            .await?;
+            outcome.into_result()?;
         }
     }
     Ok(())
+}
+
+/// Assign a user or group to an application with one of its roles.
+async fn assign(
+    pool: &DbPool,
+    t: &tenant::Tenant,
+    resource: &apps::Application,
+    principal: Principal,
+    role: String,
+) -> txn::Outcome<()> {
+    let assign = txn::ops::apps::AssignApp {
+        tenant_id: t.id.clone(),
+        app_id: resource.app_id.clone(),
+        principal,
+        roles: vec![role],
+    };
+    txn::run(pool, &CLI, &assign).await.map_done()
+}
+
+/// An application's sign-in switches as they are, so the command line can change
+/// one of them through the transaction that saves them all.
+struct AppFlags {
+    accept_other_tenants: bool,
+    mfa_required: bool,
+}
+
+impl AppFlags {
+    async fn read(pool: &DbPool, t: &tenant::Tenant, a: &apps::Application) -> anyhow::Result<Self> {
+        let sp = apps::service_principal(pool, &t.id, &a.app_id)
+            .await?
+            .context("no service principal")?;
+        Ok(Self {
+            accept_other_tenants: sp.accept_other_tenants,
+            mfa_required: sp.mfa_required,
+        })
+    }
+
+    fn save(&self, t: &tenant::Tenant, a: &apps::Application) -> txn::ops::apps::SaveAppFlags {
+        txn::ops::apps::SaveAppFlags {
+            tenant_id: t.id.clone(),
+            app_id: a.app_id.clone(),
+            accept_other_tenants: self.accept_other_tenants,
+            mfa_required: self.mfa_required,
+            allow_password_grant: a.allow_password_grant,
+            allow_id_token_implicit: a.allow_id_token_implicit,
+            allow_access_token_implicit: a.allow_access_token_implicit,
+        }
+    }
 }
 
 async fn key_cmd(pool: &DbPool, cmd: KeyCmd) -> anyhow::Result<()> {

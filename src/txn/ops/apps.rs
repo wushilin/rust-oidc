@@ -172,6 +172,39 @@ impl Transaction for SaveAppFlags {
     }
 }
 
+/// Whether only assigned accounts may sign in to the application, in its home
+/// tenant (Entra's "Assignment required?").
+pub struct SetAssignmentRequired {
+    pub tenant_id: String,
+    pub app_id: String,
+    pub required: bool,
+}
+
+impl Transaction for SetAssignmentRequired {
+    type Output = ();
+    const INFO: KindInfo = KindInfo {
+        name: "Set assignment required",
+        need: Need::Action(APP_WRITE),
+        event: Event::AdminAppAssignmentRequired,
+    };
+
+    on_application!();
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
+        let (tenant, app) = application(cx, &self.tenant_id, &self.app_id).await?;
+        let sp = apps::service_principal_in(cx.conn(), &tenant.id, &app.app_id).await;
+        let Some(sp) = cx.check(sp)? else {
+            return Err(cx.fail(Refusal::NotFound(NO_SUCH_APP.into())));
+        };
+        let done = apps::set_assignment_required_in(cx.conn(), &sp.id, self.required).await;
+        cx.check(done)
+    }
+
+    fn audit(&self, _: &()) -> Audit {
+        on_app(&self.tenant_id, &self.app_id, json!({ "required": self.required }))
+    }
+}
+
 /// Add a client secret, made before the transaction began. The output carries the
 /// value to show once; the audit row has only its key id and expiry.
 pub struct AddAppSecret {

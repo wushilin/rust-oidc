@@ -10,7 +10,7 @@ use rust_oidc::db::Event;
 use rust_oidc::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
     GrantAppRole, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri, RemoveRedirectUri, RevokeAppRole,
-    SaveAppFlags, UnassignApp,
+    SaveAppFlags, SetAssignmentRequired, UnassignApp,
 };
 use rust_oidc::txn::{self, Actor, Outcome, Refusal};
 use serde_json::Value;
@@ -617,4 +617,30 @@ async fn an_application_permission_is_granted_and_revoked() {
         Outcome::Refused(Refusal::NotFound(_))
     ));
     assert_eq!(rows(&w.s, Event::AdminAppRoleUnassign).await.len(), 1);
+}
+
+#[tokio::test]
+async fn assignment_required_is_set_with_its_audit_row_and_refused_for_an_unknown_app() {
+    let w = world().await;
+    let set = SetAssignmentRequired {
+        tenant_id: w.tid(),
+        app_id: w.web(),
+        required: true,
+    };
+    txn::run(&w.s.pool, &w.actor, &set).await.into_result().unwrap();
+    assert!(w.sp().await.app_role_assignment_required);
+    let audited = rows(&w.s, Event::AdminAppAssignmentRequired).await;
+    assert_eq!(audited.len(), 1);
+    assert_eq!(audited[0].0.as_deref(), Some(w.web().as_str()));
+    assert_eq!(audited[0].1["required"], true);
+
+    let unknown = SetAssignmentRequired {
+        tenant_id: w.tid(),
+        app_id: "00000000-0000-0000-0000-000000000000".into(),
+        required: false,
+    };
+    let outcome = txn::run(&w.s.pool, &w.actor, &unknown).await;
+    assert!(matches!(outcome, Outcome::Refused(Refusal::NotFound(_))), "{outcome:?}");
+    assert!(w.sp().await.app_role_assignment_required, "nothing changed");
+    assert_eq!(rows(&w.s, Event::AdminAppAssignmentRequired).await.len(), 1);
 }

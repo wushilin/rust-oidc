@@ -401,4 +401,5 @@ transactions! {
     UnassignApp(ops::apps::UnassignApp),
     GrantAppRole(ops::apps::GrantAppRole),
     RevokeAppRole(ops::apps::RevokeAppRole),
+    SetAssignmentRequired(ops::apps::SetAssignmentRequired),
 }

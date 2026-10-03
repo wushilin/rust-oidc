@@ -109,6 +109,8 @@ const EXPECTED: &[(&str, &str)] = &[
     ("AdminUserGroups", "admin.user.groups"),
     ("AdminFlowTestStart", "admin.flow_test.start"),
     ("AdminFlowTestResult", "admin.flow_test.result"),
+    ("AdminFlowTestCallbackAdd", "admin.flow_test.callback_add"),
+    ("AdminFlowTestClientCreate", "admin.flow_test.client_create"),
 ];
 
 #[test]

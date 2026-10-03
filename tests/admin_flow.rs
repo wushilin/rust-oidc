@@ -195,7 +195,8 @@ async fn adding_the_callback_is_an_explicit_audited_step() {
             .any(|(p, uri)| *uri == callback(&s) && *p == RedirectPlatform::PublicClient),
         "registered under the platform that was chosen: {after:?}"
     );
-    let rows = audit_rows(&s, "admin.app.redirect_uri.add").await;
+    // The flow tester's own transaction kind, so its own event.
+    let rows = audit_rows(&s, "admin.flow_test.callback_add").await;
     assert_eq!(rows.len(), 1, "one audit row: {rows:?}");
     assert_eq!(rows[0].1.as_deref(), Some(f.web.app_id.as_str()));
 }

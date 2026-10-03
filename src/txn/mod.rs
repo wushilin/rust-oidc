@@ -402,4 +402,10 @@ transactions! {
     GrantAppRole(ops::apps::GrantAppRole),
     RevokeAppRole(ops::apps::RevokeAppRole),
     SetAssignmentRequired(ops::apps::SetAssignmentRequired),
+    GrantRole(ops::roles::GrantRole),
+    RevokeRole(ops::roles::RevokeRole),
+    RotateKeys(ops::keys::RotateKeys),
+    PruneKeys(ops::keys::PruneKeys),
+    AddFlowCallback(ops::flow::AddFlowCallback),
+    CreateFlowTestClient(ops::flow::CreateFlowTestClient),
 }

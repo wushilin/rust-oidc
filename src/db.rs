@@ -584,6 +584,13 @@ pub enum Event {
     AdminFlowTestStart,
     /// What came back. The outcome only: never a code, a token or a claim value.
     AdminFlowTestResult,
+    /// The flow tester registered the console's callback as a redirect URI of the
+    /// application under test. Its own event because every kind of transaction has
+    /// one; the details carry the platform and the URI, as a redirect URI add does.
+    AdminFlowTestCallbackAdd,
+    /// The flow tester registered the tenant's own test client: an application and
+    /// its one redirect URI, in one row.
+    AdminFlowTestClientCreate,
 }
 
 impl Event {
@@ -684,6 +691,8 @@ impl Event {
         Self::AdminUserGroups,
         Self::AdminFlowTestStart,
         Self::AdminFlowTestResult,
+        Self::AdminFlowTestCallbackAdd,
+        Self::AdminFlowTestClientCreate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -787,6 +796,8 @@ impl Event {
             Self::AdminUserGroups => "admin.user.groups",
             Self::AdminFlowTestStart => "admin.flow_test.start",
             Self::AdminFlowTestResult => "admin.flow_test.result",
+            Self::AdminFlowTestCallbackAdd => "admin.flow_test.callback_add",
+            Self::AdminFlowTestClientCreate => "admin.flow_test.client_create",
         }
     }
 

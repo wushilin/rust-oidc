@@ -31,7 +31,9 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::admin::APP_WRITE;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, PlatformTab, TenantTab, audited, checked, chrome, field, optional, parse_form};
+use crate::admin::routes::{
+    At, Params, PlatformTab, Settled, TenantTab, audited, checked, chrome, field, optional, parse_form, settle,
+};
 use crate::admin::view::{self, e};
 use crate::apps::{self, Application, RedirectPlatform};
 use crate::db::Event;
@@ -44,6 +46,10 @@ use crate::rbac::Action;
 use crate::routes::audit::Channel;
 use crate::routes::{Prompt, ResponseMode, ResponseType};
 use crate::tenant::Tenant;
+use crate::txn::{
+    self,
+    ops::flow::{AddFlowCallback, CreateFlowTestClient},
+};
 use crate::{session, users};
 
 /// What a post to the flow tester asks for.
@@ -752,49 +758,25 @@ async fn create_test_client(
     tenant: &Tenant,
     form: &Params,
 ) -> Response {
-    // A mapping left behind by a deleted application would otherwise block this.
-    if flowtest::test_client(&st.pool, &tenant.id)
-        .await
-        .unwrap_or_default()
-        .is_none()
-        && let Err(e) = flowtest::forget_test_client(&st.pool, &tenant.id).await
-    {
-        tracing::error!("flow tester client mapping could not be cleared: {e}");
-        return view::server_error();
-    }
-    match flowtest::create_test_client(&st.pool, &st.public_url, tenant).await {
-        Ok(app) => {
-            // The ordinary events: this is an application registration and a
-            // redirect URI, and an auditor filtering for either must see it.
-            audited(
-                st,
-                ctx,
-                &tenant.id,
-                Event::AdminAppCreate,
-                Some(&app.app_id),
-                json!({ "displayName": crate::routes::audit::clip(&app.display_name), "purpose": flowtest::PURPOSE }),
-            )
-            .await;
-            audited(
-                st,
-                ctx,
-                &tenant.id,
-                Event::AdminAppRedirectUriAdd,
-                Some(&app.app_id),
-                json!({
-                    "platform": RedirectPlatform::PublicClient.as_str(),
-                    "uri": crate::routes::audit::clip(&flowtest::callback_uri(&st.public_url)),
-                    "purpose": flowtest::PURPOSE,
-                }),
-            )
-            .await;
+    // One transaction: a mapping left behind by a deleted application is cleared,
+    // and the application, its redirect URI and the mapping are written together.
+    let create = CreateFlowTestClient {
+        tenant_id: tenant.id.clone(),
+        callback: flowtest::callback_uri(&st.public_url),
+    };
+    match settle(txn::run(&st.pool, &ctx.actor(), &create).await) {
+        Settled::Done(made) => {
             let base = st.public_url.base();
-            view::see_other(&format!("{}?{APP_FIELD}={}", flow_url(base, tenant), app.app_id))
+            view::see_other(&format!(
+                "{}?{APP_FIELD}={}",
+                flow_url(base, tenant),
+                made.application.app_id
+            ))
         }
-        Err(e) => {
-            let message = e.to_string();
+        Settled::Refused(message) => {
             landing(st, ctx, headers, tenant, form, Some(&message), StatusCode::BAD_REQUEST).await
         }
+        Settled::Respond(resp) => resp,
     }
 }
 
@@ -817,31 +799,23 @@ async fn add_callback(
         )
         .await;
     };
+    // An application of another tenant, or none, is not found: answered as a
+    // missing page, as it always has been, before any transaction.
     let Ok(app) = apps::find_in_tenant(&st.pool, tenant, field(form, APP_FIELD)).await else {
         return view::not_found();
     };
-    let callback = flowtest::callback_uri(&st.public_url);
-    match apps::add_redirect_uri(&st.pool, &app, platform, &callback).await {
-        Ok(()) => {
-            audited(
-                st,
-                ctx,
-                &tenant.id,
-                Event::AdminAppRedirectUriAdd,
-                Some(&app.app_id),
-                json!({
-                    "platform": platform.as_str(),
-                    "uri": crate::routes::audit::clip(&callback),
-                    "purpose": flowtest::PURPOSE,
-                }),
-            )
-            .await;
-            view::see_other(&with_probe(&flow_url(st.public_url.base(), tenant), form))
-        }
-        Err(e) => {
-            let message = e.to_string();
+    let add = AddFlowCallback {
+        tenant_id: tenant.id.clone(),
+        app_id: app.app_id,
+        platform,
+        callback: flowtest::callback_uri(&st.public_url),
+    };
+    match settle(txn::run(&st.pool, &ctx.actor(), &add).await) {
+        Settled::Done(()) => view::see_other(&with_probe(&flow_url(st.public_url.base(), tenant), form)),
+        Settled::Refused(message) => {
             landing(st, ctx, headers, tenant, form, Some(&message), StatusCode::BAD_REQUEST).await
         }
+        Settled::Respond(resp) => resp,
     }
 }
 

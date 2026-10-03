@@ -8,25 +8,28 @@
 //! The two rules that make delegation safe are **not** implemented here. They are
 //! [`authz::may_write_binding`] (no widening) and [`authz::delete`] (which applies
 //! the no-widening and no-lock-out rules together, so a handler cannot apply one
-//! and forget the other). This module decides nothing on its own.
+//! and forget the other), both applied inside the transactions of
+//! [`crate::txn::ops::roles`]. This module decides nothing on its own.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
 
 use crate::AppState;
-use crate::admin::authz::{self, RefusedReason};
+use crate::admin::authz;
 use crate::admin::bindings::{self, StoredBinding};
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, TenantTab, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, Settled, TenantTab, chrome, field, parse_form, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{BINDING_READ, BINDING_WRITE};
-use crate::db::Event;
 use crate::directory::PrincipalType;
 use crate::rbac::{RoleId, Scope, ScopeKind};
 use crate::tenant::Tenant;
+use crate::txn::{
+    self,
+    ops::roles::{GrantRole, Principal, RevokeRole, RolePage},
+};
 
 /// What a post to the roles page asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,13 +51,6 @@ impl RoleOp {
 
     pub fn parse(raw: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|o| o.as_str() == raw)
-    }
-
-    fn event(self) -> Event {
-        match self {
-            Self::Grant => Event::AdminRoleGrant,
-            Self::Revoke => Event::AdminRoleRevoke,
-        }
     }
 }
 
@@ -245,118 +241,40 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
         return view::not_found();
     };
 
+    let page = RolePage::Tenant(tenant.id.clone());
     let outcome = match op {
-        RoleOp::Grant => grant(&st, &ctx, tenant, &form).await,
-        RoleOp::Revoke => revoke(&st, &ctx, tenant, &form).await,
-    };
-    match outcome {
-        Ok((target, details)) => {
-            audited(&st, &ctx, &tenant.id, op.event(), Some(&target), details).await;
-            view::see_other(&roles_url(st.public_url.base(), tenant))
+        RoleOp::Grant => {
+            let name = field(&form, PRINCIPAL).to_string();
+            let principal = match PrincipalType::parse(field(&form, PRINCIPAL_TYPE)) {
+                Some(PrincipalType::User) => Principal::User(name),
+                Some(PrincipalType::Group) => Principal::Group(name),
+                Some(PrincipalType::ServicePrincipal) | None => {
+                    return refused(&st, &ctx, tenant, "Choose a user or a group.").await;
+                }
+            };
+            let Some(role) = RoleId::parse(field(&form, ROLE)) else {
+                return refused(&st, &ctx, tenant, "Choose a role.").await;
+            };
+            // Where it applies is not asked: a role granted here applies to this
+            // tenant, which is the principal's own.
+            let grant = GrantRole { page, principal, role };
+            txn::run(&st.pool, &ctx.actor(), &grant).await.map_done()
         }
-        Err(Refusal::Message(m)) => render(&st, &ctx, tenant, Some(&m), StatusCode::BAD_REQUEST).await,
-        Err(Refusal::Forbidden) => view::forbidden(),
-    }
-}
-
-/// Why a grant or revoke did not happen.
-enum Refusal {
-    /// Something the administrator can fix, shown on the page.
-    Message(String),
-    /// Their roles do not reach that far.
-    Forbidden,
-}
-
-impl From<RefusedReason> for Refusal {
-    fn from(reason: RefusedReason) -> Self {
-        match reason {
-            RefusedReason::NotPermitted => Refusal::Forbidden,
-            RefusedReason::WouldLockOut => {
-                Refusal::Message("That is the last Global Administrator. Make somebody else one first.".into())
-            }
+        RoleOp::Revoke => {
+            let revoke = RevokeRole {
+                page,
+                binding_id: field(&form, BINDING).to_string(),
+            };
+            txn::run(&st.pool, &ctx.actor(), &revoke).await.map_done()
         }
+    };
+    match settle(outcome) {
+        Settled::Done(()) => view::see_other(&roles_url(st.public_url.base(), tenant)),
+        Settled::Refused(m) => refused(&st, &ctx, tenant, &m).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
-async fn grant(
-    st: &AppState,
-    ctx: &AdminContext,
-    tenant: &Tenant,
-    form: &Params,
-) -> Result<(String, serde_json::Value), Refusal> {
-    let name = field(form, PRINCIPAL);
-    let Some(principal_type) = PrincipalType::parse(field(form, PRINCIPAL_TYPE)) else {
-        return Err(Refusal::Message("Choose a user or a group.".into()));
-    };
-    let Some(role) = RoleId::parse(field(form, ROLE)) else {
-        return Err(Refusal::Message("Choose a role.".into()));
-    };
-    if role.scope_kind() != ScopeKind::Tenants {
-        return Err(Refusal::Message(format!(
-            "{} is not a role of one tenant. It is granted from the Global roles page.",
-            role.display_name()
-        )));
-    }
-    // Where it applies is not asked: a role granted here applies to this tenant,
-    // which is the principal's own. `bindings::create` holds the rule.
-    let scope = Scope::Tenants(vec![tenant.id.clone()]);
-    // A binding write is authorized against the *target* scope, so no principal
-    // can grant reach it does not already hold.
-    if !authz::may_write_binding(ctx.bindings(), &scope) {
-        return Err(Refusal::Forbidden);
-    }
-
-    let principal_id = match principal_type {
-        PrincipalType::User => crate::users::find_by_upn(&st.pool, &tenant.id, name)
-            .await
-            .map_err(|_| Refusal::Message("That user could not be looked up.".into()))?
-            .map(|u| u.id),
-        PrincipalType::Group => crate::groups::find(&st.pool, &tenant.id, name)
-            .await
-            .map_err(|_| Refusal::Message("That group could not be looked up.".into()))?,
-        PrincipalType::ServicePrincipal => None,
-    };
-    let Some(principal_id) = principal_id else {
-        return Err(Refusal::Message(format!(
-            "No {} named '{name}' in {}.",
-            principal_type.as_str().to_lowercase(),
-            tenant.name
-        )));
-    };
-
-    let id = bindings::create(&st.pool, principal_type, &principal_id, role, &scope, &ctx.user.id)
-        .await
-        .map_err(|e| Refusal::Message(e.to_string()))?;
-    Ok((
-        id,
-        json!({
-            "role": role.as_str(),
-            "scopeKind": scope.kind().as_str(),
-            "principalType": principal_type.as_str(),
-            "principalId": principal_id,
-        }),
-    ))
-}
-
-async fn revoke(
-    st: &AppState,
-    ctx: &AdminContext,
-    tenant: &Tenant,
-    form: &Params,
-) -> Result<(String, serde_json::Value), Refusal> {
-    let id = field(form, BINDING).to_string();
-    // Only a binding of this tenant: anything else is revoked where it is listed.
-    let own = bindings::list_for_tenant(&st.pool, &tenant.id)
-        .await
-        .map_err(|_| Refusal::Forbidden)?
-        .into_iter()
-        .any(|b| b.id == id && b.scope.kind() == ScopeKind::Tenants);
-    if !own {
-        return Err(Refusal::Forbidden);
-    }
-    // One call, both rules: no widening, and no locking the platform out.
-    authz::delete(&st.pool, ctx.bindings(), &id)
-        .await
-        .map_err(Refusal::from)?;
-    Ok((id, json!({})))
+async fn refused(st: &AppState, ctx: &AdminContext, tenant: &Tenant, message: &str) -> Response {
+    render(st, ctx, tenant, Some(message), StatusCode::BAD_REQUEST).await
 }

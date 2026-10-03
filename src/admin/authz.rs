@@ -32,6 +32,26 @@ pub fn may_write_binding(bindings: &[EffectiveBinding], target: &Scope) -> bool 
     }
 }
 
+/// Who writes a binding, which decides whether the no-widening rule applies.
+#[derive(Debug, Clone, Copy)]
+pub enum BindingWriter<'a> {
+    /// A console administrator holding these bindings: bound by no-widening.
+    Admin(&'a [EffectiveBinding]),
+    /// The operator at the command line, who has the database itself: the rule
+    /// would protect nothing, so it does not apply. The lock-out rule still does.
+    Operator,
+}
+
+impl BindingWriter<'_> {
+    /// Whether this writer may create or delete a binding whose scope is `target`.
+    pub fn may_write(&self, target: &Scope) -> bool {
+        match self {
+            Self::Admin(bindings) => may_write_binding(bindings, target),
+            Self::Operator => true,
+        }
+    }
+}
+
 /// Why a binding delete was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RefusedReason {
@@ -100,18 +120,18 @@ pub async fn delete<'c>(
     binding_id: &str,
 ) -> Result<(), RefusedReason> {
     let mut conn = db.acquire().await.map_err(|_| RefusedReason::NotPermitted)?;
-    delete_in(&mut conn, actor, binding_id).await
+    delete_in(&mut conn, BindingWriter::Admin(actor), binding_id).await
 }
 
 pub(crate) async fn delete_in(
     conn: &mut crate::db::Conn,
-    actor: &[EffectiveBinding],
+    writer: BindingWriter<'_>,
     binding_id: &str,
 ) -> Result<(), RefusedReason> {
     let target = target_scope_in(&mut *conn, binding_id)
         .await
         .map_err(|_| RefusedReason::NotPermitted)?;
-    if !may_write_binding(actor, &target) {
+    if !writer.may_write(&target) {
         return Err(RefusedReason::NotPermitted);
     }
     check_delete_in(&mut *conn, binding_id).await?;

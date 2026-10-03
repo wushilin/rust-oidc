@@ -14,15 +14,17 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, PlatformTab, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, PlatformTab, Settled, chrome, field, parse_form, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{KEY_READ, KEY_ROTATE};
-use crate::db::Event;
-use crate::keys::{self, KeyStatus, StoredKey};
+use crate::keys::{self, KeyStatus, NewKey, StoredKey};
+use crate::txn::{
+    self,
+    ops::keys::{PruneKeys, RotateKeys},
+};
 
 /// What a post to the keys page asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,13 +46,6 @@ impl KeyOp {
 
     pub fn parse(raw: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|o| o.as_str() == raw)
-    }
-
-    fn event(self) -> Event {
-        match self {
-            Self::Rotate => Event::AdminKeyRotate,
-            Self::Prune => Event::AdminKeyPrune,
-        }
     }
 }
 
@@ -168,37 +163,46 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) ->
     if let Err(resp) = ctx.check_csrf(&form) {
         return resp;
     }
-    match apply(&st, op, &form).await {
-        Ok(details) => {
-            // The keys belong to no tenant, so the row is attributed to the
-            // administrator's own: `audit_log.tenant_id` is how a tenant admin's
-            // page is filtered, and a row with none would be invisible to
-            // everyone. The actor is the person either way.
-            audited(&st, &ctx, &ctx.home_tenant.id, op.event(), None, details).await;
-            view::see_other(&keys_url(st.public_url.base()))
-        }
-        Err(err) => render(&st, &ctx, Some(&err.to_string()), StatusCode::BAD_REQUEST).await,
-    }
-}
-
-async fn apply(st: &AppState, op: KeyOp, form: &Params) -> anyhow::Result<serde_json::Value> {
-    match op {
+    // The keys belong to no tenant, so the audit row is attributed to the
+    // administrator's own (see `txn::ops::keys`): `audit_log.tenant_id` is how a
+    // tenant admin's page is filtered, and a row with none would be invisible to
+    // everyone. The actor is the person either way.
+    let outcome = match op {
         KeyOp::Rotate => {
-            keys::rotate(&st.pool).await?;
-            Ok(json!({}))
+            // RSA generation is slow: done before the transaction begins, off the
+            // async workers.
+            let fresh = match tokio::task::spawn_blocking(NewKey::generate).await {
+                Ok(Ok(key)) => key,
+                Ok(Err(err)) => {
+                    tracing::error!("signing key generation failed: {err}");
+                    return view::server_error();
+                }
+                Err(err) => {
+                    tracing::error!("signing key generation did not finish: {err}");
+                    return view::server_error();
+                }
+            };
+            txn::run(&st.pool, &ctx.actor(), &RotateKeys { fresh }).await.map_done()
         }
         KeyOp::Prune => {
-            let days = field(form, DAYS)
-                .parse::<i64>()
-                .map_err(|_| anyhow::anyhow!("the age must be a whole number of days"))?;
-            // Zero or negative would delete a key retired moments ago, whose
-            // tokens are certainly still alive.
-            if days < 1 {
-                anyhow::bail!("the age must be at least one day");
-            }
-            let deleted = keys::prune(&st.pool, days * 86_400).await?;
-            Ok(json!({ "olderThanDays": days, "deleted": deleted }))
+            let Ok(older_than_days) = field(&form, DAYS).parse::<i64>() else {
+                return render(
+                    &st,
+                    &ctx,
+                    Some("the age must be a whole number of days"),
+                    StatusCode::BAD_REQUEST,
+                )
+                .await;
+            };
+            txn::run(&st.pool, &ctx.actor(), &PruneKeys { older_than_days })
+                .await
+                .map_done()
         }
+    };
+    match settle(outcome) {
+        Settled::Done(()) => view::see_other(&keys_url(st.public_url.base())),
+        Settled::Refused(m) => render(&st, &ctx, Some(&m), StatusCode::BAD_REQUEST).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
@@ -212,8 +216,9 @@ mod tests {
         for op in KeyOp::ALL {
             assert!(seen.insert(op.as_str()), "two operations are both {}", op.as_str());
             assert_eq!(KeyOp::parse(op.as_str()), Some(*op));
-            assert!(seen.insert(op.event().as_str()), "{op:?} shares an event");
         }
+        // Each operation is its own transaction kind, and so has its own event:
+        // `every_kind_has_a_name_and_its_own_event` in tests/txn_engine.rs.
         assert_eq!(KeyOp::parse("delete"), None);
     }
 

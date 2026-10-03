@@ -4,28 +4,30 @@
 //! tenant's business and is on its own Roles tab, and nowhere else.
 //!
 //! The rules that make this safe are not implemented here. They are
-//! [`authz::may_write_binding`] (nobody grants reach they do not hold),
-//! [`bindings::create`] (the role is held from the root tenant) and
-//! [`authz::delete`] (the last Global Administrator stays).
+//! [`crate::admin::authz::may_write_binding`] (nobody grants reach they do not
+//! hold), [`bindings::create`] (the role is held from the root tenant) and
+//! [`crate::admin::authz::delete`] (the last Global Administrator stays), applied
+//! inside the transactions of [`crate::txn::ops::roles`].
 
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
 
 use crate::AppState;
-use crate::admin::authz::{self, RefusedReason};
 use crate::admin::bindings::{self, StoredBinding};
 use crate::admin::context::{AdminContext, On};
 use crate::admin::roles::RoleOp;
-use crate::admin::routes::{At, PlatformTab, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, PlatformTab, Settled, chrome, field, parse_form, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{BINDING_READ, BINDING_WRITE};
-use crate::db::Event;
 use crate::directory::PrincipalType;
 use crate::rbac::{RoleId, Scope};
 use crate::tenant::{self, Tenant};
+use crate::txn::{
+    self,
+    ops::roles::{GrantRole, Principal, RevokeRole, RolePage},
+};
 
 /// Form field names, named once.
 const ACCOUNT: &str = "account";
@@ -151,30 +153,13 @@ everything inside every tenant. Roles inside a tenant are on that tenant's Roles
 }
 
 /// The bindings that are not bound to a tenant: the only ones this page shows,
-/// and the only ones it will revoke.
+/// and the only ones [`RevokeRole`] revokes from it.
 async fn global_bindings(st: &AppState) -> anyhow::Result<Vec<StoredBinding>> {
     Ok(bindings::list_all(&st.pool)
         .await?
         .into_iter()
         .filter(|b| b.scope == Scope::All)
         .collect())
-}
-
-/// Why a write did not happen.
-enum Refusal {
-    Forbidden,
-    Message(String),
-}
-
-impl From<RefusedReason> for Refusal {
-    fn from(reason: RefusedReason) -> Self {
-        match reason {
-            RefusedReason::NotPermitted => Refusal::Forbidden,
-            RefusedReason::WouldLockOut => {
-                Refusal::Message("That is the last Global Administrator. Make somebody else one first.".into())
-            }
-        }
-    }
 }
 
 pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) -> Response {
@@ -189,146 +174,51 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) ->
         return resp;
     }
     let outcome = match op {
-        RoleOp::Grant => grant(&st, &ctx, &body).await,
-        RoleOp::Revoke => {
-            let id = field(&form, BINDING).to_string();
-            // Only what this page lists: a tenant's binding is revoked in that tenant.
-            match global_bindings(&st).await {
-                Ok(listed) if listed.iter().any(|b| b.id == id) => {}
-                Ok(_) => return view::forbidden(),
-                Err(err) => {
-                    tracing::error!("global roles could not be listed: {err}");
-                    return view::server_error();
+        RoleOp::Grant => {
+            // The one role this page grants. A form that names another is asking
+            // for a tenant role, which is granted in the tenant.
+            let role = match field(&form, ROLE).trim() {
+                "" => RoleId::GlobalAdministrator,
+                named => match RoleId::parse(named) {
+                    Some(role) => role,
+                    None => return refused(&st, &ctx, TENANT_ROLE_ELSEWHERE).await,
+                },
+            };
+            // A user (the default, and what older forms sent) or a group, each of
+            // the root tenant, which is where the role is held.
+            let principal = match PrincipalType::parse(field(&form, PRINCIPAL_TYPE)) {
+                None | Some(PrincipalType::User) => Principal::User(field(&form, ACCOUNT).to_string()),
+                Some(PrincipalType::Group) => Principal::Group(field(&form, GROUP_NAME).to_string()),
+                Some(PrincipalType::ServicePrincipal) => {
+                    return refused(&st, &ctx, "Choose a user or a group.").await;
                 }
-            }
-            // One call, both rules: no widening, and no locking the platform out.
-            authz::delete(&st.pool, ctx.bindings(), &id)
-                .await
-                .map(|()| (id, json!({})))
-                .map_err(Refusal::from)
+            };
+            let grant = GrantRole {
+                page: RolePage::Global,
+                principal,
+                role,
+            };
+            txn::run(&st.pool, &ctx.actor(), &grant).await.map_done()
+        }
+        RoleOp::Revoke => {
+            // Only what this page lists: a tenant's binding is revoked in that tenant.
+            let revoke = RevokeRole {
+                page: RolePage::Global,
+                binding_id: field(&form, BINDING).to_string(),
+            };
+            txn::run(&st.pool, &ctx.actor(), &revoke).await.map_done()
         }
     };
-    match outcome {
-        Ok((target, details)) => {
-            // A change to who administers the platform belongs in the root
-            // tenant's history: it is not an event of any one other tenant.
-            let log_tenant = match tenant::root(&st.pool).await {
-                Ok(Some(root)) => root.id,
-                _ => ctx.home_tenant.id.clone(),
-            };
-            let event = match op {
-                RoleOp::Grant => Event::AdminRoleGrant,
-                RoleOp::Revoke => Event::AdminRoleRevoke,
-            };
-            audited(&st, &ctx, &log_tenant, event, Some(&target), details).await;
-            view::see_other(&page_url(st.public_url.base()))
-        }
-        Err(Refusal::Message(m)) => render(&st, &ctx, Some(&m), StatusCode::BAD_REQUEST).await,
-        Err(Refusal::Forbidden) => view::forbidden(),
+    match settle(outcome) {
+        Settled::Done(()) => view::see_other(&page_url(st.public_url.base())),
+        Settled::Refused(m) => refused(&st, &ctx, &m).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
-async fn grant(st: &AppState, ctx: &AdminContext, body: &[u8]) -> Result<(String, serde_json::Value), Refusal> {
-    // Read from the raw body: the tenant field repeats once per tick, and the
-    // console's usual form map keeps only one value per name.
-    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(body).into_owned().collect();
-    let one = |name: &str| {
-        pairs
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.trim())
-            .unwrap_or_default()
-    };
-    // The one role this page grants. A form that names another is asking for a
-    // tenant role, which is granted in the tenant.
-    let role = RoleId::GlobalAdministrator;
-    if !matches!(one(ROLE), "" | "GlobalAdministrator") {
-        return Err(Refusal::Message(
-            "A role inside a tenant is granted from that tenant's Roles tab.".into(),
-        ));
-    }
-    // A user (the default, and what older forms sent) or a group, each of the
-    // root tenant, which is where the role is held.
-    let Some(root) = tenant::root(&st.pool)
-        .await
-        .map_err(|_| Refusal::Message("The root tenant could not be looked up.".into()))?
-    else {
-        return Err(Refusal::Message("There is no root tenant.".into()));
-    };
-    let lookup_failed = |_| Refusal::Message("That could not be looked up.".to_string());
-    let (principal_type, principal_id, home) = match PrincipalType::parse(one(PRINCIPAL_TYPE)) {
-        None | Some(PrincipalType::User) => {
-            let typed = one(ACCOUNT);
-            if typed.is_empty() {
-                return Err(Refusal::Message("Enter a user name.".into()));
-            }
-            // The part before the @ is completed with the root tenant's domain;
-            // a full name is taken as typed, and its domain decides its tenant.
-            let account = if typed.contains('@') {
-                typed.to_string()
-            } else {
-                let domain = tenant::domains(&st.pool, &root.id)
-                    .await
-                    .map_err(lookup_failed)?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
-                format!("{typed}@{domain}")
-            };
-            let (_, domain) = account.rsplit_once('@').unwrap_or_default();
-            let home = tenant::resolve(&st.pool, domain).await.map_err(lookup_failed)?;
-            let user = match &home {
-                Some(t) => crate::users::find_by_upn(&st.pool, &t.id, &account)
-                    .await
-                    .map_err(lookup_failed)?,
-                None => None,
-            };
-            let Some(user) = user else {
-                return Err(Refusal::Message(format!("There is no account named '{account}'.")));
-            };
-            (PrincipalType::User, user.id, home)
-        }
-        Some(PrincipalType::Group) => {
-            let name = one(GROUP_NAME);
-            if name.is_empty() {
-                return Err(Refusal::Message("Enter a group name.".into()));
-            }
-            let Some(id) = crate::groups::find(&st.pool, &root.id, name)
-                .await
-                .map_err(lookup_failed)?
-            else {
-                return Err(Refusal::Message(format!(
-                    "There is no group named '{name}' in {}.",
-                    root.name
-                )));
-            };
-            (PrincipalType::Group, id, Some(root.clone()))
-        }
-        Some(PrincipalType::ServicePrincipal) => {
-            return Err(Refusal::Message("Choose a user or a group.".into()));
-        }
-    };
+/// Refused when the form names a role other than Global Administrator.
+const TENANT_ROLE_ELSEWHERE: &str = "A role inside a tenant is granted from that tenant's Roles tab.";
 
-    // Where the role applies follows from the role and the account's tenant.
-    let Some(scope) = home.as_ref().and_then(|t| role.scope_held_by(&t.id, t.is_root)) else {
-        return Err(Refusal::Message(bindings::ScopeRefused::GlobalOutsideRoot.to_string()));
-    };
-    // A binding write is authorized against the *target* scope, so no principal
-    // can grant reach it does not already hold.
-    if !authz::may_write_binding(ctx.bindings(), &scope) {
-        return Err(Refusal::Forbidden);
-    }
-
-    let id = bindings::create(&st.pool, principal_type, &principal_id, role, &scope, &ctx.user.id)
-        .await
-        .map_err(|e| Refusal::Message(e.to_string()))?;
-    Ok((
-        id,
-        json!({
-            "role": role.as_str(),
-            "scopeKind": scope.kind().as_str(),
-            "principalType": principal_type.as_str(),
-            "principalId": principal_id,
-        }),
-    ))
+async fn refused(st: &AppState, ctx: &AdminContext, message: &str) -> Response {
+    render(st, ctx, Some(message), StatusCode::BAD_REQUEST).await
 }

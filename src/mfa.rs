@@ -18,9 +18,10 @@
 use anyhow::bail;
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
+use sqlx::Connection;
 
 use crate::apps::ServicePrincipal;
-use crate::db::DbPool;
+use crate::db::Handle;
 use crate::tenant::Tenant;
 use crate::util::{new_guid, now, random_bytes, random_string, sha256_hex};
 
@@ -143,11 +144,16 @@ impl Purpose {
     }
 }
 
-pub async fn policy(pool: &DbPool, user_id: &str) -> anyhow::Result<MfaPolicy> {
+pub async fn policy<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<MfaPolicy> {
+    let mut conn = db.acquire().await?;
+    policy_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn policy_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<MfaPolicy> {
     let row: Option<(Option<String>,)> =
-        sqlx::query_as(crate::db::q(pool, "SELECT mfa_policy FROM users WHERE id = ?"))
+        sqlx::query_as(crate::db::qc(&conn, "SELECT mfa_policy FROM users WHERE id = ?"))
             .bind(user_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     Ok(row
         .and_then(|(p,)| p)
@@ -155,35 +161,65 @@ pub async fn policy(pool: &DbPool, user_id: &str) -> anyhow::Result<MfaPolicy> {
         .unwrap_or(MfaPolicy::Default))
 }
 
-pub async fn set_policy(pool: &DbPool, tenant_id: &str, user_id: &str, policy: MfaPolicy) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::q(
-        pool,
+pub async fn set_policy<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    user_id: &str,
+    policy: MfaPolicy,
+) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    set_policy_in(&mut conn, tenant_id, user_id, policy).await
+}
+
+pub(crate) async fn set_policy_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    user_id: &str,
+    policy: MfaPolicy,
+) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE users SET mfa_policy = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
     .bind(policy.stored())
     .bind(now())
     .bind(user_id)
     .bind(tenant_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
 
 /// When the user set their authenticator up, if they have.
-pub async fn enrolled_at(pool: &DbPool, user_id: &str) -> anyhow::Result<Option<i64>> {
-    let row: Option<(i64,)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn enrolled_at<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<Option<i64>> {
+    let mut conn = db.acquire().await?;
+    enrolled_at_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn enrolled_at_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT enrolled_at FROM user_totp WHERE user_id = ?",
     ))
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.map(|(at,)| at))
 }
 
 /// Whether MFA is required of this user here. `tenant` is the user's own.
-pub async fn required(pool: &DbPool, tenant: &Tenant, user_id: &str, at: At<'_>) -> anyhow::Result<bool> {
-    let base = match policy(pool, user_id).await? {
+pub async fn required<'c>(db: impl Handle<'c>, tenant: &Tenant, user_id: &str, at: At<'_>) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    required_in(&mut conn, tenant, user_id, at).await
+}
+
+pub(crate) async fn required_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    user_id: &str,
+    at: At<'_>,
+) -> anyhow::Result<bool> {
+    let base = match policy_in(&mut *conn, user_id).await? {
         MfaPolicy::Required => true,
         MfaPolicy::NotRequired => false,
         MfaPolicy::Default => tenant.settings.require_mfa,
@@ -197,11 +233,21 @@ pub async fn required(pool: &DbPool, tenant: &Tenant, user_id: &str, at: At<'_>)
 }
 
 /// What this user's sign-in needs after the password, here.
-pub async fn step(pool: &DbPool, tenant: &Tenant, user_id: &str, at: At<'_>) -> anyhow::Result<Step> {
-    if enrolled_at(pool, user_id).await?.is_some() {
+pub async fn step<'c>(db: impl Handle<'c>, tenant: &Tenant, user_id: &str, at: At<'_>) -> anyhow::Result<Step> {
+    let mut conn = db.acquire().await?;
+    step_in(&mut conn, tenant, user_id, at).await
+}
+
+pub(crate) async fn step_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    user_id: &str,
+    at: At<'_>,
+) -> anyhow::Result<Step> {
+    if enrolled_at_in(&mut *conn, user_id).await?.is_some() {
         return Ok(Step::Verify);
     }
-    Ok(if required(pool, tenant, user_id, at).await? {
+    Ok(if required_in(&mut *conn, tenant, user_id, at).await? {
         Step::Enroll
     } else {
         Step::Done
@@ -323,13 +369,13 @@ pub fn verify_new(secret: &str, code: &str) -> bool {
 /// Check an authenticator code for an enrolled user. A code is accepted once:
 /// the step it matched is recorded, and a code for that step or an earlier one
 /// is refused afterwards, so a code seen over someone's shoulder is spent.
-async fn verify_totp(pool: &DbPool, user_id: &str, code: &str) -> anyhow::Result<bool> {
-    let row: Option<(String, i64)> = sqlx::query_as(crate::db::q(
-        pool,
+async fn verify_totp_in(conn: &mut crate::db::Conn, user_id: &str, code: &str) -> anyhow::Result<bool> {
+    let row: Option<(String, i64)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT secret, last_step FROM user_totp WHERE user_id = ?",
     ))
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((secret, last_step)) = row else {
         return Ok(false);
@@ -341,14 +387,14 @@ async fn verify_totp(pool: &DbPool, user_id: &str, code: &str) -> anyhow::Result
         return Ok(false);
     }
     // Conditional, so two posts of the same code race to one success.
-    let done = sqlx::query(crate::db::q(
-        pool,
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE user_totp SET last_step = ? WHERE user_id = ? AND last_step < ?",
     ))
     .bind(step)
     .bind(user_id)
     .bind(step)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() == 1)
 }
@@ -400,38 +446,51 @@ async fn insert_recovery_codes(
 }
 
 /// Spend a recovery code. Each works once.
-async fn use_recovery_code(pool: &DbPool, user_id: &str, code: &str) -> anyhow::Result<bool> {
+async fn use_recovery_code_in(conn: &mut crate::db::Conn, user_id: &str, code: &str) -> anyhow::Result<bool> {
     if normalise_recovery(code).len() != RECOVERY_GROUP * 2 {
         return Ok(false);
     }
-    let done = sqlx::query(crate::db::q(
-        pool,
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE user_recovery_codes SET used_at = ? WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
     ))
     .bind(now())
     .bind(user_id)
     .bind(recovery_hash(code))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
 
 /// How many unused recovery codes a user has left.
-pub async fn recovery_codes_left(pool: &DbPool, user_id: &str) -> anyhow::Result<i64> {
-    let (n,): (i64,) = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn recovery_codes_left<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<i64> {
+    let mut conn = db.acquire().await?;
+    recovery_codes_left_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn recovery_codes_left_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT COUNT(*) FROM user_recovery_codes WHERE user_id = ? AND used_at IS NULL",
     ))
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(n)
 }
 
 /// A new set of recovery codes, replacing all the old ones. Shown once.
-pub async fn replace_recovery_codes(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<String>> {
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+pub async fn replace_recovery_codes<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut conn = db.acquire().await?;
+    replace_recovery_codes_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn replace_recovery_codes_in(
+    conn: &mut crate::db::Conn,
+    user_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     let codes = insert_recovery_codes(&mut tx, engine, user_id).await?;
     tx.commit().await?;
     Ok(codes)
@@ -456,14 +515,19 @@ impl Factor {
 
 /// Check what someone typed at the second step: six digits are an authenticator
 /// code, anything else is tried as a recovery code.
-pub async fn check(pool: &DbPool, user_id: &str, typed: &str) -> anyhow::Result<Option<Factor>> {
+pub async fn check<'c>(db: impl Handle<'c>, user_id: &str, typed: &str) -> anyhow::Result<Option<Factor>> {
+    let mut conn = db.acquire().await?;
+    check_in(&mut conn, user_id, typed).await
+}
+
+pub(crate) async fn check_in(conn: &mut crate::db::Conn, user_id: &str, typed: &str) -> anyhow::Result<Option<Factor>> {
     let digits = typed.trim().replace(' ', "");
     if digits.len() == DIGITS as usize && digits.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(verify_totp(pool, user_id, &digits)
+        return Ok(verify_totp_in(&mut *conn, user_id, &digits)
             .await?
             .then_some(Factor::Authenticator));
     }
-    Ok(use_recovery_code(pool, user_id, typed)
+    Ok(use_recovery_code_in(&mut *conn, user_id, typed)
         .await?
         .then_some(Factor::RecoveryCode))
 }
@@ -472,9 +536,14 @@ pub async fn check(pool: &DbPool, user_id: &str, typed: &str) -> anyhow::Result<
 
 /// Make `secret` the user's authenticator, replacing any other, with a new set
 /// of recovery codes, which are returned to be shown once.
-pub async fn enroll(pool: &DbPool, user_id: &str, secret: &str) -> anyhow::Result<Vec<String>> {
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+pub async fn enroll<'c>(db: impl Handle<'c>, user_id: &str, secret: &str) -> anyhow::Result<Vec<String>> {
+    let mut conn = db.acquire().await?;
+    enroll_in(&mut conn, user_id, secret).await
+}
+
+pub(crate) async fn enroll_in(conn: &mut crate::db::Conn, user_id: &str, secret: &str) -> anyhow::Result<Vec<String>> {
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_totp WHERE user_id = ?"))
         .bind(user_id)
         .execute(&mut *tx)
@@ -498,20 +567,25 @@ pub async fn enroll(pool: &DbPool, user_id: &str, secret: &str) -> anyhow::Resul
 /// An administrator's reset: the authenticator and every recovery code go, and
 /// so do the user's sessions and refresh tokens, so nothing signed in with the
 /// old authenticator keeps working. `false` when there was nothing to reset.
-pub async fn reset(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
-    let in_tenant: Option<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn reset<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    reset_in(&mut conn, tenant_id, user_id).await
+}
+
+pub(crate) async fn reset_in(conn: &mut crate::db::Conn, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let in_tenant: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id FROM users WHERE id = ? AND tenant_id = ?",
     ))
     .bind(user_id)
     .bind(tenant_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     if in_tenant.is_none() {
         bail!("no such account in this tenant");
     }
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     let removed = sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_totp WHERE user_id = ?"))
         .bind(user_id)
         .execute(&mut *tx)
@@ -524,8 +598,8 @@ pub async fn reset(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Res
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    crate::users::end_sessions_in(&mut tx, user_id).await?;
     tx.commit().await?;
-    crate::users::end_sessions(pool, user_id).await?;
     Ok(removed > 0)
 }
 
@@ -542,16 +616,30 @@ pub struct Pending {
 
 /// Start a second step for a user whose password was right (or whose session
 /// already stands). Returns the ticket for the page's form.
-pub async fn begin(pool: &DbPool, tenant_id: &str, user_id: &str, purpose: Purpose) -> anyhow::Result<String> {
+pub async fn begin<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    user_id: &str,
+    purpose: Purpose,
+) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    begin_in(&mut conn, tenant_id, user_id, purpose).await
+}
+
+pub(crate) async fn begin_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    user_id: &str,
+    purpose: Purpose,
+) -> anyhow::Result<String> {
     let ticket = crate::util::b64url(&random_bytes(32));
     let ts = now();
-    sqlx::query(crate::db::q(pool, "DELETE FROM mfa_pending WHERE expires_at < ?"))
+    sqlx::query(crate::db::qc(&conn, "DELETE FROM mfa_pending WHERE expires_at < ?"))
         .bind(ts)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     let secret = (purpose == Purpose::Enroll).then(new_secret);
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(&conn,
         "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at)
          VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
     ))
@@ -562,15 +650,24 @@ pub async fn begin(pool: &DbPool, tenant_id: &str, user_id: &str, purpose: Purpo
     .bind(secret)
     .bind(ts)
     .bind(ts + TICKET_LIFETIME_SECS)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(ticket)
 }
 
 /// The live second step a ticket names, in this tenant.
-pub async fn pending(pool: &DbPool, ticket: &str, tenant_id: &str) -> anyhow::Result<Option<Pending>> {
-    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn pending<'c>(db: impl Handle<'c>, ticket: &str, tenant_id: &str) -> anyhow::Result<Option<Pending>> {
+    let mut conn = db.acquire().await?;
+    pending_in(&mut conn, ticket, tenant_id).await
+}
+
+pub(crate) async fn pending_in(
+    conn: &mut crate::db::Conn,
+    ticket: &str,
+    tenant_id: &str,
+) -> anyhow::Result<Option<Pending>> {
+    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT user_id, tenant_id, purpose, enroll_secret FROM mfa_pending
          WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ?",
     ))
@@ -578,7 +675,7 @@ pub async fn pending(pool: &DbPool, ticket: &str, tenant_id: &str) -> anyhow::Re
     .bind(tenant_id)
     .bind(now())
     .bind(MAX_ATTEMPTS)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.and_then(|(user_id, tenant_id, purpose, enroll_secret)| {
         Some(Pending {
@@ -591,30 +688,40 @@ pub async fn pending(pool: &DbPool, ticket: &str, tenant_id: &str) -> anyhow::Re
 }
 
 /// Count a wrong code. `false` once the ticket has had its last attempt.
-pub async fn failed_attempt(pool: &DbPool, ticket: &str) -> anyhow::Result<bool> {
+pub async fn failed_attempt<'c>(db: impl Handle<'c>, ticket: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    failed_attempt_in(&mut conn, ticket).await
+}
+
+pub(crate) async fn failed_attempt_in(conn: &mut crate::db::Conn, ticket: &str) -> anyhow::Result<bool> {
     let hash = sha256_hex(ticket.as_bytes());
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE mfa_pending SET attempts = attempts + 1 WHERE ticket_hash = ?",
     ))
     .bind(&hash)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    let row: Option<(i64,)> = sqlx::query_as(crate::db::q(
-        pool,
+    let row: Option<(i64,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT attempts FROM mfa_pending WHERE ticket_hash = ?",
     ))
     .bind(&hash)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.is_some_and(|(n,)| n < MAX_ATTEMPTS))
 }
 
 /// The second step is over, one way or the other.
-pub async fn finish(pool: &DbPool, ticket: &str) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(pool, "DELETE FROM mfa_pending WHERE ticket_hash = ?"))
+pub async fn finish<'c>(db: impl Handle<'c>, ticket: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    finish_in(&mut conn, ticket).await
+}
+
+pub(crate) async fn finish_in(conn: &mut crate::db::Conn, ticket: &str) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(&conn, "DELETE FROM mfa_pending WHERE ticket_hash = ?"))
         .bind(sha256_hex(ticket.as_bytes()))
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! Storage for role bindings, and expansion into effective grants.
 
-use crate::db::DbPool;
+use crate::db::Handle;
+use sqlx::Connection;
 use sqlx::Row;
 
 use crate::rbac::{EffectiveBinding, RoleId, Scope, ScopeKind};
@@ -79,8 +80,20 @@ where
 /// what it is for this principal, and anything else is refused here, inside the
 /// transaction that writes the row, so no page, CLI command or future caller can
 /// grant around it.
-pub async fn create(
-    pool: &DbPool,
+pub async fn create<'c>(
+    db: impl Handle<'c>,
+    principal_type: PrincipalType,
+    principal_id: &str,
+    role: RoleId,
+    scope: &Scope,
+    created_by: &str,
+) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    create_in(&mut conn, principal_type, principal_id, role, scope, created_by).await
+}
+
+pub(crate) async fn create_in(
+    conn: &mut crate::db::Conn,
     principal_type: PrincipalType,
     principal_id: &str,
     role: RoleId,
@@ -95,8 +108,8 @@ pub async fn create(
         anyhow::bail!("a service principal cannot hold a console role");
     }
     let id = new_guid();
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     let Some((home, home_is_root)) = home_of(&mut *tx, engine, principal_type, principal_id).await? else {
         anyhow::bail!("no such user or group");
     };
@@ -136,9 +149,14 @@ pub async fn create(
     Ok(id)
 }
 
-pub async fn delete(pool: &DbPool, binding_id: &str) -> anyhow::Result<bool> {
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+pub async fn delete<'c>(db: impl Handle<'c>, binding_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    delete_in(&mut conn, binding_id).await
+}
+
+pub(crate) async fn delete_in(conn: &mut crate::db::Conn, binding_id: &str) -> anyhow::Result<bool> {
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     let admins = crate::admin::lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM role_bindings WHERE id = ?"))
         .bind(binding_id)
@@ -151,18 +169,18 @@ pub async fn delete(pool: &DbPool, binding_id: &str) -> anyhow::Result<bool> {
 
 /// Scope rows join `tenants`, so a binding naming a deleted tenant yields no
 /// tenant ids and therefore grants nothing.
-async fn scope_of(pool: &DbPool, binding_id: &str, kind: ScopeKind) -> anyhow::Result<Scope> {
+async fn scope_of_in(conn: &mut crate::db::Conn, binding_id: &str, kind: ScopeKind) -> anyhow::Result<Scope> {
     match kind {
         ScopeKind::All => Ok(Scope::All),
         ScopeKind::Tenants => {
-            let rows = sqlx::query(crate::db::q(
-                pool,
+            let rows = sqlx::query(crate::db::qc(
+                &conn,
                 "SELECT rbt.tenant_id FROM role_binding_tenants rbt
                  JOIN tenants t ON t.id = rbt.tenant_id
                  WHERE rbt.binding_id = ?",
             ))
             .bind(binding_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
             Ok(Scope::Tenants(rows.iter().map(|r| r.get("tenant_id")).collect()))
         }
@@ -171,9 +189,17 @@ async fn scope_of(pool: &DbPool, binding_id: &str, kind: ScopeKind) -> anyhow::R
 
 /// Every binding held by the user directly or through a group they belong to.
 /// Recomputed on each call: never cache this in a session.
-pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<Vec<EffectiveBinding>> {
-    let rows = sqlx::query(crate::db::q(
-        pool,
+pub async fn effective_for_user<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<Vec<EffectiveBinding>> {
+    let mut conn = db.acquire().await?;
+    effective_for_user_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn effective_for_user_in(
+    conn: &mut crate::db::Conn,
+    user_id: &str,
+) -> anyhow::Result<Vec<EffectiveBinding>> {
+    let rows = sqlx::query(crate::db::qc(
+        &conn,
         "SELECT id, role_id, scope_kind FROM role_bindings
          WHERE (principal_type = ? AND principal_id = ?)
             OR (principal_type = ? AND principal_id IN
@@ -183,13 +209,13 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
     .bind(user_id)
     .bind(PrincipalType::Group.as_str())
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     // The read-side half of the rule `create` enforces, applied with the user's
     // own tenant (a group is always in its members' tenant).
-    let Some((home, home_is_root)) = home_of(pool, crate::db::engine_of(pool), PrincipalType::User, user_id).await?
-    else {
+    let engine = crate::db::engine_of_conn(&conn);
+    let Some((home, home_is_root)) = home_of(&mut *conn, engine, PrincipalType::User, user_id).await? else {
         return Ok(Vec::new());
     };
 
@@ -204,7 +230,7 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
         };
         // A stored scope grants what the role can be held at and nothing more:
         // a row that says otherwise is cut back to that, or grants nothing.
-        let stored = scope_of(pool, &id, kind).await?;
+        let stored = scope_of_in(&mut *conn, &id, kind).await?;
         let Some(held) = role.scope_held_by(&home, home_is_root) else {
             continue;
         };
@@ -220,23 +246,36 @@ pub async fn effective_for_user(pool: &DbPool, user_id: &str) -> anyhow::Result<
     Ok(out)
 }
 
-pub async fn list_all(pool: &DbPool) -> anyhow::Result<Vec<StoredBinding>> {
+pub async fn list_all<'c>(db: impl Handle<'c>) -> anyhow::Result<Vec<StoredBinding>> {
+    let mut conn = db.acquire().await?;
+    list_all_in(&mut conn).await
+}
+
+pub(crate) async fn list_all_in(conn: &mut crate::db::Conn) -> anyhow::Result<Vec<StoredBinding>> {
     // Through `db::q` like every other statement, although this one carries no
     // placeholder today: `tests/sql_routing.rs` only flags calls containing `?`,
     // so an unrouted statement here would stay invisible until someone added a
     // `WHERE` and broke Postgres.
-    let rows = sqlx::query(crate::db::q(
-        pool,
+    let rows = sqlx::query(crate::db::qc(
+        &conn,
         "SELECT id, principal_type, principal_id, role_id, scope_kind FROM role_bindings ORDER BY created_at",
     ))
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
-    hydrate(pool, rows).await
+    hydrate_in(&mut *conn, rows).await
 }
 
-pub async fn list_for_tenant(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<StoredBinding>> {
-    let rows = sqlx::query(crate::db::q(
-        pool,
+pub async fn list_for_tenant<'c>(db: impl Handle<'c>, tenant_id: &str) -> anyhow::Result<Vec<StoredBinding>> {
+    let mut conn = db.acquire().await?;
+    list_for_tenant_in(&mut conn, tenant_id).await
+}
+
+pub(crate) async fn list_for_tenant_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+) -> anyhow::Result<Vec<StoredBinding>> {
+    let rows = sqlx::query(crate::db::qc(
+        &conn,
         "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
          FROM role_bindings b
          LEFT JOIN role_binding_tenants rbt ON rbt.binding_id = b.id
@@ -245,12 +284,12 @@ pub async fn list_for_tenant(pool: &DbPool, tenant_id: &str) -> anyhow::Result<V
     ))
     .bind(ScopeKind::All.as_str())
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
-    hydrate(pool, rows).await
+    hydrate_in(&mut *conn, rows).await
 }
 
-async fn hydrate(pool: &DbPool, rows: Vec<sqlx::any::AnyRow>) -> anyhow::Result<Vec<StoredBinding>> {
+async fn hydrate_in(conn: &mut crate::db::Conn, rows: Vec<sqlx::any::AnyRow>) -> anyhow::Result<Vec<StoredBinding>> {
     let mut out = Vec::new();
     for row in rows {
         let id: String = row.get("id");
@@ -261,7 +300,7 @@ async fn hydrate(pool: &DbPool, rows: Vec<sqlx::any::AnyRow>) -> anyhow::Result<
         ) else {
             continue;
         };
-        let scope = scope_of(pool, &id, kind).await?;
+        let scope = scope_of_in(&mut *conn, &id, kind).await?;
         out.push(StoredBinding {
             id,
             principal_type,

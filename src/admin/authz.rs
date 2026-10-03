@@ -11,7 +11,7 @@
 
 use anyhow::Context;
 
-use crate::db::DbPool;
+use crate::db::Handle;
 use crate::rbac::{Action, EffectiveBinding, Resource, RoleId, Scope, ScopeKind, Verb, allowed, allowed_at_all_scope};
 
 const WRITE_BINDING: Action = Action::new(Resource::RoleBinding, Verb::Write);
@@ -54,13 +54,18 @@ pub enum RefusedReason {
 /// tightening it means joining `users` and `group_members` and deciding what
 /// "reachable" means, which is a product question. Recorded in
 /// `docs/decisions-log.md`.
-pub async fn check_delete(pool: &DbPool, binding_id: &str) -> Result<(), RefusedReason> {
-    let row: Option<(String, String)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn check_delete<'c>(db: impl Handle<'c>, binding_id: &str) -> Result<(), RefusedReason> {
+    let mut conn = db.acquire().await.map_err(|_| RefusedReason::NotPermitted)?;
+    check_delete_in(&mut conn, binding_id).await
+}
+
+pub(crate) async fn check_delete_in(conn: &mut crate::db::Conn, binding_id: &str) -> Result<(), RefusedReason> {
+    let row: Option<(String, String)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT role_id, scope_kind FROM role_bindings WHERE id = ?",
     ))
     .bind(binding_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|_| RefusedReason::NotPermitted)?;
     let Some((role, scope_kind)) = row else {
@@ -71,13 +76,13 @@ pub async fn check_delete(pool: &DbPool, binding_id: &str) -> Result<(), Refused
     if role != RoleId::GlobalAdministrator.as_str() || scope_kind != ScopeKind::All.as_str() {
         return Ok(());
     }
-    let (count,): (i64,) = sqlx::query_as(crate::db::q(
-        pool,
+    let (count,): (i64,) = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT COUNT(*) FROM role_bindings WHERE role_id = ? AND scope_kind = ?",
     ))
     .bind(RoleId::GlobalAdministrator.as_str())
     .bind(ScopeKind::All.as_str())
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|_| RefusedReason::NotPermitted)?;
     if count <= 1 {
@@ -89,15 +94,28 @@ pub async fn check_delete(pool: &DbPool, binding_id: &str) -> Result<(), Refused
 
 /// Delete a binding, having checked both rules. The one entry point a handler
 /// should use, so neither rule can be forgotten at a call site.
-pub async fn delete(pool: &DbPool, actor: &[EffectiveBinding], binding_id: &str) -> Result<(), RefusedReason> {
-    let target = target_scope(pool, binding_id)
+pub async fn delete<'c>(
+    db: impl Handle<'c>,
+    actor: &[EffectiveBinding],
+    binding_id: &str,
+) -> Result<(), RefusedReason> {
+    let mut conn = db.acquire().await.map_err(|_| RefusedReason::NotPermitted)?;
+    delete_in(&mut conn, actor, binding_id).await
+}
+
+pub(crate) async fn delete_in(
+    conn: &mut crate::db::Conn,
+    actor: &[EffectiveBinding],
+    binding_id: &str,
+) -> Result<(), RefusedReason> {
+    let target = target_scope_in(&mut *conn, binding_id)
         .await
         .map_err(|_| RefusedReason::NotPermitted)?;
     if !may_write_binding(actor, &target) {
         return Err(RefusedReason::NotPermitted);
     }
-    check_delete(pool, binding_id).await?;
-    match crate::admin::bindings::delete(pool, binding_id).await {
+    check_delete_in(&mut *conn, binding_id).await?;
+    match crate::admin::bindings::delete_in(&mut *conn, binding_id).await {
         Ok(true) => Ok(()),
         // Gone between the check and the delete: the end state is the one asked
         // for, so this is not an error the caller needs to distinguish.
@@ -112,8 +130,8 @@ pub async fn delete(pool: &DbPool, actor: &[EffectiveBinding], binding_id: &str)
 }
 
 /// The scope of an existing binding, for authorizing a write against it.
-async fn target_scope(pool: &DbPool, binding_id: &str) -> anyhow::Result<Scope> {
-    let all = crate::admin::bindings::list_all(pool).await?;
+async fn target_scope_in(conn: &mut crate::db::Conn, binding_id: &str) -> anyhow::Result<Scope> {
+    let all = crate::admin::bindings::list_all_in(&mut *conn).await?;
     all.into_iter()
         .find(|b| b.id == binding_id)
         .map(|b| b.scope)

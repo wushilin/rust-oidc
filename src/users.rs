@@ -1,7 +1,8 @@
 use crate::admin::lockout;
-use crate::db::DbPool;
+use crate::db::Handle;
 use anyhow::{Context, anyhow, bail};
 use argon2::{Argon2, PasswordHasher};
+use sqlx::Connection;
 
 use crate::tenant::{self, Tenant};
 use crate::util::{new_guid, now};
@@ -23,7 +24,12 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 }
 
 /// Like Entra, a UPN must be `local@domain` where `domain` is verified in the tenant.
-pub async fn validate_upn(pool: &DbPool, tenant: &Tenant, upn: &str) -> anyhow::Result<String> {
+pub async fn validate_upn<'c>(db: impl Handle<'c>, tenant: &Tenant, upn: &str) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    validate_upn_in(&mut conn, tenant, upn).await
+}
+
+pub(crate) async fn validate_upn_in(conn: &mut crate::db::Conn, tenant: &Tenant, upn: &str) -> anyhow::Result<String> {
     let upn = upn.trim();
     let Some((local, domain)) = upn.rsplit_once('@') else {
         bail!("UPN '{upn}' must be in the form user@domain");
@@ -32,24 +38,55 @@ pub async fn validate_upn(pool: &DbPool, tenant: &Tenant, upn: &str) -> anyhow::
         bail!("invalid UPN '{upn}'");
     }
     let domain = tenant::normalize_domain(domain)?;
-    if !tenant::domains(pool, &tenant.id).await?.contains(&domain) {
+    if !tenant::domains_in(&mut *conn, &tenant.id).await?.contains(&domain) {
         bail!("domain '{domain}' is not a verified domain of tenant '{}'", tenant.name);
     }
     Ok(format!("{local}@{domain}"))
 }
 
-pub async fn create(pool: &DbPool, tenant: &Tenant, user: NewUser<'_>) -> anyhow::Result<String> {
-    let upn = validate_upn(pool, tenant, user.upn).await?;
-    if user.password.chars().count() < 8 {
-        bail!("password must be at least 8 characters");
+pub async fn create<'c>(db: impl Handle<'c>, tenant: &Tenant, user: NewUser<'_>) -> anyhow::Result<String> {
+    let password = NewPassword::for_new_account(user.password)?;
+    let mut conn = db.acquire().await?;
+    create_in(&mut conn, tenant, &user.account(), &password).await
+}
+
+/// A new account, without its password: what [`create_in`] stores beside a
+/// [`NewPassword`] prepared before the transaction began.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAccount<'a> {
+    pub upn: &'a str,
+    pub display_name: Option<&'a str>,
+    pub given_name: Option<&'a str>,
+    pub family_name: Option<&'a str>,
+    pub email: Option<&'a str>,
+}
+
+impl<'a> NewUser<'a> {
+    pub fn account(&self) -> NewAccount<'a> {
+        NewAccount {
+            upn: self.upn,
+            display_name: self.display_name,
+            given_name: self.given_name,
+            family_name: self.family_name,
+            email: self.email,
+        }
     }
+}
+
+pub(crate) async fn create_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    user: &NewAccount<'_>,
+    password: &NewPassword,
+) -> anyhow::Result<String> {
+    let upn = validate_upn_in(&mut *conn, tenant, user.upn).await?;
     let id = new_guid();
     let ts = now();
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "INSERT INTO users (id, tenant_id, upn, upn_folded, email, email_verified, display_name, given_name,
-                            family_name, password_hash, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            family_name, password_hash, enabled, must_change_password, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ))
     .bind(&id)
     .bind(&tenant.id)
@@ -60,15 +97,15 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, user: NewUser<'_>) -> anyhow
     .bind(user.display_name)
     .bind(user.given_name)
     .bind(user.family_name)
-    .bind(hash_password(user.password)?)
+    .bind(&password.hash)
     .bind(true)
+    .bind(password.by == PasswordSetBy::AdminTemporary)
     .bind(ts)
     .bind(ts)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    let engine = crate::db::engine_of(pool);
-    let mut conn = pool.acquire().await?;
-    remember_password(&mut conn, engine, &id, &hash_password(user.password)?).await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    remember_password(&mut *conn, engine, &id, &password.hash).await?;
     Ok(id)
 }
 
@@ -90,26 +127,40 @@ pub struct User {
 /// A live account by its object id, whatever its tenant: for an application
 /// that accepts accounts of other tenants, where the account need not be of the
 /// tenant the request came to. What it may do there is [`crate::access`]'s to say.
-pub async fn find_by_id(pool: &DbPool, user_id: &str) -> anyhow::Result<Option<User>> {
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+pub async fn find_by_id<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<Option<User>> {
+    let mut conn = db.acquire().await?;
+    find_by_id_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn find_by_id_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<Option<User>> {
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users WHERE id = ? AND deleted_at IS NULL",
     ))
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?)
 }
 
-pub async fn find(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<Option<User>> {
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+pub async fn find<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str) -> anyhow::Result<Option<User>> {
+    let mut conn = db.acquire().await?;
+    find_in(&mut conn, tenant_id, user_id).await
+}
+
+pub(crate) async fn find_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    user_id: &str,
+) -> anyhow::Result<Option<User>> {
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
     ))
     .bind(tenant_id)
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?)
 }
 
@@ -146,13 +197,38 @@ pub struct AuthTrace {
     pub lockout_triggered: bool,
 }
 
-pub async fn authenticate(pool: &DbPool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<AuthResult> {
-    Ok(authenticate_traced(pool, tenant, upn, password).await?.0)
+pub async fn authenticate<'c>(
+    db: impl Handle<'c>,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<AuthResult> {
+    let mut conn = db.acquire().await?;
+    authenticate_in(&mut conn, tenant, upn, password).await
+}
+
+pub(crate) async fn authenticate_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<AuthResult> {
+    Ok(authenticate_traced_in(&mut *conn, tenant, upn, password).await?.0)
 }
 
 /// [`authenticate`], plus the [`AuthTrace`] the audit log needs.
-pub async fn authenticate_traced(
-    pool: &DbPool,
+pub async fn authenticate_traced<'c>(
+    db: impl Handle<'c>,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    let mut conn = db.acquire().await?;
+    authenticate_traced_in(&mut conn, tenant, upn, password).await
+}
+
+pub(crate) async fn authenticate_traced_in(
+    conn: &mut crate::db::Conn,
     tenant: &Tenant,
     upn: &str,
     password: &str,
@@ -167,11 +243,11 @@ pub async fn authenticate_traced(
         locked_until: Option<i64>,
     }
     let row: Option<Row> = sqlx::query_as(
-        crate::db::q(pool, "SELECT id, password_hash, enabled, failed_logins, locked_until FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL"),
+        crate::db::qc(&conn, "SELECT id, password_hash, enabled, failed_logins, locked_until FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL"),
     )
     .bind(&tenant.id)
     .bind(crate::util::fold(upn))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let Some(row) = row else {
@@ -193,14 +269,14 @@ pub async fn authenticate_traced(
     if !ok {
         let failures = row.failed_logins + 1;
         let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
-        sqlx::query(crate::db::q(
-            pool,
+        sqlx::query(crate::db::qc(
+            &conn,
             "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?",
         ))
         .bind(failures)
         .bind(locked_until)
         .bind(&row.id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         trace.lockout_triggered = locked_until.is_some();
         return Ok((AuthResult::InvalidCredentials, trace));
@@ -208,14 +284,16 @@ pub async fn authenticate_traced(
     if !row.enabled {
         return Ok((AuthResult::Disabled, trace));
     }
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?",
     ))
     .bind(&row.id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    let user = find(pool, &tenant.id, &row.id).await?.context("user vanished")?;
+    let user = find_in(&mut *conn, &tenant.id, &row.id)
+        .await?
+        .context("user vanished")?;
     Ok((AuthResult::Ok(user), trace))
 }
 
@@ -244,40 +322,96 @@ pub const MAX_PASSWORD_HISTORY: i64 = 24;
 #[error("That password was used recently. Choose one that is not among the last {0} used for this account.")]
 pub struct PasswordReused(pub i64);
 
-/// Set a user's password, held to the tenant's rules for who is setting it.
+/// The fewest characters a password may have.
+pub const MIN_PASSWORD_CHARS: usize = 8;
+
+/// A password checked against the rules and hashed, ready to store.
 ///
-/// Like Entra, any new password revokes the user's refresh tokens and ends their
-/// sessions. A temporary password also marks the account as having to choose
-/// its own at the next sign-in; any other clears that mark.
-pub async fn change_password(
-    pool: &DbPool,
+/// Hashing (and checking a password against the remembered ones) is deliberately
+/// slow, so it happens before a transaction begins: a transaction is given one of
+/// these, never a plain password. The only ways to make one are
+/// [`NewPassword::for_new_account`] and [`prepare_password`], which apply the rules.
+#[derive(Clone)]
+pub struct NewPassword {
+    hash: String,
+    by: PasswordSetBy,
+}
+
+impl std::fmt::Debug for NewPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewPassword")
+            .field("by", &self.by)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NewPassword {
+    /// The first password of an account an administrator is creating: there is
+    /// no history yet. `temporary` makes them choose their own at first sign-in.
+    pub fn for_new_account_as(password: &str, by: PasswordSetBy) -> anyhow::Result<Self> {
+        check_length(password)?;
+        Ok(Self {
+            hash: hash_password(password)?,
+            by,
+        })
+    }
+
+    pub fn for_new_account(password: &str) -> anyhow::Result<Self> {
+        Self::for_new_account_as(password, PasswordSetBy::Admin)
+    }
+
+    pub fn by(&self) -> PasswordSetBy {
+        self.by
+    }
+}
+
+fn check_length(password: &str) -> anyhow::Result<()> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        bail!("password must be at least {MIN_PASSWORD_CHARS} characters");
+    }
+    Ok(())
+}
+
+/// Check a new password for an existing account against the tenant's rules for
+/// who is setting it, and hash it. Run before the transaction that stores it.
+pub async fn prepare_password<'c>(
+    db: impl Handle<'c>,
     tenant: &Tenant,
     user_id: &str,
     password: &str,
     by: PasswordSetBy,
-) -> anyhow::Result<()> {
-    if password.chars().count() < 8 {
-        bail!("password must be at least 8 characters");
-    }
-    let current: Option<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
+) -> anyhow::Result<NewPassword> {
+    let mut conn = db.acquire().await?;
+    prepare_password_in(&mut conn, tenant, user_id, password, by).await
+}
+
+pub(crate) async fn prepare_password_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    user_id: &str,
+    password: &str,
+    by: PasswordSetBy,
+) -> anyhow::Result<NewPassword> {
+    check_length(password)?;
+    let current: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT password_hash FROM users WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
     .bind(user_id)
     .bind(&tenant.id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((current,)) = current else {
         bail!("no such account in this tenant");
     };
     let remembered = tenant.settings.password_history.clamp(0, MAX_PASSWORD_HISTORY);
     if by != PasswordSetBy::AdminTemporary && remembered > 0 {
-        let mut recent: Vec<String> = sqlx::query_as::<_, (String,)>(crate::db::q(
-            pool,
+        let mut recent: Vec<String> = sqlx::query_as::<_, (String,)>(crate::db::qc(
+            &conn,
             "SELECT password_hash FROM password_history WHERE user_id = ? ORDER BY created_at DESC",
         ))
         .bind(user_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?
         .into_iter()
         .map(|(h,)| h)
@@ -291,27 +425,74 @@ pub async fn change_password(
             return Err(PasswordReused(remembered).into());
         }
     }
+    Ok(NewPassword {
+        hash: hash_password(password)?,
+        by,
+    })
+}
 
-    let hash = hash_password(password)?;
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
-    sqlx::query(crate::db::sql_stmt(
+/// Set a user's password, held to the tenant's rules for who is setting it.
+///
+/// Like Entra, any new password revokes the user's refresh tokens and ends their
+/// sessions. A temporary password also marks the account as having to choose
+/// its own at the next sign-in; any other clears that mark.
+pub async fn change_password<'c>(
+    db: impl Handle<'c>,
+    tenant: &Tenant,
+    user_id: &str,
+    password: &str,
+    by: PasswordSetBy,
+) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    change_password_in(&mut conn, tenant, user_id, password, by).await
+}
+
+async fn change_password_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    user_id: &str,
+    password: &str,
+    by: PasswordSetBy,
+) -> anyhow::Result<()> {
+    let password = prepare_password_in(&mut *conn, tenant, user_id, password, by).await?;
+    if !store_password_in(&mut *conn, &tenant.id, user_id, &password).await? {
+        bail!("no such account in this tenant");
+    }
+    Ok(())
+}
+
+/// Store a prepared password: see [`change_password`]. False when the tenant
+/// has no such live account.
+pub(crate) async fn store_password_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    user_id: &str,
+    password: &NewPassword,
+) -> anyhow::Result<bool> {
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
+    let changed = sqlx::query(crate::db::sql_stmt(
         engine,
         "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, must_change_password = ?,
                           updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
-    .bind(&hash)
-    .bind(by == PasswordSetBy::AdminTemporary)
+    .bind(&password.hash)
+    .bind(password.by == PasswordSetBy::AdminTemporary)
     .bind(now())
     .bind(user_id)
+    .bind(tenant_id)
     .execute(&mut *tx)
-    .await?;
-    remember_password(&mut tx, engine, user_id, &hash).await?;
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Ok(false);
+    }
+    remember_password(&mut tx, engine, user_id, &password.hash).await?;
     // As in Entra, a new password revokes the user's refresh tokens and sessions.
     revoke_access(&mut tx, engine, user_id).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Record a password in the user's history, keeping the newest few only.
@@ -348,56 +529,63 @@ async fn remember_password(
 }
 
 /// Whether the user must choose a new password before anything is issued to them.
-pub async fn must_change_password(pool: &DbPool, user_id: &str) -> anyhow::Result<bool> {
-    let row: Option<(crate::db::Flag,)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn must_change_password<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    must_change_password_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn must_change_password_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<bool> {
+    let row: Option<(crate::db::Flag,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT must_change_password FROM users WHERE id = ?",
     ))
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.is_some_and(|(f,)| f.into()))
 }
 
 /// Mark or unmark an account as having to choose its own password at the next
 /// sign-in, without changing the password.
-pub async fn set_must_change_password(pool: &DbPool, user_id: &str, must: bool) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(
-        pool,
+pub async fn set_must_change_password<'c>(db: impl Handle<'c>, user_id: &str, must: bool) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_must_change_password_in(&mut conn, user_id, must).await
+}
+
+pub(crate) async fn set_must_change_password_in(
+    conn: &mut crate::db::Conn,
+    user_id: &str,
+    must: bool,
+) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE users SET must_change_password = ? WHERE id = ?",
     ))
     .bind(must)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// [`change_password`] by an administrator, for an account named by its user
 /// name, as the command line names it.
-pub async fn set_password(pool: &DbPool, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<()> {
-    set_password_as(pool, tenant, upn, password, PasswordSetBy::Admin).await
+pub async fn set_password<'c>(db: impl Handle<'c>, tenant: &Tenant, upn: &str, password: &str) -> anyhow::Result<()> {
+    set_password_as(db, tenant, upn, password, PasswordSetBy::Admin).await
 }
 
-pub async fn set_password_as(
-    pool: &DbPool,
+pub async fn set_password_as<'c>(
+    db: impl Handle<'c>,
     tenant: &Tenant,
     upn: &str,
     password: &str,
     by: PasswordSetBy,
 ) -> anyhow::Result<()> {
-    let user: Option<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
-        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
-    ))
-    .bind(&tenant.id)
-    .bind(crate::util::fold(upn))
-    .fetch_optional(pool)
-    .await?;
-    let Some((id,)) = user else {
+    let mut conn = db.acquire().await?;
+    let Some(user) = find_by_upn_in(&mut conn, &tenant.id, upn).await? else {
         bail!("user '{upn}' not found");
     };
-    change_password(pool, tenant, &id, password, by).await
+    change_password_in(&mut conn, tenant, &user.id, password, by).await
 }
 
 /// Largest page the console will ask for, so a tenant with many users cannot
@@ -413,8 +601,19 @@ pub const LIST_LIMIT: i64 = 200;
 /// case-sensitive on SQLite and Postgres and case-insensitive under MySQL's
 /// default collation; display names are not identities, so the difference is
 /// cosmetic. `%` and `_` in the search term are wildcards.
-pub async fn list(
-    pool: &DbPool,
+pub async fn list<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    query: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<User>> {
+    let mut conn = db.acquire().await?;
+    list_in(&mut conn, tenant_id, query, limit, offset).await
+}
+
+pub(crate) async fn list_in(
+    conn: &mut crate::db::Conn,
     tenant_id: &str,
     query: Option<&str>,
     limit: i64,
@@ -424,8 +623,8 @@ pub async fn list(
         Some(q) => format!("%{q}%"),
         None => "%".to_string(),
     };
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users
          WHERE tenant_id = ? AND deleted_at IS NULL
@@ -437,7 +636,7 @@ pub async fn list(
     .bind(&pattern)
     .bind(limit.clamp(1, LIST_LIMIT))
     .bind(offset.max(0))
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?)
 }
 
@@ -454,14 +653,24 @@ pub struct UserAttributes<'a> {
 /// Overwrite a user's profile attributes. `false` when no such live user exists
 /// **in that tenant**: `tenant_id` is in the `WHERE`, so a handler cannot be
 /// talked into editing another tenant's user by guessing an id.
-pub async fn update_attributes(
-    pool: &DbPool,
+pub async fn update_attributes<'c>(
+    db: impl Handle<'c>,
     tenant_id: &str,
     user_id: &str,
     attrs: &UserAttributes<'_>,
 ) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::q(
-        pool,
+    let mut conn = db.acquire().await?;
+    update_attributes_in(&mut conn, tenant_id, user_id, attrs).await
+}
+
+pub(crate) async fn update_attributes_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    user_id: &str,
+    attrs: &UserAttributes<'_>,
+) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE users SET display_name = ?, given_name = ?, family_name = ?, email = ?,
                           email_verified = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
@@ -474,7 +683,7 @@ pub async fn update_attributes(
     .bind(now())
     .bind(user_id)
     .bind(tenant_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
@@ -482,9 +691,24 @@ pub async fn update_attributes(
 /// Enable or disable a user. Disabling also ends their browser sessions and
 /// revokes their refresh tokens: leaving those alive would mean a disabled
 /// account kept working until every token expired.
-pub async fn set_enabled(pool: &DbPool, tenant_id: &str, user_id: &str, enabled: bool) -> anyhow::Result<bool> {
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+pub async fn set_enabled<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    user_id: &str,
+    enabled: bool,
+) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    set_enabled_in(&mut conn, tenant_id, user_id, enabled).await
+}
+
+pub(crate) async fn set_enabled_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    user_id: &str,
+    enabled: bool,
+) -> anyhow::Result<bool> {
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
         engine,
@@ -507,10 +731,15 @@ pub async fn set_enabled(pool: &DbPool, tenant_id: &str, user_id: &str, enabled:
 /// Mark a user deleted. Kept rather than removed so audit rows and the `oid` in
 /// already-issued tokens still resolve to something, and so the UPN is not freed
 /// for reuse by a different person.
-pub async fn soft_delete(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
-    let engine = crate::db::engine_of(pool);
+pub async fn soft_delete<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    soft_delete_in(&mut conn, tenant_id, user_id).await
+}
+
+pub(crate) async fn soft_delete_in(conn: &mut crate::db::Conn, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let engine = crate::db::engine_of_conn(&conn);
     let ts = now();
-    let mut tx = pool.begin().await?;
+    let mut tx = conn.begin().await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
         engine,
@@ -533,9 +762,14 @@ pub async fn soft_delete(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyho
 /// Bring a deleted account back, enabled, with the password, groups and roles it
 /// had. The way back from deleting somebody by mistake; `false` when no deleted
 /// account has that name.
-pub async fn restore(pool: &DbPool, tenant_id: &str, upn: &str) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::q(
-        pool,
+pub async fn restore<'c>(db: impl Handle<'c>, tenant_id: &str, upn: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    restore_in(&mut conn, tenant_id, upn).await
+}
+
+pub(crate) async fn restore_in(conn: &mut crate::db::Conn, tenant_id: &str, upn: &str) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE users SET deleted_at = NULL, enabled = ?, updated_at = ?
          WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NOT NULL",
     ))
@@ -543,16 +777,40 @@ pub async fn restore(pool: &DbPool, tenant_id: &str, upn: &str) -> anyhow::Resul
     .bind(now())
     .bind(tenant_id)
     .bind(crate::util::fold(upn))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
 
 /// [`restore`] by object id, as Find by id offers it. `false` when that id is not
 /// a deleted account of this tenant.
-pub async fn restore_id(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::q(
-        pool,
+pub async fn restore_id<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    restore_id_in(&mut conn, tenant_id, user_id).await
+}
+
+/// The id of a deleted account of the tenant, by its user name: the newest, if
+/// the name was deleted more than once.
+pub(crate) async fn deleted_id_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    upn: &str,
+) -> anyhow::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NOT NULL
+         ORDER BY deleted_at DESC",
+    ))
+    .bind(tenant_id)
+    .bind(crate::util::fold(upn))
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+pub(crate) async fn restore_id_in(conn: &mut crate::db::Conn, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE users SET deleted_at = NULL, enabled = ?, updated_at = ?
          WHERE tenant_id = ? AND id = ? AND deleted_at IS NOT NULL",
     ))
@@ -560,16 +818,21 @@ pub async fn restore_id(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow
     .bind(now())
     .bind(tenant_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
 
 /// End every session and refresh token a user holds, as disabling them does,
 /// without changing anything else about the account.
-pub async fn end_sessions(pool: &DbPool, user_id: &str) -> anyhow::Result<()> {
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+pub async fn end_sessions<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    end_sessions_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn end_sessions_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<()> {
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     revoke_access(&mut tx, engine, user_id).await?;
     tx.commit().await?;
     Ok(())
@@ -602,14 +865,23 @@ async fn revoke_access(tx: &mut sqlx::AnyConnection, engine: crate::db::Engine, 
 
 /// A live user by UPN within a tenant. Case-insensitive, through `upn_folded`,
 /// like every other identity lookup.
-pub async fn find_by_upn(pool: &DbPool, tenant_id: &str, upn: &str) -> anyhow::Result<Option<User>> {
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+pub async fn find_by_upn<'c>(db: impl Handle<'c>, tenant_id: &str, upn: &str) -> anyhow::Result<Option<User>> {
+    let mut conn = db.acquire().await?;
+    find_by_upn_in(&mut conn, tenant_id, upn).await
+}
+
+pub(crate) async fn find_by_upn_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    upn: &str,
+) -> anyhow::Result<Option<User>> {
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
     ))
     .bind(tenant_id)
     .bind(crate::util::fold(upn))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?)
 }

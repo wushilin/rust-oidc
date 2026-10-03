@@ -1,7 +1,8 @@
 //! Application registrations and service principals, modelled on Entra ID.
 
-use crate::db::DbPool;
+use crate::db::Handle;
 use anyhow::{Context, bail};
+use sqlx::Connection;
 use sqlx::FromRow;
 
 use crate::directory::PrincipalType;
@@ -52,7 +53,16 @@ pub struct CreatedApp {
 
 /// Register an app in its home tenant: application object, default identifier
 /// URI `api://{appId}` and the home-tenant service principal.
-pub async fn create(pool: &DbPool, tenant: &Tenant, display_name: &str) -> anyhow::Result<CreatedApp> {
+pub async fn create<'c>(db: impl Handle<'c>, tenant: &Tenant, display_name: &str) -> anyhow::Result<CreatedApp> {
+    let mut conn = db.acquire().await?;
+    create_in(&mut conn, tenant, display_name).await
+}
+
+pub(crate) async fn create_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    display_name: &str,
+) -> anyhow::Result<CreatedApp> {
     let application = Application {
         id: new_guid(),
         app_id: new_guid(),
@@ -65,8 +75,8 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, display_name: &str) -> anyho
     let sp_id = new_guid();
     let identifier_uri = format!("api://{}", application.app_id);
     let ts = now();
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
         "INSERT INTO applications (id, app_id, tenant_id, display_name, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -106,95 +116,145 @@ pub async fn create(pool: &DbPool, tenant: &Tenant, display_name: &str) -> anyho
     })
 }
 
-pub async fn find(pool: &DbPool, app_id: &str) -> anyhow::Result<Option<Application>> {
+pub async fn find<'c>(db: impl Handle<'c>, app_id: &str) -> anyhow::Result<Option<Application>> {
+    let mut conn = db.acquire().await?;
+    find_in(&mut conn, app_id).await
+}
+
+pub(crate) async fn find_in(conn: &mut crate::db::Conn, app_id: &str) -> anyhow::Result<Option<Application>> {
     if !is_guid(app_id) {
         return Ok(None);
     }
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
                 allow_access_token_implicit FROM applications
          WHERE app_id = ? AND deleted_at IS NULL",
     ))
     // GUIDs are stored lowercase; fold the probe so `ABC-..` still finds them.
     .bind(crate::util::fold(app_id))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?)
 }
 
-pub async fn find_in_tenant(pool: &DbPool, tenant: &Tenant, app_id: &str) -> anyhow::Result<Application> {
-    match find(pool, app_id).await? {
+pub async fn find_in_tenant<'c>(db: impl Handle<'c>, tenant: &Tenant, app_id: &str) -> anyhow::Result<Application> {
+    let mut conn = db.acquire().await?;
+    find_in_tenant_in(&mut conn, tenant, app_id).await
+}
+
+pub(crate) async fn find_in_tenant_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    app_id: &str,
+) -> anyhow::Result<Application> {
+    match find_in(&mut *conn, app_id).await? {
         Some(app) if app.tenant_id == tenant.id => Ok(app),
         _ => bail!("application '{app_id}' not found in tenant '{}'", tenant.name),
     }
 }
 
-pub async fn list(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+pub async fn list<'c>(db: impl Handle<'c>, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
+    let mut conn = db.acquire().await?;
+    list_in(&mut conn, tenant_id).await
+}
+
+pub(crate) async fn list_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
                 allow_access_token_implicit FROM applications
          WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
     ))
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?)
 }
 
-pub async fn service_principal(
-    pool: &DbPool,
+pub async fn service_principal<'c>(
+    db: impl Handle<'c>,
     tenant_id: &str,
     app_id: &str,
 ) -> anyhow::Result<Option<ServicePrincipal>> {
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+    let mut conn = db.acquire().await?;
+    service_principal_in(&mut conn, tenant_id, app_id).await
+}
+
+pub(crate) async fn service_principal_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    app_id: &str,
+) -> anyhow::Result<Option<ServicePrincipal>> {
+    Ok(sqlx::query_as(crate::db::qc(&conn,
         "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required, mfa_required, accept_other_tenants FROM service_principals
          WHERE tenant_id = ? AND app_id = ?",
     ))
     .bind(tenant_id)
     .bind(crate::util::fold(app_id))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?)
 }
 
-pub async fn add_identifier_uri(pool: &DbPool, app: &Application, uri: &str) -> anyhow::Result<()> {
+pub async fn add_identifier_uri<'c>(db: impl Handle<'c>, app: &Application, uri: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    add_identifier_uri_in(&mut conn, app, uri).await
+}
+
+pub(crate) async fn add_identifier_uri_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    uri: &str,
+) -> anyhow::Result<()> {
     url::Url::parse(uri).with_context(|| format!("identifier URI '{uri}' is not a valid URI"))?;
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "INSERT INTO app_identifier_uris (application_id, tenant_id, uri) VALUES (?, ?, ?)",
     ))
     .bind(&app.id)
     .bind(&app.tenant_id)
     .bind(uri)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .with_context(|| format!("identifier URI '{uri}' is already used in this tenant"))?;
     Ok(())
 }
 
-pub async fn identifier_uris(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn identifier_uris<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Result<Vec<String>> {
+    let mut conn = db.acquire().await?;
+    identifier_uris_in(&mut conn, app).await
+}
+
+pub(crate) async fn identifier_uris_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT uri FROM app_identifier_uris WHERE application_id = ? ORDER BY uri",
     ))
     .bind(&app.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows.into_iter().map(|(u,)| u).collect())
 }
 
 /// Resolve a resource named in a scope (`api://...` or a bare appId) to the
 /// resource's service principal in `tenant_id`.
-pub async fn resolve_resource(
-    pool: &DbPool,
+pub async fn resolve_resource<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    resource: &str,
+) -> anyhow::Result<Option<(Application, ServicePrincipal)>> {
+    let mut conn = db.acquire().await?;
+    resolve_resource_in(&mut conn, tenant_id, resource).await
+}
+
+pub(crate) async fn resolve_resource_in(
+    conn: &mut crate::db::Conn,
     tenant_id: &str,
     resource: &str,
 ) -> anyhow::Result<Option<(Application, ServicePrincipal)>> {
     let app: Option<Application> = if is_guid(resource) {
-        find(pool, resource).await?
+        find_in(&mut *conn, resource).await?
     } else {
-        sqlx::query_as(crate::db::q(
-            pool,
+        sqlx::query_as(crate::db::qc(
+            &conn,
             "SELECT a.id, a.app_id, a.tenant_id, a.display_name, a.allow_password_grant,
                     a.allow_id_token_implicit, a.allow_access_token_implicit FROM applications a
              JOIN app_identifier_uris u ON u.application_id = a.id
@@ -202,11 +262,11 @@ pub async fn resolve_resource(
         ))
         .bind(tenant_id)
         .bind(resource)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?
     };
     let Some(app) = app else { return Ok(None) };
-    let sp = service_principal(pool, tenant_id, &app.app_id).await?;
+    let sp = service_principal_in(&mut *conn, tenant_id, &app.app_id).await?;
     Ok(sp.map(|sp| (app, sp)))
 }
 
@@ -218,8 +278,18 @@ pub struct NewSecret {
     pub end_at: i64,
 }
 
-pub async fn add_secret(
-    pool: &DbPool,
+pub async fn add_secret<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+    display_name: Option<&str>,
+    valid_days: i64,
+) -> anyhow::Result<NewSecret> {
+    let mut conn = db.acquire().await?;
+    add_secret_in(&mut conn, app, display_name, valid_days).await
+}
+
+pub(crate) async fn add_secret_in(
+    conn: &mut crate::db::Conn,
     app: &Application,
     display_name: Option<&str>,
     valid_days: i64,
@@ -232,7 +302,7 @@ pub async fn add_secret(
     let ts = now();
     let end_at = ts + valid_days * 86_400;
     sqlx::query(
-        crate::db::q(pool, "INSERT INTO app_secrets (key_id, application_id, display_name, hint, secret_hash, start_at, end_at, created_at)
+        crate::db::qc(&conn, "INSERT INTO app_secrets (key_id, application_id, display_name, hint, secret_hash, start_at, end_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
     )
     .bind(&key_id)
@@ -243,19 +313,28 @@ pub async fn add_secret(
     .bind(ts)
     .bind(end_at)
     .bind(ts)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(NewSecret { key_id, secret, end_at })
 }
 
-pub async fn remove_secret(pool: &DbPool, app: &Application, key_id: &str) -> anyhow::Result<()> {
-    let res = sqlx::query(crate::db::q(
-        pool,
+pub async fn remove_secret<'c>(db: impl Handle<'c>, app: &Application, key_id: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    remove_secret_in(&mut conn, app, key_id).await
+}
+
+pub(crate) async fn remove_secret_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    key_id: &str,
+) -> anyhow::Result<()> {
+    let res = sqlx::query(crate::db::qc(
+        &conn,
         "DELETE FROM app_secrets WHERE application_id = ? AND key_id = ?",
     ))
     .bind(&app.id)
     .bind(key_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     if res.rows_affected() == 0 {
         bail!("secret '{key_id}' not found");
@@ -270,13 +349,22 @@ pub enum SecretCheck {
     Invalid,
 }
 
-pub async fn verify_secret(pool: &DbPool, app: &Application, secret: &str) -> anyhow::Result<SecretCheck> {
-    let rows: Vec<(String, i64, i64)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn verify_secret<'c>(db: impl Handle<'c>, app: &Application, secret: &str) -> anyhow::Result<SecretCheck> {
+    let mut conn = db.acquire().await?;
+    verify_secret_in(&mut conn, app, secret).await
+}
+
+pub(crate) async fn verify_secret_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    secret: &str,
+) -> anyhow::Result<SecretCheck> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT secret_hash, start_at, end_at FROM app_secrets WHERE application_id = ?",
     ))
     .bind(&app.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     let presented = sha256_hex(secret.as_bytes());
     let ts = now();
@@ -411,8 +499,20 @@ impl RedirectPlatform {
     }
 }
 
-pub async fn add_role(
-    pool: &DbPool,
+pub async fn add_role<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+    value: &str,
+    display_name: &str,
+    description: Option<&str>,
+    member_types: &[MemberType],
+) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    add_role_in(&mut conn, app, value, display_name, description, member_types).await
+}
+
+pub(crate) async fn add_role_in(
+    conn: &mut crate::db::Conn,
     app: &Application,
     value: &str,
     display_name: &str,
@@ -426,8 +526,8 @@ pub async fn add_role(
         bail!("allowed member types must be User and/or Application");
     }
     let id = new_guid();
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "INSERT INTO app_roles (id, application_id, value, display_name, description, allowed_member_types, enabled)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     ))
@@ -440,7 +540,7 @@ pub async fn add_role(
         &member_types.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
     )?)
     .bind(true)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .with_context(|| format!("app role '{value}' already exists"))?;
     Ok(id)
@@ -462,14 +562,19 @@ impl AppRole {
     }
 }
 
-pub async fn roles(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<AppRole>> {
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+pub async fn roles<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Result<Vec<AppRole>> {
+    let mut conn = db.acquire().await?;
+    roles_in(&mut conn, app).await
+}
+
+pub(crate) async fn roles_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<AppRole>> {
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, value, display_name, allowed_member_types, enabled FROM app_roles
          WHERE application_id = ? ORDER BY value",
     ))
     .bind(&app.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?)
 }
 
@@ -494,11 +599,11 @@ struct Resolved {
 /// The tenant a name's domain belongs to, when it is a tenant other than
 /// `tenant`. A user is named by user name, so its domain says its tenant; a
 /// group of another tenant is named `name@domain`, the same way.
-async fn other_tenant_of(pool: &DbPool, tenant: &Tenant, name: &str) -> anyhow::Result<Option<Tenant>> {
+async fn other_tenant_of_in(conn: &mut crate::db::Conn, tenant: &Tenant, name: &str) -> anyhow::Result<Option<Tenant>> {
     let Some((_, domain)) = name.rsplit_once('@') else {
         return Ok(None);
     };
-    Ok(crate::tenant::resolve(pool, domain)
+    Ok(crate::tenant::resolve_in(&mut *conn, domain)
         .await?
         .filter(|t| t.id != tenant.id))
 }
@@ -506,10 +611,14 @@ async fn other_tenant_of(pool: &DbPool, tenant: &Tenant, name: &str) -> anyhow::
 /// Resolve a principal named for an assignment in `tenant`. A user or group of
 /// another tenant is found in its own tenant; whether it may be assigned is
 /// [`admit`]'s to say. A client application is always of this tenant.
-async fn resolve_principal(pool: &DbPool, tenant: &Tenant, principal: &Principal) -> anyhow::Result<Resolved> {
+async fn resolve_principal_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    principal: &Principal,
+) -> anyhow::Result<Resolved> {
     Ok(match principal {
         Principal::App(app_id) => {
-            let sp = service_principal(pool, &tenant.id, app_id)
+            let sp = service_principal_in(&mut *conn, &tenant.id, app_id)
                 .await?
                 .with_context(|| format!("app '{app_id}' not found in tenant '{}'", tenant.name))?;
             Resolved {
@@ -520,16 +629,16 @@ async fn resolve_principal(pool: &DbPool, tenant: &Tenant, principal: &Principal
             }
         }
         Principal::User(upn) => {
-            let home = other_tenant_of(pool, tenant, upn)
+            let home = other_tenant_of_in(&mut *conn, tenant, upn)
                 .await?
                 .unwrap_or_else(|| tenant.clone());
-            let row: Option<(String,)> = sqlx::query_as(crate::db::q(
-                pool,
+            let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
+                &conn,
                 "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
             ))
             .bind(&home.id)
             .bind(crate::util::fold(upn))
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
             let (id,) = row.with_context(|| format!("user '{upn}' not found"))?;
             Resolved {
@@ -543,20 +652,20 @@ async fn resolve_principal(pool: &DbPool, tenant: &Tenant, principal: &Principal
             // `name@domain` names a group of the tenant owning the domain; a
             // plain name, or one whose suffix is no other tenant's, is this
             // tenant's.
-            let (home, group_name) = match other_tenant_of(pool, tenant, name).await? {
+            let (home, group_name) = match other_tenant_of_in(&mut *conn, tenant, name).await? {
                 Some(other) => {
                     let (local, _) = name.rsplit_once('@').expect("has a domain");
                     (other, local.to_string())
                 }
                 None => (tenant.clone(), name.to_string()),
             };
-            let row: Option<(String,)> = sqlx::query_as(crate::db::q(
-                pool,
+            let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
+                &conn,
                 "SELECT id FROM user_groups WHERE tenant_id = ? AND name_folded = ?",
             ))
             .bind(&home.id)
             .bind(crate::util::fold(&group_name))
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
             let (id,) = row.with_context(|| format!("group '{name}' not found"))?;
             Resolved {
@@ -602,9 +711,14 @@ fn admit(sp: &ServicePrincipal, resource: &Application, principal: &Resolved) ->
 pub struct OutsideAssignmentsRemain(pub i64);
 
 /// How many users and groups of other tenants are assigned to `sp`.
-pub async fn outside_assignments(pool: &DbPool, sp: &ServicePrincipal) -> anyhow::Result<i64> {
-    let (n,): (i64,) = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn outside_assignments<'c>(db: impl Handle<'c>, sp: &ServicePrincipal) -> anyhow::Result<i64> {
+    let mut conn = db.acquire().await?;
+    outside_assignments_in(&mut conn, sp).await
+}
+
+pub(crate) async fn outside_assignments_in(conn: &mut crate::db::Conn, sp: &ServicePrincipal) -> anyhow::Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT COUNT(*) FROM app_assignments a
          LEFT JOIN users u ON a.principal_type = ? AND u.id = a.principal_id
          LEFT JOIN user_groups g ON a.principal_type = ? AND g.id = a.principal_id
@@ -614,7 +728,7 @@ pub async fn outside_assignments(pool: &DbPool, sp: &ServicePrincipal) -> anyhow
     .bind(PrincipalType::Group.as_str())
     .bind(&sp.id)
     .bind(&sp.tenant_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(n)
 }
@@ -622,20 +736,33 @@ pub async fn outside_assignments(pool: &DbPool, sp: &ServicePrincipal) -> anyhow
 /// Accept accounts of other tenants, or stop. Stopping is refused while any of
 /// theirs are assigned (the user's rule): the access they would lose has to be
 /// taken away on purpose, assignment by assignment.
-pub async fn set_accept_other_tenants(pool: &DbPool, sp: &ServicePrincipal, accept: bool) -> anyhow::Result<()> {
+pub async fn set_accept_other_tenants<'c>(
+    db: impl Handle<'c>,
+    sp: &ServicePrincipal,
+    accept: bool,
+) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_accept_other_tenants_in(&mut conn, sp, accept).await
+}
+
+pub(crate) async fn set_accept_other_tenants_in(
+    conn: &mut crate::db::Conn,
+    sp: &ServicePrincipal,
+    accept: bool,
+) -> anyhow::Result<()> {
     if !accept && sp.accept_other_tenants {
-        let outside = outside_assignments(pool, sp).await?;
+        let outside = outside_assignments_in(&mut *conn, sp).await?;
         if outside > 0 {
             return Err(OutsideAssignmentsRemain(outside).into());
         }
     }
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE service_principals SET accept_other_tenants = ? WHERE id = ?",
     ))
     .bind(accept)
     .bind(&sp.id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -712,27 +839,38 @@ pub struct Outside {
 /// their roles are changed. Returns the assignment's id.
 ///
 /// One transaction: the assignment and its roles change together or not at all.
-pub async fn assign(
-    pool: &DbPool,
+pub async fn assign<'c>(
+    db: impl Handle<'c>,
     tenant: &Tenant,
     resource: &Application,
     principal: &Principal,
     role_values: &[String],
 ) -> anyhow::Result<String> {
-    let Some(resource_sp) = service_principal(pool, &tenant.id, &resource.app_id).await? else {
+    let mut conn = db.acquire().await?;
+    assign_in(&mut conn, tenant, resource, principal, role_values).await
+}
+
+pub(crate) async fn assign_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    resource: &Application,
+    principal: &Principal,
+    role_values: &[String],
+) -> anyhow::Result<String> {
+    let Some(resource_sp) = service_principal_in(&mut *conn, &tenant.id, &resource.app_id).await? else {
         bail!(
             "app '{}' has no service principal in tenant '{}'",
             resource.app_id,
             tenant.name
         );
     };
-    let resolved = resolve_principal(pool, tenant, principal).await?;
+    let resolved = resolve_principal_in(&mut *conn, tenant, principal).await?;
     if resolved.kind == PrincipalType::ServicePrincipal {
         bail!("only a user or a group is assigned to an application");
     }
     admit(&resource_sp, resource, &resolved)?;
     let (principal_id, principal_type, member_type) = (resolved.id, resolved.kind, resolved.member_type);
-    let defined = roles(pool, resource).await?;
+    let defined = roles_in(&mut *conn, resource).await?;
     let mut picked: Vec<&AppRole> = Vec::new();
     for value in role_values {
         let role = defined
@@ -747,8 +885,8 @@ pub async fn assign(
         }
     }
 
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     let id = ensure_assigned(
         &mut tx,
         engine,
@@ -788,37 +926,50 @@ pub async fn assign(
 }
 
 /// Everyone assigned to `resource` in `tenant_id`, users before groups, by name.
-pub async fn assignments(pool: &DbPool, tenant_id: &str, resource: &Application) -> anyhow::Result<Vec<Assignment>> {
-    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+pub async fn assignments<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    resource: &Application,
+) -> anyhow::Result<Vec<Assignment>> {
+    let mut conn = db.acquire().await?;
+    assignments_in(&mut conn, tenant_id, resource).await
+}
+
+pub(crate) async fn assignments_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    resource: &Application,
+) -> anyhow::Result<Vec<Assignment>> {
+    let Some(sp) = service_principal_in(&mut *conn, tenant_id, &resource.app_id).await? else {
         return Ok(Vec::new());
     };
-    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::q(
-        pool,
+    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, principal_type, principal_id FROM app_assignments WHERE tenant_id = ? AND resource_id = ?",
     ))
     .bind(tenant_id)
     .bind(&sp.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     let mut out = Vec::new();
     for (id, principal_type, principal_id) in rows {
         let Some(principal_type) = PrincipalType::parse(&principal_type) else {
             continue;
         };
-        let held: Vec<(String,)> = sqlx::query_as(crate::db::q(
-            pool,
+        let held: Vec<(String,)> = sqlx::query_as(crate::db::qc(
+            &conn,
             "SELECT r.value FROM app_role_assignments a JOIN app_roles r ON r.id = a.app_role_id
              WHERE a.resource_id = ? AND a.principal_id = ? ORDER BY r.value",
         ))
         .bind(&sp.id)
         .bind(&principal_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
-        let outside = crate::access::outside_principal(pool, tenant_id, principal_type, &principal_id).await?;
+        let outside = crate::access::outside_principal_in(&mut *conn, tenant_id, principal_type, &principal_id).await?;
         out.push(Assignment {
             id,
             principal_type,
-            principal_name: principal_name(pool, principal_type, &principal_id).await,
+            principal_name: principal_name_in(&mut *conn, principal_type, &principal_id).await,
             principal_id,
             roles: held.into_iter().map(|(v,)| v).collect(),
             outside,
@@ -839,17 +990,27 @@ pub async fn assignments(pool: &DbPool, tenant_id: &str, resource: &Application)
 
 /// Withdraw an assignment and the roles that came with it. Scoped by tenant and
 /// by the resource, so an id alone cannot reach another tenant's row.
-pub async fn unassign(
-    pool: &DbPool,
+pub async fn unassign<'c>(
+    db: impl Handle<'c>,
     tenant_id: &str,
     resource: &Application,
     assignment_id: &str,
 ) -> anyhow::Result<bool> {
-    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+    let mut conn = db.acquire().await?;
+    unassign_in(&mut conn, tenant_id, resource, assignment_id).await
+}
+
+pub(crate) async fn unassign_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    resource: &Application,
+    assignment_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(sp) = service_principal_in(&mut *conn, tenant_id, &resource.app_id).await? else {
         return Ok(false);
     };
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     let found: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
         "SELECT principal_id FROM app_assignments WHERE id = ? AND tenant_id = ? AND resource_id = ?",
@@ -877,27 +1038,38 @@ pub async fn unassign(
 }
 
 /// Assign app role `role_value` of `resource` to a principal in the same tenant.
-pub async fn assign_role(
-    pool: &DbPool,
+pub async fn assign_role<'c>(
+    db: impl Handle<'c>,
     tenant: &Tenant,
     resource: &Application,
     role_value: &str,
     principal: &Principal,
 ) -> anyhow::Result<()> {
-    let Some(resource_sp) = service_principal(pool, &tenant.id, &resource.app_id).await? else {
+    let mut conn = db.acquire().await?;
+    assign_role_in(&mut conn, tenant, resource, role_value, principal).await
+}
+
+pub(crate) async fn assign_role_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    resource: &Application,
+    role_value: &str,
+    principal: &Principal,
+) -> anyhow::Result<()> {
+    let Some(resource_sp) = service_principal_in(&mut *conn, &tenant.id, &resource.app_id).await? else {
         bail!(
             "app '{}' has no service principal in tenant '{}'",
             resource.app_id,
             tenant.name
         );
     };
-    let role = roles(pool, resource)
+    let role = roles_in(&mut *conn, resource)
         .await?
         .into_iter()
         .find(|r| r.value == role_value)
         .with_context(|| format!("app '{}' has no role '{role_value}'", resource.display_name))?;
 
-    let resolved = resolve_principal(pool, tenant, principal).await?;
+    let resolved = resolve_principal_in(&mut *conn, tenant, principal).await?;
     admit(&resource_sp, resource, &resolved)?;
     let (principal_id, principal_type, member_type) = (resolved.id, resolved.kind, resolved.member_type);
     if !role.allows(member_type) {
@@ -909,10 +1081,10 @@ pub async fn assign_role(
     // A user or group that holds a role is assigned to the application: the role
     // row never exists without the assignment it belongs to.
     if principal_type != PrincipalType::ServicePrincipal {
-        let mut conn = pool.acquire().await?;
+        let engine = crate::db::engine_of_conn(&conn);
         ensure_assigned(
-            &mut conn,
-            crate::db::engine_of(pool),
+            &mut *conn,
+            engine,
             &tenant.id,
             &resource_sp.id,
             &principal_id,
@@ -922,8 +1094,8 @@ pub async fn assign_role(
     }
     // Re-assigning is a no-op: UNIQUE (resource_id, app_role_id, principal_id).
     crate::db::inserted(
-        sqlx::query(crate::db::q(
-            pool,
+        sqlx::query(crate::db::qc(
+            &conn,
             "INSERT INTO app_role_assignments
                 (id, tenant_id, resource_id, app_role_id, principal_id, principal_type, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -935,7 +1107,7 @@ pub async fn assign_role(
         .bind(&principal_id)
         .bind(principal_type.as_str())
         .bind(now())
-        .execute(pool)
+        .execute(&mut *conn)
         .await,
     )?;
     Ok(())
@@ -951,13 +1123,22 @@ pub struct RoleRef {
 
 /// Role values of `resource_sp` assigned to the client service principal
 /// `client_sp_id` (the `roles` claim of an app-only token).
-pub async fn app_roles_for_service_principal(
-    pool: &DbPool,
+pub async fn app_roles_for_service_principal<'c>(
+    db: impl Handle<'c>,
     resource_sp_id: &str,
     client_sp_id: &str,
 ) -> anyhow::Result<Vec<RoleRef>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::q(
-        pool,
+    let mut conn = db.acquire().await?;
+    app_roles_for_service_principal_in(&mut conn, resource_sp_id, client_sp_id).await
+}
+
+pub(crate) async fn app_roles_for_service_principal_in(
+    conn: &mut crate::db::Conn,
+    resource_sp_id: &str,
+    client_sp_id: &str,
+) -> anyhow::Result<Vec<RoleRef>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT r.value, r.id, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND a.principal_id = ? AND a.principal_type = ?
@@ -968,7 +1149,7 @@ pub async fn app_roles_for_service_principal(
     .bind(client_sp_id)
     .bind(PrincipalType::ServicePrincipal.as_str())
     .bind(true)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows
         .into_iter()
@@ -1004,32 +1185,42 @@ pub fn validate_redirect_uri(platform: RedirectPlatform, uri: &str) -> anyhow::R
     Ok(())
 }
 
-pub async fn add_redirect_uri(
-    pool: &DbPool,
+pub async fn add_redirect_uri<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+    platform: RedirectPlatform,
+    uri: &str,
+) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    add_redirect_uri_in(&mut conn, app, platform, uri).await
+}
+
+pub(crate) async fn add_redirect_uri_in(
+    conn: &mut crate::db::Conn,
     app: &Application,
     platform: RedirectPlatform,
     uri: &str,
 ) -> anyhow::Result<()> {
     validate_redirect_uri(platform, uri)?;
-    let existing: Option<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
+    let existing: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT platform FROM app_redirect_uris WHERE application_id = ? AND uri = ?",
     ))
     .bind(&app.id)
     .bind(uri)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     if let Some((p,)) = existing {
         bail!("redirect URI '{uri}' is already registered for platform {p}");
     }
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "INSERT INTO app_redirect_uris (application_id, platform, uri) VALUES (?, ?, ?)",
     ))
     .bind(&app.id)
     .bind(platform.as_str())
     .bind(uri)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -1043,13 +1234,24 @@ pub async fn add_redirect_uri(
 /// platform would be the unsafe direction, because the rules get weaker from
 /// `web` to `spa` to `publicClient`. `add_redirect_uri` only ever writes a
 /// [`RedirectPlatform`], so this cannot happen from our own writes.
-pub async fn redirect_uris(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<(RedirectPlatform, String)>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn redirect_uris<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+) -> anyhow::Result<Vec<(RedirectPlatform, String)>> {
+    let mut conn = db.acquire().await?;
+    redirect_uris_in(&mut conn, app).await
+}
+
+pub(crate) async fn redirect_uris_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+) -> anyhow::Result<Vec<(RedirectPlatform, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT platform, uri FROM app_redirect_uris WHERE application_id = ? ORDER BY platform, uri",
     ))
     .bind(&app.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows
         .into_iter()
@@ -1083,12 +1285,21 @@ pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
 }
 
 /// The platform of the registered redirect URI matching `requested`, if any.
-pub async fn match_redirect_uri(
-    pool: &DbPool,
+pub async fn match_redirect_uri<'c>(
+    db: impl Handle<'c>,
     app: &Application,
     requested: &str,
 ) -> anyhow::Result<Option<RedirectPlatform>> {
-    Ok(redirect_uris(pool, app)
+    let mut conn = db.acquire().await?;
+    match_redirect_uri_in(&mut conn, app, requested).await
+}
+
+pub(crate) async fn match_redirect_uri_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    requested: &str,
+) -> anyhow::Result<Option<RedirectPlatform>> {
+    Ok(redirect_uris_in(&mut *conn, app)
         .await?
         .into_iter()
         .find(|(_, uri)| redirect_uri_matches(uri, requested))
@@ -1097,8 +1308,19 @@ pub async fn match_redirect_uri(
 
 // ---- delegated permission scopes ----
 
-pub async fn add_scope(
-    pool: &DbPool,
+pub async fn add_scope<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+    value: &str,
+    display_name: &str,
+    consent: ScopeConsent,
+) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    add_scope_in(&mut conn, app, value, display_name, consent).await
+}
+
+pub(crate) async fn add_scope_in(
+    conn: &mut crate::db::Conn,
     app: &Application,
     value: &str,
     display_name: &str,
@@ -1108,8 +1330,8 @@ pub async fn add_scope(
         bail!("invalid scope value '{value}'");
     }
     let id = new_guid();
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "INSERT INTO app_scopes (id, application_id, value, display_name, type, enabled) VALUES (?, ?, ?, ?, ?, ?)",
     ))
     .bind(&id)
@@ -1118,29 +1340,47 @@ pub async fn add_scope(
     .bind(display_name)
     .bind(consent.as_str())
     .bind(true)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .with_context(|| format!("scope '{value}' already exists"))?;
     Ok(id)
 }
 
-pub async fn enabled_scopes(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn enabled_scopes<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Result<Vec<String>> {
+    let mut conn = db.acquire().await?;
+    enabled_scopes_in(&mut conn, app).await
+}
+
+pub(crate) async fn enabled_scopes_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT value FROM app_scopes WHERE application_id = ? AND enabled = ? ORDER BY value",
     ))
     .bind(&app.id)
     .bind(true)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows.into_iter().map(|(v,)| v).collect())
 }
 
 /// Role values of `resource_sp_id` a user holds directly or through group
 /// membership (the `roles` claim of user tokens).
-pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &str) -> anyhow::Result<Vec<RoleRef>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn app_roles_for_user<'c>(
+    db: impl Handle<'c>,
+    resource_sp_id: &str,
+    user_id: &str,
+) -> anyhow::Result<Vec<RoleRef>> {
+    let mut conn = db.acquire().await?;
+    app_roles_for_user_in(&mut conn, resource_sp_id, user_id).await
+}
+
+pub(crate) async fn app_roles_for_user_in(
+    conn: &mut crate::db::Conn,
+    resource_sp_id: &str,
+    user_id: &str,
+) -> anyhow::Result<Vec<RoleRef>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT DISTINCT r.value, r.id, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND r.enabled = ?
@@ -1155,7 +1395,7 @@ pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &s
     .bind(user_id)
     .bind(PrincipalType::Group.as_str())
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows
         .into_iter()
@@ -1166,9 +1406,18 @@ pub async fn app_roles_for_user(pool: &DbPool, resource_sp_id: &str, user_id: &s
 
 /// Whether the user may sign in to an app that requires assignment
 /// (`appRoleAssignmentRequired`), directly or through a group.
-pub async fn user_is_assigned(pool: &DbPool, sp_id: &str, user_id: &str) -> anyhow::Result<bool> {
-    let (n,): (i64,) = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn user_is_assigned<'c>(db: impl Handle<'c>, sp_id: &str, user_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    user_is_assigned_in(&mut conn, sp_id, user_id).await
+}
+
+pub(crate) async fn user_is_assigned_in(
+    conn: &mut crate::db::Conn,
+    sp_id: &str,
+    user_id: &str,
+) -> anyhow::Result<bool> {
+    let (n,): (i64,) = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT COUNT(*) FROM app_assignments
          WHERE resource_id = ?
            AND ((principal_type = ? AND principal_id = ?)
@@ -1180,7 +1429,7 @@ pub async fn user_is_assigned(pool: &DbPool, sp_id: &str, user_id: &str) -> anyh
     .bind(user_id)
     .bind(PrincipalType::Group.as_str())
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(n > 0)
 }
@@ -1196,26 +1445,40 @@ pub fn not_assigned_message(app: &Application) -> String {
 }
 
 /// Require MFA of everyone signing in to this application in its tenant.
-pub async fn set_mfa_required(pool: &DbPool, sp_id: &str, required: bool) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(
-        pool,
+pub async fn set_mfa_required<'c>(db: impl Handle<'c>, sp_id: &str, required: bool) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_mfa_required_in(&mut conn, sp_id, required).await
+}
+
+pub(crate) async fn set_mfa_required_in(conn: &mut crate::db::Conn, sp_id: &str, required: bool) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE service_principals SET mfa_required = ? WHERE id = ?",
     ))
     .bind(required)
     .bind(sp_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
-pub async fn set_assignment_required(pool: &DbPool, sp_id: &str, required: bool) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(
-        pool,
+pub async fn set_assignment_required<'c>(db: impl Handle<'c>, sp_id: &str, required: bool) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_assignment_required_in(&mut conn, sp_id, required).await
+}
+
+pub(crate) async fn set_assignment_required_in(
+    conn: &mut crate::db::Conn,
+    sp_id: &str,
+    required: bool,
+) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE service_principals SET app_role_assignment_required = ? WHERE id = ?",
     ))
     .bind(required)
     .bind(sp_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -1239,34 +1502,57 @@ pub fn normalize_thumbprint(raw: &str) -> String {
 }
 
 /// Allow or forbid the resource owner password grant for this app.
-pub async fn set_password_grant_allowed(pool: &DbPool, app: &Application, allowed: bool) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(
-        pool,
+pub async fn set_password_grant_allowed<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+    allowed: bool,
+) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_password_grant_allowed_in(&mut conn, app, allowed).await
+}
+
+pub(crate) async fn set_password_grant_allowed_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    allowed: bool,
+) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE applications SET allow_password_grant = ? WHERE id = ?",
     ))
     .bind(allowed)
     .bind(&app.id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// Allow or forbid front-channel tokens for this app: Entra's "ID tokens" and
 /// "access tokens" toggles. Both off means `response_type` must be `code`.
-pub async fn set_implicit_allowed(
-    pool: &DbPool,
+pub async fn set_implicit_allowed<'c>(
+    db: impl Handle<'c>,
     app: &Application,
     id_token: bool,
     access_token: bool,
 ) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(
-        pool,
+    let mut conn = db.acquire().await?;
+    set_implicit_allowed_in(&mut conn, app, id_token, access_token).await
+}
+
+pub(crate) async fn set_implicit_allowed_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    id_token: bool,
+    access_token: bool,
+) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        &conn,
         "UPDATE applications SET allow_id_token_implicit = ?, allow_access_token_implicit = ? WHERE id = ?",
     ))
     .bind(id_token)
     .bind(access_token)
     .bind(&app.id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -1339,14 +1625,24 @@ pub fn parse_certificate(pem: &str) -> anyhow::Result<ParsedCertificate> {
 }
 
 /// Register a certificate credential. Returns its thumbprint (`key_id`).
-pub async fn add_key_credential(
-    pool: &DbPool,
+pub async fn add_key_credential<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+    cert_pem: &str,
+    display_name: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    add_key_credential_in(&mut conn, app, cert_pem, display_name).await
+}
+
+pub(crate) async fn add_key_credential_in(
+    conn: &mut crate::db::Conn,
     app: &Application,
     cert_pem: &str,
     display_name: Option<&str>,
 ) -> anyhow::Result<String> {
     let cert = parse_certificate(cert_pem)?;
-    let engine = crate::db::engine_of(pool);
+    let engine = crate::db::engine_of_conn(&conn);
     // UPDATE first, INSERT if nothing matched; a unique violation means a
     // concurrent registration inserted it meanwhile, so go round and UPDATE.
     // (sqlx's MySQL driver sets FOUND_ROWS, so an unchanged row still counts.)
@@ -1365,7 +1661,7 @@ pub async fn add_key_credential(
         .bind(cert.not_after)
         .bind(&app.id)
         .bind(&cert.key_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         if updated.rows_affected() > 0 {
             return Ok(cert.key_id);
@@ -1386,7 +1682,7 @@ pub async fn add_key_credential(
             .bind(now())
             .bind(cert.not_before)
             .bind(cert.not_after)
-            .execute(pool)
+            .execute(&mut *conn)
             .await,
         )?;
         if done {
@@ -1400,25 +1696,42 @@ pub async fn add_key_credential(
     )
 }
 
-pub async fn key_credentials(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<KeyCredential>> {
-    Ok(sqlx::query_as::<_, KeyCredential>(crate::db::q(
-        pool,
+pub async fn key_credentials<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Result<Vec<KeyCredential>> {
+    let mut conn = db.acquire().await?;
+    key_credentials_in(&mut conn, app).await
+}
+
+pub(crate) async fn key_credentials_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+) -> anyhow::Result<Vec<KeyCredential>> {
+    Ok(sqlx::query_as::<_, KeyCredential>(crate::db::qc(
+        &conn,
         "SELECT key_id, display_name, public_n, public_e, not_before, not_after
          FROM app_key_credentials WHERE application_id = ? ORDER BY created_at",
     ))
     .bind(&app.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?)
 }
 
-pub async fn remove_key_credential(pool: &DbPool, app: &Application, key_id: &str) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::q(
-        pool,
+pub async fn remove_key_credential<'c>(db: impl Handle<'c>, app: &Application, key_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    remove_key_credential_in(&mut conn, app, key_id).await
+}
+
+pub(crate) async fn remove_key_credential_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    key_id: &str,
+) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "DELETE FROM app_key_credentials WHERE application_id = ? AND key_id = ?",
     ))
     .bind(&app.id)
     .bind(key_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
@@ -1443,14 +1756,19 @@ impl StoredSecret {
     }
 }
 
-pub async fn secrets(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<StoredSecret>> {
-    Ok(sqlx::query_as(crate::db::q(
-        pool,
+pub async fn secrets<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Result<Vec<StoredSecret>> {
+    let mut conn = db.acquire().await?;
+    secrets_in(&mut conn, app).await
+}
+
+pub(crate) async fn secrets_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<StoredSecret>> {
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT key_id, display_name, hint, start_at, end_at FROM app_secrets
          WHERE application_id = ? ORDER BY created_at",
     ))
     .bind(&app.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?)
 }
 
@@ -1477,14 +1795,19 @@ struct ScopeRow {
     enabled: bool,
 }
 
-pub async fn scopes(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<StoredScope>> {
-    let rows: Vec<ScopeRow> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn scopes<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Result<Vec<StoredScope>> {
+    let mut conn = db.acquire().await?;
+    scopes_in(&mut conn, app).await
+}
+
+pub(crate) async fn scopes_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<StoredScope>> {
+    let rows: Vec<ScopeRow> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, value, display_name, type, enabled FROM app_scopes
          WHERE application_id = ? ORDER BY value",
     ))
     .bind(&app.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows
         .into_iter()
@@ -1500,20 +1823,30 @@ pub async fn scopes(pool: &DbPool, app: &Application) -> anyhow::Result<Vec<Stor
 
 /// Remove a registered redirect URI. `false` when it was not registered under
 /// that platform, so the caller can say so rather than report a silent success.
-pub async fn remove_redirect_uri(
-    pool: &DbPool,
+pub async fn remove_redirect_uri<'c>(
+    db: impl Handle<'c>,
     app: &Application,
     platform: RedirectPlatform,
     uri: &str,
 ) -> anyhow::Result<bool> {
-    let done = sqlx::query(crate::db::q(
-        pool,
+    let mut conn = db.acquire().await?;
+    remove_redirect_uri_in(&mut conn, app, platform, uri).await
+}
+
+pub(crate) async fn remove_redirect_uri_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    platform: RedirectPlatform,
+    uri: &str,
+) -> anyhow::Result<bool> {
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "DELETE FROM app_redirect_uris WHERE application_id = ? AND platform = ? AND uri = ?",
     ))
     .bind(&app.id)
     .bind(platform.as_str())
     .bind(uri)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
@@ -1524,22 +1857,31 @@ pub async fn remove_redirect_uri(
 /// resource, so an application with no identifier URI could no longer be asked
 /// for a token by name. Entra enforces nothing here; we do, because the
 /// alternative is a registration that silently stops working.
-pub async fn remove_identifier_uri(pool: &DbPool, app: &Application, uri: &str) -> anyhow::Result<()> {
-    let registered = identifier_uris(pool, app).await?;
+pub async fn remove_identifier_uri<'c>(db: impl Handle<'c>, app: &Application, uri: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    remove_identifier_uri_in(&mut conn, app, uri).await
+}
+
+pub(crate) async fn remove_identifier_uri_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    uri: &str,
+) -> anyhow::Result<()> {
+    let registered = identifier_uris_in(&mut *conn, app).await?;
     if !registered.iter().any(|u| u == uri) {
         bail!("identifier URI '{uri}' is not registered on this application");
     }
     if registered.len() <= 1 {
         bail!("an application must keep at least one Application ID URI");
     }
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "DELETE FROM app_identifier_uris WHERE application_id = ? AND tenant_id = ? AND uri = ?",
     ))
     .bind(&app.id)
     .bind(&app.tenant_id)
     .bind(uri)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -1557,23 +1899,32 @@ pub struct StoredAssignment {
 }
 
 /// Every app-role assignment on `resource`'s service principal in `tenant_id`.
-pub async fn role_assignments(
-    pool: &DbPool,
+pub async fn role_assignments<'c>(
+    db: impl Handle<'c>,
     tenant_id: &str,
     resource: &Application,
 ) -> anyhow::Result<Vec<StoredAssignment>> {
-    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+    let mut conn = db.acquire().await?;
+    role_assignments_in(&mut conn, tenant_id, resource).await
+}
+
+pub(crate) async fn role_assignments_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    resource: &Application,
+) -> anyhow::Result<Vec<StoredAssignment>> {
+    let Some(sp) = service_principal_in(&mut *conn, tenant_id, &resource.app_id).await? else {
         return Ok(Vec::new());
     };
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(crate::db::q(
-        pool,
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT a.id, r.value, a.principal_type, a.principal_id FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.tenant_id = ? AND a.resource_id = ? ORDER BY r.value",
     ))
     .bind(tenant_id)
     .bind(&sp.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     let mut out = Vec::new();
     for (id, role_value, principal_type, principal_id) in rows {
@@ -1582,7 +1933,7 @@ pub async fn role_assignments(
         let Some(principal_type) = PrincipalType::parse(&principal_type) else {
             continue;
         };
-        let principal_name = principal_name(pool, principal_type, &principal_id).await;
+        let principal_name = principal_name_in(&mut *conn, principal_type, &principal_id).await;
         out.push(StoredAssignment {
             id,
             role_value,
@@ -1595,7 +1946,7 @@ pub async fn role_assignments(
 }
 
 /// The display name behind an assignment's principal id, falling back to the id.
-async fn principal_name(pool: &DbPool, principal_type: PrincipalType, principal_id: &str) -> String {
+async fn principal_name_in(conn: &mut crate::db::Conn, principal_type: PrincipalType, principal_id: &str) -> String {
     let sql = match principal_type {
         PrincipalType::User => "SELECT upn FROM users WHERE id = ? AND deleted_at IS NULL",
         PrincipalType::Group => "SELECT name FROM user_groups WHERE id = ?",
@@ -1605,9 +1956,9 @@ async fn principal_name(pool: &DbPool, principal_type: PrincipalType, principal_
              WHERE sp.id = ? AND a.deleted_at IS NULL"
         }
     };
-    let found: Option<(String,)> = sqlx::query_as(crate::db::q(pool, sql))
+    let found: Option<(String,)> = sqlx::query_as(crate::db::qc(&conn, sql))
         .bind(principal_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .unwrap_or(None);
     found.map(|(n,)| n).unwrap_or_else(|| principal_id.to_string())
@@ -1617,23 +1968,33 @@ async fn principal_name(pool: &DbPool, principal_type: PrincipalType, principal_
 ///
 /// Scoped by tenant *and* by the resource's service principal, so an assignment
 /// id alone cannot reach another tenant's row even if one were guessed.
-pub async fn remove_role_assignment(
-    pool: &DbPool,
+pub async fn remove_role_assignment<'c>(
+    db: impl Handle<'c>,
     tenant_id: &str,
     resource: &Application,
     assignment_id: &str,
 ) -> anyhow::Result<bool> {
-    let Some(sp) = service_principal(pool, tenant_id, &resource.app_id).await? else {
+    let mut conn = db.acquire().await?;
+    remove_role_assignment_in(&mut conn, tenant_id, resource, assignment_id).await
+}
+
+pub(crate) async fn remove_role_assignment_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    resource: &Application,
+    assignment_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(sp) = service_principal_in(&mut *conn, tenant_id, &resource.app_id).await? else {
         return Ok(false);
     };
-    let done = sqlx::query(crate::db::q(
-        pool,
+    let done = sqlx::query(crate::db::qc(
+        &conn,
         "DELETE FROM app_role_assignments WHERE id = ? AND tenant_id = ? AND resource_id = ?",
     ))
     .bind(assignment_id)
     .bind(tenant_id)
     .bind(&sp.id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }

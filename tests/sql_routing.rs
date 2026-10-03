@@ -63,11 +63,14 @@ fn has_token(body: &str, needle: &str, allow_path_before: bool) -> bool {
     })
 }
 
-/// The call goes through `db::sql_stmt`, `db::q`, or an imported bare `q(`/`sql_stmt(`.
+/// The call goes through `db::sql_stmt`, `db::q`, `db::qc` (the same, given a
+/// connection), or an imported bare `q(`/`qc(`/`sql_stmt(`.
 /// A path ending in `::q(` from some other module does not count.
 fn routed(body: &str) -> bool {
     has_token(body, "db::sql_stmt(", true)
         || has_token(body, "db::q(", true)
+        || has_token(body, "db::qc(", true)
+        || has_token(body, "qc(", false)
         || has_token(body, "sql_stmt(", false)
         || has_token(body, "q(", false)
 }

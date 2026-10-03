@@ -16,7 +16,7 @@
 //! the sign-in would not do.
 
 use crate::apps::{self, ServicePrincipal};
-use crate::db::DbPool;
+use crate::db::Handle;
 use crate::directory::PrincipalType;
 use crate::error::{AadError, Aadsts};
 use crate::tenant::{self, Tenant};
@@ -56,42 +56,71 @@ impl CrossTenantPolicy {
     }
 }
 
-pub async fn policy(pool: &DbPool, user_id: &str) -> anyhow::Result<CrossTenantPolicy> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as(crate::db::q(pool, "SELECT cross_tenant_policy FROM users WHERE id = ?"))
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await?;
+pub async fn policy<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<CrossTenantPolicy> {
+    let mut conn = db.acquire().await?;
+    policy_in(&mut conn, user_id).await
+}
+
+pub(crate) async fn policy_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<CrossTenantPolicy> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT cross_tenant_policy FROM users WHERE id = ?",
+    ))
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
     Ok(row
         .and_then(|(p,)| p)
         .and_then(|p| CrossTenantPolicy::parse(&p))
         .unwrap_or(CrossTenantPolicy::Default))
 }
 
-pub async fn set_policy(
-    pool: &DbPool,
+pub async fn set_policy<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    user_id: &str,
+    policy: CrossTenantPolicy,
+) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    set_policy_in(&mut conn, tenant_id, user_id, policy).await
+}
+
+pub(crate) async fn set_policy_in(
+    conn: &mut crate::db::Conn,
     tenant_id: &str,
     user_id: &str,
     policy: CrossTenantPolicy,
 ) -> anyhow::Result<bool> {
     let stored = (policy != CrossTenantPolicy::Default).then_some(policy.as_str());
-    let done = sqlx::query(crate::db::q(
-        pool,
+    let done = sqlx::query(crate::db::qc(&conn,
         "UPDATE users SET cross_tenant_policy = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
     .bind(stored)
     .bind(now())
     .bind(user_id)
     .bind(tenant_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(done.rows_affected() > 0)
 }
 
 /// Whether the account's own tenant lets it sign in to other tenants'
 /// applications, and what decided it.
-pub async fn home_allows(pool: &DbPool, home: &Tenant, user_id: &str) -> anyhow::Result<(bool, CrossTenantPolicy)> {
-    let own = policy(pool, user_id).await?;
+pub async fn home_allows<'c>(
+    db: impl Handle<'c>,
+    home: &Tenant,
+    user_id: &str,
+) -> anyhow::Result<(bool, CrossTenantPolicy)> {
+    let mut conn = db.acquire().await?;
+    home_allows_in(&mut conn, home, user_id).await
+}
+
+pub(crate) async fn home_allows_in(
+    conn: &mut crate::db::Conn,
+    home: &Tenant,
+    user_id: &str,
+) -> anyhow::Result<(bool, CrossTenantPolicy)> {
+    let own = policy_in(&mut *conn, user_id).await?;
     let allowed = match own {
         CrossTenantPolicy::Allow => true,
         CrossTenantPolicy::Disallow => false,
@@ -102,8 +131,13 @@ pub async fn home_allows(pool: &DbPool, home: &Tenant, user_id: &str) -> anyhow:
 
 /// The account's own tenant, if it is live: a disabled tenant's accounts sign in
 /// nowhere.
-pub async fn home_of(pool: &DbPool, user: &User) -> anyhow::Result<Option<Tenant>> {
-    tenant::resolve(pool, &user.tenant_id).await
+pub async fn home_of<'c>(db: impl Handle<'c>, user: &User) -> anyhow::Result<Option<Tenant>> {
+    let mut conn = db.acquire().await?;
+    home_of_in(&mut conn, user).await
+}
+
+pub(crate) async fn home_of_in(conn: &mut crate::db::Conn, user: &User) -> anyhow::Result<Option<Tenant>> {
+    tenant::resolve_in(&mut *conn, &user.tenant_id).await
 }
 
 /// Why a user may not sign in to an application.
@@ -172,16 +206,26 @@ impl Decision {
 
 /// Whether `user` may sign in to the application `sp` of `app_tenant`. The user
 /// is already known to be live and enabled; this is about the application.
-pub async fn decide(
-    pool: &DbPool,
+pub async fn decide<'c>(
+    db: impl Handle<'c>,
+    app_tenant: &Tenant,
+    sp: &ServicePrincipal,
+    user: &User,
+) -> anyhow::Result<Decision> {
+    let mut conn = db.acquire().await?;
+    decide_in(&mut conn, app_tenant, sp, user).await
+}
+
+pub(crate) async fn decide_in(
+    conn: &mut crate::db::Conn,
     app_tenant: &Tenant,
     sp: &ServicePrincipal,
     user: &User,
 ) -> anyhow::Result<Decision> {
     let outsider = user.tenant_id != app_tenant.id;
-    let Some(home) = home_of(pool, user).await? else {
+    let Some(home) = home_of_in(&mut *conn, user).await? else {
         // Their tenant is disabled: refuse, naming it as best we can.
-        let named = tenant::find_for_admin(pool, &user.tenant_id).await?;
+        let named = tenant::find_for_admin_in(&mut *conn, &user.tenant_id).await?;
         return Ok(Decision {
             home: named,
             outsider,
@@ -191,14 +235,14 @@ pub async fn decide(
     let refusal = if outsider {
         if !sp.accept_other_tenants {
             Some(Refusal::OtherTenantsNotAccepted)
-        } else if !apps::user_is_assigned(pool, &sp.id, &user.id).await? {
+        } else if !apps::user_is_assigned_in(&mut *conn, &sp.id, &user.id).await? {
             Some(Refusal::NotAssigned)
-        } else if !home_allows(pool, &home, &user.id).await?.0 {
+        } else if !home_allows_in(&mut *conn, &home, &user.id).await?.0 {
             Some(Refusal::HomeDisallows)
         } else {
             None
         }
-    } else if sp.app_role_assignment_required && !apps::user_is_assigned(pool, &sp.id, &user.id).await? {
+    } else if sp.app_role_assignment_required && !apps::user_is_assigned_in(&mut *conn, &sp.id, &user.id).await? {
         Some(Refusal::NotAssigned)
     } else {
         None
@@ -214,26 +258,47 @@ pub async fn decide(
 /// `app_tenant`: checked in the account's own tenant when the name is of
 /// another tenant and the application accepts other tenants, and in
 /// `app_tenant` otherwise (where a name of another tenant is simply unknown).
-pub async fn authenticate(
-    pool: &DbPool,
+pub async fn authenticate<'c>(
+    db: impl Handle<'c>,
+    app_tenant: &Tenant,
+    sp: Option<&ServicePrincipal>,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    let mut conn = db.acquire().await?;
+    authenticate_in(&mut conn, app_tenant, sp, upn, password).await
+}
+
+pub(crate) async fn authenticate_in(
+    conn: &mut crate::db::Conn,
     app_tenant: &Tenant,
     sp: Option<&ServicePrincipal>,
     upn: &str,
     password: &str,
 ) -> anyhow::Result<(AuthResult, AuthTrace)> {
     let home = match upn.trim().rsplit_once('@') {
-        Some((_, domain)) if sp.is_some_and(|sp| sp.accept_other_tenants) => {
-            tenant::resolve(pool, domain).await?.filter(|t| t.id != app_tenant.id)
-        }
+        Some((_, domain)) if sp.is_some_and(|sp| sp.accept_other_tenants) => tenant::resolve_in(&mut *conn, domain)
+            .await?
+            .filter(|t| t.id != app_tenant.id),
         _ => None,
     };
-    users::authenticate_traced(pool, home.as_ref().unwrap_or(app_tenant), upn, password).await
+    users::authenticate_traced_in(&mut *conn, home.as_ref().unwrap_or(app_tenant), upn, password).await
 }
 
 /// For an assignment's principal: its tenant's name if it is not `tenant_id`'s,
 /// and for a user whether their tenant lets them sign in elsewhere now.
-pub async fn outside_principal(
-    pool: &DbPool,
+pub async fn outside_principal<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    kind: PrincipalType,
+    principal_id: &str,
+) -> anyhow::Result<Option<apps::Outside>> {
+    let mut conn = db.acquire().await?;
+    outside_principal_in(&mut conn, tenant_id, kind, principal_id).await
+}
+
+pub(crate) async fn outside_principal_in(
+    conn: &mut crate::db::Conn,
     tenant_id: &str,
     kind: PrincipalType,
     principal_id: &str,
@@ -243,19 +308,19 @@ pub async fn outside_principal(
         PrincipalType::Group => "SELECT tenant_id FROM user_groups WHERE id = ?",
         PrincipalType::ServicePrincipal => return Ok(None),
     };
-    let row: Option<(String,)> = sqlx::query_as(crate::db::q(pool, sql))
+    let row: Option<(String,)> = sqlx::query_as(crate::db::qc(&conn, sql))
         .bind(principal_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
     let Some((home_id,)) = row.filter(|(t,)| t != tenant_id) else {
         return Ok(None);
     };
-    let home = tenant::find_for_admin(pool, &home_id).await?;
+    let home = tenant::find_for_admin_in(&mut *conn, &home_id).await?;
     let may_sign_in = match kind {
-        PrincipalType::User => home.enabled && home_allows(pool, &home, principal_id).await?.0,
+        PrincipalType::User => home.enabled && home_allows_in(&mut *conn, &home, principal_id).await?.0,
         _ => home.enabled,
     };
-    let domain = tenant::domains(pool, &home.id)
+    let domain = tenant::domains_in(&mut *conn, &home.id)
         .await?
         .into_iter()
         .next()
@@ -349,8 +414,19 @@ fn only(headline: String) -> Report {
 /// About an account of another tenant that this application has not assigned,
 /// it says only that: whether such an account exists is not this tenant's to
 /// learn.
-pub async fn explain(
-    pool: &DbPool,
+pub async fn explain<'c>(
+    db: impl Handle<'c>,
+    app_tenant: &Tenant,
+    sp: &ServicePrincipal,
+    app: &apps::Application,
+    upn: &str,
+) -> anyhow::Result<Report> {
+    let mut conn = db.acquire().await?;
+    explain_in(&mut conn, app_tenant, sp, app, upn).await
+}
+
+pub(crate) async fn explain_in(
+    conn: &mut crate::db::Conn,
     app_tenant: &Tenant,
     sp: &ServicePrincipal,
     app: &apps::Application,
@@ -360,20 +436,20 @@ pub async fn explain(
     let Some((_, domain)) = upn.rsplit_once('@') else {
         return Ok(only("Enter a full user name, with the @ part.".into()));
     };
-    let ours = tenant::domains(pool, &app_tenant.id).await?;
+    let ours = tenant::domains_in(&mut *conn, &app_tenant.id).await?;
     let local = ours.iter().any(|d| crate::util::fold(d) == crate::util::fold(domain));
     // The account's tenant, disabled ones included: its state is reported.
     let home = if local {
         Some(app_tenant.clone())
     } else {
-        tenant::find_for_admin(pool, domain).await.ok()
+        tenant::find_for_admin_in(&mut *conn, domain).await.ok()
     };
     let user = match &home {
-        Some(t) => users::find_by_upn(pool, &t.id, upn).await?,
+        Some(t) => users::find_by_upn_in(&mut *conn, &t.id, upn).await?,
         None => None,
     };
     let assigned = match &user {
-        Some(u) => apps::user_is_assigned(pool, &sp.id, &u.id).await?,
+        Some(u) => apps::user_is_assigned_in(&mut *conn, &sp.id, &u.id).await?,
         None => false,
     };
     if !local && !assigned {
@@ -390,9 +466,9 @@ pub async fn explain(
 
     // ---- the account ----
     let (locked_until,): (Option<i64>,) =
-        sqlx::query_as(crate::db::q(pool, "SELECT locked_until FROM users WHERE id = ?"))
+        sqlx::query_as(crate::db::qc(&conn, "SELECT locked_until FROM users WHERE id = ?"))
             .bind(&user.id)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
     let locked = locked_until.is_some_and(|t| t > now());
     let account = vec![
@@ -419,7 +495,7 @@ pub async fn explain(
             format!("{} accepts only accounts of {}", app.display_name, app_tenant.name),
         ));
     }
-    let via = assignment_paths(pool, sp, &user.id).await?;
+    let via = assignment_paths_in(&mut *conn, sp, &user.id).await?;
     let mut assignment = Vec::new();
     if outsider {
         assignment.push(line(Mark::Note, "An account of another tenant must be assigned"));
@@ -464,7 +540,7 @@ pub async fn explain(
 
     // ---- other tenants ----
     if outsider {
-        let (allowed, own) = home_allows(pool, &home, &user.id).await?;
+        let (allowed, own) = home_allows_in(&mut *conn, &home, &user.id).await?;
         sections.push(Section {
             title: "Signing in from another tenant",
             lines: vec![
@@ -491,10 +567,10 @@ pub async fn explain(
     }
 
     // ---- what sign-in will ask for ----
-    let mfa_policy = crate::mfa::policy(pool, &user.id).await?;
-    let enrolled = crate::mfa::enrolled_at(pool, &user.id).await?.is_some();
-    let step = crate::mfa::step(pool, &home, &user.id, crate::mfa::At::App(sp)).await?;
-    let must_change = users::must_change_password(pool, &user.id).await?;
+    let mfa_policy = crate::mfa::policy_in(&mut *conn, &user.id).await?;
+    let enrolled = crate::mfa::enrolled_at_in(&mut *conn, &user.id).await?.is_some();
+    let step = crate::mfa::step_in(&mut *conn, &home, &user.id, crate::mfa::At::App(sp)).await?;
+    let must_change = users::must_change_password_in(&mut *conn, &user.id).await?;
     let mfa_outcome = match step {
         crate::mfa::Step::Done => line(Mark::Pass, "No second step is asked for"),
         crate::mfa::Step::Verify => line(Mark::Note, "A code from their authenticator is asked for"),
@@ -544,7 +620,7 @@ pub async fn explain(
     });
 
     // ---- the token ----
-    let roles: Vec<String> = apps::app_roles_for_user(pool, &sp.id, &user.id)
+    let roles: Vec<String> = apps::app_roles_for_user_in(&mut *conn, &sp.id, &user.id)
         .await?
         .into_iter()
         .map(|r| r.value)
@@ -566,7 +642,7 @@ pub async fn explain(
             ),
         ));
     } else {
-        let names = crate::groups::names_for_user(pool, &user.id).await?;
+        let names = crate::groups::names_for_user_in(&mut *conn, &user.id).await?;
         token.push(line(
             Mark::Note,
             if names.is_empty() {
@@ -582,7 +658,7 @@ pub async fn explain(
     });
 
     // ---- the verdicts ----
-    let decision = decide(pool, app_tenant, sp, &user).await?;
+    let decision = decide_in(&mut *conn, app_tenant, sp, &user).await?;
     let blocked: Option<String> = if !user.enabled {
         Some("the account is disabled".into())
     } else if locked {
@@ -656,13 +732,13 @@ pub async fn explain(
 
 /// How a user is assigned to `sp`: "directly", or "through group X", each with
 /// the roles that assignment carries.
-async fn assignment_paths(
-    pool: &DbPool,
+async fn assignment_paths_in(
+    conn: &mut crate::db::Conn,
     sp: &ServicePrincipal,
     user_id: &str,
 ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::q(
-        pool,
+    let rows: Vec<(String, String)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT principal_type, principal_id FROM app_assignments
          WHERE resource_id = ? AND ((principal_type = ? AND principal_id = ?)
             OR (principal_type = ? AND principal_id IN (SELECT group_id FROM group_members WHERE user_id = ?)))",
@@ -672,28 +748,28 @@ async fn assignment_paths(
     .bind(user_id)
     .bind(PrincipalType::Group.as_str())
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     let mut out = Vec::new();
     for (kind, principal_id) in rows {
         let how = if kind == PrincipalType::Group.as_str() {
             let name: Option<(String,)> =
-                sqlx::query_as(crate::db::q(pool, "SELECT name FROM user_groups WHERE id = ?"))
+                sqlx::query_as(crate::db::qc(&conn, "SELECT name FROM user_groups WHERE id = ?"))
                     .bind(&principal_id)
-                    .fetch_optional(pool)
+                    .fetch_optional(&mut *conn)
                     .await?;
             format!("through group {}", name.map(|(n,)| n).unwrap_or(principal_id.clone()))
         } else {
             "directly".to_string()
         };
-        let roles: Vec<(String,)> = sqlx::query_as(crate::db::q(
-            pool,
+        let roles: Vec<(String,)> = sqlx::query_as(crate::db::qc(
+            &conn,
             "SELECT r.value FROM app_role_assignments a JOIN app_roles r ON r.id = a.app_role_id
              WHERE a.resource_id = ? AND a.principal_id = ? ORDER BY r.value",
         ))
         .bind(&sp.id)
         .bind(&principal_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         out.push((how, roles.into_iter().map(|(v,)| v).collect()));
     }

@@ -19,6 +19,7 @@ pub mod secrets;
 pub mod server;
 pub mod session;
 pub mod tenant;
+pub mod txn;
 pub mod users;
 pub mod util;
 

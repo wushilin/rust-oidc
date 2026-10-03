@@ -1,7 +1,7 @@
 //! Built-in directory roles. Template ids are Microsoft's well-known GUIDs, so
 //! apps that check the `wids` claim behave the same as against Entra ID.
 
-use crate::db::DbPool;
+use crate::db::Handle;
 
 /// What kind of directory object a principal is: the `principal_type` column of
 /// `app_role_assignments` and of `role_bindings`.
@@ -92,8 +92,17 @@ pub fn find(name_or_id: &str) -> Option<&'static DirectoryRole> {
 
 /// `wids`: the directory roles this user holds in `tenant_id`, derived from role
 /// bindings. Roles without a Microsoft template id (ours alone) are not `wids`.
-pub async fn wids_for_user(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
-    let bindings = crate::admin::bindings::effective_for_user(pool, user_id).await?;
+pub async fn wids_for_user<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut conn = db.acquire().await?;
+    wids_for_user_in(&mut conn, tenant_id, user_id).await
+}
+
+pub(crate) async fn wids_for_user_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    user_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let bindings = crate::admin::bindings::effective_for_user_in(&mut *conn, user_id).await?;
     let mut out: Vec<String> = bindings
         .iter()
         .filter(|b| b.scope.covers(tenant_id))

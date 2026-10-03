@@ -9,7 +9,7 @@
 //!   Graph's appId as audience, and that token is what `/oidc/userinfo` accepts.
 //!   Bare names like `User.Read` are Graph scopes, as in Entra.
 
-use crate::db::DbPool;
+use crate::db::Handle;
 
 use crate::apps::{self, Application, ServicePrincipal};
 use crate::error::{AadError, Aadsts};
@@ -74,7 +74,12 @@ fn invalid_scope(scope: &str) -> AadError {
     )
 }
 
-pub async fn resolve(pool: &DbPool, tenant: &Tenant, scope: &str) -> Result<Grant, AadError> {
+pub async fn resolve<'c>(db: impl Handle<'c>, tenant: &Tenant, scope: &str) -> Result<Grant, AadError> {
+    let mut conn = db.acquire().await?;
+    resolve_in(&mut conn, tenant, scope).await
+}
+
+pub(crate) async fn resolve_in(conn: &mut crate::db::Conn, tenant: &Tenant, scope: &str) -> Result<Grant, AadError> {
     let mut oidc = Vec::new();
     let mut graph_scopes: Vec<String> = Vec::new();
     // (identifier as requested, resolved resource, requested values)
@@ -114,7 +119,7 @@ pub async fn resolve(pool: &DbPool, tenant: &Tenant, scope: &str) -> Result<Gran
             Some((existing, _, _, values)) if existing == resource => values.push(value.to_string()),
             Some(_) => return Err(more_than_one_resource()),
             None => {
-                let (app, sp) = apps::resolve_resource(pool, &tenant.id, resource)
+                let (app, sp) = apps::resolve_resource_in(&mut *conn, &tenant.id, resource)
                     .await?
                     .ok_or_else(|| AadError::resource_not_found(resource, &tenant.name))?;
                 app_resource = Some((resource.to_string(), app, sp, vec![value.to_string()]));
@@ -129,7 +134,7 @@ pub async fn resolve(pool: &DbPool, tenant: &Tenant, scope: &str) -> Result<Gran
     let mut granted: Vec<String> = oidc.iter().map(|s| s.to_string()).collect();
     let (resource, scp) = match app_resource {
         Some((identifier, app, sp, values)) => {
-            let exposed = apps::enabled_scopes(pool, &app).await?;
+            let exposed = apps::enabled_scopes_in(&mut *conn, &app).await?;
             let mut scp = Vec::new();
             for value in values {
                 if value == ".default" {

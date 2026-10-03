@@ -122,20 +122,20 @@ async fn concurrent_certificate_registrations_leave_one_row_with_last_writer_fie
         for r in results {
             r.expect("no registration should fail");
         }
-        assert_eq!(apps::key_credentials(&pool, &app).await.unwrap().len(), 1);
+        assert_eq!(apps::key_credentials(&*pool, &app).await.unwrap().len(), 1);
         // A later registration of the same certificate refreshes it in place.
-        apps::add_key_credential(&pool, &app, &pem, Some("renamed"))
+        apps::add_key_credential(&*pool, &app, &pem, Some("renamed"))
             .await
             .unwrap();
-        let creds = apps::key_credentials(&pool, &app).await.unwrap();
+        let creds = apps::key_credentials(&*pool, &app).await.unwrap();
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].display_name.as_deref(), Some("renamed"));
         // Re-registering with identical arguments changes nothing. MySQL reports 0 affected
         // rows for that unless sqlx sets CLIENT_FOUND_ROWS, which the upsert relies on.
-        apps::add_key_credential(&pool, &app, &pem, Some("renamed"))
+        apps::add_key_credential(&*pool, &app, &pem, Some("renamed"))
             .await
             .expect("no-change re-registration");
-        assert_eq!(apps::key_credentials(&pool, &app).await.unwrap().len(), 1);
+        assert_eq!(apps::key_credentials(&*pool, &app).await.unwrap().len(), 1);
     }
 }
 
@@ -143,7 +143,7 @@ async fn concurrent_certificate_registrations_leave_one_row_with_last_writer_fie
 async fn concurrent_and_repeated_membership_is_idempotent() {
     for pool in common::all_engine_pools().await {
         let (t, _, _) = fixture(&pool).await;
-        groups::create(&pool, &t, "Admins", None).await.unwrap();
+        groups::create(&*pool, &t, "Admins", None).await.unwrap();
         let results = contend(|_| {
             let (p, t) = (pool.clone(), t.clone());
             async move { groups::add_member(&p, &t, "Admins", "alice@contoso.com").await }
@@ -164,10 +164,10 @@ async fn concurrent_and_repeated_membership_is_idempotent() {
 async fn a_non_duplicate_insert_failure_is_not_swallowed() {
     for pool in common::all_engine_pools().await {
         let (t, _, _) = fixture(&pool).await;
-        groups::create(&pool, &t, "Admins", None).await.unwrap();
+        groups::create(&*pool, &t, "Admins", None).await.unwrap();
         // Unknown user: a lookup error, not silently ignored.
         assert!(
-            groups::add_member(&pool, &t, "Admins", "nobody@contoso.com")
+            groups::add_member(&*pool, &t, "Admins", "nobody@contoso.com")
                 .await
                 .is_err()
         );

@@ -386,6 +386,21 @@ impl std::ops::Deref for EnginePool {
     }
 }
 
+/// An `EnginePool` is a database handle like the pool it wraps, so storage
+/// functions taking `impl Handle` accept `&pool` from a multi-engine test.
+impl<'a> sqlx::Acquire<'a> for &'a EnginePool {
+    type Database = sqlx::Any;
+    type Connection = sqlx::pool::PoolConnection<sqlx::Any>;
+
+    fn acquire(self) -> futures::future::BoxFuture<'a, Result<Self::Connection, sqlx::Error>> {
+        <&DbPool as sqlx::Acquire<'a>>::acquire(&self.pool)
+    }
+
+    fn begin(self) -> futures::future::BoxFuture<'a, Result<sqlx::Transaction<'a, sqlx::Any>, sqlx::Error>> {
+        <&DbPool as sqlx::Acquire<'a>>::begin(&self.pool)
+    }
+}
+
 impl Drop for EnginePool {
     fn drop(&mut self) {
         match &self.cleanup {

@@ -8,6 +8,29 @@ use sqlx::pool::PoolConnectionMetadata;
 /// The one place an engine is named. Everything above this module uses `DbPool`.
 pub type Db = sqlx::Any;
 pub type DbPool = sqlx::Pool<Db>;
+/// One connection, possibly inside a transaction.
+pub type Conn = sqlx::AnyConnection;
+
+/// What a storage function takes to reach the database: the pool, for a call on
+/// its own, or an open transaction (`&mut Conn`), for a call that is part of a
+/// larger change. Inside a transaction, a function that begins its own makes a
+/// savepoint, so everything still commits or rolls back together.
+pub trait Handle<'c>: sqlx::Acquire<'c, Database = Db> + Send {}
+impl<'c, T> Handle<'c> for T where T: sqlx::Acquire<'c, Database = Db> + Send {}
+
+/// The engine behind a connection.
+pub fn engine_of_conn(conn: &Conn) -> Engine {
+    match conn.backend_name() {
+        "PostgreSQL" => Engine::Postgres,
+        "MySQL" => Engine::MySql,
+        _ => Engine::Sqlite,
+    }
+}
+
+/// [`q`] for a connection.
+pub fn qc(conn: &Conn, statement: &'static str) -> sqlx::AssertSqlSafe<std::borrow::Cow<'static, str>> {
+    sql_stmt(engine_of_conn(conn), statement)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
@@ -548,6 +571,9 @@ pub enum Event {
     AdminUserMfaReset,
     AdminUserMfaPolicy,
     AdminUserCrossTenantPolicy,
+    /// Which of the tenant's groups an account is in was set from its page: one
+    /// entry, on the account, listing the groups joined and left.
+    AdminUserGroups,
     /// An administrator sent an authorize request from the console's flow tester.
     /// The row records who, against which application, and with what response
     /// type -- never the state, the nonce or the PKCE verifier it generated.
@@ -649,6 +675,7 @@ impl Event {
         Self::AdminUserMfaReset,
         Self::AdminUserMfaPolicy,
         Self::AdminUserCrossTenantPolicy,
+        Self::AdminUserGroups,
         Self::AdminFlowTestStart,
         Self::AdminFlowTestResult,
     ];
@@ -749,6 +776,7 @@ impl Event {
             Self::AdminUserMfaReset => "admin.user.mfa_reset",
             Self::AdminUserMfaPolicy => "admin.user.mfa_policy",
             Self::AdminUserCrossTenantPolicy => "admin.user.cross_tenant_policy",
+            Self::AdminUserGroups => "admin.user.groups",
             Self::AdminFlowTestStart => "admin.flow_test.start",
             Self::AdminFlowTestResult => "admin.flow_test.result",
         }

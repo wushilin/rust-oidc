@@ -1,6 +1,7 @@
-use crate::db::DbPool;
+use crate::db::Handle;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
+use sqlx::Connection;
 use sqlx::FromRow;
 
 use crate::util::{fold, is_guid, new_guid, now};
@@ -143,66 +144,86 @@ impl From<TenantRow> for Tenant {
 
 /// Resolve the `{tenant}` path segment: a tenant GUID or one of its verified
 /// domains. Deleted and disabled tenants do not resolve.
-pub async fn resolve(pool: &DbPool, key: &str) -> anyhow::Result<Option<Tenant>> {
+pub async fn resolve<'c>(db: impl Handle<'c>, key: &str) -> anyhow::Result<Option<Tenant>> {
+    let mut conn = db.acquire().await?;
+    resolve_in(&mut conn, key).await
+}
+
+pub(crate) async fn resolve_in(conn: &mut crate::db::Conn, key: &str) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> = if is_guid(key) {
-        sqlx::query_as(crate::db::q(
-            pool,
+        sqlx::query_as(crate::db::qc(
+            &conn,
             "SELECT id, name, is_root, enabled, settings FROM tenants
              WHERE id = ? AND deleted_at IS NULL AND enabled = ?",
         ))
         .bind(fold(key))
         .bind(true)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?
     } else {
-        sqlx::query_as(crate::db::q(
-            pool,
+        sqlx::query_as(crate::db::qc(
+            &conn,
             "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
              JOIN tenant_domains d ON d.tenant_id = t.id
              WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = ?",
         ))
         .bind(fold(key))
         .bind(true)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?
     };
     Ok(row.map(Tenant::from))
 }
 
-pub async fn root(pool: &DbPool) -> anyhow::Result<Option<Tenant>> {
-    let row: Option<TenantRow> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn root<'c>(db: impl Handle<'c>) -> anyhow::Result<Option<Tenant>> {
+    let mut conn = db.acquire().await?;
+    root_in(&mut conn).await
+}
+
+pub(crate) async fn root_in(conn: &mut crate::db::Conn) -> anyhow::Result<Option<Tenant>> {
+    let row: Option<TenantRow> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = ?",
     ))
     .bind(true)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.map(Tenant::from))
 }
 
-pub async fn list(pool: &DbPool) -> anyhow::Result<Vec<(Tenant, Vec<String>)>> {
+pub async fn list<'c>(db: impl Handle<'c>) -> anyhow::Result<Vec<(Tenant, Vec<String>)>> {
+    let mut conn = db.acquire().await?;
+    list_in(&mut conn).await
+}
+
+pub(crate) async fn list_in(conn: &mut crate::db::Conn) -> anyhow::Result<Vec<(Tenant, Vec<String>)>> {
     let rows: Vec<TenantRow> = sqlx::query_as(
         "SELECT id, name, is_root, enabled, settings FROM tenants
          WHERE deleted_at IS NULL ORDER BY is_root DESC, created_at",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     let mut out = Vec::new();
     for row in rows {
         let t = Tenant::from(row);
-        let domains = domains(pool, &t.id).await?;
+        let domains = domains_in(&mut *conn, &t.id).await?;
         out.push((t, domains));
     }
     Ok(out)
 }
 
-pub async fn domains(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn domains<'c>(db: impl Handle<'c>, tenant_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut conn = db.acquire().await?;
+    domains_in(&mut conn, tenant_id).await
+}
+
+pub(crate) async fn domains_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain",
     ))
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows.into_iter().map(|(d,)| d).collect())
 }
@@ -216,13 +237,28 @@ pub async fn domains(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<Strin
 /// `accepts_others`: the application accepts accounts of other tenants, so a name
 /// of another tenant was checked in that tenant and its failure is an ordinary
 /// wrong name or password.
-pub async fn not_ours_hint(pool: &DbPool, tenant: &Tenant, upn: &str, accepts_others: bool) -> Option<String> {
+pub async fn not_ours_hint<'c>(
+    db: impl Handle<'c>,
+    tenant: &Tenant,
+    upn: &str,
+    accepts_others: bool,
+) -> Option<String> {
+    let mut conn = db.acquire().await.ok()?;
+    not_ours_hint_in(&mut conn, tenant, upn, accepts_others).await
+}
+
+pub(crate) async fn not_ours_hint_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    upn: &str,
+    accepts_others: bool,
+) -> Option<String> {
     let (_, domain) = upn.trim().rsplit_once('@')?;
-    let ours = domains(pool, &tenant.id).await.ok()?;
+    let ours = domains_in(&mut *conn, &tenant.id).await.ok()?;
     if ours.iter().any(|d| fold(d) == fold(domain)) {
         return None;
     }
-    if accepts_others && resolve(pool, domain).await.ok().flatten().is_some() {
+    if accepts_others && resolve_in(&mut *conn, domain).await.ok().flatten().is_some() {
         return None;
     }
     let endings: Vec<String> = ours.iter().map(|d| format!("@{d}")).collect();
@@ -253,12 +289,22 @@ pub fn normalize_domain(domain: &str) -> anyhow::Result<String> {
     Ok(d)
 }
 
-pub async fn create(pool: &DbPool, name: &str, domain: &str, is_root: bool) -> anyhow::Result<Tenant> {
+pub async fn create<'c>(db: impl Handle<'c>, name: &str, domain: &str, is_root: bool) -> anyhow::Result<Tenant> {
+    let mut conn = db.acquire().await?;
+    create_in(&mut conn, name, domain, is_root).await
+}
+
+pub(crate) async fn create_in(
+    conn: &mut crate::db::Conn,
+    name: &str,
+    domain: &str,
+    is_root: bool,
+) -> anyhow::Result<Tenant> {
     let domain = normalize_domain(domain)?;
     let id = new_guid();
     let settings = TenantSettings::default();
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
         "INSERT INTO tenants (id, name, is_root, enabled, settings, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -306,10 +352,19 @@ pub struct DomainChange {
 ///   something else is somebody's real address and is left alone.
 /// - Refused if another tenant holds the domain, or if two accounts would end up
 ///   with the same name (possible only for a tenant that had several domains).
-pub async fn change_domain(pool: &DbPool, tenant_id: &str, new_domain: &str) -> anyhow::Result<DomainChange> {
+pub async fn change_domain<'c>(db: impl Handle<'c>, tenant_id: &str, new_domain: &str) -> anyhow::Result<DomainChange> {
+    let mut conn = db.acquire().await?;
+    change_domain_in(&mut conn, tenant_id, new_domain).await
+}
+
+pub(crate) async fn change_domain_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    new_domain: &str,
+) -> anyhow::Result<DomainChange> {
     let to = normalize_domain(new_domain)?;
-    let engine = crate::db::engine_of(pool);
-    let mut tx = pool.begin().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = conn.begin().await?;
 
     let from: Vec<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
@@ -431,16 +486,21 @@ async fn insert_domain(
 }
 
 /// Resolve a tenant for CLI use; unlike [`resolve`] this also finds disabled tenants.
-pub async fn find_for_admin(pool: &DbPool, key: &str) -> anyhow::Result<Tenant> {
-    let row: Option<TenantRow> = sqlx::query_as(crate::db::q(
-        pool,
+pub async fn find_for_admin<'c>(db: impl Handle<'c>, key: &str) -> anyhow::Result<Tenant> {
+    let mut conn = db.acquire().await?;
+    find_for_admin_in(&mut conn, key).await
+}
+
+pub(crate) async fn find_for_admin_in(conn: &mut crate::db::Conn, key: &str) -> anyhow::Result<Tenant> {
+    let row: Option<TenantRow> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
          WHERE t.deleted_at IS NULL AND (t.id = ?
                OR t.id IN (SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?))",
     ))
     .bind(fold(key))
     .bind(fold(key))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     match row {
         Some(r) => Ok(r.into()),
@@ -454,27 +514,41 @@ pub async fn find_for_admin(pool: &DbPool, key: &str) -> anyhow::Result<Tenant> 
 ///
 /// Validated before it is stored, so a tenant cannot hold a combination the
 /// console would refuse to show.
-pub async fn save_settings(pool: &DbPool, tenant_id: &str, settings: &TenantSettings) -> anyhow::Result<()> {
+pub async fn save_settings<'c>(db: impl Handle<'c>, tenant_id: &str, settings: &TenantSettings) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    save_settings_in(&mut conn, tenant_id, settings).await
+}
+
+pub(crate) async fn save_settings_in(
+    conn: &mut crate::db::Conn,
+    tenant_id: &str,
+    settings: &TenantSettings,
+) -> anyhow::Result<()> {
     settings.validate()?;
-    sqlx::query(crate::db::q(pool, "UPDATE tenants SET settings = ? WHERE id = ?"))
+    sqlx::query(crate::db::qc(&conn, "UPDATE tenants SET settings = ? WHERE id = ?"))
         .bind(serde_json::to_string(settings)?)
         .bind(tenant_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
 /// Rename a tenant. The display name only: the id and the verified domains are
 /// what anything else refers to, so a rename breaks nothing.
-pub async fn set_name(pool: &DbPool, tenant_id: &str, name: &str) -> anyhow::Result<()> {
+pub async fn set_name<'c>(db: impl Handle<'c>, tenant_id: &str, name: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_name_in(&mut conn, tenant_id, name).await
+}
+
+pub(crate) async fn set_name_in(conn: &mut crate::db::Conn, tenant_id: &str, name: &str) -> anyhow::Result<()> {
     let name = name.trim();
     if name.is_empty() {
         bail!("a tenant needs a name");
     }
-    sqlx::query(crate::db::q(pool, "UPDATE tenants SET name = ? WHERE id = ?"))
+    sqlx::query(crate::db::qc(&conn, "UPDATE tenants SET name = ? WHERE id = ?"))
         .bind(name)
         .bind(tenant_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -488,18 +562,23 @@ pub async fn set_name(pool: &DbPool, tenant_id: &str, name: &str) -> anyhow::Res
 /// admin surface is deliberately web-only. So disabling it would lock every
 /// administrator out of the deployment with no path back short of editing the
 /// database by hand. The same shape of rule as `admin::authz::check_delete`.
-pub async fn set_enabled(pool: &DbPool, tenant_id: &str, enabled: bool) -> anyhow::Result<()> {
-    let tenant = find_for_admin(pool, tenant_id).await?;
+pub async fn set_enabled<'c>(db: impl Handle<'c>, tenant_id: &str, enabled: bool) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_enabled_in(&mut conn, tenant_id, enabled).await
+}
+
+pub(crate) async fn set_enabled_in(conn: &mut crate::db::Conn, tenant_id: &str, enabled: bool) -> anyhow::Result<()> {
+    let tenant = find_for_admin_in(&mut *conn, tenant_id).await?;
     if !enabled && tenant.is_root {
         bail!(
             "the root tenant cannot be disabled: it holds the administrators who would \
              have to re-enable it, and nothing outside the database could undo it"
         );
     }
-    sqlx::query(crate::db::q(pool, "UPDATE tenants SET enabled = ? WHERE id = ?"))
+    sqlx::query(crate::db::qc(&conn, "UPDATE tenants SET enabled = ? WHERE id = ?"))
         .bind(enabled)
         .bind(&tenant.id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -515,9 +594,14 @@ pub async fn set_enabled(pool: &DbPool, tenant_id: &str, enabled: bool) -> anyho
 /// - a domain still used by a live account's UPN. Such an account could still be
 ///   authenticated through its own tenant, but the console's sign-in resolves the
 ///   tenant *from the UPN's domain*, so it could no longer sign in there.
-pub async fn remove_domain(pool: &DbPool, tenant_id: &str, domain: &str) -> anyhow::Result<()> {
+pub async fn remove_domain<'c>(db: impl Handle<'c>, tenant_id: &str, domain: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    remove_domain_in(&mut conn, tenant_id, domain).await
+}
+
+pub(crate) async fn remove_domain_in(conn: &mut crate::db::Conn, tenant_id: &str, domain: &str) -> anyhow::Result<()> {
     let domain = normalize_domain(domain)?;
-    let held = domains(pool, tenant_id).await?;
+    let held = domains_in(&mut *conn, tenant_id).await?;
     let Some(stored) = held.iter().find(|d| fold(d) == domain) else {
         bail!("'{domain}' is not a verified domain of this tenant");
     };
@@ -526,24 +610,24 @@ pub async fn remove_domain(pool: &DbPool, tenant_id: &str, domain: &str) -> anyh
     }
     // `normalize_domain` admits only letters, digits, '-' and '.', so the pattern
     // can hold no LIKE wildcard.
-    let (in_use,): (i64,) = sqlx::query_as(crate::db::q(
-        pool,
+    let (in_use,): (i64,) = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT COUNT(*) FROM users WHERE tenant_id = ? AND deleted_at IS NULL AND upn_folded LIKE ?",
     ))
     .bind(tenant_id)
     .bind(format!("%@{domain}"))
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if in_use > 0 {
         bail!("{in_use} account(s) still use '{domain}' in their user name");
     }
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "DELETE FROM tenant_domains WHERE tenant_id = ? AND domain_folded = ?",
     ))
     .bind(tenant_id)
     .bind(fold(stored))
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }

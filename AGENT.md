@@ -33,11 +33,12 @@ being moved to it.*
 8. **Global rules are checked by the engine**, at the end, against the final
    state (for example: someone can still act as Global Administrator). Storage
    functions also enforce their own rules where they write.
-9. **A transaction takes its own locks**, through the context, in the fixed
-   order (named locks, tenant, user, group, application). Taking a lock out of
-   order is a programming error. Every wait has a timeout (5 s); a lock not
-   granted in time aborts the transaction as `Busy`. Locks are released at
-   commit or rollback, on every path.
+9. **A transaction declares its own locks** (`Transaction::locks`); the engine
+   takes every lock of the run or batch before anything runs, sorted in one
+   fixed order (named locks, tenant, user, group, application; then by id), so
+   no two transactions wait on each other in a cycle. Every wait has a timeout
+   (5 s); a lock not granted in time aborts the transaction as `Busy`. Locks
+   are released at commit or rollback, on every path.
 10. **Nothing slow inside a transaction**: password hashing, key generation and
     HTTP calls happen before it begins, and their results are passed in.
 11. **Storage functions take a handle, not a pool**: `impl Handle<'c>`, so the

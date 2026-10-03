@@ -1235,3 +1235,45 @@ front-channel logout notification, then flip both in `src/routes/discovery.rs`.
 predates commit `bc217fa`. I did **not** redeploy (out of scope), so the results are
 evidence about the deployed build only. Recorded at the top of `docs/conformance.md`
 so a future reader does not over-read them.
+
+## Transactions: every change through one engine (`src/txn`)
+
+The design was agreed with the owner (see `TODO.md` and `AGENT.md`). These are the
+choices made while building it that the owner did not make explicitly.
+
+**29. A transaction declares its locks; the engine takes them, sorted, before it
+runs.** The agreed design had each transaction take its own locks as it went, in a
+fixed order. The first batch test showed why that is not enough: in a batch, a later
+transaction may need a lock that sorts before one an earlier transaction already
+holds (enable account B, then disable account A, needs the Administrators lock after
+B's row). So each transaction still names its own locks (`Transaction::locks`), and
+the engine takes every lock of the run or the whole batch up front, sorted by
+`LockTarget`'s derived order (kind, then id) and each once. Two transactions can then
+never wait on each other in a cycle; a lock not granted within 5 s is `Busy`. A
+transaction that names an account by user name (resolved only inside it) locks the
+account's tenant instead. *To reverse:* give `Cx` a `lock` method again and accept
+that batches must be ordered by hand.
+
+**30. Global rules are checked at the end and by the storage layer.** The engine
+checks the last-Global-Administrator rule once, against the final state. The storage
+functions that can remove one still check it themselves, inside their own savepoint,
+so a batch "grant B, then revoke A" works and "revoke A, then grant B" is refused at
+its first step. *To reverse:* drop the per-function checks; the engine's check alone
+then decides.
+
+**31. Passwords are checked and hashed before the transaction**, by
+`users::prepare_password` (length, history, hash) or `NewPassword::for_new_account`.
+Checking against the remembered passwords is outside the transaction too, so two
+changes at the same instant could both pass the history rule; that race is accepted.
+A transaction is only ever given a `NewPassword`, never a plain password.
+
+**32. Setting a user's groups on their page writes one audit row**,
+`admin.user.groups`, on the account, listing the groups joined and left: one change,
+one row. It used to write one `admin.group.member.add`/`remove` row per group. Adding
+several user names to a group from the group's page is still one transaction (and one
+row) per name, as with every bulk button.
+
+**33. The command line's audit rows use the console's event names.** A CLI change is
+the same transaction as the console's, so it records the same event (`admin.user.create`
+rather than `user.create`), with actor `cli`. The old CLI names stay in `Event` so old
+rows still read back.

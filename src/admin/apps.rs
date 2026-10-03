@@ -15,23 +15,26 @@
 //! exists in that response and nowhere else. It is never written to `audit_log`
 //! (the row carries the key id) and never re-rendered into a later page.
 
+use crate::AppState;
+use crate::admin::context::{AdminContext, On};
+use crate::admin::routes::{At, Params, Settled, TenantTab, checked, chrome, field, optional, parse_form, settle};
+use crate::admin::view::{self, e};
+use crate::admin::{APP_READ, APP_ROTATE, APP_WRITE, ASSIGNMENT_READ, ASSIGNMENT_WRITE};
+use crate::apps::{self, Application, MemberType, Principal, RedirectPlatform, ScopeConsent};
+use crate::directory::PrincipalType;
+use crate::rbac::Action;
+use crate::tenant::Tenant;
+use crate::txn::ops::apps::{
+    AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
+    GrantAppRole, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri, RemoveRedirectUri, RevokeAppRole,
+    SaveAppFlags, UnassignApp,
+};
+use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
+use crate::util::now;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
-
-use crate::AppState;
-use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, TenantTab, audited, checked, chrome, field, optional, parse_form};
-use crate::admin::view::{self, e};
-use crate::admin::{APP_READ, APP_ROTATE, APP_WRITE, ASSIGNMENT_READ, ASSIGNMENT_WRITE};
-use crate::apps::{self, Application, MemberType, Principal, RedirectPlatform, ScopeConsent};
-use crate::db::Event;
-use crate::directory::PrincipalType;
-use crate::rbac::Action;
-use crate::tenant::Tenant;
-use crate::util::now;
 
 /// What a post to an application's page asks for.
 ///
@@ -208,23 +211,27 @@ impl AppOp {
         }
     }
 
-    fn event(self) -> Event {
+    /// The transaction it runs, for the test that the page asks for the same
+    /// action the transaction needs.
+    #[cfg(test)]
+    fn kind(self) -> crate::txn::TxnKind {
+        use crate::txn::TxnKind;
         match self {
-            Self::Flags => Event::AdminAppFlags,
-            Self::SecretAdd => Event::AdminAppSecretAdd,
-            Self::SecretRemove => Event::AdminAppSecretRemove,
-            Self::CertificateAdd => Event::AdminAppKeyAdd,
-            Self::CertificateRemove => Event::AdminAppKeyRemove,
-            Self::RedirectUriAdd => Event::AdminAppRedirectUriAdd,
-            Self::RedirectUriRemove => Event::AdminAppRedirectUriRemove,
-            Self::IdentifierUriAdd => Event::AdminAppIdentifierUriAdd,
-            Self::IdentifierUriRemove => Event::AdminAppIdentifierUriRemove,
-            Self::ScopeAdd => Event::AdminAppScopeAdd,
-            Self::RoleAdd => Event::AdminAppRoleAdd,
-            Self::Assign => Event::AdminAppAssign,
-            Self::Unassign => Event::AdminAppUnassign,
-            Self::RoleAssign => Event::AdminAppRoleAssign,
-            Self::RoleUnassign => Event::AdminAppRoleUnassign,
+            Self::Flags => TxnKind::SaveAppFlags,
+            Self::SecretAdd => TxnKind::AddAppSecret,
+            Self::SecretRemove => TxnKind::RemoveAppSecret,
+            Self::CertificateAdd => TxnKind::AddAppCertificate,
+            Self::CertificateRemove => TxnKind::RemoveAppCertificate,
+            Self::RedirectUriAdd => TxnKind::AddRedirectUri,
+            Self::RedirectUriRemove => TxnKind::RemoveRedirectUri,
+            Self::IdentifierUriAdd => TxnKind::AddIdentifierUri,
+            Self::IdentifierUriRemove => TxnKind::RemoveIdentifierUri,
+            Self::ScopeAdd => TxnKind::AddAppScope,
+            Self::RoleAdd => TxnKind::AddAppRole,
+            Self::Assign => TxnKind::AssignApp,
+            Self::Unassign => TxnKind::UnassignApp,
+            Self::RoleAssign => TxnKind::GrantAppRole,
+            Self::RoleUnassign => TxnKind::RevokeAppRole,
         }
     }
 }
@@ -371,31 +378,14 @@ pub async fn create_app(
     let Some(tenant) = ctx.tenant(&key) else {
         return view::not_found();
     };
-    let name = field(&form, NAME);
-    if name.is_empty() {
-        return list(
-            &st,
-            &ctx,
-            tenant,
-            Some("An application needs a display name."),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-    }
-    match apps::create(&st.pool, tenant, name).await {
-        Ok(created) => {
-            audited(
-                &st,
-                &ctx,
-                &tenant.id,
-                Event::AdminAppCreate,
-                Some(&created.application.app_id),
-                json!({ "displayName": crate::routes::audit::clip(name) }),
-            )
-            .await;
-            view::see_other(&app_url(st.public_url.base(), tenant, &created.application))
-        }
-        Err(err) => list(&st, &ctx, tenant, Some(&err.to_string()), StatusCode::BAD_REQUEST).await,
+    let create = CreateApp {
+        tenant_id: tenant.id.clone(),
+        display_name: field(&form, NAME).to_string(),
+    };
+    match settle(txn::run(&st.pool, &ctx.actor(), &create).await) {
+        Settled::Done(app) => view::see_other(&app_url(st.public_url.base(), tenant, &app)),
+        Settled::Refused(message) => list(&st, &ctx, tenant, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
@@ -1411,18 +1401,13 @@ when they call this one with their own credentials.</p>
 
 // ---- writes ----
 
-/// What one operation did, for the audit row and for what to render next.
-struct Outcome {
-    details: serde_json::Value,
+/// What a completed operation leaves to render.
+enum Applied {
+    /// Back to the section, `303`.
+    Redirect,
     /// A value that must be shown exactly once, so the response is the page
     /// itself rather than a redirect to it.
-    reveal: Option<String>,
-}
-
-impl Outcome {
-    fn plain(details: serde_json::Value) -> Self {
-        Self { details, reveal: None }
-    }
+    Reveal(String),
 }
 
 pub async fn detail_post(
@@ -1457,158 +1442,188 @@ pub async fn detail_post(
         .map(|(_, v)| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .collect();
-    match apply(&st, tenant, &app, op, &form, &ticked).await {
-        Ok(outcome) => {
-            audited(&st, &ctx, &tenant.id, op.event(), Some(&app.app_id), outcome.details).await;
-            match &outcome.reveal {
-                // The one deliberate exception to "303 after a post": the value
-                // lives in this response and nowhere else.
-                Some(secret) => {
-                    let page = Page {
-                        reveal: Some(secret),
-                        ..Page::default()
-                    };
-                    // Re-read the application: the flags may have changed.
-                    let app = apps::find_in_tenant(&st.pool, tenant, &app_key).await.unwrap_or(app);
-                    detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::OK).await
-                }
-                None => view::see_other(&section_url(st.public_url.base(), tenant, &app, op.section())),
-            }
+    match settle(apply(&st, &ctx, tenant, &app, op, &form, ticked).await) {
+        Settled::Done(Applied::Redirect) => {
+            view::see_other(&section_url(st.public_url.base(), tenant, &app, op.section()))
         }
-        Err(err) => {
-            let message = err.to_string();
+        // The one deliberate exception to "303 after a post": the value lives in
+        // this response and nowhere else.
+        Settled::Done(Applied::Reveal(secret)) => {
+            let page = Page {
+                reveal: Some(&secret),
+                ..Page::default()
+            };
+            detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::OK).await
+        }
+        Settled::Refused(message) => {
             let page = Page {
                 error: Some(&message),
                 ..Page::default()
             };
             detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::BAD_REQUEST).await
         }
+        Settled::Respond(resp) => resp,
     }
 }
 
-/// Carry out one operation. Every branch calls into [`crate::apps`]; nothing
-/// about an application is decided here.
+/// A form that cannot become a transaction: refused before one begins.
+fn invalid(message: &str) -> Outcome<Applied> {
+    Outcome::Refused(Refusal::Invalid(message.to_string()))
+}
+
+/// Run one transaction; a completed one goes back to its section.
+async fn redirect<T: Transaction>(st: &AppState, actor: &Actor, t: &T) -> Outcome<Applied> {
+    match txn::run(&st.pool, actor, t).await {
+        Outcome::Done(_) => Outcome::Done(Applied::Redirect),
+        Outcome::Refused(r) => Outcome::Refused(r),
+        Outcome::Failed(m) => Outcome::Failed(m),
+    }
+}
+
+/// Carry out one operation as the signed-in administrator: one transaction,
+/// which checks, changes and records it, or does none of that. Only reading the
+/// form happens here; every rule about an application is in [`crate::apps`].
 async fn apply(
     st: &AppState,
+    ctx: &AdminContext,
     tenant: &Tenant,
     app: &Application,
     op: AppOp,
     form: &Params,
-    ticked: &[String],
-) -> anyhow::Result<Outcome> {
+    ticked: Vec<String>,
+) -> Outcome<Applied> {
+    let actor = ctx.actor();
+    let (tenant_id, app_id) = (tenant.id.clone(), app.app_id.clone());
+    let text = |name: &str| field(form, name).to_string();
+    let maybe = |name: &str| optional(form, name).map(str::to_string);
     match op {
         AppOp::Flags => {
-            // Refused (and nothing saved) while other tenants' accounts are assigned.
-            if !checked(form, ACCEPT_OTHER_TENANTS)
-                && let Some(sp) = apps::service_principal(&st.pool, &tenant.id, &app.app_id).await?
-                && sp.accept_other_tenants
-            {
-                let outside = apps::outside_assignments(&st.pool, &sp).await?;
-                if outside > 0 {
-                    return Err(apps::OutsideAssignmentsRemain(outside).into());
-                }
-            }
-            let password = checked(form, ALLOW_PASSWORD_GRANT);
-            let id_token = checked(form, ALLOW_ID_TOKEN);
-            let access_token = checked(form, ALLOW_ACCESS_TOKEN);
-            apps::set_password_grant_allowed(&st.pool, app, password).await?;
-            apps::set_implicit_allowed(&st.pool, app, id_token, access_token).await?;
-            let mfa = checked(form, REQUIRE_MFA);
-            let others = checked(form, ACCEPT_OTHER_TENANTS);
-            if let Some(sp) = apps::service_principal(&st.pool, &tenant.id, &app.app_id).await? {
-                apps::set_mfa_required(&st.pool, &sp.id, mfa).await?;
-                apps::set_accept_other_tenants(&st.pool, &sp, others).await?;
-            }
-            Ok(Outcome::plain(json!({
-                "acceptOtherTenants": others,
-                "requireMfa": mfa,
-                "allowPasswordGrant": password,
-                "allowIdTokenImplicit": id_token,
-                "allowAccessTokenImplicit": access_token,
-            })))
+            // Every switch in one transaction: a refusal (stopping accepting
+            // other tenants while theirs are assigned) saves none of them.
+            let t = SaveAppFlags {
+                tenant_id,
+                app_id,
+                accept_other_tenants: checked(form, ACCEPT_OTHER_TENANTS),
+                mfa_required: checked(form, REQUIRE_MFA),
+                allow_password_grant: checked(form, ALLOW_PASSWORD_GRANT),
+                allow_id_token_implicit: checked(form, ALLOW_ID_TOKEN),
+                allow_access_token_implicit: checked(form, ALLOW_ACCESS_TOKEN),
+            };
+            redirect(st, &actor, &t).await
         }
         AppOp::SecretAdd => {
-            let days = parse_days(field(form, DAYS))?;
-            let created = apps::add_secret(&st.pool, app, optional(form, NAME), days).await?;
-            // The key id and the expiry, never the value and never a prefix of it.
-            Ok(Outcome {
-                details: json!({ "keyId": created.key_id, "endsAt": created.end_at }),
-                reveal: Some(created.secret),
-            })
+            let valid_days = match parse_days(field(form, DAYS)) {
+                Ok(d) => d,
+                Err(err) => return invalid(&err.to_string()),
+            };
+            // Made before the transaction: nothing slow inside one.
+            let t = AddAppSecret {
+                tenant_id,
+                app_id,
+                secret: apps::PreparedSecret::generate(),
+                valid_days,
+                display_name: maybe(NAME),
+            };
+            match txn::run(&st.pool, &actor, &t).await {
+                Outcome::Done(created) => Outcome::Done(Applied::Reveal(created.secret)),
+                Outcome::Refused(r) => Outcome::Refused(r),
+                Outcome::Failed(m) => Outcome::Failed(m),
+            }
         }
         AppOp::SecretRemove => {
-            let key_id = field(form, KEY_ID);
-            apps::remove_secret(&st.pool, app, key_id).await?;
-            Ok(Outcome::plain(json!({ "keyId": key_id })))
+            let key_id = text(KEY_ID);
+            redirect(
+                st,
+                &actor,
+                &RemoveAppSecret {
+                    tenant_id,
+                    app_id,
+                    key_id,
+                },
+            )
+            .await
         }
         AppOp::CertificateAdd => {
-            let pem = field(form, CERT);
-            // The same refusal the CLI makes: a pasted key pair would store the
-            // private key in `cert_der` and the administrator would never know.
-            if pem.contains("PRIVATE KEY") {
-                anyhow::bail!("that is a private key; paste only the certificate");
-            }
-            let key_id = apps::add_key_credential(&st.pool, app, pem, optional(form, NAME)).await?;
-            Ok(Outcome::plain(json!({ "keyId": key_id })))
+            let t = AddAppCertificate {
+                tenant_id,
+                app_id,
+                certificate_pem: text(CERT),
+                display_name: maybe(NAME),
+            };
+            redirect(st, &actor, &t).await
         }
         AppOp::CertificateRemove => {
-            let key_id = field(form, KEY_ID);
-            if !apps::remove_key_credential(&st.pool, app, key_id).await? {
-                anyhow::bail!("no certificate with that thumbprint is registered");
-            }
-            Ok(Outcome::plain(json!({ "keyId": key_id })))
+            let key_id = text(KEY_ID);
+            redirect(
+                st,
+                &actor,
+                &RemoveAppCertificate {
+                    tenant_id,
+                    app_id,
+                    key_id,
+                },
+            )
+            .await
         }
-        AppOp::RedirectUriAdd => {
-            let (platform, uri) = (parse_platform(form)?, field(form, URI));
-            apps::add_redirect_uri(&st.pool, app, platform, uri).await?;
-            Ok(Outcome::plain(
-                json!({ "platform": platform.as_str(), "uri": crate::routes::audit::clip(uri) }),
-            ))
-        }
-        AppOp::RedirectUriRemove => {
-            let (platform, uri) = (parse_platform(form)?, field(form, URI));
-            if !apps::remove_redirect_uri(&st.pool, app, platform, uri).await? {
-                anyhow::bail!("that redirect URI is not registered under that platform");
+        AppOp::RedirectUriAdd | AppOp::RedirectUriRemove => {
+            let Some(platform) = parse_platform(form) else {
+                return invalid(CHOOSE_PLATFORM);
+            };
+            let uri = text(URI);
+            if op == AppOp::RedirectUriAdd {
+                let t = AddRedirectUri {
+                    tenant_id,
+                    app_id,
+                    platform,
+                    uri,
+                };
+                redirect(st, &actor, &t).await
+            } else {
+                let t = RemoveRedirectUri {
+                    tenant_id,
+                    app_id,
+                    platform,
+                    uri,
+                };
+                redirect(st, &actor, &t).await
             }
-            Ok(Outcome::plain(
-                json!({ "platform": platform.as_str(), "uri": crate::routes::audit::clip(uri) }),
-            ))
         }
         AppOp::IdentifierUriAdd => {
-            let uri = field(form, URI);
-            apps::add_identifier_uri(&st.pool, app, uri).await?;
-            Ok(Outcome::plain(json!({ "uri": crate::routes::audit::clip(uri) })))
+            let uri = text(URI);
+            redirect(st, &actor, &AddIdentifierUri { tenant_id, app_id, uri }).await
         }
         AppOp::IdentifierUriRemove => {
-            let uri = field(form, URI);
-            apps::remove_identifier_uri(&st.pool, app, uri).await?;
-            Ok(Outcome::plain(json!({ "uri": crate::routes::audit::clip(uri) })))
+            let uri = text(URI);
+            redirect(st, &actor, &RemoveIdentifierUri { tenant_id, app_id, uri }).await
         }
         AppOp::ScopeAdd => {
-            let value = field(form, VALUE);
             let Some(consent) = ScopeConsent::parse(field(form, CONSENT)) else {
-                anyhow::bail!("choose who can consent to that scope");
+                return invalid("choose who can consent to that scope");
             };
-            let display = optional(form, DISPLAY_NAME).unwrap_or(value);
-            let id = apps::add_scope(&st.pool, app, value, display, consent).await?;
-            Ok(Outcome::plain(
-                json!({ "id": id, "value": crate::routes::audit::clip(value), "consent": consent.as_str() }),
-            ))
+            let t = AddAppScope {
+                tenant_id,
+                app_id,
+                value: text(VALUE),
+                consent,
+                display_name: maybe(DISPLAY_NAME),
+            };
+            redirect(st, &actor, &t).await
         }
         AppOp::RoleAdd => {
-            let value = field(form, VALUE);
-            let types: Vec<MemberType> = MemberType::ALL
+            let member_types: Vec<MemberType> = MemberType::ALL
                 .iter()
                 .copied()
                 .filter(|t| checked(form, &member_field(*t)))
                 .collect();
-            let display = optional(form, DISPLAY_NAME).unwrap_or(value);
-            let id = apps::add_role(&st.pool, app, value, display, optional(form, DESCRIPTION), &types).await?;
-            Ok(Outcome::plain(json!({
-                "id": id,
-                "value": crate::routes::audit::clip(value),
-                "allowedMemberTypes": types.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
-            })))
+            let t = AddAppRole {
+                tenant_id,
+                app_id,
+                value: text(VALUE),
+                member_types,
+                display_name: maybe(DISPLAY_NAME),
+                description: maybe(DESCRIPTION),
+            };
+            redirect(st, &actor, &t).await
         }
         AppOp::Assign => {
             let typed = field(form, PRINCIPAL).trim();
@@ -1619,60 +1634,61 @@ async fn apply(
                 Some(("group", rest)) => (Some(PrincipalType::Group), rest.trim()),
                 _ => (PrincipalType::parse(field(form, PRINCIPAL_TYPE)), typed),
             };
-            let (kind, principal) = match picked {
-                Some(PrincipalType::User) => (PrincipalType::User, Principal::User(name.to_string())),
-                Some(PrincipalType::Group) => (PrincipalType::Group, Principal::Group(name.to_string())),
-                _ => anyhow::bail!("choose a user or a group"),
+            let principal = match picked {
+                Some(PrincipalType::User) => Principal::User(name.to_string()),
+                Some(PrincipalType::Group) => Principal::Group(name.to_string()),
+                _ => return invalid("choose a user or a group"),
             };
-            // `assign` resolves the principal within this tenant and checks each
-            // role, so neither is decided here.
-            let id = apps::assign(&st.pool, tenant, app, &principal, ticked).await?;
-            Ok(Outcome::plain(json!({
-                "assignmentId": id,
-                "principalType": kind.as_str(),
-                "principal": crate::routes::audit::clip(name),
-                "roles": ticked.iter().map(|r| crate::routes::audit::clip(r)).collect::<Vec<_>>(),
-            })))
+            let t = AssignApp {
+                tenant_id,
+                app_id,
+                principal,
+                roles: ticked,
+            };
+            redirect(st, &actor, &t).await
         }
         AppOp::Unassign => {
-            let id = field(form, ASSIGNMENT);
-            if !apps::unassign(&st.pool, &tenant.id, app, id).await? {
-                anyhow::bail!("that assignment no longer exists");
-            }
-            Ok(Outcome::plain(json!({ "assignmentId": id })))
+            let assignment_id = text(ASSIGNMENT);
+            let t = UnassignApp {
+                tenant_id,
+                app_id,
+                assignment_id,
+            };
+            redirect(st, &actor, &t).await
         }
         AppOp::RoleAssign => {
-            let role = field(form, ROLE);
-            let name = field(form, PRINCIPAL);
             // People are assigned with `Assign`; this grants a role to a client
             // application.
-            let Some(kind @ PrincipalType::ServicePrincipal) = PrincipalType::parse(field(form, PRINCIPAL_TYPE)) else {
-                anyhow::bail!("a role is granted this way to an application only; assign users and groups above");
+            let Some(PrincipalType::ServicePrincipal) = PrincipalType::parse(field(form, PRINCIPAL_TYPE)) else {
+                return invalid("a role is granted this way to an application only; assign users and groups above");
             };
-            let principal = Principal::App(name.to_string());
-            // `assign_role` resolves the principal within this tenant and checks
-            // the role's allowed member types, so neither is decided here.
-            apps::assign_role(&st.pool, tenant, app, role, &principal).await?;
-            Ok(Outcome::plain(json!({
-                "role": crate::routes::audit::clip(role),
-                "principalType": kind.as_str(),
-                "principal": crate::routes::audit::clip(name),
-            })))
+            let t = GrantAppRole {
+                tenant_id,
+                app_id,
+                role: text(ROLE),
+                client_app_id: text(PRINCIPAL),
+            };
+            redirect(st, &actor, &t).await
         }
         AppOp::RoleUnassign => {
-            let id = field(form, ASSIGNMENT);
-            if !apps::remove_role_assignment(&st.pool, &tenant.id, app, id).await? {
-                anyhow::bail!("that role assignment no longer exists");
-            }
-            Ok(Outcome::plain(json!({ "assignmentId": id })))
+            let assignment_id = text(ASSIGNMENT);
+            let t = RevokeAppRole {
+                tenant_id,
+                app_id,
+                assignment_id,
+            };
+            redirect(st, &actor, &t).await
         }
     }
 }
 
+/// Refused when the form names no platform, or one outside the closed set.
+const CHOOSE_PLATFORM: &str = "choose a platform";
+
 /// The platform named by the form. A value outside the closed set is refused,
 /// never defaulted: the rules get weaker from `web` to `publicClient`.
-fn parse_platform(form: &Params) -> anyhow::Result<RedirectPlatform> {
-    RedirectPlatform::parse(field(form, PLATFORM)).ok_or_else(|| anyhow::anyhow!("choose a platform"))
+fn parse_platform(form: &Params) -> Option<RedirectPlatform> {
+    RedirectPlatform::parse(field(form, PLATFORM))
 }
 
 /// A secret lifetime in days. `apps::add_secret` holds the range; this only has
@@ -1685,6 +1701,7 @@ fn parse_days(raw: &str) -> anyhow::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::txn::Need;
 
     #[test]
     fn operations_round_trip_and_are_distinct() {
@@ -1725,17 +1742,14 @@ mod tests {
         }
     }
 
-    /// Every operation records a distinct event, so the audit trail can tell
-    /// which one happened.
+    /// Every operation runs its own kind of transaction (and so records its own
+    /// event), and the page asks for the same action the transaction needs.
     #[test]
-    fn every_operation_records_its_own_event() {
+    fn every_operation_runs_its_own_transaction_with_the_same_action() {
         let mut seen = std::collections::HashSet::new();
         for op in AppOp::ALL {
-            assert!(
-                seen.insert(op.event().as_str()),
-                "{:?} shares an event with another operation",
-                op
-            );
+            assert!(seen.insert(op.kind().info().event.as_str()), "{op:?} shares an event");
+            assert_eq!(op.kind().info().need, Need::Action(op.action()), "{op:?}");
         }
     }
 

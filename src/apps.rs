@@ -205,6 +205,19 @@ pub(crate) async fn add_identifier_uri_in(
     uri: &str,
 ) -> anyhow::Result<()> {
     url::Url::parse(uri).with_context(|| format!("identifier URI '{uri}' is not a valid URI"))?;
+    // Looked for first, so a duplicate is refused by name rather than as a broken
+    // constraint (which would abort a larger transaction on Postgres).
+    let taken: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT uri FROM app_identifier_uris WHERE tenant_id = ? AND uri = ?",
+    ))
+    .bind(&app.tenant_id)
+    .bind(uri)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if taken.is_some() {
+        bail!("identifier URI '{uri}' is already used in this tenant");
+    }
     sqlx::query(crate::db::qc(
         &conn,
         "INSERT INTO app_identifier_uris (application_id, tenant_id, uri) VALUES (?, ?, ?)",
@@ -278,6 +291,16 @@ pub struct NewSecret {
     pub end_at: i64,
 }
 
+/// Never the value: an outcome printed in a log or a test failure stays clean.
+impl std::fmt::Debug for NewSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewSecret")
+            .field("key_id", &self.key_id)
+            .field("end_at", &self.end_at)
+            .finish_non_exhaustive()
+    }
+}
+
 pub async fn add_secret<'c>(
     db: impl Handle<'c>,
     app: &Application,
@@ -294,10 +317,46 @@ pub(crate) async fn add_secret_in(
     display_name: Option<&str>,
     valid_days: i64,
 ) -> anyhow::Result<NewSecret> {
+    add_prepared_secret_in(conn, app, display_name, valid_days, &PreparedSecret::generate()).await
+}
+
+/// A client secret made, and hashed, before the transaction that stores it: only
+/// the hash and a three-character hint are ever stored. Its `Debug` never shows
+/// the value.
+pub struct PreparedSecret {
+    secret: String,
+    hint: String,
+    hash: String,
+}
+
+impl PreparedSecret {
+    pub fn generate() -> Self {
+        let secret = generate_client_secret();
+        Self {
+            hint: secret[..3].to_string(),
+            hash: sha256_hex(secret.as_bytes()),
+            secret,
+        }
+    }
+}
+
+impl std::fmt::Debug for PreparedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedSecret(..)")
+    }
+}
+
+/// Store a secret made beforehand, valid for `valid_days` from now.
+pub(crate) async fn add_prepared_secret_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    display_name: Option<&str>,
+    valid_days: i64,
+    prepared: &PreparedSecret,
+) -> anyhow::Result<NewSecret> {
     if !(1..=730).contains(&valid_days) {
         bail!("secret lifetime must be between 1 and 730 days (Entra's maximum is 24 months)");
     }
-    let secret = generate_client_secret();
     let key_id = new_guid();
     let ts = now();
     let end_at = ts + valid_days * 86_400;
@@ -308,14 +367,18 @@ pub(crate) async fn add_secret_in(
     .bind(&key_id)
     .bind(&app.id)
     .bind(display_name)
-    .bind(&secret[..3])
-    .bind(sha256_hex(secret.as_bytes()))
+    .bind(&prepared.hint)
+    .bind(&prepared.hash)
     .bind(ts)
     .bind(end_at)
     .bind(ts)
     .execute(&mut *conn)
     .await?;
-    Ok(NewSecret { key_id, secret, end_at })
+    Ok(NewSecret {
+        key_id,
+        secret: prepared.secret.clone(),
+        end_at,
+    })
 }
 
 pub async fn remove_secret<'c>(db: impl Handle<'c>, app: &Application, key_id: &str) -> anyhow::Result<()> {
@@ -511,6 +574,24 @@ pub async fn add_role<'c>(
     add_role_in(&mut conn, app, value, display_name, description, member_types).await
 }
 
+/// Whether the application already has a role or scope with this value. Checked
+/// before the insert so a duplicate is refused by name, rather than as a broken
+/// constraint (which, inside a larger transaction on Postgres, would also abort
+/// it); the unique constraint still backs it.
+async fn value_taken_in(
+    conn: &mut crate::db::Conn,
+    statement: &'static str,
+    app: &Application,
+    value: &str,
+) -> anyhow::Result<bool> {
+    let found: Option<(String,)> = sqlx::query_as(crate::db::qc(&conn, statement))
+        .bind(&app.id)
+        .bind(value)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(found.is_some())
+}
+
 pub(crate) async fn add_role_in(
     conn: &mut crate::db::Conn,
     app: &Application,
@@ -524,6 +605,16 @@ pub(crate) async fn add_role_in(
     }
     if member_types.is_empty() {
         bail!("allowed member types must be User and/or Application");
+    }
+    if value_taken_in(
+        &mut *conn,
+        "SELECT value FROM app_roles WHERE application_id = ? AND value = ?",
+        app,
+        value,
+    )
+    .await?
+    {
+        bail!("app role '{value}' already exists");
     }
     let id = new_guid();
     sqlx::query(crate::db::qc(
@@ -578,6 +669,7 @@ pub(crate) async fn roles_in(conn: &mut crate::db::Conn, app: &Application) -> a
     .await?)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
     /// A client application, by appId; resolves to its service principal.
     App(String),
@@ -1092,7 +1184,21 @@ pub(crate) async fn assign_role_in(
         )
         .await?;
     }
-    // Re-assigning is a no-op: UNIQUE (resource_id, app_role_id, principal_id).
+    // Re-assigning is a no-op. Looked for first, so inside a larger transaction
+    // it is not a broken constraint (which aborts the transaction on Postgres);
+    // UNIQUE (resource_id, app_role_id, principal_id) backs it.
+    let held: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT id FROM app_role_assignments WHERE resource_id = ? AND app_role_id = ? AND principal_id = ?",
+    ))
+    .bind(&resource_sp.id)
+    .bind(&role.id)
+    .bind(&principal_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if held.is_some() {
+        return Ok(());
+    }
     crate::db::inserted(
         sqlx::query(crate::db::qc(
             &conn,
@@ -1328,6 +1434,16 @@ pub(crate) async fn add_scope_in(
 ) -> anyhow::Result<String> {
     if value.is_empty() || value.contains(char::is_whitespace) || value.starts_with('.') || value.contains('/') {
         bail!("invalid scope value '{value}'");
+    }
+    if value_taken_in(
+        &mut *conn,
+        "SELECT value FROM app_scopes WHERE application_id = ? AND value = ?",
+        app,
+        value,
+    )
+    .await?
+    {
+        bail!("scope '{value}' already exists");
     }
     let id = new_guid();
     sqlx::query(crate::db::qc(

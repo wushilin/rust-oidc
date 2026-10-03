@@ -23,6 +23,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("Lockout", "auth.lockout"),
     ("SessionCreate", "session.create"),
     ("SessionEnd", "session.end"),
+    ("SessionEndEverywhere", "session.end_everywhere"),
     ("ConsentGranted", "auth.consent_granted"),
     ("ConsentDenied", "auth.consent_denied"),
     ("TokenIssued", "token.issued"),

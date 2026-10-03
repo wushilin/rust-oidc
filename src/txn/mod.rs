@@ -381,4 +381,8 @@ transactions! {
     ChangeTenantDomain(ops::tenants::ChangeTenantDomain),
     RemoveTenantDomain(ops::tenants::RemoveTenantDomain),
     SaveTenantSettings(ops::tenants::SaveTenantSettings),
+    ChangeOwnPassword(ops::self_service::ChangeOwnPassword),
+    EnrollAuthenticator(ops::self_service::EnrollAuthenticator),
+    ReplaceRecoveryCodes(ops::self_service::ReplaceRecoveryCodes),
+    SignOutEverywhere(ops::self_service::SignOutEverywhere),
 }

@@ -475,6 +475,8 @@ pub enum Event {
     Lockout,
     SessionCreate,
     SessionEnd,
+    /// The user signed themselves out everywhere, from My Account.
+    SessionEndEverywhere,
     /// The user answered the consent page for an application.
     ConsentGranted,
     ConsentDenied,
@@ -594,6 +596,7 @@ impl Event {
         Self::Lockout,
         Self::SessionCreate,
         Self::SessionEnd,
+        Self::SessionEndEverywhere,
         Self::ConsentGranted,
         Self::ConsentDenied,
         Self::TokenIssued,
@@ -692,6 +695,7 @@ impl Event {
             Self::Lockout => "auth.lockout",
             Self::SessionCreate => "session.create",
             Self::SessionEnd => "session.end",
+            Self::SessionEndEverywhere => "session.end_everywhere",
             Self::ConsentGranted => "auth.consent_granted",
             Self::ConsentDenied => "auth.consent_denied",
             Self::TokenIssued => "token.issued",

@@ -5,6 +5,7 @@
 //! `_in` functions, and aborts only through the context.
 
 pub mod groups;
+pub mod self_service;
 pub mod tenants;
 pub mod users;
 

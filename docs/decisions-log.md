@@ -1288,3 +1288,14 @@ tenant through any other caller of the engine. Saving settings stays
 row); a domain in its place is refused as not found. Disabling declares the
 administrators lock, since it can take administrators away. *To reverse:* change
 `scope()` in `src/txn/ops/tenants.rs`.
+
+**35. A user's own changes (My Account, and the forced password change and MFA
+set-up at sign-in) are transactions run as the user** (`Actor::User`,
+`Scope::Own`). What changed with it: their audit rows belong to the user's *home*
+tenant, also when they signed in to another tenant's application; `mfa.enrolled`
+always records `voluntary`; "sign out everywhere" records its own event,
+`session.end_everywhere` (it was `session.end` with `everywhere: true`); replacing
+recovery codes is refused without an authenticator; and a database error while
+changing a password shows the error page rather than the raw error in the form.
+Recovery codes are generated (and hashed, SHA-256) before the transaction, like
+passwords.

@@ -67,3 +67,73 @@ pub fn router(state: AppState) -> Router {
     };
     app.layer(TraceLayer::new_for_http())
 }
+
+/// How a user's change to their own account came out, for the sign-in pages and
+/// My Account (the console's own sign-in uses the console's `settle`). A
+/// refusal is shown on the page the user was on; anything else is an error page.
+pub(crate) fn settle_own<T>(outcome: crate::txn::Outcome<T>, tenant_name: &str) -> crate::admin::routes::Settled<T> {
+    use crate::admin::routes::Settled;
+    use crate::txn::{Outcome, Refusal};
+    match outcome {
+        Outcome::Done(v) => Settled::Done(v),
+        // Only the user may change their own account; anything else is ours.
+        Outcome::Refused(Refusal::NotPermitted) | Outcome::Failed(_) => Settled::Respond(crate::html::error(
+            Some(tenant_name),
+            &crate::error::AadError::server_error().description(),
+        )),
+        Outcome::Refused(r) => Settled::Refused(r.to_string()),
+    }
+}
+
+/// The user chooses a new password for their own account, `home` being its
+/// tenant: checked against their history and hashed first, then stored by the
+/// engine with its audit row.
+pub(crate) async fn change_own_password(
+    st: &AppState,
+    home: &crate::tenant::Tenant,
+    user_id: &str,
+    password: &str,
+    via: audit::Channel,
+) -> crate::txn::Outcome<()> {
+    use crate::users::{self, PasswordSetBy};
+    let password = match users::prepare_password(&st.pool, home, user_id, password, PasswordSetBy::User).await {
+        Ok(p) => p,
+        Err(e) => return crate::txn::Outcome::from_error(&e),
+    };
+    let change = crate::txn::ops::self_service::ChangeOwnPassword {
+        tenant_id: home.id.clone(),
+        user_id: user_id.to_string(),
+        password,
+        via,
+    };
+    crate::txn::run(&st.pool, &own(user_id), &change).await
+}
+
+/// The user's authenticator, confirmed with a code from it, becomes theirs:
+/// recovery codes are made first, and the engine stores both with the audit row.
+/// The output is the recovery codes, to show once.
+pub(crate) async fn enroll_own_authenticator(
+    st: &AppState,
+    home_id: &str,
+    user_id: &str,
+    secret: &str,
+    via: audit::Channel,
+    voluntary: bool,
+) -> crate::txn::Outcome<Vec<String>> {
+    let enroll = crate::txn::ops::self_service::EnrollAuthenticator {
+        tenant_id: home_id.to_string(),
+        user_id: user_id.to_string(),
+        secret: secret.to_string(),
+        codes: crate::mfa::NewRecoveryCodes::generate(),
+        via,
+        voluntary,
+    };
+    crate::txn::run(&st.pool, &own(user_id), &enroll).await
+}
+
+/// The actor for a user's change to their own account.
+pub(crate) fn own(user_id: &str) -> crate::txn::Actor {
+    crate::txn::Actor::User {
+        user_id: user_id.to_string(),
+    }
+}

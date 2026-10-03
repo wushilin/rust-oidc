@@ -564,24 +564,17 @@ async fn console_second_step(st: &AppState, form: &Params, op: crate::html::Logi
             let refused = if new != confirm {
                 Some("The passwords don't match.".to_string())
             } else {
-                users::change_password(&st.pool, &home, &user.id, new, users::PasswordSetBy::User)
-                    .await
-                    .err()
-                    .map(|e| e.to_string())
+                let changed = crate::routes::change_own_password(st, &home, &user.id, new, Channel::Console).await;
+                match settle(changed) {
+                    Settled::Done(()) => None,
+                    Settled::Refused(message) => Some(message),
+                    Settled::Respond(resp) => return resp,
+                }
             };
             if let Some(message) = refused {
                 return console_change_page(st, &home, &user.upn, ticket, Some(&message));
             }
             let _ = crate::mfa::finish(&st.pool, ticket).await;
-            audit::record(
-                st,
-                &home.id,
-                Actor::Id(&user.id),
-                crate::db::Event::PasswordChanged,
-                Some(&user.id),
-                json!({ "via": Channel::Console.as_str() }),
-            )
-            .await;
             console_session(st, &home, &user).await
         }
         Purpose::Verify => match crate::mfa::check(&st.pool, &user.id, typed).await {
@@ -634,24 +627,15 @@ async fn console_second_step(st: &AppState, form: &Params, op: crate::html::Logi
                     _ => sign_in_page(st, &user.upn, Some(MFA_EXPIRED)),
                 };
             }
-            let codes = match crate::mfa::enroll(&st.pool, &user.id, &secret).await {
-                Ok(codes) => codes,
-                Err(e) => {
-                    tracing::error!("MFA enrolment failed during console sign-in: {e}");
-                    return view::server_error();
-                }
+            // Then signed out everywhere, by the same transaction.
+            let enrolled =
+                crate::routes::enroll_own_authenticator(st, &home.id, &user.id, &secret, Channel::Console, false).await;
+            let codes = match settle(enrolled) {
+                Settled::Done(codes) => codes,
+                Settled::Refused(message) => return sign_in_page(st, &user.upn, Some(&message)),
+                Settled::Respond(resp) => return resp,
             };
             let _ = crate::mfa::finish(&st.pool, ticket).await;
-            let _ = users::end_sessions(&st.pool, &user.id).await;
-            audit::record(
-                st,
-                &home.id,
-                Actor::Id(&user.id),
-                crate::db::Event::MfaEnrolled,
-                Some(&user.id),
-                json!({ "via": Channel::Console.as_str() }),
-            )
-            .await;
             let mut resp = crate::html::mfa_enrolled(&home.name, &codes, &format!("{}/admin", st.public_url.base()));
             resp.headers_mut()
                 .append(header::SET_COOKIE, session::clear_login_nonce(&st.public_url));

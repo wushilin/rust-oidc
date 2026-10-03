@@ -22,12 +22,17 @@ use serde_json::json;
 
 use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
+use crate::admin::routes::Settled;
 use crate::claims::Amr;
 use crate::error::AadError;
 use crate::html::{self, AccountOp, LoginOp};
 use crate::mfa::{self, Purpose};
 use crate::session::{self, CSRF_COOKIE, SESSION_COOKIE};
 use crate::tenant::{self, Tenant};
+use crate::txn::{
+    self,
+    ops::self_service::{ReplaceRecoveryCodes, SignOutEverywhere},
+};
 use crate::users::{self, AuthResult, User};
 use crate::util::ct_eq;
 
@@ -440,20 +445,15 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
                     _ => login_page(st, tenant, "", Some(EXPIRED)),
                 };
             }
-            let codes = match mfa::enroll(&st.pool, &user.id, &secret).await {
-                Ok(codes) => codes,
-                Err(e) => return fail(tenant, e),
+            // Set up at sign-in, the transaction also signs them out everywhere.
+            let enrolled =
+                super::enroll_own_authenticator(st, &tenant.id, &user.id, &secret, Channel::MyAccount, voluntary).await;
+            let codes = match super::settle_own(enrolled, &tenant.name) {
+                Settled::Done(codes) => codes,
+                Settled::Refused(message) => return login_page(st, tenant, "", Some(&message)),
+                Settled::Respond(resp) => return resp,
             };
             let _ = mfa::finish(&st.pool, ticket).await;
-            audit::record(
-                st,
-                &tenant.id,
-                Actor::Id(&user.id),
-                Event::MfaEnrolled,
-                Some(&user.id),
-                json!({ "via": Channel::MyAccount.as_str(), "voluntary": voluntary }),
-            )
-            .await;
             if voluntary {
                 // Set up from the page: still signed in, now with both methods,
                 // and the codes on the page this once.
@@ -468,7 +468,6 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
                 return signed_in(st, tenant, headers, &user, &amr, shown).await;
             }
             // Set up at sign-in: signed out, and back in with it.
-            let _ = users::end_sessions(&st.pool, &user.id).await;
             let mut resp = html::mfa_enrolled(&tenant.name, &codes, &url(st, tenant));
             resp.headers_mut().append(
                 header::SET_COOKIE,
@@ -481,10 +480,12 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
             let refused = if new != get(form, html::CONFIRM_PASSWORD) {
                 Some("The passwords don't match.".to_string())
             } else {
-                users::change_password(&st.pool, tenant, &user.id, new, users::PasswordSetBy::User)
-                    .await
-                    .err()
-                    .map(|e| e.to_string())
+                let changed = super::change_own_password(st, tenant, &user.id, new, Channel::MyAccount).await;
+                match super::settle_own(changed, &tenant.name) {
+                    Settled::Done(()) => None,
+                    Settled::Refused(message) => Some(message),
+                    Settled::Respond(resp) => return resp,
+                }
             };
             if let Some(message) = refused {
                 return step_page(
@@ -499,15 +500,6 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
                 );
             }
             let _ = mfa::finish(&st.pool, ticket).await;
-            audit::record(
-                st,
-                &tenant.id,
-                Actor::Id(&user.id),
-                Event::PasswordChanged,
-                Some(&user.id),
-                json!({ "via": Channel::MyAccount.as_str() }),
-            )
-            .await;
             let mut amr = vec![Amr::Pwd.as_str()];
             if waiting.purpose == Purpose::ChangePasswordAfterMfa {
                 amr.push(Amr::Mfa.as_str());
@@ -558,18 +550,12 @@ async fn action(
             if new != get(form, html::CONFIRM_PASSWORD) {
                 return refuse("The new passwords don't match.").await;
             }
-            if let Err(e) = users::change_password(&st.pool, tenant, &user.id, new, users::PasswordSetBy::User).await {
-                return refuse(&e.to_string()).await;
+            let changed = super::change_own_password(st, tenant, &user.id, new, Channel::MyAccount).await;
+            match super::settle_own(changed, &tenant.name) {
+                Settled::Done(()) => {}
+                Settled::Refused(message) => return refuse(&message).await,
+                Settled::Respond(resp) => return resp,
             }
-            audit::record(
-                st,
-                &tenant.id,
-                Actor::Id(&user.id),
-                Event::PasswordChanged,
-                Some(&user.id),
-                json!({ "via": Channel::MyAccount.as_str() }),
-            )
-            .await;
             // A new password ends every session; this browser stays signed in.
             let amr: Vec<&str> = amr.iter().map(String::as_str).collect();
             let shown = Shown {
@@ -607,19 +593,17 @@ async fn action(
                 super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::MyAccount).await;
                 return refuse("That code didn't work. Use the six-digit code from your authenticator.").await;
             }
-            let codes = match mfa::replace_recovery_codes(&st.pool, &user.id).await {
-                Ok(codes) => codes,
-                Err(e) => return fail(tenant, e),
+            let replace = ReplaceRecoveryCodes {
+                tenant_id: tenant.id.clone(),
+                user_id: user.id.clone(),
+                codes: mfa::NewRecoveryCodes::generate(),
             };
-            audit::record(
-                st,
-                &tenant.id,
-                Actor::Id(&user.id),
-                Event::MfaRecoveryCodesReplaced,
-                Some(&user.id),
-                json!({}),
-            )
-            .await;
+            let replaced = txn::run(&st.pool, &super::own(&user.id), &replace).await;
+            let codes = match super::settle_own(replaced, &tenant.name) {
+                Settled::Done(codes) => codes,
+                Settled::Refused(message) => return refuse(&message).await,
+                Settled::Respond(resp) => return resp,
+            };
             dashboard(
                 st,
                 tenant,
@@ -633,18 +617,16 @@ async fn action(
             .await
         }
         AccountOp::SignOutEverywhere => {
-            if let Err(e) = users::end_sessions(&st.pool, &user.id).await {
-                return fail(tenant, e);
+            let sign_out = SignOutEverywhere {
+                tenant_id: tenant.id.clone(),
+                user_id: user.id.clone(),
+            };
+            let ended = txn::run(&st.pool, &super::own(&user.id), &sign_out).await;
+            match super::settle_own(ended, &tenant.name) {
+                Settled::Done(()) => {}
+                Settled::Refused(message) => return refuse(&message).await,
+                Settled::Respond(resp) => return resp,
             }
-            audit::record(
-                st,
-                &tenant.id,
-                Actor::Id(&user.id),
-                Event::SessionEnd,
-                Some(&user.id),
-                json!({ "via": Channel::MyAccount.as_str(), "everywhere": true }),
-            )
-            .await;
             let mut resp = html::signed_out(Some(&tenant.name));
             let h = resp.headers_mut();
             h.append(

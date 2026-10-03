@@ -103,6 +103,56 @@ impl Amr {
     }
 }
 
+/// How strongly the user was authenticated: the `acr` claim, and what an
+/// application asks for with `acr_values` on the authorize request.
+///
+/// Entra's v2.0 tokens carry no `acr` (its step-up is Conditional Access
+/// authentication contexts, in `acrs`); this is the OpenID Connect claim, with
+/// two levels in the style Keycloak uses. See `docs/decisions-log.md`, 38.
+///
+/// The level is derived from `amr` rather than stored: `amr` is already kept
+/// with the session and carried by codes, refresh tokens, device codes and OBO
+/// assertions, so the level travels with it and cannot disagree with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acr {
+    /// A password.
+    Password,
+    /// A password and a second factor.
+    Mfa,
+}
+
+impl Acr {
+    /// What `acr_values_supported` advertises, weakest first.
+    pub const ALL: &'static [Acr] = &[Self::Password, Self::Mfa];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "1",
+            Self::Mfa => "2",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|a| a.as_str() == raw)
+    }
+
+    /// The level a sign-in reached, from its authentication methods.
+    pub fn of(amr: &[String]) -> Self {
+        if amr.iter().any(|m| m == Amr::Mfa.as_str()) {
+            Self::Mfa
+        } else {
+            Self::Password
+        }
+    }
+
+    /// The level an authorize request asks for: the first value of `acr_values`
+    /// (space-separated, in order of preference) this server knows. Others are
+    /// ignored, as OpenID Connect makes `acr_values` a voluntary request.
+    pub fn requested(acr_values: &str) -> Option<Self> {
+        acr_values.split_ascii_whitespace().find_map(Self::parse)
+    }
+}
+
 /// The `acct` claim's value for an account of another tenant (Entra: 0 member,
 /// 1 guest).
 const ACCT_EXTERNAL: u8 = 1;
@@ -153,6 +203,7 @@ pub async fn issue(
     at.insert("iat".into(), json!(iat));
     at.insert("nbf".into(), json!(iat));
     at.insert("exp".into(), json!(iat + lifetime));
+    at.insert("acr".into(), json!(Acr::of(&sign_in.amr).as_str()));
     at.insert("amr".into(), json!(sign_in.amr));
     at.insert("azp".into(), json!(sign_in.client.app_id));
     at.insert("azpacr".into(), json!(azpacr.as_str()));
@@ -188,6 +239,7 @@ pub async fn issue(
         id.insert("iat".into(), json!(iat));
         id.insert("nbf".into(), json!(iat));
         id.insert("exp".into(), json!(iat + ID_TOKEN_LIFETIME));
+        id.insert("acr".into(), json!(Acr::of(&sign_in.amr).as_str()));
         id.insert("amr".into(), json!(sign_in.amr));
         id.insert("auth_time".into(), json!(sign_in.auth_time));
         if let Some(code) = front.code {

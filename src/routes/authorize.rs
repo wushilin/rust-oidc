@@ -19,7 +19,7 @@ use crate::AppState;
 use crate::access;
 use crate::admin::routes::Settled;
 use crate::apps::{self, Application, RedirectPlatform, ServicePrincipal};
-use crate::claims::{self, Amr, Azpacr};
+use crate::claims::{self, Acr, Amr, Azpacr};
 use crate::error::{AadError, Aadsts, OAuthError};
 use crate::html;
 use crate::mfa::{self, Purpose};
@@ -642,6 +642,7 @@ async fn continue_authorize(
     // ---- a second factor, where one is needed and this session has none ----
     if !session.amr.iter().any(|m| m == Amr::Mfa.as_str()) {
         let step = mfa::step(&st.pool, &decision.home, &user.id, mfa::At::App(&v.sp)).await?;
+        let step = stepped_up(step, params);
         if step != mfa::Step::Done {
             if prompt.none {
                 let (code, what) = match step {
@@ -888,6 +889,24 @@ fn refused_page(v: &Validated, home: &Tenant, refusal: access::Refusal) -> Respo
 }
 
 /// Start the second step of a sign-in: a code, or setting an authenticator up.
+/// The second step, raised to what the application asked for with `acr_values`.
+///
+/// An account with an authenticator is always asked for a code, so asking for
+/// [`Acr::Mfa`] changes only an account without one: it sets one up now, exactly
+/// as when its tenant or the application requires MFA. A session that already
+/// has a second factor never gets here.
+fn stepped_up(step: mfa::Step, params: &Params) -> mfa::Step {
+    let wants_mfa = get(params, ACR_VALUES).and_then(Acr::requested) == Some(Acr::Mfa);
+    if step == mfa::Step::Done && wants_mfa {
+        mfa::Step::Enroll
+    } else {
+        step
+    }
+}
+
+/// The authorize parameter an application asks for a level of authentication with.
+const ACR_VALUES: &str = "acr_values";
+
 async fn start_mfa(st: &AppState, v: &Validated, request: &str, user: &User, step: mfa::Step) -> Response {
     let purpose = match step {
         mfa::Step::Enroll => Purpose::Enroll,
@@ -1278,7 +1297,7 @@ pub async fn login(
                     }
                     // A second step, where one is needed, before there is any session.
                     let step = match mfa::step(&st.pool, &decision.home, &user.id, mfa::At::App(&v.sp)).await {
-                        Ok(step) => step,
+                        Ok(step) => stepped_up(step, &params),
                         Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
                     };
                     if step != mfa::Step::Done {

@@ -130,6 +130,7 @@ pub async fn openid_configuration(
         "grant_types_supported": GRANT_TYPES.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
         "code_challenge_methods_supported": CODE_CHALLENGE_METHODS,
         "prompt_values_supported": Prompt::SUPPORTED.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        "acr_values_supported": crate::claims::Acr::ALL.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
         "claims_parameter_supported": false,
         "request_parameter_supported": false,
         "issuer": at(Endpoint::Issuer),
@@ -143,7 +144,7 @@ pub async fn openid_configuration(
             "sub", "iss", "aud", "exp", "iat", "nbf", "auth_time", "nonce", "ver", "tid", "oid",
             "uti", "azp", "azpacr", "idtyp", "name", "preferred_username", "upn", "email",
             "given_name", "family_name", "roles", "role_ids", "groups", "group_ids", "wids", "scp",
-            "amr", "idp", "acct"
+            "acr", "amr", "idp", "acct"
         ],
         "tenant_region_scope": null,
         "cloud_instance_name": url.host(),

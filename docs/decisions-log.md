@@ -1345,3 +1345,22 @@ the one asked for; a console save of another switch at the same instant can be
 overwritten by the value read (accepted: these are operator commands). Assignment
 required became its own kind (`admin.app.assignment_required`); the CLI's
 `add-identifier-uri` used to write no audit row at all.
+
+## `acr` and step-up
+
+**38. `acr` is emitted, and `acr_values` steps the sign-in up** (decided by the owner,
+2026-10-04, after weighing it against Entra's v2.0 tokens, which carry no `acr`). Two
+levels in the style Keycloak uses: `"1"` = password, `"2"` = password + second factor,
+listed in `acr_values_supported`. The level is **derived from `amr`** at issue time
+rather than stored, so every path that already carries `amr` (sessions, codes, refresh
+tokens, device codes, OBO) carries the level with no new storage and the two can never
+disagree. `acr_values` is a voluntary request (OpenID Connect): the first value this
+server knows is taken, unknown ones are ignored, and a token may report a higher level
+than asked. Asking for `"2"` changes only an account without an authenticator (one
+with an authenticator is always asked for a code): it sets one up at that sign-in,
+exactly as when MFA is required of it; `prompt=none` cannot do that and answers
+`interaction_required`. Not built: the `claims` parameter with an essential `acr`, and
+so `unmet_authentication_requirements` (`claims_parameter_supported` stays `false`);
+and Entra's own mechanism, Conditional Access authentication contexts in `acrs`.
+*To reverse:* drop the two `acr` inserts in `src/claims.rs`, `acr_values_supported` in
+discovery, and `stepped_up` in `src/routes/authorize.rs`.

@@ -35,18 +35,20 @@ before certification is claimed publicly.
 |---|---|---|
 | `EnsureIdTokenDoesNotContainNonRequestedClaims` | id_token contains non-requested claims `oid`, `tid`, `uti`, `ver` | These are core Entra v2.0 claims, present in every Entra id_token. Removing them would break every client that reads `tid`/`oid`. Emitted at `src/routes/token.rs:547-554`. |
 | `EnsureIdTokenDoesNotContainEmailForScopeEmail` | `email` appears in the id_token although the suite did not request it via `claims` | Entra puts `email` in the id_token when the `email` scope is granted, without needing a `claims` request. |
-| `ValidateIdTokenACRClaimAgainstAcrValuesRequest` | `acr_values` was requested so the server SHOULD return `acr`, but did not | **Unresolved — see below.** rust-oidc emits no `acr` anywhere. |
+| `ValidateIdTokenACRClaimAgainstAcrValuesRequest` | `acr_values` was requested so the server SHOULD return `acr`, but did not | **Resolved 2026-10-04 (not yet re-run):** `acr` is now emitted and `acr_values` honoured — see below. |
 
 Note the spec language: `acr` is a SHOULD, and the suite raises these three as WARNING,
 not FAILURE. They do not block certification on their own.
 
-**`acr` is not settled.** This was recorded here as an accepted deviation because `acr`
-is a v1.0 claim that v2.0 tokens do not carry. Entra's live v2.0 discovery document
-contradicts that: `acr` *is* listed in its `claims_supported`. It also omits
-`acr_values_supported`, and its `claims_supported` is demonstrably unreliable in both
-directions — it omits `oid` and `uti`, which Entra certainly does emit. So the metadata
-cannot settle what Entra actually puts in a v2.0 token. Deciding this needs a capture
-from a real tenant; until then it is an open question, not a justified omission.
+**`acr` was decided by the owner on 2026-10-04: emit it, and honour `acr_values`.**
+Two levels: `"1"` = password, `"2"` = password + a second factor, advertised in
+`acr_values_supported` and derived from `amr` (`src/claims.rs`, `Acr`). Asking for
+`acr_values=2` makes an account without an authenticator set one up at that sign-in,
+and a password-only session is stepped up. The suite asks for values of its own
+(e.g. `1 2`), so the first known one is taken and unknown ones are ignored; the next
+conformance run should turn this warning into a pass. Entra itself does step-up with
+Conditional Access authentication contexts (`acrs`), not `acr`; this is a deliberate
+divergence (decision 38).
 
 ## Accepted: minimal userinfo response
 

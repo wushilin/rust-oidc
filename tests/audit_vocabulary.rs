@@ -19,6 +19,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("MfaFailed", "auth.mfa_failed"),
     ("MfaEnrolled", "auth.mfa_enrolled"),
     ("PasswordChanged", "auth.password_changed"),
+    ("MfaRecoveryCodesReplaced", "auth.mfa_recovery_codes_replaced"),
     ("Lockout", "auth.lockout"),
     ("SessionCreate", "session.create"),
     ("SessionEnd", "session.end"),

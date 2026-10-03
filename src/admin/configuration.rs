@@ -96,7 +96,8 @@ libraries need only the discovery document, or the issuer, and find the rest the
 <h2>This server</h2>
 <table><tr><th>Setting</th><th>Value</th></tr>
 <tr><td>Public address</td><td><code>{base}</code></td></tr>
-<tr><td>Host</td><td><code>{host}</code></td></tr></table>
+<tr><td>Host</td><td><code>{host}</code></td></tr>
+<tr><td>My Account, for users</td><td><code>{my_account}</code></td></tr></table>
 <h2>Addresses</h2><p class="sub">The same for every tenant, with the tenant's id in place of
 <code>{placeholder}</code>. The tenant's domain works there too, but tokens always name the issuer by id, so
 configure the id.</p>
@@ -110,6 +111,7 @@ client, a secret or certificate: those are on the application's page inside its 
 are signed with are on the Signing keys tab, and applications fetch them from the JWKS address.</p>"#,
         base = e(url.base()),
         host = e(url.host()),
+        my_account = e(&url.tenant_url(TENANT_PLACEHOLDER, "myaccount")),
         placeholder = e(TENANT_PLACEHOLDER),
     );
     view::page(

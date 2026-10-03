@@ -447,6 +447,8 @@ pub enum Event {
     MfaEnrolled,
     /// The user chose a new password: at a forced change, or in My Account.
     PasswordChanged,
+    /// The user replaced their recovery codes.
+    MfaRecoveryCodesReplaced,
     Lockout,
     SessionCreate,
     SessionEnd,
@@ -561,6 +563,7 @@ impl Event {
         Self::MfaFailed,
         Self::MfaEnrolled,
         Self::PasswordChanged,
+        Self::MfaRecoveryCodesReplaced,
         Self::Lockout,
         Self::SessionCreate,
         Self::SessionEnd,
@@ -656,6 +659,7 @@ impl Event {
             Self::MfaFailed => "auth.mfa_failed",
             Self::MfaEnrolled => "auth.mfa_enrolled",
             Self::PasswordChanged => "auth.password_changed",
+            Self::MfaRecoveryCodesReplaced => "auth.mfa_recovery_codes_replaced",
             Self::Lockout => "auth.lockout",
             Self::SessionCreate => "session.create",
             Self::SessionEnd => "session.end",

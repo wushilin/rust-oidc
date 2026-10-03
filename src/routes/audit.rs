@@ -38,6 +38,8 @@ pub enum Channel {
     EndSession,
     /// The admin console's own sign-in form, which is not an OAuth flow.
     Console,
+    /// My Account, the user's own page, which is not an OAuth flow either.
+    MyAccount,
 }
 
 impl Channel {
@@ -48,6 +50,7 @@ impl Channel {
             Self::Ropc => "password_grant",
             Self::EndSession => "end_session",
             Self::Console => "console",
+            Self::MyAccount => "my_account",
         }
     }
 }

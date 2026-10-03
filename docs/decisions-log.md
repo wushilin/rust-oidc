@@ -1165,6 +1165,16 @@ per tenant, default 3, 0-24, kept as Argon2 hashes (24 per user); an admin's tem
 password is exempt, every other new password is checked. Mine: any new password ends
 the user's sessions and refresh tokens, as resets already did.
 
+**153. My Account** at `/{tenant}/myaccount`, as agreed: profile read-only; change
+password knowing the current one; set up an authenticator voluntarily; replace it after
+confirming with a current code or a recovery code; new recovery codes after an
+authenticator code (a recovery code is refused for that); sign out everywhere. Mine: it
+signs in with the tenant's own browser session, so a user signed in to an application
+is signed in here, under the same steps (second factor, forced change); a voluntary
+set-up keeps the user signed in (only a set-up at sign-in signs them out); a password
+changed here ends every other session and keeps this browser's; the address is on the
+Configuration page. Forgot-password is out (no mail).
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

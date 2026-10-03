@@ -41,12 +41,23 @@ button.link { background:none; border:none; color:var(--accent); padding:0; }
 ul.consent { list-style:none; padding:0; margin:12px 0; }
 ul.consent li { border:1px solid var(--border); padding:10px 14px; margin:8px 0; }
 .code { color:var(--muted); font-size:12px; word-break:break-all; margin-top:18px; }
+main.wide { max-width:600px; }
+main.wide h2 { font-size:16px; margin:28px 0 6px; padding-top:18px; border-top:1px solid var(--border); }
+dl.profile { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:8px 0; }
+dl.profile dt { color:var(--muted); } dl.profile dd { margin:0; word-break:break-all; }
+.notice { border:1px solid var(--accent); border-radius:6px; padding:10px 14px; margin:12px 0; }
+button.secondary { background:transparent; color:var(--accent); }
 ol.steps { padding-left:20px; margin:12px 0; } ol.steps li { margin:10px 0; }
 .qr { display:flex; justify-content:center; margin:12px 0; } .qr svg { width:200px; height:200px; background:#fff; padding:6px; border-radius:4px; }
 .key { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.06em; word-break:break-all; background:var(--bg); padding:6px 8px; border-radius:4px; }
 ul.codes { list-style:none; padding:0; margin:12px 0; display:grid; grid-template-columns:1fr 1fr; gap:6px 18px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:15px; }
 a.button { display:inline-block; padding:9px 18px; border-radius:4px; background:var(--accent); color:#fff; text-decoration:none; }
 "#;
+
+/// [`page`] with room for a page of sections rather than one form.
+fn wide_page(title: &str, tenant_name: Option<&str>, body: &str) -> String {
+    page(title, tenant_name, body).replacen("<main>", r#"<main class="wide">"#, 1)
+}
 
 fn page(title: &str, tenant_name: Option<&str>, body: &str) -> String {
     let tenant = tenant_name
@@ -331,7 +342,7 @@ pub fn mfa_enroll(p: &MfaEnroll) -> Response {
         .map(|c| String::from_utf8_lossy(c).into_owned())
         .collect();
     let body = format!(
-        r#"<h1>Set up your authenticator</h1><p class="sub">{upn} must use a second step to sign in.</p>
+        r#"<h1>Set up your authenticator</h1><p class="sub">A second step for signing in as {upn}.</p>
 <ol class="steps"><li>Install an authenticator app on your phone, such as Microsoft Authenticator or Google Authenticator.</li>
 <li>Scan this code with it:<div class="qr">{qr}</div>or enter this key: <div class="key">{key}</div></li>
 <li>Enter the six-digit code the app shows.</li></ol>
@@ -424,6 +435,165 @@ pub fn change_password(p: &ChangePassword) -> Response {
         page("Update your password", Some(p.tenant_name), &body),
         CSP_DEFAULT,
     )
+}
+
+/// What My Account shows. Every action posts to `action` with its own `op` and
+/// the page's CSRF token, and the ones that need more say so in their forms.
+pub struct MyAccount<'a> {
+    pub tenant_name: &'a str,
+    pub action: &'a str,
+    pub csrf: &'a str,
+    pub upn: &'a str,
+    pub display_name: Option<&'a str>,
+    pub given_name: Option<&'a str>,
+    pub family_name: Option<&'a str>,
+    pub email: Option<&'a str>,
+    /// When the authenticator was set up, as text; `None` when there is none.
+    pub mfa_since: Option<&'a str>,
+    pub recovery_codes_left: i64,
+    /// Whether MFA is required of this user, for the wording only.
+    pub mfa_required: bool,
+    /// A message from the last action: done, or why not.
+    pub notice: Option<&'a str>,
+    pub error: Option<&'a str>,
+    /// New recovery codes, shown once.
+    pub new_codes: Option<&'a [String]>,
+}
+
+/// The `op` values My Account's forms carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountOp {
+    Password,
+    MfaSetup,
+    MfaReplace,
+    RecoveryCodes,
+    SignOutEverywhere,
+}
+
+impl AccountOp {
+    pub const ALL: &'static [AccountOp] = &[
+        Self::Password,
+        Self::MfaSetup,
+        Self::MfaReplace,
+        Self::RecoveryCodes,
+        Self::SignOutEverywhere,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "account_password",
+            Self::MfaSetup => "account_mfa_setup",
+            Self::MfaReplace => "account_mfa_replace",
+            Self::RecoveryCodes => "account_recovery_codes",
+            Self::SignOutEverywhere => "account_sign_out_everywhere",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|o| o.as_str() == raw)
+    }
+}
+
+/// My Account's form fields.
+pub const CURRENT_PASSWORD: &str = "current_password";
+
+pub fn my_account(p: &MyAccount) -> Response {
+    let form = |op: AccountOp, inner: &str, button: &str, class: &str| {
+        format!(
+            r#"<form method="post" action="{action}"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="op" value="{op}">{inner}<div class="actions"><button type="submit" class="{class}">{button}</button></div></form>"#,
+            action = escape(p.action),
+            csrf = escape(p.csrf),
+            op = op.as_str(),
+            button = escape(button),
+            class = class,
+        )
+    };
+    let row = |label: &str, value: Option<&str>| match value.filter(|v| !v.is_empty()) {
+        Some(v) => format!("<dt>{}</dt><dd>{}</dd>", escape(label), escape(v)),
+        None => String::new(),
+    };
+    let banner = match (p.error, p.notice) {
+        (Some(e), _) => format!(r#"<p class="error" role="alert">{}</p>"#, escape(e)),
+        (None, Some(n)) => format!(r#"<p class="notice" role="status">{}</p>"#, escape(n)),
+        _ => String::new(),
+    };
+    let codes = p
+        .new_codes
+        .map(|codes| {
+            let items: String = codes.iter().map(|c| format!("<li>{}</li>", escape(c))).collect();
+            format!(
+                r#"<div class="notice"><strong>Your new recovery codes.</strong> Save them somewhere safe; they are shown only now, and the old ones no longer work.<ul class="codes">{items}</ul></div>"#
+            )
+        })
+        .unwrap_or_default();
+    let code_field = |id: &str, label: &str| {
+        format!(
+            r#"<label for="{id}">{label}</label><input id="{id}" name="{MFA_CODE}" type="text" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required>"#,
+            label = escape(label),
+        )
+    };
+    let mfa = match p.mfa_since {
+        None => format!(
+            r#"<p>{}</p>{}"#,
+            if p.mfa_required {
+                "Your organisation requires a second step to sign in. You will set up an authenticator at your next sign-in, or now."
+            } else {
+                "You sign in with your password alone. An authenticator app adds a second step, asked for at every sign-in once it is set up."
+            },
+            form(AccountOp::MfaSetup, "", "Set up an authenticator", "")
+        ),
+        Some(since) => format!(
+            r#"<p>Authenticator set up {since}. {left} unused recovery code{s}.</p>
+<h3 style="font-size:14px;margin:16px 0 0">New phone</h3><p class="sub">Confirm with a code from your current authenticator, or with a recovery code if you no longer have it.</p>{replace}
+<h3 style="font-size:14px;margin:16px 0 0">Recovery codes</h3><p class="sub">New codes replace all of the old ones. Confirm with a code from your authenticator.</p>{codes_form}"#,
+            since = escape(since),
+            left = p.recovery_codes_left,
+            s = if p.recovery_codes_left == 1 { "" } else { "s" },
+            replace = form(
+                AccountOp::MfaReplace,
+                &code_field("replace_code", "Authenticator or recovery code"),
+                "Set up a new authenticator",
+                "secondary"
+            ),
+            codes_form = form(
+                AccountOp::RecoveryCodes,
+                &code_field("codes_code", "Authenticator code"),
+                "Get new recovery codes",
+                "secondary"
+            ),
+        ),
+    };
+    let password = form(
+        AccountOp::Password,
+        &format!(
+            r#"<label for="current_password">Current password</label><input id="current_password" name="{CURRENT_PASSWORD}" type="password" autocomplete="current-password" required>
+<label for="new_password">New password</label><input id="new_password" name="{NEW_PASSWORD}" type="password" autocomplete="new-password" required>
+<label for="confirm_password">Confirm new password</label><input id="confirm_password" name="{CONFIRM_PASSWORD}" type="password" autocomplete="new-password" required>"#
+        ),
+        "Change password",
+        "",
+    );
+    let body = format!(
+        r#"<h1>My account</h1><p class="sub">{upn}</p>{banner}{codes}
+<h2>Profile</h2><dl class="profile">{name}{given}{family}{user}{email}</dl>
+<p class="sub">Ask an administrator to change these.</p>
+<h2>Password</h2>{password}
+<h2>Multi-factor authentication</h2>{mfa}
+<h2>Sessions</h2><p>Sign out of every browser and application you are signed in to, this one included.</p>{everywhere}"#,
+        upn = escape(p.upn),
+        name = row("Name", p.display_name),
+        given = row("Given name", p.given_name),
+        family = row("Family name", p.family_name),
+        user = row("User name", Some(p.upn)),
+        email = row("Email", p.email),
+        everywhere = form(AccountOp::SignOutEverywhere, "", "Sign out everywhere", "secondary"),
+    );
+    let status = if p.error.is_some() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    respond(status, wide_page("My account", Some(p.tenant_name), &body), CSP_DEFAULT)
 }
 
 pub fn error(tenant_name: Option<&str>, message: &str) -> Response {

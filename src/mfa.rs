@@ -85,6 +85,8 @@ pub enum At<'a> {
     App(&'a ServicePrincipal),
     /// Signing in to the admin console: the tenant's console switch applies.
     Console,
+    /// Signing in to My Account: only the user's and the tenant's own setting.
+    MyAccount,
 }
 
 /// What a sign-in needs after the password.
@@ -189,6 +191,7 @@ pub async fn required(pool: &DbPool, tenant: &Tenant, user_id: &str, at: At<'_>)
     let here = match at {
         At::App(sp) => sp.mfa_required,
         At::Console => tenant.settings.require_console_mfa,
+        At::MyAccount => false,
     };
     Ok(base || here)
 }

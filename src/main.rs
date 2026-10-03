@@ -12,7 +12,12 @@ use rust_oidc::apps::{self, MemberType, Principal, RedirectPlatform, ScopeConsen
 use rust_oidc::config::PublicUrl;
 use rust_oidc::rbac::{RoleId, Scope};
 use rust_oidc::server::{self, TlsArgs};
+use rust_oidc::txn::{self, Actor as TxnActor};
 use rust_oidc::{AppState, db, directory, groups, keys, routes, tenant, users};
+
+/// Who every command-line change is made by: an operator with access to the
+/// database, recorded as `cli`.
+const CLI: TxnActor = TxnActor::Cli;
 
 #[derive(Parser)]
 #[command(
@@ -526,20 +531,17 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
             directory_role,
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
-            let password = password_or_stdin(password)?;
-            let id = users::create(
-                pool,
-                &t,
-                users::NewUser {
-                    upn: &upn,
-                    password: &password,
-                    display_name: display_name.as_deref(),
-                    given_name: given_name.as_deref(),
-                    family_name: family_name.as_deref(),
-                    email: email.as_deref(),
-                },
-            )
-            .await?;
+            let password = users::NewPassword::for_new_account(&password_or_stdin(password)?)?;
+            let create = txn::ops::users::CreateUser {
+                tenant_id: t.id.clone(),
+                upn: upn.clone(),
+                password,
+                display_name,
+                given_name,
+                family_name,
+                email,
+            };
+            let id = txn::run(pool, &CLI, &create).await.into_result()?.id;
             if let Some(role) = directory_role {
                 let Some(found) = directory::find(&role) else {
                     bail!("unknown directory role '{role}'");
@@ -557,15 +559,6 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
                 )
                 .await?;
             }
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::UserCreate,
-                Some(&id),
-                json!({ "upn": upn }),
-            )
-            .await?;
             print_json(json!({ "id": id, "userPrincipalName": upn }));
         }
         UserCmd::SetPassword {
@@ -581,23 +574,25 @@ async fn user_cmd(pool: &DbPool, cmd: UserCmd) -> anyhow::Result<()> {
             } else {
                 users::PasswordSetBy::Admin
             };
-            users::set_password_as(pool, &t, &upn, &password, by).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::UserSetPassword,
-                Some(&upn),
-                json!({}),
-            )
-            .await?;
+            let Some(user) = users::find_by_upn(pool, &t.id, &upn).await? else {
+                bail!("user '{upn}' not found");
+            };
+            // Checked against the history and hashed before the transaction.
+            let password = users::prepare_password(pool, &t, &user.id, &password, by).await?;
+            let reset = txn::ops::users::ResetPassword {
+                tenant_id: t.id.clone(),
+                account: txn::ops::Account::Id(user.id),
+                password,
+            };
+            txn::run(pool, &CLI, &reset).await.into_result()?;
         }
         UserCmd::Restore { tenant: key, upn } => {
             let t = tenant::find_for_admin(pool, &key).await?;
-            if !users::restore(pool, &t.id, &upn).await? {
-                bail!("no deleted account named '{upn}' in that tenant");
-            }
-            db::audit(pool, Some(&t.id), Actor::Cli, Event::UserRestore, Some(&upn), json!({})).await?;
+            let restore = txn::ops::users::RestoreUser {
+                tenant_id: t.id.clone(),
+                account: txn::ops::Account::Upn(upn.clone()),
+            };
+            txn::run(pool, &CLI, &restore).await.into_result()?;
             print_json(json!({ "userPrincipalName": upn, "restored": true }));
         }
     }
@@ -612,16 +607,12 @@ async fn group_cmd(pool: &DbPool, cmd: GroupCmd) -> anyhow::Result<()> {
             description,
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
-            let id = groups::create(pool, &t, &name, description.as_deref()).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::GroupCreate,
-                Some(&id),
-                json!({ "name": name }),
-            )
-            .await?;
+            let create = txn::ops::groups::CreateGroup {
+                tenant_id: t.id.clone(),
+                name: name.clone(),
+                description,
+            };
+            let id = txn::run(pool, &CLI, &create).await.into_result()?;
             print_json(json!({ "id": id, "displayName": name }));
         }
         GroupCmd::AddMember {
@@ -630,16 +621,16 @@ async fn group_cmd(pool: &DbPool, cmd: GroupCmd) -> anyhow::Result<()> {
             user,
         } => {
             let t = tenant::find_for_admin(pool, &key).await?;
-            groups::add_member(pool, &t, &group, &user).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::GroupAddMember,
-                Some(&group),
-                json!({ "upn": user }),
-            )
-            .await?;
+            // The command line names the group, the console its id.
+            let Some(group_id) = groups::find(pool, &t.id, &group).await? else {
+                bail!("group '{group}' not found");
+            };
+            let add = txn::ops::groups::AddGroupMember {
+                tenant_id: t.id.clone(),
+                group_id,
+                account: txn::ops::Account::Upn(user),
+            };
+            txn::run(pool, &CLI, &add).await.into_result()?;
         }
     }
     Ok(())

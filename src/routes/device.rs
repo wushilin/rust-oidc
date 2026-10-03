@@ -17,6 +17,7 @@ use sqlx::Row;
 use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
 use crate::access;
+use crate::admin::routes::Settled;
 use crate::apps::{self, Application};
 use crate::claims::Amr;
 use crate::error::{AadError, Aadsts, no_store};
@@ -563,24 +564,17 @@ async fn second_step(
             let refused = if new != confirm {
                 Some("The passwords don't match.".to_string())
             } else {
-                users::change_password(&st.pool, &home, &user.id, new, users::PasswordSetBy::User)
-                    .await
-                    .err()
-                    .map(|e| e.to_string())
+                let changed = super::change_own_password(st, &home, &user.id, new, Channel::Device).await;
+                match super::settle_own(changed, &tenant.name) {
+                    Settled::Done(()) => None,
+                    Settled::Refused(message) => Some(message),
+                    Settled::Respond(resp) => return resp,
+                }
             };
             if let Some(message) = refused {
                 return change_page(st, tenant, &pending, &user.upn, &ticket, Some(&message));
             }
             let _ = mfa::finish(&st.pool, &ticket).await;
-            audit::record(
-                st,
-                &tenant.id,
-                Actor::Id(&user.id),
-                Event::PasswordChanged,
-                Some(&user.id),
-                json!({ "via": Channel::Device.as_str() }),
-            )
-            .await;
             let mut amr = vec![Amr::Pwd.as_str()];
             if waiting.purpose == Purpose::ChangePasswordAfterMfa {
                 amr.push(Amr::Mfa.as_str());
@@ -640,21 +634,15 @@ async fn second_step(
                     _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
                 };
             }
-            let codes = match mfa::enroll(&st.pool, &user.id, &secret).await {
-                Ok(codes) => codes,
-                Err(e) => return html::error(Some(&tenant.name), &AadError::from(e).description()),
+            // Then signed out everywhere, by the same transaction.
+            let enrolled =
+                super::enroll_own_authenticator(st, &home.id, &user.id, &secret, Channel::Device, false).await;
+            let codes = match super::settle_own(enrolled, &tenant.name) {
+                Settled::Done(codes) => codes,
+                Settled::Refused(message) => return login_page(st, tenant, &pending, "", Some(&message)),
+                Settled::Respond(resp) => return resp,
             };
             let _ = mfa::finish(&st.pool, &ticket).await;
-            let _ = users::end_sessions(&st.pool, &user.id).await;
-            audit::record(
-                st,
-                &tenant.id,
-                Actor::Id(&user.id),
-                Event::MfaEnrolled,
-                Some(&user.id),
-                json!({ "via": Channel::Device.as_str() }),
-            )
-            .await;
             let again = format!("{}?user_code={}", deviceauth_url(st, &tenant.id), pending.user_code);
             let mut resp = html::mfa_enrolled(&tenant.name, &codes, &again);
             resp.headers_mut().append(

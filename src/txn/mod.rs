@@ -374,4 +374,8 @@ transactions! {
     DeleteGroup(ops::groups::DeleteGroup),
     AddGroupMember(ops::groups::AddGroupMember),
     RemoveGroupMember(ops::groups::RemoveGroupMember),
+    ChangeOwnPassword(ops::self_service::ChangeOwnPassword),
+    EnrollAuthenticator(ops::self_service::EnrollAuthenticator),
+    ReplaceRecoveryCodes(ops::self_service::ReplaceRecoveryCodes),
+    SignOutEverywhere(ops::self_service::SignOutEverywhere),
 }

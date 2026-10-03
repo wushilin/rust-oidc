@@ -417,11 +417,42 @@ fn new_recovery_code() -> String {
     format!("{}-{}", &raw[..RECOVERY_GROUP], &raw[RECOVERY_GROUP..])
 }
 
+/// A new set of recovery codes, made and hashed before the transaction that
+/// stores them. The plain codes are shown to the user once and never stored or
+/// recorded. The only way to make one is [`NewRecoveryCodes::generate`], so the
+/// hashes always belong to the codes.
+pub struct NewRecoveryCodes {
+    plain: Vec<String>,
+    hashes: Vec<String>,
+}
+
+impl std::fmt::Debug for NewRecoveryCodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewRecoveryCodes")
+            .field("count", &self.plain.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NewRecoveryCodes {
+    pub fn generate() -> Self {
+        let plain: Vec<String> = (0..RECOVERY_CODE_COUNT).map(|_| new_recovery_code()).collect();
+        let hashes = plain.iter().map(|c| recovery_hash(c)).collect();
+        Self { plain, hashes }
+    }
+
+    /// The codes to show the user, once.
+    pub fn plain(&self) -> &[String] {
+        &self.plain
+    }
+}
+
 async fn insert_recovery_codes(
     conn: &mut sqlx::AnyConnection,
     engine: crate::db::Engine,
     user_id: &str,
-) -> anyhow::Result<Vec<String>> {
+    codes: &NewRecoveryCodes,
+) -> anyhow::Result<()> {
     sqlx::query(crate::db::sql_stmt(
         engine,
         "DELETE FROM user_recovery_codes WHERE user_id = ?",
@@ -429,20 +460,19 @@ async fn insert_recovery_codes(
     .bind(user_id)
     .execute(&mut *conn)
     .await?;
-    let codes: Vec<String> = (0..RECOVERY_CODE_COUNT).map(|_| new_recovery_code()).collect();
-    for code in &codes {
+    for hash in &codes.hashes {
         sqlx::query(crate::db::sql_stmt(
             engine,
             "INSERT INTO user_recovery_codes (id, user_id, code_hash, created_at) VALUES (?, ?, ?, ?)",
         ))
         .bind(new_guid())
         .bind(user_id)
-        .bind(recovery_hash(code))
+        .bind(hash)
         .bind(now())
         .execute(&mut *conn)
         .await?;
     }
-    Ok(codes)
+    Ok(())
 }
 
 /// Spend a recovery code. Each works once.
@@ -481,19 +511,27 @@ pub(crate) async fn recovery_codes_left_in(conn: &mut crate::db::Conn, user_id: 
 
 /// A new set of recovery codes, replacing all the old ones. Shown once.
 pub async fn replace_recovery_codes<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<Vec<String>> {
+    let codes = NewRecoveryCodes::generate();
     let mut conn = db.acquire().await?;
-    replace_recovery_codes_in(&mut conn, user_id).await
+    replace_recovery_codes_in(&mut conn, user_id, &codes).await?;
+    Ok(codes.plain)
 }
 
+/// Store a prepared set of recovery codes in place of the user's old ones.
+/// Refused when the user has no authenticator: the codes stand in for one.
 pub(crate) async fn replace_recovery_codes_in(
     conn: &mut crate::db::Conn,
     user_id: &str,
-) -> anyhow::Result<Vec<String>> {
+    codes: &NewRecoveryCodes,
+) -> anyhow::Result<()> {
+    if enrolled_at_in(&mut *conn, user_id).await?.is_none() {
+        bail!("You have no authenticator. Set one up first; it comes with recovery codes.");
+    }
     let engine = crate::db::engine_of_conn(&conn);
     let mut tx = conn.begin().await?;
-    let codes = insert_recovery_codes(&mut tx, engine, user_id).await?;
+    insert_recovery_codes(&mut tx, engine, user_id, codes).await?;
     tx.commit().await?;
-    Ok(codes)
+    Ok(())
 }
 
 /// Which kind of second factor was given.
@@ -537,11 +575,19 @@ pub(crate) async fn check_in(conn: &mut crate::db::Conn, user_id: &str, typed: &
 /// Make `secret` the user's authenticator, replacing any other, with a new set
 /// of recovery codes, which are returned to be shown once.
 pub async fn enroll<'c>(db: impl Handle<'c>, user_id: &str, secret: &str) -> anyhow::Result<Vec<String>> {
+    let codes = NewRecoveryCodes::generate();
     let mut conn = db.acquire().await?;
-    enroll_in(&mut conn, user_id, secret).await
+    enroll_in(&mut conn, user_id, secret, &codes).await?;
+    Ok(codes.plain)
 }
 
-pub(crate) async fn enroll_in(conn: &mut crate::db::Conn, user_id: &str, secret: &str) -> anyhow::Result<Vec<String>> {
+/// [`enroll`], with recovery codes made before the transaction began.
+pub(crate) async fn enroll_in(
+    conn: &mut crate::db::Conn,
+    user_id: &str,
+    secret: &str,
+    codes: &NewRecoveryCodes,
+) -> anyhow::Result<()> {
     let engine = crate::db::engine_of_conn(&conn);
     let mut tx = conn.begin().await?;
     sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_totp WHERE user_id = ?"))
@@ -559,9 +605,9 @@ pub(crate) async fn enroll_in(conn: &mut crate::db::Conn, user_id: &str, secret:
     .bind(matching_step(secret, &code_for(secret, now()), now()).unwrap_or(0))
     .execute(&mut *tx)
     .await?;
-    let codes = insert_recovery_codes(&mut tx, engine, user_id).await?;
+    insert_recovery_codes(&mut tx, engine, user_id, codes).await?;
     tx.commit().await?;
-    Ok(codes)
+    Ok(())
 }
 
 /// An administrator's reset: the authenticator and every recovery code go, and

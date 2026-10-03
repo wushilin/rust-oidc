@@ -103,6 +103,10 @@ impl Amr {
     }
 }
 
+/// The `acct` claim's value for an account of another tenant (Entra: 0 member,
+/// 1 guest).
+const ACCT_EXTERNAL: u8 = 1;
+
 pub async fn issue(
     st: &AppState,
     sign_in: &SignIn,
@@ -116,8 +120,21 @@ pub async fn issue(
     let tid = &sign_in.tenant.id;
     let iat = now();
     let sub = st.secrets.pairwise_sub(&user.id, &sign_in.client.app_id).await?;
-    let user_groups = groups::for_user(pool, &user.id).await?;
-    let wids = directory::wids_for_user(pool, tid, &user.id).await?;
+    // An account of another tenant: its own tenant's groups and directory roles
+    // mean nothing here, so neither is claimed; `idp` says where it is from, and
+    // `acct` marks it as external (1), as Entra does for a guest.
+    let outsider = user.tenant_id != *tid;
+    let user_groups = if outsider {
+        Vec::new()
+    } else {
+        groups::for_user(pool, &user.id).await?
+    };
+    let wids = if outsider {
+        Vec::new()
+    } else {
+        directory::wids_for_user(pool, tid, &user.id).await?
+    };
+    let idp = outsider.then(|| st.public_url.issuer(&user.tenant_id));
     let name = user.display_name.clone().unwrap_or_else(|| user.upn.clone());
 
     // ---- access token ----
@@ -128,6 +145,10 @@ pub async fn issue(
     };
     let mut at = Map::new();
     at.insert("aud".into(), json!(grant.resource.audience()));
+    if let Some(idp) = &idp {
+        at.insert("idp".into(), json!(idp));
+        at.insert("acct".into(), json!(ACCT_EXTERNAL));
+    }
     at.insert("iss".into(), json!(st.public_url.issuer(tid)));
     at.insert("iat".into(), json!(iat));
     at.insert("nbf".into(), json!(iat));
@@ -159,6 +180,10 @@ pub async fn issue(
         };
         let mut id = Map::new();
         id.insert("aud".into(), json!(sign_in.client.app_id));
+        if let Some(idp) = &idp {
+            id.insert("idp".into(), json!(idp));
+            id.insert("acct".into(), json!(ACCT_EXTERNAL));
+        }
         id.insert("iss".into(), json!(st.public_url.issuer(tid)));
         id.insert("iat".into(), json!(iat));
         id.insert("nbf".into(), json!(iat));

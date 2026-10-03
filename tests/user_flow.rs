@@ -806,8 +806,11 @@ async fn groups_wids_and_assignment_required() {
     )
     .await
     .unwrap();
+    // A refused sign-in leaves no session (it is refused before one is made),
+    // so the user signs in again, and now gets in.
     let page = b.authorize(&s, &f.tenant.id, &params).await;
-    assert_eq!(page.status, 302, "session exists, assignment now satisfied");
+    let page = b.login(&page, &f.upn, &f.password).await;
+    assert_eq!(page.status, 302, "assignment now satisfied: {}", page.body);
     let code = page.redirect_params()["code"].clone();
     let (_, body) = s
         .token(

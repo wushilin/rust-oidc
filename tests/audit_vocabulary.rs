@@ -103,6 +103,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("AdminUserRestore", "admin.user.restore"),
     ("AdminUserMfaReset", "admin.user.mfa_reset"),
     ("AdminUserMfaPolicy", "admin.user.mfa_policy"),
+    ("AdminUserCrossTenantPolicy", "admin.user.cross_tenant_policy"),
     ("AdminFlowTestStart", "admin.flow_test.start"),
     ("AdminFlowTestResult", "admin.flow_test.result"),
 ];

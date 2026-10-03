@@ -16,6 +16,7 @@ use sqlx::Row;
 
 use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
+use crate::access;
 use crate::apps::{self, Application};
 use crate::claims::Amr;
 use crate::error::{AadError, Aadsts, no_store};
@@ -369,11 +370,42 @@ async fn step_after_code(st: &AppState, tenant: &Tenant, headers: &HeaderMap, us
         Err(_) => return html::error(Some(&tenant.name), "Something went wrong. Please try again."),
     };
     match session::find(&st.pool, headers, &tenant.id).await {
-        Ok(Some(s)) => match second_step_needed(st, tenant, &pending, &s.user_id, &s.amr).await {
-            Some(step) => start_mfa(st, tenant, &pending, &s.user_id, step).await,
-            None => approval_page(st, tenant, &pending, &s.user_id).await,
-        },
+        Ok(Some(s)) => {
+            if let Err(refused) = gate(st, tenant, &pending, &s.user_id).await {
+                return refused;
+            }
+            match second_step_needed(st, tenant, &pending, &s.user_id, &s.amr).await {
+                Some(step) => start_mfa(st, tenant, &pending, &s.user_id, step).await,
+                None => approval_page(st, tenant, &pending, &s.user_id).await,
+            }
+        }
         _ => login_page(st, tenant, &pending, "", None),
+    }
+}
+
+/// Whether this user may use the client at all ([`access::decide`]); the page
+/// saying why not, if not.
+async fn gate(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &str) -> Result<(), Response> {
+    let failed = |e: anyhow::Error| html::error(Some(&tenant.name), &AadError::from(e).description());
+    let user = users::find_by_id(&st.pool, user_id)
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| login_page(st, tenant, pending, "", None))?;
+    let sp = apps::service_principal(&st.pool, &tenant.id, &pending.client.app_id)
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| html::error(Some(&tenant.name), "That application is not available."))?;
+    let decision = access::decide(&st.pool, tenant, &sp, &user).await.map_err(failed)?;
+    match decision.refusal {
+        None => Ok(()),
+        Some(refusal) => Err(html::error(
+            Some(&tenant.name),
+            &format!(
+                "AADSTS{}: {}",
+                refusal.aadsts().code(),
+                refusal.message(&pending.client.display_name, &tenant.name, &decision.home.name)
+            ),
+        )),
     }
 }
 
@@ -393,7 +425,10 @@ async fn second_step_needed(
         .await
         .ok()
         .flatten()?;
-    match mfa::step(&st.pool, tenant, user_id, mfa::At::App(&sp)).await {
+    // Their own tenant's MFA rules, for an account of another tenant too.
+    let user = users::find_by_id(&st.pool, user_id).await.ok().flatten()?;
+    let home = access::home_of(&st.pool, &user).await.ok().flatten()?;
+    match mfa::step(&st.pool, &home, user_id, mfa::At::App(&sp)).await {
         Ok(mfa::Step::Done) | Err(_) => None,
         Ok(step) => Some(step),
     }
@@ -405,7 +440,7 @@ async fn start_mfa(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &
     } else {
         Purpose::Verify
     };
-    let user = match users::find(&st.pool, &tenant.id, user_id).await {
+    let user = match users::find_by_id(&st.pool, user_id).await {
         Ok(Some(u)) => u,
         _ => return login_page(st, tenant, pending, "", None),
     };
@@ -504,9 +539,12 @@ async fn second_step(
     let Ok(Some(waiting)) = mfa::pending(&st.pool, &ticket, &tenant.id).await else {
         return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED));
     };
-    let user = match users::find(&st.pool, &tenant.id, &waiting.user_id).await {
+    let user = match users::find_by_id(&st.pool, &waiting.user_id).await {
         Ok(Some(u)) if u.enabled => u,
         _ => return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
+    };
+    let Ok(Some(home)) = access::home_of(&st.pool, &user).await else {
+        return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED));
     };
     let fits = match op {
         DeviceOp::MfaEnroll => waiting.purpose == Purpose::Enroll,
@@ -528,7 +566,7 @@ async fn second_step(
             let refused = if new != confirm {
                 Some("The passwords don't match.".to_string())
             } else {
-                users::change_password(&st.pool, tenant, &user.id, new, users::PasswordSetBy::User)
+                users::change_password(&st.pool, &home, &user.id, new, users::PasswordSetBy::User)
                     .await
                     .err()
                     .map(|e| e.to_string())
@@ -650,7 +688,7 @@ fn login_page(st: &AppState, tenant: &Tenant, pending: &Pending, upn: &str, erro
 }
 
 async fn approval_page(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &str) -> Response {
-    let user = match users::find(&st.pool, &tenant.id, user_id).await {
+    let user = match users::find_by_id(&st.pool, user_id).await {
         Ok(Some(u)) if u.enabled => u,
         _ => return login_page(st, tenant, pending, "", None),
     };
@@ -696,7 +734,11 @@ async fn sign_in(
     };
     let upn = get(form, "upn").unwrap_or_default();
     let password = get(form, "password").unwrap_or_default();
-    let (outcome, trace) = match users::authenticate_traced(&st.pool, tenant, upn, password).await {
+    let sp = apps::service_principal(&st.pool, &tenant.id, &pending.client.app_id)
+        .await
+        .ok()
+        .flatten();
+    let (outcome, trace) = match access::authenticate(&st.pool, tenant, sp.as_ref(), upn, password).await {
         Ok(o) => o,
         Err(e) => return Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
     };
@@ -713,7 +755,13 @@ async fn sign_in(
     let user = match outcome {
         AuthResult::Ok(user) => user,
         AuthResult::InvalidCredentials => {
-            let hint = tenant::not_ours_hint(&st.pool, tenant, upn).await;
+            let hint = tenant::not_ours_hint(
+                &st.pool,
+                tenant,
+                upn,
+                sp.as_ref().is_some_and(|sp| sp.accept_other_tenants),
+            )
+            .await;
             return Err(login_page(
                 st,
                 tenant,
@@ -745,6 +793,7 @@ async fn sign_in(
         }
     };
 
+    gate(st, tenant, &pending, &user.id).await?;
     // A second step, where one is needed, before there is any session.
     if let Some(step) = second_step_needed(st, tenant, &pending, &user.id, &[]).await {
         return Ok(start_mfa(st, tenant, &pending, &user.id, step).await);
@@ -872,6 +921,11 @@ async fn decide(
     let Ok(Some(s)) = session::find(&st.pool, headers, &tenant.id).await else {
         return login_page(st, tenant, &pending, "", None);
     };
+    if status == DeviceStatus::Approved
+        && let Err(refused) = gate(st, tenant, &pending, &s.user_id).await
+    {
+        return refused;
+    }
     if status == DeviceStatus::Approved
         && let Some(step) = second_step_needed(st, tenant, &pending, &s.user_id, &s.amr).await
     {

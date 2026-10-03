@@ -31,6 +31,7 @@ use crate::tenant::{self, Tenant, TenantSettings};
 /// what makes the form and the type obviously the same three values.
 const REQUIRE_MFA: &str = "require_mfa";
 const PASSWORD_HISTORY: &str = "password_history";
+const ALLOW_CROSS_TENANT: &str = "allow_cross_tenant_sign_in";
 const REQUIRE_CONSOLE_MFA: &str = "require_console_mfa";
 const ACCESS_TOKEN: &str = "access_token_lifetime_secs";
 const SESSION: &str = "session_lifetime_secs";
@@ -89,6 +90,10 @@ async fn render(
 <label for="{PASSWORD_HISTORY}">Remembered passwords</label><input id="{PASSWORD_HISTORY}" name="{PASSWORD_HISTORY}" type="text" value="{history}"{disabled}>
 <p class="muted">A new password may not be one of the account's last this many. Between 0 (off) and {max_history}.
 A temporary password set by an administrator is exempt; the one the user then chooses is not.</p>
+<h2>Other organizations</h2>
+<label><input type="checkbox" name="{ALLOW_CROSS_TENANT}"{cross}{disabled}> Allow this tenant's accounts to sign in to applications of other tenants</label>
+<p class="muted">Only to applications that accept other tenants and have assigned the account, directly or
+through one of this tenant's groups. A user's own setting, on their page, can make an exception either way.</p>
 <h2>Multi-factor authentication</h2>
 <label><input type="checkbox" name="{REQUIRE_MFA}"{mfa}{disabled}> Require MFA of everyone signing in to this tenant's applications</label>
 <p class="muted">A user's own setting, on their page, can make an exception either way. Whoever has not set
@@ -104,6 +109,11 @@ issued are self-contained and cannot be shortened after the fact.</p>{manage}"#,
         csrf = view::csrf_input(&ctx.csrf),
         mfa = if settings.require_mfa { " checked" } else { "" },
         history = settings.password_history,
+        cross = if settings.allow_cross_tenant_sign_in {
+            " checked"
+        } else {
+            ""
+        },
         max_history = TenantSettings::MAX_PASSWORD_HISTORY,
         console_mfa = if settings.require_console_mfa { " checked" } else { "" },
         root_note = if tenant.is_root {
@@ -206,6 +216,7 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
                     }
                 },
             },
+            allow_cross_tenant_sign_in: checked(&form, ALLOW_CROSS_TENANT),
             require_mfa: checked(&form, REQUIRE_MFA),
             require_console_mfa: checked(&form, REQUIRE_CONSOLE_MFA),
         },

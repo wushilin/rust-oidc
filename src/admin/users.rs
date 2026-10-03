@@ -39,6 +39,8 @@ pub enum UserOp {
     MfaPolicy,
     /// Remove their authenticator and recovery codes.
     MfaReset,
+    /// Whether they may sign in to other tenants' applications.
+    CrossTenant,
 }
 
 impl UserOp {
@@ -51,6 +53,7 @@ impl UserOp {
         Self::Groups,
         Self::MfaPolicy,
         Self::MfaReset,
+        Self::CrossTenant,
     ];
 
     /// The form's `op` field.
@@ -66,6 +69,7 @@ impl UserOp {
             Self::Groups => "groups",
             Self::MfaPolicy => "mfa_policy",
             Self::MfaReset => "mfa_reset",
+            Self::CrossTenant => "cross_tenant",
         }
     }
 
@@ -79,7 +83,7 @@ impl UserOp {
         match self {
             // Removing an authenticator is a reset of a credential, like a password.
             Self::Reset | Self::MfaReset => USER_RESET,
-            Self::MfaPolicy => USER_WRITE,
+            Self::MfaPolicy | Self::CrossTenant => USER_WRITE,
             Self::Attributes | Self::Enable | Self::Disable | Self::Delete => USER_WRITE,
             // Who is in a group is the group's to change.
             Self::Groups => GROUP_WRITE,
@@ -97,12 +101,16 @@ impl UserOp {
             Self::Groups => Event::AdminGroupMemberAdd,
             Self::MfaPolicy => Event::AdminUserMfaPolicy,
             Self::MfaReset => Event::AdminUserMfaReset,
+            Self::CrossTenant => Event::AdminUserCrossTenantPolicy,
         }
     }
 }
 
 /// Whether a password an administrator sets must be replaced at next sign-in.
 const REQUIRE_CHANGE: &str = "require_change";
+
+/// The user's setting for other tenants' applications.
+const CROSS_TENANT: &str = "cross_tenant";
 
 /// The user's MFA setting on their page.
 const MFA_POLICY: &str = "mfa_policy";
@@ -769,6 +777,43 @@ disabled or deleted from here. Another administrator can.</p>"#
         )
     };
 
+    let other_tenants = {
+        use crate::access::CrossTenantPolicy;
+        let own = crate::access::policy(&st.pool, &user.id)
+            .await
+            .unwrap_or(CrossTenantPolicy::Default);
+        let tenant_rule = if tenant.settings.allow_cross_tenant_sign_in {
+            "This tenant allows its accounts to sign in to other tenants' applications that assign them."
+        } else {
+            "This tenant does not allow its accounts to sign in to other tenants' applications."
+        };
+        let setting = if may_write {
+            let options: String = CrossTenantPolicy::ALL
+                .iter()
+                .map(|p| {
+                    format!(
+                        r#"<option value="{v}"{sel}>{label}</option>"#,
+                        v = e(p.as_str()),
+                        sel = if *p == own { " selected" } else { "" },
+                        label = e(p.label()),
+                    )
+                })
+                .collect();
+            format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+<label for="cross_tenant">Signing in to other tenants' applications</label><select id="cross_tenant" name="{CROSS_TENANT}">{options}</select>
+<p class="muted">{tenant_rule} Only applications that accept other tenants and assign this account let it in.</p>
+<div class="actions"><button type="submit">Save</button></div></form>"#,
+                url = e(&url),
+                op_field = UserOp::FIELD,
+                op = UserOp::CrossTenant.as_str(),
+            )
+        } else {
+            format!(r#"<p>{}. <span class="muted">{tenant_rule}</span></p>"#, e(own.label()))
+        };
+        format!(r#"<h2>Other organizations</h2>{setting}"#)
+    };
+
     let groups = if ctx.can_in(GROUP_READ, tenant) {
         let held = crate::groups::for_user(&st.pool, &user.id).await.unwrap_or_default();
         let all = crate::groups::list(&st.pool, &tenant.id).await.unwrap_or_default();
@@ -827,7 +872,7 @@ disabled or deleted from here. Another administrator can.</p>"#
 
     let body = format!(
         r#"<h1>{upn}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
-<h2>Attributes</h2>{attributes}{state}{reset}{mfa}{groups}{history}"#,
+<h2>Attributes</h2>{attributes}{state}{reset}{mfa}{other_tenants}{groups}{history}"#,
         upn = e(&user.upn),
         tenant_name = e(&tenant.name),
         id = e(&user.id),
@@ -987,6 +1032,13 @@ async fn apply(
             };
             crate::mfa::set_policy(&st.pool, &tenant.id, &user.id, policy).await?;
             Ok(json!({ "mfaPolicy": policy.as_str() }))
+        }
+        UserOp::CrossTenant => {
+            let Some(policy) = crate::access::CrossTenantPolicy::parse(field(form, CROSS_TENANT)) else {
+                anyhow::bail!("choose a setting");
+            };
+            crate::access::set_policy(&st.pool, &tenant.id, &user.id, policy).await?;
+            Ok(json!({ "crossTenantPolicy": policy.as_str() }))
         }
         UserOp::MfaReset => {
             if !crate::mfa::reset(&st.pool, &tenant.id, &user.id).await? {

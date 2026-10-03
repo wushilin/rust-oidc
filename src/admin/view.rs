@@ -121,6 +121,14 @@ a.tile { display:flex; flex-direction:column; gap:4px; padding:14px 16px; backgr
 a.tile:hover { border-color:var(--accent); }
 a.tile span { color:var(--muted); font-size:13.5px; }
 a.tile .pill { align-self:flex-start; margin-top:4px; }
+/* Check sign-in: a verdict, then each check with its mark. */
+p.verdict { font-weight:600; font-size:16px; padding:10px 14px; border-radius:6px; border:1px solid var(--line); background:var(--surface); }
+p.verdict.works { border-color:var(--ok); color:var(--ok); }
+p.verdict.refused { border-color:var(--err); color:var(--err); }
+ul.checks { list-style:none; padding:0; margin:6px 0 14px; }
+ul.checks li { padding:3px 0; }
+.mark { display:inline-block; width:1.4em; font-weight:700; }
+.mark.pass { color:var(--ok); } .mark.fail { color:var(--err); } .mark.note { color:var(--muted); }
 /* Dialogs: the browser's popover, centred over a dimmed page. */
 [popover].dialog { margin:auto; inset:0; max-width:460px; width:calc(100% - 32px); height:fit-content; border:1px solid var(--line); border-radius:8px; padding:20px 22px; background:var(--surface); color:var(--ink); box-shadow:0 16px 48px rgba(0,0,0,.28); }
 [popover].dialog::backdrop { background:rgba(10,16,20,.45); }

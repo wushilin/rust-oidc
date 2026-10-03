@@ -69,7 +69,8 @@ pub async fn userinfo(State(st): State<AppState>, method: Method, headers: Heade
     if str_claim("iss") != st.public_url.issuer(&t.id) {
         return unauthorized("The access token's issuer is not valid.");
     }
-    let Ok(Some(user)) = users::find(&st.pool, &t.id, &oid).await else {
+    // Of this tenant, or of another signed in to one of its applications.
+    let Ok(Some(user)) = users::find_by_id(&st.pool, &oid).await else {
         return unauthorized("The user no longer exists.");
     };
     if !user.enabled {

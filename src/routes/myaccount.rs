@@ -329,7 +329,7 @@ async fn password(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form: &Pa
     let user = match outcome {
         AuthResult::Ok(user) => user,
         AuthResult::InvalidCredentials => {
-            let hint = tenant::not_ours_hint(&st.pool, tenant, upn).await;
+            let hint = tenant::not_ours_hint(&st.pool, tenant, upn, false).await;
             return login_page(
                 st,
                 tenant,

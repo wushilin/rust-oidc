@@ -1175,6 +1175,22 @@ set-up keeps the user signed in (only a set-up at sign-in signs them out); a pas
 changed here ends every other session and keeps this browser's; the address is on the
 Configuration page. Forgot-password is out (no mail).
 
+**154. Signing in to an application of another tenant** (user's design, 3 Oct): the
+application accepts other tenants (a switch that cannot be turned off while any of
+theirs are assigned), the account is assigned directly or through a group of its own
+tenant (named `name@domain`, flagged "membership managed by"), and the account's own
+tenant lets it: a tenant default (off) and a per-user Default / Allow / Disallow. One
+function, `access::decide`, answers it for browser, device code, password grant and
+every token (so a refresh stops when a lever changes) and for the console's Check
+sign-in tool. Mine: the password is checked in the account's own tenant; MFA, lockout,
+forced change and password history are its own tenant's; the token is issued by the
+application's tenant with `idp` = the home issuer and `acct` = 1, no `groups`, no
+`wids`; `oid` stays the account's own (Entra gives guests a new one); refusals are
+AADSTS50020, 50105 and 500213 (the last our guess). An unassigned or refused user is
+now refused right after the password, before any second step or session.
+Check sign-in says only "not assigned" about another tenant's account that is not
+assigned here.
+
 ## Housekeeping
 
 **22. `Amr` is stored as strings, not parsed into the enum.** A token minted by an

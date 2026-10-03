@@ -199,6 +199,11 @@ pub enum Aadsts {
     MfaRegistrationRequired,
     /// The account must choose a new password before anything is issued to it.
     PasswordExpired,
+    /// An account of another tenant, at an application that accepts only its own.
+    ExternalUserNotInTenant,
+    /// The account's own tenant does not let it sign in to other tenants'
+    /// applications. **Our guess** at Entra's closest number.
+    OutboundAccessBlocked,
 
     // ---- grants ----
     UnsupportedGrantType,
@@ -281,6 +286,8 @@ impl Aadsts {
         Self::MfaRequired,
         Self::MfaRegistrationRequired,
         Self::PasswordExpired,
+        Self::ExternalUserNotInTenant,
+        Self::OutboundAccessBlocked,
         Self::UnsupportedGrantType,
         Self::PasswordGrantNotAllowed,
         Self::GrantRevoked,
@@ -336,6 +343,8 @@ impl Aadsts {
             Self::MfaRequired => 50076,
             Self::MfaRegistrationRequired => 50079,
             Self::PasswordExpired => 50055,
+            Self::ExternalUserNotInTenant => 50020,
+            Self::OutboundAccessBlocked => 500213,
             Self::UnsupportedGrantType => 70003,
             Self::PasswordGrantNotAllowed => 700034,
             Self::GrantRevoked => 50173,

@@ -547,6 +547,7 @@ pub enum Event {
     AdminUserRestore,
     AdminUserMfaReset,
     AdminUserMfaPolicy,
+    AdminUserCrossTenantPolicy,
     /// An administrator sent an authorize request from the console's flow tester.
     /// The row records who, against which application, and with what response
     /// type -- never the state, the nonce or the PKCE verifier it generated.
@@ -647,6 +648,7 @@ impl Event {
         Self::AdminUserRestore,
         Self::AdminUserMfaReset,
         Self::AdminUserMfaPolicy,
+        Self::AdminUserCrossTenantPolicy,
         Self::AdminFlowTestStart,
         Self::AdminFlowTestResult,
     ];
@@ -746,6 +748,7 @@ impl Event {
             Self::AdminUserRestore => "admin.user.restore",
             Self::AdminUserMfaReset => "admin.user.mfa_reset",
             Self::AdminUserMfaPolicy => "admin.user.mfa_policy",
+            Self::AdminUserCrossTenantPolicy => "admin.user.cross_tenant_policy",
             Self::AdminFlowTestStart => "admin.flow_test.start",
             Self::AdminFlowTestResult => "admin.flow_test.result",
         }

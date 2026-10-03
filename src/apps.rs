@@ -39,6 +39,9 @@ pub struct ServicePrincipal {
     /// Everyone signing in to it must use MFA.
     #[sqlx(try_from = "crate::db::Flag")]
     pub mfa_required: bool,
+    /// Accounts of other tenants may sign in to it, when assigned to it.
+    #[sqlx(try_from = "crate::db::Flag")]
+    pub accept_other_tenants: bool,
 }
 
 pub struct CreatedApp {
@@ -145,7 +148,7 @@ pub async fn service_principal(
 ) -> anyhow::Result<Option<ServicePrincipal>> {
     Ok(sqlx::query_as(crate::db::q(
         pool,
-        "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required, mfa_required FROM service_principals
+        "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required, mfa_required, accept_other_tenants FROM service_principals
          WHERE tenant_id = ? AND app_id = ?",
     ))
     .bind(tenant_id)
@@ -479,45 +482,162 @@ pub enum Principal {
     Group(String),
 }
 
-/// A named principal of this tenant, as its id, its kind, and the kind of app
-/// role it may hold.
-async fn resolve_principal(
-    pool: &DbPool,
-    tenant: &Tenant,
-    principal: &Principal,
-) -> anyhow::Result<(String, PrincipalType, MemberType)> {
+/// A named principal, resolved: its id, its kind, the kind of app role it may
+/// hold, and the tenant it belongs to.
+struct Resolved {
+    id: String,
+    kind: PrincipalType,
+    member_type: MemberType,
+    tenant_id: String,
+}
+
+/// The tenant a name's domain belongs to, when it is a tenant other than
+/// `tenant`. A user is named by user name, so its domain says its tenant; a
+/// group of another tenant is named `name@domain`, the same way.
+async fn other_tenant_of(pool: &DbPool, tenant: &Tenant, name: &str) -> anyhow::Result<Option<Tenant>> {
+    let Some((_, domain)) = name.rsplit_once('@') else {
+        return Ok(None);
+    };
+    Ok(crate::tenant::resolve(pool, domain)
+        .await?
+        .filter(|t| t.id != tenant.id))
+}
+
+/// Resolve a principal named for an assignment in `tenant`. A user or group of
+/// another tenant is found in its own tenant; whether it may be assigned is
+/// [`admit`]'s to say. A client application is always of this tenant.
+async fn resolve_principal(pool: &DbPool, tenant: &Tenant, principal: &Principal) -> anyhow::Result<Resolved> {
     Ok(match principal {
         Principal::App(app_id) => {
             let sp = service_principal(pool, &tenant.id, app_id)
                 .await?
                 .with_context(|| format!("app '{app_id}' not found in tenant '{}'", tenant.name))?;
-            (sp.id, PrincipalType::ServicePrincipal, MemberType::Application)
+            Resolved {
+                id: sp.id,
+                kind: PrincipalType::ServicePrincipal,
+                member_type: MemberType::Application,
+                tenant_id: tenant.id.clone(),
+            }
         }
         Principal::User(upn) => {
+            let home = other_tenant_of(pool, tenant, upn)
+                .await?
+                .unwrap_or_else(|| tenant.clone());
             let row: Option<(String,)> = sqlx::query_as(crate::db::q(
                 pool,
                 "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
             ))
-            .bind(&tenant.id)
+            .bind(&home.id)
             .bind(crate::util::fold(upn))
             .fetch_optional(pool)
             .await?;
             let (id,) = row.with_context(|| format!("user '{upn}' not found"))?;
-            (id, PrincipalType::User, MemberType::User)
+            Resolved {
+                id,
+                kind: PrincipalType::User,
+                member_type: MemberType::User,
+                tenant_id: home.id,
+            }
         }
         Principal::Group(name) => {
+            // `name@domain` names a group of the tenant owning the domain; a
+            // plain name, or one whose suffix is no other tenant's, is this
+            // tenant's.
+            let (home, group_name) = match other_tenant_of(pool, tenant, name).await? {
+                Some(other) => {
+                    let (local, _) = name.rsplit_once('@').expect("has a domain");
+                    (other, local.to_string())
+                }
+                None => (tenant.clone(), name.to_string()),
+            };
             let row: Option<(String,)> = sqlx::query_as(crate::db::q(
                 pool,
                 "SELECT id FROM user_groups WHERE tenant_id = ? AND name_folded = ?",
             ))
-            .bind(&tenant.id)
-            .bind(crate::util::fold(name))
+            .bind(&home.id)
+            .bind(crate::util::fold(&group_name))
             .fetch_optional(pool)
             .await?;
             let (id,) = row.with_context(|| format!("group '{name}' not found"))?;
-            (id, PrincipalType::Group, MemberType::User)
+            Resolved {
+                id,
+                kind: PrincipalType::Group,
+                member_type: MemberType::User,
+                tenant_id: home.id,
+            }
         }
     })
+}
+
+/// Refusal of an account or group of another tenant for an application that
+/// accepts only its own tenant's.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{app} accepts only accounts of its own tenant. To assign accounts or groups of other tenants, \
+     turn on \"Accept accounts of other tenants\" under Authentication first."
+)]
+pub struct OtherTenantsNotAccepted {
+    pub app: String,
+}
+
+/// Whether a principal may be assigned to `sp`: one of its own tenant always,
+/// one of another only when the application accepts other tenants. The rule is
+/// here, where every assignment is written, and not on any page.
+fn admit(sp: &ServicePrincipal, resource: &Application, principal: &Resolved) -> anyhow::Result<()> {
+    if principal.tenant_id != sp.tenant_id && !sp.accept_other_tenants {
+        return Err(OtherTenantsNotAccepted {
+            app: resource.display_name.clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Refusal to stop accepting other tenants while some of theirs are assigned.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{0} account(s) or group(s) of other tenants are assigned to this application. Remove them under \
+     Users and groups first; then it can accept only its own tenant's accounts."
+)]
+pub struct OutsideAssignmentsRemain(pub i64);
+
+/// How many users and groups of other tenants are assigned to `sp`.
+pub async fn outside_assignments(pool: &DbPool, sp: &ServicePrincipal) -> anyhow::Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT COUNT(*) FROM app_assignments a
+         LEFT JOIN users u ON a.principal_type = ? AND u.id = a.principal_id
+         LEFT JOIN user_groups g ON a.principal_type = ? AND g.id = a.principal_id
+         WHERE a.resource_id = ? AND COALESCE(u.tenant_id, g.tenant_id) <> ?",
+    ))
+    .bind(PrincipalType::User.as_str())
+    .bind(PrincipalType::Group.as_str())
+    .bind(&sp.id)
+    .bind(&sp.tenant_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Accept accounts of other tenants, or stop. Stopping is refused while any of
+/// theirs are assigned (the user's rule): the access they would lose has to be
+/// taken away on purpose, assignment by assignment.
+pub async fn set_accept_other_tenants(pool: &DbPool, sp: &ServicePrincipal, accept: bool) -> anyhow::Result<()> {
+    if !accept && sp.accept_other_tenants {
+        let outside = outside_assignments(pool, sp).await?;
+        if outside > 0 {
+            return Err(OutsideAssignmentsRemain(outside).into());
+        }
+    }
+    sqlx::query(crate::db::q(
+        pool,
+        "UPDATE service_principals SET accept_other_tenants = ? WHERE id = ?",
+    ))
+    .bind(accept)
+    .bind(&sp.id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The assignment of a user or group to an application's service principal,
@@ -570,6 +690,21 @@ pub struct Assignment {
     pub principal_name: String,
     /// Role values, sorted.
     pub roles: Vec<String>,
+    /// For a user or group of another tenant: that tenant's name, and for a user,
+    /// whether their tenant currently lets them sign in elsewhere.
+    pub outside: Option<Outside>,
+}
+
+/// What an assignment row says about a principal of another tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outside {
+    pub tenant_name: String,
+    /// The tenant's domain: how one of its groups is named from here
+    /// (`name@domain`).
+    pub domain: String,
+    /// `false` when their own tenant does not let them sign in to other
+    /// tenants' applications (always `true` for a group: each member decides).
+    pub may_sign_in: bool,
 }
 
 /// Assign a user or group to `resource` with exactly `role_values`, replacing
@@ -591,10 +726,12 @@ pub async fn assign(
             tenant.name
         );
     };
-    let (principal_id, principal_type, member_type) = resolve_principal(pool, tenant, principal).await?;
-    if principal_type == PrincipalType::ServicePrincipal {
+    let resolved = resolve_principal(pool, tenant, principal).await?;
+    if resolved.kind == PrincipalType::ServicePrincipal {
         bail!("only a user or a group is assigned to an application");
     }
+    admit(&resource_sp, resource, &resolved)?;
+    let (principal_id, principal_type, member_type) = (resolved.id, resolved.kind, resolved.member_type);
     let defined = roles(pool, resource).await?;
     let mut picked: Vec<&AppRole> = Vec::new();
     for value in role_values {
@@ -677,12 +814,14 @@ pub async fn assignments(pool: &DbPool, tenant_id: &str, resource: &Application)
         .bind(&principal_id)
         .fetch_all(pool)
         .await?;
+        let outside = crate::access::outside_principal(pool, tenant_id, principal_type, &principal_id).await?;
         out.push(Assignment {
             id,
             principal_type,
             principal_name: principal_name(pool, principal_type, &principal_id).await,
             principal_id,
             roles: held.into_iter().map(|(v,)| v).collect(),
+            outside,
         });
     }
     out.sort_by(|a, b| {
@@ -758,7 +897,9 @@ pub async fn assign_role(
         .find(|r| r.value == role_value)
         .with_context(|| format!("app '{}' has no role '{role_value}'", resource.display_name))?;
 
-    let (principal_id, principal_type, member_type) = resolve_principal(pool, tenant, principal).await?;
+    let resolved = resolve_principal(pool, tenant, principal).await?;
+    admit(&resource_sp, resource, &resolved)?;
+    let (principal_id, principal_type, member_type) = (resolved.id, resolved.kind, resolved.member_type);
     if !role.allows(member_type) {
         bail!(
             "app role '{role_value}' cannot be assigned to {} principals",

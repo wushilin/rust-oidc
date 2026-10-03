@@ -16,7 +16,7 @@
 //! (the row carries the key id) and never re-rendered into a later page.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::json;
@@ -51,6 +51,8 @@ pub enum AppSection {
     Roles,
     Assignments,
     Permissions,
+    /// Would this user be let in, and if not, why.
+    Check,
 }
 
 impl AppSection {
@@ -62,6 +64,7 @@ impl AppSection {
         Self::Roles,
         Self::Assignments,
         Self::Permissions,
+        Self::Check,
     ];
 
     pub fn label(self) -> &'static str {
@@ -73,6 +76,7 @@ impl AppSection {
             Self::Roles => "App roles",
             Self::Assignments => "Users and groups",
             Self::Permissions => "Application permissions",
+            Self::Check => "Check sign-in",
         }
     }
 
@@ -86,6 +90,7 @@ impl AppSection {
             Self::Roles => "roles",
             Self::Assignments => "users",
             Self::Permissions => "permissions",
+            Self::Check => "check",
         }
     }
 
@@ -96,7 +101,7 @@ impl AppSection {
     /// What it takes to open it, beyond seeing the application.
     fn action(self) -> Action {
         match self {
-            Self::Assignments | Self::Permissions => ASSIGNMENT_READ,
+            Self::Assignments | Self::Permissions | Self::Check => ASSIGNMENT_READ,
             _ => APP_READ,
         }
     }
@@ -241,6 +246,7 @@ const PRINCIPAL_TYPE: &str = "principal_type";
 const ASSIGNMENT: &str = "assignment";
 const ALLOW_PASSWORD_GRANT: &str = "allow_password_grant";
 const REQUIRE_MFA: &str = "require_mfa";
+const ACCEPT_OTHER_TENANTS: &str = "accept_other_tenants";
 const ALLOW_ID_TOKEN: &str = "allow_id_token_implicit";
 const ALLOW_ACCESS_TOKEN: &str = "allow_access_token_implicit";
 /// One checkbox per [`MemberType`], named by the type itself.
@@ -428,6 +434,7 @@ pub async fn section_page(
     ctx: AdminContext,
     State(st): State<AppState>,
     Path((key, app_key, section)): Path<(String, String, String)>,
+    Query(query): Query<Params>,
 ) -> Response {
     let Some(section) = AppSection::parse(&section).filter(|s| *s != AppSection::Overview) else {
         return view::not_found();
@@ -444,8 +451,18 @@ pub async fn section_page(
     let Ok(app) = apps::find_in_tenant(&st.pool, tenant, &app_key).await else {
         return view::not_found();
     };
-    detail(&st, &ctx, tenant, &app, section, Page::default(), StatusCode::OK).await
+    let page = Page {
+        check: query
+            .get(CHECK_UPN)
+            .map(String::as_str)
+            .filter(|u| !u.trim().is_empty()),
+        ..Page::default()
+    };
+    detail(&st, &ctx, tenant, &app, section, page, StatusCode::OK).await
 }
+
+/// The user name the Check sign-in form asks about.
+const CHECK_UPN: &str = "upn";
 
 /// What a render of the application page needs beyond the application itself.
 #[derive(Default)]
@@ -453,6 +470,8 @@ struct Page<'a> {
     error: Option<&'a str>,
     /// A value that exists only in this response: a freshly created secret.
     reveal: Option<&'a str>,
+    /// The user name the Check sign-in section was asked about.
+    check: Option<&'a str>,
 }
 
 async fn detail(
@@ -475,15 +494,18 @@ async fn detail(
         AppSection::Overview => overview(st, ctx, tenant, app).await,
         AppSection::Authentication => {
             let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
-            let mfa_required = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
+            let sp = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
                 .await
                 .ok()
-                .flatten()
-                .is_some_and(|sp| sp.mfa_required);
+                .flatten();
+            let switches = Switches {
+                mfa_required: sp.as_ref().is_some_and(|sp| sp.mfa_required),
+                accept_other_tenants: sp.as_ref().is_some_and(|sp| sp.accept_other_tenants),
+            };
             format!(
                 "{}{}",
                 redirect_section(&url, &csrf, &redirect_uris, may_write),
-                flags_form(&url, &csrf, app, mfa_required, may_write)
+                flags_form(&url, &csrf, app, switches, may_write)
             )
         }
         AppSection::Credentials => {
@@ -511,7 +533,12 @@ async fn detail(
         AppSection::Assignments => {
             let roles = apps::roles(&st.pool, app).await.unwrap_or_default();
             let assigned = apps::assignments(&st.pool, &tenant.id, app).await.unwrap_or_default();
-            assignment_section(&url, &csrf, &assigned, &roles, tenant, may_assign)
+            let accepts_others = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|sp| sp.accept_other_tenants);
+            assignment_section(&url, &csrf, &assigned, &roles, tenant, accepts_others, may_assign)
         }
         AppSection::Permissions => {
             let roles = apps::roles(&st.pool, app).await.unwrap_or_default();
@@ -527,6 +554,7 @@ other applications may hold. Add one under App roles, with the Application membe
                 section
             }
         }
+        AppSection::Check => check_section(st, tenant, app, page.check, &format!("{url}/check")).await,
     };
 
     let reveal = page
@@ -684,7 +712,79 @@ flow needs before it runs anything.</p>"#,
     format!(r#"{facts}<div class="tiles">{cards}</div>{flow}"#)
 }
 
-fn flags_form(url: &str, csrf: &str, app: &Application, mfa_required: bool, may_write: bool) -> String {
+/// The service principal's own switches, shown with the application's flags.
+#[derive(Clone, Copy)]
+struct Switches {
+    mfa_required: bool,
+    accept_other_tenants: bool,
+}
+
+/// Check sign-in: a user name in, and every check that decides it out, from
+/// [`crate::access::explain`] -- the same decision the sign-in makes.
+async fn check_section(st: &AppState, tenant: &Tenant, app: &Application, upn: Option<&str>, url: &str) -> String {
+    let form = format!(
+        r#"<h2>Check sign-in</h2><p class="sub">Whether an account would be let in to this application, and what decides it:
+its state, its assignment and real group memberships, every setting involved, and what the token would carry. Nothing is
+changed and no password is asked for.</p>
+<form method="get" action="{url}" class="find"><input name="{CHECK_UPN}" type="search" value="{value}" placeholder="User name" aria-label="User name" autocapitalize="none" spellcheck="false" autofocus>
+<button type="submit">Check</button></form>"#,
+        url = e(url),
+        value = e(upn.unwrap_or_default()),
+    );
+    let Some(upn) = upn else {
+        return form;
+    };
+    let sp = match apps::service_principal(&st.pool, &tenant.id, &app.app_id).await {
+        Ok(Some(sp)) => sp,
+        _ => return format!(r#"{form}<p class="error">This application has no service principal here.</p>"#),
+    };
+    let report = match crate::access::explain(&st.pool, tenant, &sp, app, upn).await {
+        Ok(r) => r,
+        Err(err) => return format!(r#"{form}{}"#, view::error_block(Some(&err.to_string()))),
+    };
+    use crate::access::Mark;
+    let mark = |m: Mark| match m {
+        Mark::Pass => r#"<span class="mark pass" aria-label="passes">&#x2713;</span>"#,
+        Mark::Fail => r#"<span class="mark fail" aria-label="fails">&#x2717;</span>"#,
+        Mark::Note => r#"<span class="mark note" aria-hidden="true">&middot;</span>"#,
+    };
+    let flows: String = report
+        .flows
+        .iter()
+        .map(|f| {
+            format!(
+                "<tr><td>{}{}</td><td>{}</td></tr>",
+                mark(if f.works { Mark::Pass } else { Mark::Fail }),
+                e(f.flow.label()),
+                e(&f.detail)
+            )
+        })
+        .collect();
+    let sections: String = report
+        .sections
+        .iter()
+        .map(|sec| {
+            let lines: String = sec
+                .lines
+                .iter()
+                .map(|l| format!("<li>{}{}</li>", mark(l.mark), e(&l.text)))
+                .collect();
+            format!(r#"<h3>{}</h3><ul class="checks">{lines}</ul>"#, e(sec.title))
+        })
+        .collect();
+    let flows = if flows.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<table><tr><th>Way of signing in</th><th>Result</th></tr>{flows}</table>"#)
+    };
+    format!(
+        r#"{form}<p class="verdict {class}">{headline}</p>{flows}{sections}"#,
+        class = if report.works { "works" } else { "refused" },
+        headline = e(&report.headline),
+    )
+}
+
+fn flags_form(url: &str, csrf: &str, app: &Application, switches: Switches, may_write: bool) -> String {
     let checkbox = |name: &str, on: bool, label: &str, note: &str| {
         format!(
             r#"<label><input type="checkbox" name="{name}"{on}{disabled}> {label}</label>
@@ -698,13 +798,20 @@ fn flags_form(url: &str, csrf: &str, app: &Application, mfa_required: bool, may_
     format!(
         r#"<h2>Sign-in and grants</h2><form method="post" action="{url}">{csrf}
 <input type="hidden" name="{op_field}" value="{op}">
-{mfa}{password}{id_token}{access_token}{save}</form>"#,
+{others}{mfa}{password}{id_token}{access_token}{save}</form>"#,
         url = e(url),
         op_field = AppOp::FIELD,
         op = AppOp::Flags.as_str(),
+        others = checkbox(
+            ACCEPT_OTHER_TENANTS,
+            switches.accept_other_tenants,
+            "Accept accounts of other tenants",
+            "Accounts and groups of other tenants can then be assigned under Users and groups, and only those \
+             assigned can sign in. Their own tenant must also allow it. This cannot be turned off while any are assigned.",
+        ),
         mfa = checkbox(
             REQUIRE_MFA,
-            mfa_required,
+            switches.mfa_required,
             "Require multi-factor authentication",
             "Everyone signing in to this application must use MFA, whatever their own or the tenant's setting. \
              Whoever has not set up an authenticator does so at that sign-in.",
@@ -1099,12 +1206,22 @@ fn role_boxes(roles: &[&apps::AppRole], held: &[String]) -> String {
 /// Who is assigned to the application, and the roles each was given. A user or
 /// group is assigned first; roles are optional and are ticked, not assigned one
 /// at a time.
+/// How an assignment's principal is named, so it can be named again: a group of
+/// another tenant as `name@domain`.
+fn address(a: &apps::Assignment) -> String {
+    match (&a.outside, a.principal_type) {
+        (Some(o), PrincipalType::Group) => format!("{}@{}", a.principal_name, o.domain),
+        _ => a.principal_name.clone(),
+    }
+}
+
 fn assignment_section(
     url: &str,
     csrf: &str,
     assignments: &[apps::Assignment],
     roles: &[apps::AppRole],
     tenant: &Tenant,
+    accepts_others: bool,
     may_assign: bool,
 ) -> String {
     let user_roles: Vec<&apps::AppRole> = roles
@@ -1134,15 +1251,33 @@ fn assignment_section(
                     op_field = AppOp::FIELD,
                     op = AppOp::Assign.as_str(),
                     kind = e(a.principal_type.as_str()),
-                    who = e(&a.principal_name),
+                    who = e(&address(a)),
                     boxes = role_boxes(&user_roles, &a.roles),
                 )
             } else {
                 String::new()
             };
+            let outside = match &a.outside {
+                None => String::new(),
+                Some(o) => {
+                    let mut pills = format!(r#" <span class="pill">{}</span>"#, e(&o.tenant_name));
+                    if a.principal_type == PrincipalType::Group {
+                        pills.push_str(&format!(
+                            r#" <span class="pill bad" title="Who is in this group is decided by {t}, not here.">membership managed by {t}</span>"#,
+                            t = e(&o.tenant_name)
+                        ));
+                    } else if !o.may_sign_in {
+                        pills.push_str(&format!(
+                            r#" <span class="pill bad">{} does not allow it to sign in here</span>"#,
+                            e(&o.tenant_name)
+                        ));
+                    }
+                    pills
+                }
+            };
             format!(
-                "<tr><td>{who}</td><td>{kind}</td><td>{held}{change}</td><td>{remove}</td></tr>",
-                who = e(&a.principal_name),
+                "<tr><td>{who}{outside}</td><td>{kind}</td><td>{held}{change}</td><td>{remove}</td></tr>",
+                who = e(&address(a)),
                 kind = e(a.principal_type.as_str()),
                 remove = if may_assign {
                     remove_button(url, csrf, AppOp::Unassign, ASSIGNMENT, &a.id, "Remove")
@@ -1181,14 +1316,22 @@ fn assignment_section(
                 r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
 <label for="assign_kind">Assign</label>
 <select id="assign_kind" name="{PRINCIPAL_TYPE}">{kind_options}</select>
-<label for="assign_principal">Name in {tenant_name}</label>
+<label for="assign_principal">Name</label>
 <input id="assign_principal" name="{PRINCIPAL}" type="text" required autocapitalize="none" spellcheck="false">
+<p class="muted">A user name, or a group name of {tenant_name}. {others}</p>
 {boxes}
 <div class="actions"><button type="submit">Assign</button></div></form>"#,
                 url = e(url),
                 op_field = AppOp::FIELD,
                 op = AppOp::Assign.as_str(),
                 tenant_name = e(&tenant.name),
+                others = if accepts_others {
+                    "An account of another tenant is named by its user name; a group of another tenant as \
+                     group@its-domain, or with the prefixes user: and group:."
+                } else {
+                    "This application accepts only this tenant's accounts; turn on \"Accept accounts of other \
+                     tenants\" under Authentication to assign others."
+                },
             ),
             false,
         )
@@ -1322,8 +1465,8 @@ pub async fn detail_post(
                 // lives in this response and nowhere else.
                 Some(secret) => {
                     let page = Page {
-                        error: None,
                         reveal: Some(secret),
+                        ..Page::default()
                     };
                     // Re-read the application: the flags may have changed.
                     let app = apps::find_in_tenant(&st.pool, tenant, &app_key).await.unwrap_or(app);
@@ -1336,7 +1479,7 @@ pub async fn detail_post(
             let message = err.to_string();
             let page = Page {
                 error: Some(&message),
-                reveal: None,
+                ..Page::default()
             };
             detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::BAD_REQUEST).await
         }
@@ -1355,16 +1498,29 @@ async fn apply(
 ) -> anyhow::Result<Outcome> {
     match op {
         AppOp::Flags => {
+            // Refused (and nothing saved) while other tenants' accounts are assigned.
+            if !checked(form, ACCEPT_OTHER_TENANTS)
+                && let Some(sp) = apps::service_principal(&st.pool, &tenant.id, &app.app_id).await?
+                && sp.accept_other_tenants
+            {
+                let outside = apps::outside_assignments(&st.pool, &sp).await?;
+                if outside > 0 {
+                    return Err(apps::OutsideAssignmentsRemain(outside).into());
+                }
+            }
             let password = checked(form, ALLOW_PASSWORD_GRANT);
             let id_token = checked(form, ALLOW_ID_TOKEN);
             let access_token = checked(form, ALLOW_ACCESS_TOKEN);
             apps::set_password_grant_allowed(&st.pool, app, password).await?;
             apps::set_implicit_allowed(&st.pool, app, id_token, access_token).await?;
             let mfa = checked(form, REQUIRE_MFA);
+            let others = checked(form, ACCEPT_OTHER_TENANTS);
             if let Some(sp) = apps::service_principal(&st.pool, &tenant.id, &app.app_id).await? {
                 apps::set_mfa_required(&st.pool, &sp.id, mfa).await?;
+                apps::set_accept_other_tenants(&st.pool, &sp, others).await?;
             }
             Ok(Outcome::plain(json!({
+                "acceptOtherTenants": others,
                 "requireMfa": mfa,
                 "allowPasswordGrant": password,
                 "allowIdTokenImplicit": id_token,
@@ -1455,8 +1611,15 @@ async fn apply(
             })))
         }
         AppOp::Assign => {
-            let name = field(form, PRINCIPAL);
-            let (kind, principal) = match PrincipalType::parse(field(form, PRINCIPAL_TYPE)) {
+            let typed = field(form, PRINCIPAL).trim();
+            // `user:` and `group:` name the kind in the name itself, whatever the
+            // select says.
+            let (picked, name) = match typed.split_once(':') {
+                Some(("user", rest)) => (Some(PrincipalType::User), rest.trim()),
+                Some(("group", rest)) => (Some(PrincipalType::Group), rest.trim()),
+                _ => (PrincipalType::parse(field(form, PRINCIPAL_TYPE)), typed),
+            };
+            let (kind, principal) = match picked {
                 Some(PrincipalType::User) => (PrincipalType::User, Principal::User(name.to_string())),
                 Some(PrincipalType::Group) => (PrincipalType::Group, Principal::Group(name.to_string())),
                 _ => anyhow::bail!("choose a user or a group"),

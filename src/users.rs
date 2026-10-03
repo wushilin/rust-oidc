@@ -87,6 +87,20 @@ pub struct User {
     pub enabled: bool,
 }
 
+/// A live account by its object id, whatever its tenant: for an application
+/// that accepts accounts of other tenants, where the account need not be of the
+/// tenant the request came to. What it may do there is [`crate::access`]'s to say.
+pub async fn find_by_id(pool: &DbPool, user_id: &str) -> anyhow::Result<Option<User>> {
+    Ok(sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
+         FROM users WHERE id = ? AND deleted_at IS NULL",
+    ))
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 pub async fn find(pool: &DbPool, tenant_id: &str, user_id: &str) -> anyhow::Result<Option<User>> {
     Ok(sqlx::query_as(crate::db::q(
         pool,

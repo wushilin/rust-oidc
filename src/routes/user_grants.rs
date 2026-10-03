@@ -377,7 +377,7 @@ pub(super) async fn issue(
     azpacr: Azpacr,
     family: Family,
 ) -> Result<Response, AadError> {
-    let user = users::find(&st.pool, &tenant.id, user_id)
+    let user = users::find_by_id(&st.pool, user_id)
         .await?
         .filter(|u| u.enabled)
         .ok_or_else(|| AadError::invalid_grant(Aadsts::AccountDisabled, "The user account is disabled."))?;
@@ -392,11 +392,12 @@ pub(super) async fn issue(
     let sp = apps::service_principal(&st.pool, &tenant.id, &client.app_id)
         .await?
         .ok_or_else(|| AadError::app_not_found(client_app_id, &tenant.id))?;
-    if sp.app_role_assignment_required && !apps::user_is_assigned(&st.pool, &sp.id, &user.id).await? {
-        return Err(AadError::invalid_grant(
-            Aadsts::NotAssigned,
-            apps::not_assigned_message(&client),
-        ));
+    // Assignment, and for an account of another tenant everything else that
+    // lets it in: one decision, re-made at every grant, so a refresh token stops
+    // working the moment any of it changes.
+    let decision = crate::access::decide(&st.pool, tenant, &sp, &user).await?;
+    if let Some(err) = decision.grant_error(&client.display_name, tenant) {
+        return Err(err);
     }
     // An account that must choose a new password gets nothing until it has, in
     // a browser: the password grant cannot show the page.
@@ -410,7 +411,7 @@ pub(super) async fn issue(
     // factor does not get a token where one is needed now -- the password grant
     // never has one, and a refresh token carries the methods of its sign-in.
     if !family.amr.iter().any(|m| m == Amr::Mfa.as_str()) {
-        let (code, verb) = match crate::mfa::step(&st.pool, tenant, &user.id, crate::mfa::At::App(&sp)).await? {
+        let (code, verb) = match crate::mfa::step(&st.pool, &decision.home, &user.id, crate::mfa::At::App(&sp)).await? {
             crate::mfa::Step::Done => (None, ""),
             crate::mfa::Step::Verify => (Some(Aadsts::MfaRequired), "use"),
             crate::mfa::Step::Enroll => (Some(Aadsts::MfaRegistrationRequired), "enroll in"),
@@ -699,7 +700,8 @@ pub async fn password(
     let password = param(params, "password").ok_or_else(|| AadError::missing_parameter("password"))?;
     let scope = param(params, "scope").ok_or_else(|| AadError::missing_parameter("scope"))?;
 
-    let (outcome, trace) = users::authenticate_traced(&st.pool, tenant, username, password).await?;
+    let sp = apps::service_principal(&st.pool, &tenant.id, &client.app.app_id).await?;
+    let (outcome, trace) = crate::access::authenticate(&st.pool, tenant, sp.as_ref(), username, password).await?;
     audit::sign_in_failure(
         st,
         &tenant.id,

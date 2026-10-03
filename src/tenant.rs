@@ -22,6 +22,10 @@ pub struct TenantSettings {
     /// How many of a user's own recent passwords a new one may not repeat. Zero
     /// turns the rule off.
     pub password_history: i64,
+    /// This tenant's accounts may sign in to applications of other tenants that
+    /// assign them. Off unless the tenant turns it on; a user's own setting
+    /// can override it either way.
+    pub allow_cross_tenant_sign_in: bool,
 }
 
 impl Default for TenantSettings {
@@ -33,6 +37,7 @@ impl Default for TenantSettings {
             require_mfa: false,
             require_console_mfa: false,
             password_history: Self::DEFAULT_PASSWORD_HISTORY,
+            allow_cross_tenant_sign_in: false,
         }
     }
 }
@@ -207,10 +212,17 @@ pub async fn domains(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<Strin
 /// `None` when the name ends in one of this tenant's domains (then it is just a
 /// wrong name or password, and stays that). Says nothing about whether any such
 /// account exists anywhere.
-pub async fn not_ours_hint(pool: &DbPool, tenant: &Tenant, upn: &str) -> Option<String> {
+///
+/// `accepts_others`: the application accepts accounts of other tenants, so a name
+/// of another tenant was checked in that tenant and its failure is an ordinary
+/// wrong name or password.
+pub async fn not_ours_hint(pool: &DbPool, tenant: &Tenant, upn: &str, accepts_others: bool) -> Option<String> {
     let (_, domain) = upn.trim().rsplit_once('@')?;
     let ours = domains(pool, &tenant.id).await.ok()?;
     if ours.iter().any(|d| fold(d) == fold(domain)) {
+        return None;
+    }
+    if accepts_others && resolve(pool, domain).await.ok().flatten().is_some() {
         return None;
     }
     let endings: Vec<String> = ours.iter().map(|d| format!("@{d}")).collect();

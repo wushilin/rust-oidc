@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 
 use super::audit::{self, Actor, Channel, Event};
 use crate::AppState;
+use crate::access;
 use crate::apps::{self, Application, RedirectPlatform, ServicePrincipal};
 use crate::claims::{self, Amr, Azpacr};
 use crate::error::{AadError, Aadsts, OAuthError};
@@ -587,7 +588,8 @@ async fn continue_authorize(
     // ---- who is the user? ----
     let session = session::find(&st.pool, headers, &v.tenant.id).await?;
     let user = match &session {
-        Some(s) => users::find(&st.pool, &v.tenant.id, &s.user_id).await?,
+        // Of this tenant, or of another one signed in here (see `access`).
+        Some(s) => users::find_by_id(&st.pool, &s.user_id).await?,
         None => None,
     };
     let fresh = interaction == Interaction::SignedIn;
@@ -630,9 +632,15 @@ async fn continue_authorize(
     }
     let (session, user) = (session.expect("checked"), user.expect("checked"));
 
+    // ---- may this user use this application at all? ----
+    let decision = access::decide(&st.pool, &v.tenant, &v.sp, &user).await?;
+    if let Some(refusal) = decision.refusal {
+        return Err(Step::Page(refused_page(v, &decision.home, refusal)));
+    }
+
     // ---- a second factor, where one is needed and this session has none ----
     if !session.amr.iter().any(|m| m == Amr::Mfa.as_str()) {
-        let step = mfa::step(&st.pool, &v.tenant, &user.id, mfa::At::App(&v.sp)).await?;
+        let step = mfa::step(&st.pool, &decision.home, &user.id, mfa::At::App(&v.sp)).await?;
         if step != mfa::Step::Done {
             if prompt.none {
                 let (code, what) = match step {
@@ -650,16 +658,6 @@ async fn continue_authorize(
 
     if prompt.select_account && interaction == Interaction::None {
         return Err(Step::Page(account_picker(st, v, request, &user)));
-    }
-
-    if v.sp.app_role_assignment_required && !apps::user_is_assigned(&st.pool, &v.sp.id, &user.id).await? {
-        let err = AadError::new(
-            StatusCode::FORBIDDEN,
-            OAuthError::AccessDenied,
-            Aadsts::NotAssigned,
-            apps::not_assigned_message(&v.client),
-        );
-        return Err(Step::Page(html::error(Some(&v.tenant.name), &err.description())));
     }
 
     // ---- consent, when the client asked for it ----
@@ -877,6 +875,17 @@ async fn consent_page(
     resp
 }
 
+/// The page for a user who may not use this application, saying why.
+fn refused_page(v: &Validated, home: &Tenant, refusal: access::Refusal) -> Response {
+    let err = AadError::new(
+        StatusCode::FORBIDDEN,
+        OAuthError::AccessDenied,
+        refusal.aadsts(),
+        refusal.message(&v.client.display_name, &v.tenant.name, &home.name),
+    );
+    html::error(Some(&v.tenant.name), &err.description())
+}
+
 /// Start the second step of a sign-in: a code, or setting an authenticator up.
 async fn start_mfa(st: &AppState, v: &Validated, request: &str, user: &User, step: mfa::Step) -> Response {
     let purpose = match step {
@@ -1032,9 +1041,13 @@ async fn second_step(
         Ok(None) => return login_page(st, v, request, "", Some(MFA_EXPIRED)),
         Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
     };
-    let user = match users::find(&st.pool, &v.tenant.id, &pending.user_id).await {
+    let user = match users::find_by_id(&st.pool, &pending.user_id).await {
         Ok(Some(u)) if u.enabled => u,
         _ => return login_page(st, v, request, "", Some(MFA_EXPIRED)),
+    };
+    // Their own tenant's password rules, for an account of another tenant too.
+    let Ok(Some(home)) = access::home_of(&st.pool, &user).await else {
+        return login_page(st, v, request, "", Some(MFA_EXPIRED));
     };
     let fits = match op {
         html::LoginOp::MfaEnroll => pending.purpose == Purpose::Enroll,
@@ -1056,7 +1069,7 @@ async fn second_step(
             let refused = if new != confirm {
                 Some("The passwords don't match.".to_string())
             } else {
-                users::change_password(&st.pool, &v.tenant, &user.id, &new, users::PasswordSetBy::User)
+                users::change_password(&st.pool, &home, &user.id, &new, users::PasswordSetBy::User)
                     .await
                     .err()
                     .map(|e| e.to_string())
@@ -1244,7 +1257,7 @@ pub async fn login(
         None => {
             let upn = form.get("upn").map(|s| s.trim().to_string()).unwrap_or_default();
             let password = form.get("password").cloned().unwrap_or_default();
-            let (outcome, trace) = match users::authenticate_traced(&st.pool, &v.tenant, &upn, &password).await {
+            let (outcome, trace) = match access::authenticate(&st.pool, &v.tenant, Some(&v.sp), &upn, &password).await {
                 Ok(o) => o,
                 Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
             };
@@ -1260,8 +1273,17 @@ pub async fn login(
             .await;
             let message = match outcome {
                 AuthResult::Ok(user) => {
+                    // May they use this application? Answered before any second
+                    // step, so nobody sets up an authenticator only to be refused.
+                    let decision = match access::decide(&st.pool, &v.tenant, &v.sp, &user).await {
+                        Ok(d) => d,
+                        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+                    };
+                    if let Some(refusal) = decision.refusal {
+                        return refused_page(&v, &decision.home, refusal);
+                    }
                     // A second step, where one is needed, before there is any session.
-                    let step = match mfa::step(&st.pool, &v.tenant, &user.id, mfa::At::App(&v.sp)).await {
+                    let step = match mfa::step(&st.pool, &decision.home, &user.id, mfa::At::App(&v.sp)).await {
                         Ok(step) => step,
                         Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
                     };
@@ -1271,7 +1293,9 @@ pub async fn login(
                     return finish_sign_in(&st, &tenant_key, &headers, &params, &request, &v, &user, false).await;
                 }
                 AuthResult::InvalidCredentials => {
-                    if let Some(hint) = tenant::not_ours_hint(&st.pool, &v.tenant, &upn).await {
+                    if let Some(hint) =
+                        tenant::not_ours_hint(&st.pool, &v.tenant, &upn, v.sp.accept_other_tenants).await
+                    {
                         return login_page(&st, &v, &request, &upn, Some(&hint));
                     }
                     "Your account or password is incorrect. (AADSTS50126: Error validating credentials due to invalid username or password.)"

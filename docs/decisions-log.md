@@ -1299,3 +1299,13 @@ recovery codes is refused without an authenticator; and a database error while
 changing a password shows the error page rather than the raw error in the form.
 Recovery codes are generated (and hashed, SHA-256) before the transaction, like
 passwords.
+
+**36. Application transactions refuse duplicates before inserting.** Inside the
+engine a unique-constraint violation is a database error (`Failed`, a 500), and on
+Postgres it aborts the whole transaction. So adding a scope, app role or identifier
+URI that exists is looked up first and refused with the old "already exists"
+message; granting an app role that is already granted completes without a second
+row. Client secrets are generated before the transaction (`apps::PreparedSecret`:
+value, hint, SHA-256); the value is only in the output, for the one-time reveal.
+The "that is a private key" check on a pasted certificate moved from the page into
+the transaction. Certificate parsing runs inside it: it is fast, unlike hashing.

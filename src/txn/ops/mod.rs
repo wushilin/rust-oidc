@@ -4,6 +4,7 @@
 //! and the writes on the context's connection, through the storage layer's
 //! `_in` functions, and aborts only through the context.
 
+pub mod apps;
 pub mod groups;
 pub mod self_service;
 pub mod tenants;

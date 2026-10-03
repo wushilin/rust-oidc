@@ -6,7 +6,8 @@
 # Actions tab (without publishing) to check that everything still builds.
 #
 # Native runners are used wherever GitHub has one, so nothing is cross-compiled
-# except macOS x86_64 (built on Apple silicon). FreeBSD has no hosted runners:
+# except macOS x86_64 (built on Apple silicon). The Linux builds target musl, so
+# they are fully static and run on any distribution, old or new. FreeBSD has no hosted runners:
 # it builds inside a FreeBSD virtual machine, the arm64 one under emulation,
 # which is why that job is by far the slowest.
 
@@ -32,8 +33,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-amd64,   runner: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
-          - { name: linux-arm64,   runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: linux-amd64,   runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64,   runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { name: macos-amd64,   runner: macos-14,         target: x86_64-apple-darwin }
           - { name: macos-arm64,   runner: macos-14,         target: aarch64-apple-darwin }
           - { name: windows-amd64, runner: windows-2022,     target: x86_64-pc-windows-msvc }
@@ -45,12 +46,28 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The C parts (SQLite, aws-lc) are compiled against musl with musl-gcc.
+      - if: endsWith(matrix.target, '-linux-musl')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+
       # aws-lc (the TLS crypto) assembles with NASM on x86_64 Windows.
       - if: matrix.target == 'x86_64-pc-windows-msvc'
         uses: ilammy/setup-nasm@v1
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *-linux-musl ]]; then
+            export CC_$(echo "${{ matrix.target }}" | tr - _)=musl-gcc
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check the Linux binary is static
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          file "target/${{ matrix.target }}/release/${BIN}"
+          file "target/${{ matrix.target }}/release/${BIN}" | grep -q "statically linked"
+          "target/${{ matrix.target }}/release/${BIN}" --version
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -97,6 +114,8 @@ jobs:
           release: "14.3"
           arch: ${{ matrix.arch }}
           usesh: true
+          # The VM does not inherit the job's environment unless asked.
+          envs: "BIN GITHUB_REF_NAME"
           prepare: |
             pkg install -y rust cmake gmake
           run: |

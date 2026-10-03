@@ -1235,3 +1235,14 @@ front-channel logout notification, then flip both in `src/routes/discovery.rs`.
 predates commit `bc217fa`. I did **not** redeploy (out of scope), so the results are
 evidence about the deployed build only. Recorded at the top of `docs/conformance.md`
 so a future reader does not over-read them.
+
+**29. Tenant transactions: the tenants page's changes are authorized at platform scope
+in the engine too, and name the tenant by id.** Create, rename, enable, disable, change
+domain and remove domain run as `Scope::Platform` transactions (an every-tenant grant),
+the same rule the page has always applied (`On::Platform`), rather than
+`Scope::Tenant`, which would let a tenant's own administrator rename or re-domain their
+tenant through any other caller of the engine. Saving settings stays
+`Scope::Tenant`. These transactions take the tenant's id only (the lock is on that
+row); a domain in its place is refused as not found. Disabling declares the
+administrators lock, since it can take administrators away. *To reverse:* change
+`scope()` in `src/txn/ops/tenants.rs`.

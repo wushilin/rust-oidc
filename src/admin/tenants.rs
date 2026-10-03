@@ -19,16 +19,18 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::json;
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, PlatformTab, audited, chrome, field, parse_form};
+use crate::admin::routes::{At, Params, PlatformTab, Settled, chrome, field, parse_form, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{TENANT_CREATE, TENANT_READ, TENANT_WRITE};
-use crate::db::Event;
 use crate::rbac::Action;
 use crate::tenant::{self, Tenant};
+use crate::txn::ops::tenants::{
+    ChangeTenantDomain, CreateTenant, DisableTenant, EnableTenant, RemoveTenantDomain, RenameTenant,
+};
+use crate::txn::{self, Outcome};
 
 /// What a post to the tenants page asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,17 +76,6 @@ impl TenantOp {
         match self {
             Self::Create => TENANT_CREATE,
             Self::Rename | Self::Enable | Self::Disable | Self::DomainChange | Self::DomainRemove => TENANT_WRITE,
-        }
-    }
-
-    fn event(self) -> Event {
-        match self {
-            Self::Create => Event::AdminTenantCreate,
-            Self::Rename => Event::AdminTenantRename,
-            Self::Enable => Event::AdminTenantEnable,
-            Self::Disable => Event::AdminTenantDisable,
-            Self::DomainChange => Event::AdminTenantDomainChange,
-            Self::DomainRemove => Event::AdminTenantDomainRemove,
         }
     }
 }
@@ -323,9 +314,8 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) ->
     if let Err(resp) = ctx.check_csrf(&form) {
         return resp;
     }
-    match apply(&st, op, &form).await {
-        Ok((tenant_id, details)) => {
-            audited(&st, &ctx, &tenant_id, op.event(), Some(&tenant_id), details).await;
+    match settle(apply(&st, &ctx, op, &form).await) {
+        Settled::Done(tenant_id) => {
             let base = st.public_url.base();
             // Back to the tenant's Settings page when that is where it was asked
             // from -- unless the tenant was just disabled, which closes that page.
@@ -336,49 +326,65 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, body: Bytes) ->
                 view::see_other(&tenants_url(base))
             }
         }
-        Err(err) => render(&st, &ctx, Some(&err.to_string()), StatusCode::BAD_REQUEST).await,
+        Settled::Refused(message) => render(&st, &ctx, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
-/// Carry out one operation, returning the tenant it was about and what to record.
-async fn apply(st: &AppState, op: TenantOp, form: &Params) -> anyhow::Result<(String, serde_json::Value)> {
-    // `Create` has no existing tenant to name.
-    if op == TenantOp::Create {
-        let (name, domain) = (field(form, NAME), field(form, DOMAIN));
-        // Never a root tenant: there is exactly one, and the schema's unique
-        // index on `is_root` would refuse a second anyway.
-        let created = tenant::create(&st.pool, name, domain, false).await?;
-        return Ok((
-            created.id.clone(),
-            json!({ "name": created.name, "domain": crate::routes::audit::clip(domain) }),
-        ));
+/// The outcome of a change to an existing tenant, carrying that tenant's id.
+fn about(outcome: Outcome<()>, tenant_id: String) -> Outcome<String> {
+    match outcome {
+        Outcome::Done(()) => Outcome::Done(tenant_id),
+        Outcome::Refused(r) => Outcome::Refused(r),
+        Outcome::Failed(m) => Outcome::Failed(m),
     }
-    // Resolves a disabled tenant too, which `tenant::resolve` deliberately does
-    // not: re-enabling one is the whole reason this route exists.
-    let target = tenant::find_for_admin(&st.pool, field(form, TENANT)).await?;
+}
+
+/// Run one operation as its transaction, giving the id of the tenant it was
+/// about. The tenant is named by id, and found whether enabled or not:
+/// re-enabling a disabled one is the whole reason this route exists.
+async fn apply(st: &AppState, ctx: &AdminContext, op: TenantOp, form: &Params) -> Outcome<String> {
+    let actor = ctx.actor();
+    let tenant_id = field(form, TENANT).to_string();
+    let domain = field(form, DOMAIN).to_string();
+    let name = field(form, NAME).to_string();
     match op {
-        TenantOp::Create => unreachable!("handled above"),
+        TenantOp::Create => match txn::run(&st.pool, &actor, &CreateTenant { name, domain }).await {
+            Outcome::Done(created) => Outcome::Done(created.id),
+            other => about(other.map_done(), String::new()),
+        },
         TenantOp::Rename => {
-            let name = field(form, NAME);
-            tenant::set_name(&st.pool, &target.id, name).await?;
-            Ok((target.id, json!({ "name": crate::routes::audit::clip(name) })))
+            let rename = RenameTenant {
+                tenant_id: tenant_id.clone(),
+                name,
+            };
+            about(txn::run(&st.pool, &actor, &rename).await, tenant_id)
         }
-        TenantOp::Enable | TenantOp::Disable => {
-            let enabled = op == TenantOp::Enable;
-            tenant::set_enabled(&st.pool, &target.id, enabled).await?;
-            Ok((target.id, json!({ "enabled": enabled })))
+        TenantOp::Enable => {
+            let enable = EnableTenant {
+                tenant_id: tenant_id.clone(),
+            };
+            about(txn::run(&st.pool, &actor, &enable).await, tenant_id)
+        }
+        TenantOp::Disable => {
+            let disable = DisableTenant {
+                tenant_id: tenant_id.clone(),
+            };
+            about(txn::run(&st.pool, &actor, &disable).await, tenant_id)
         }
         TenantOp::DomainChange => {
-            let change = tenant::change_domain(&st.pool, &target.id, field(form, DOMAIN)).await?;
-            Ok((
-                target.id,
-                json!({ "from": change.from, "to": change.to, "renamed": change.renamed }),
-            ))
+            let change = ChangeTenantDomain {
+                tenant_id: tenant_id.clone(),
+                domain,
+            };
+            about(txn::run(&st.pool, &actor, &change).await.map_done(), tenant_id)
         }
         TenantOp::DomainRemove => {
-            let domain = field(form, DOMAIN);
-            tenant::remove_domain(&st.pool, &target.id, domain).await?;
-            Ok((target.id, json!({ "domain": crate::routes::audit::clip(domain) })))
+            let remove = RemoveTenantDomain {
+                tenant_id: tenant_id.clone(),
+                domain,
+            };
+            about(txn::run(&st.pool, &actor, &remove).await, tenant_id)
         }
     }
 }
@@ -404,14 +410,6 @@ mod tests {
         assert_eq!(TenantOp::Create.action(), TENANT_CREATE);
         for op in TenantOp::ALL.iter().filter(|o| **o != TenantOp::Create) {
             assert_eq!(op.action(), TENANT_WRITE, "{op:?}");
-        }
-    }
-
-    #[test]
-    fn every_operation_records_its_own_event() {
-        let mut seen = std::collections::HashSet::new();
-        for op in TenantOp::ALL {
-            assert!(seen.insert(op.event().as_str()), "{op:?} shares an event");
         }
     }
 }

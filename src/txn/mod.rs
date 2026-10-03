@@ -374,4 +374,10 @@ transactions! {
     DeleteGroup(ops::groups::DeleteGroup),
     AddGroupMember(ops::groups::AddGroupMember),
     RemoveGroupMember(ops::groups::RemoveGroupMember),
+    GrantRole(ops::roles::GrantRole),
+    RevokeRole(ops::roles::RevokeRole),
+    RotateKeys(ops::keys::RotateKeys),
+    PruneKeys(ops::keys::PruneKeys),
+    AddFlowCallback(ops::flow::AddFlowCallback),
+    CreateFlowTestClient(ops::flow::CreateFlowTestClient),
 }

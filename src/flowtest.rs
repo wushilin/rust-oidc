@@ -905,17 +905,32 @@ struct PendingRow {
 
 /// This tenant's flow tester client, if it has one and it still exists.
 pub async fn test_client(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Option<Application>> {
-    let row: Option<(String,)> = sqlx::query_as(crate::db::q(
-        pool,
+    let mut conn = pool.acquire().await?;
+    test_client_in(&mut conn, tenant_id).await
+}
+
+pub(crate) async fn test_client_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<Option<Application>> {
+    let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
         "SELECT app_id FROM flow_test_clients WHERE tenant_id = ?",
     ))
     .bind(tenant_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((app_id,)) = row else { return Ok(None) };
     // Deleted in the applications section: the row stays, the client is gone, and
     // the console offers to create another.
-    Ok(apps::find(pool, &app_id).await?.filter(|a| a.tenant_id == tenant_id))
+    Ok(apps::find_in(&mut *conn, &app_id)
+        .await?
+        .filter(|a| a.tenant_id == tenant_id))
+}
+
+/// What registering the flow tester client came to.
+#[derive(Debug)]
+pub struct TestClient {
+    pub application: Application,
+    /// False when the tenant already had one, which is returned unchanged.
+    pub created: bool,
 }
 
 /// Register this tenant's flow tester client: an ordinary application whose only
@@ -923,36 +938,65 @@ pub async fn test_client(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Optio
 /// can be exercised end to end -- including the code redemption -- without a
 /// secret and without touching any real registration.
 pub async fn create_test_client(pool: &DbPool, url: &PublicUrl, tenant: &Tenant) -> anyhow::Result<Application> {
-    if let Some(existing) = test_client(pool, &tenant.id).await? {
-        return Ok(existing);
+    let mut conn = pool.acquire().await?;
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let made = create_test_client_in(&mut *tx, &callback_uri(url), tenant).await?;
+    tx.commit().await?;
+    Ok(made.application)
+}
+
+/// [`create_test_client`] on a connection, with the callback URI given. A mapping
+/// left behind by a deleted application is cleared first, or it would block this.
+pub(crate) async fn create_test_client_in(
+    conn: &mut crate::db::Conn,
+    callback: &str,
+    tenant: &Tenant,
+) -> anyhow::Result<TestClient> {
+    if let Some(existing) = test_client_in(&mut *conn, &tenant.id).await? {
+        return Ok(TestClient {
+            application: existing,
+            created: false,
+        });
     }
-    let created = apps::create(pool, tenant, TEST_CLIENT_NAME).await?;
-    apps::add_redirect_uri(
-        pool,
+    forget_test_client_in(&mut *conn, &tenant.id).await?;
+    let created = apps::create_in(&mut *conn, tenant, TEST_CLIENT_NAME).await?;
+    apps::add_redirect_uri_in(
+        &mut *conn,
         &created.application,
         RedirectPlatform::PublicClient,
-        &callback_uri(url),
+        callback,
     )
     .await?;
-    sqlx::query(crate::db::q(
-        pool,
+    sqlx::query(crate::db::qc(
+        &conn,
         "INSERT INTO flow_test_clients (tenant_id, app_id, created_at) VALUES (?, ?, ?)",
     ))
     .bind(&tenant.id)
     .bind(&created.application.app_id)
     .bind(now())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    Ok(created.application)
+    Ok(TestClient {
+        application: created.application,
+        created: true,
+    })
 }
 
 /// Forget the mapping, for the one case it can go stale: the application was
 /// deleted in the applications section and another is being registered.
 pub async fn forget_test_client(pool: &DbPool, tenant_id: &str) -> anyhow::Result<()> {
-    sqlx::query(crate::db::q(pool, "DELETE FROM flow_test_clients WHERE tenant_id = ?"))
-        .bind(tenant_id)
-        .execute(pool)
-        .await?;
+    let mut conn = pool.acquire().await?;
+    forget_test_client_in(&mut conn, tenant_id).await
+}
+
+pub(crate) async fn forget_test_client_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        &conn,
+        "DELETE FROM flow_test_clients WHERE tenant_id = ?",
+    ))
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

@@ -201,34 +201,67 @@ async fn load_keys(pool: &DbPool) -> anyhow::Result<Vec<LoadedKey>> {
         .collect()
 }
 
-/// Generate a key + self-signed certificate and store it with `status`.
-pub async fn generate(pool: &DbPool, status: KeyStatus) -> anyhow::Result<String> {
-    let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?;
-    let mut params = CertificateParams::new(Vec::<String>::new())?;
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "rust-oidc token signing");
-    params.distinguished_name = dn;
-    let now_dt = time::OffsetDateTime::now_utc();
-    params.not_before = now_dt - time::Duration::days(1);
-    params.not_after = now_dt + time::Duration::days(CERT_VALIDITY_DAYS);
-    let cert = params.self_signed(&key_pair)?;
-    let cert_der = cert.der().to_vec();
-    let kid = b64url(&Sha1::digest(&cert_der));
+/// A key and its self-signed certificate, generated and not yet stored. RSA
+/// generation is slow, so it happens before a transaction begins and the result
+/// is passed in. Deliberately not `Debug`: it holds the private key.
+pub struct NewKey {
+    kid: String,
+    private_key_pem: String,
+    cert_der: Vec<u8>,
+    not_after: i64,
+}
 
-    sqlx::query(crate::db::q(
-        pool,
+impl NewKey {
+    /// Generate an RSA-2048 key wrapped in a self-signed certificate.
+    pub fn generate() -> anyhow::Result<Self> {
+        let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?;
+        let mut params = CertificateParams::new(Vec::<String>::new())?;
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "rust-oidc token signing");
+        params.distinguished_name = dn;
+        let now_dt = time::OffsetDateTime::now_utc();
+        params.not_before = now_dt - time::Duration::days(1);
+        params.not_after = now_dt + time::Duration::days(CERT_VALIDITY_DAYS);
+        let cert = params.self_signed(&key_pair)?;
+        let cert_der = cert.der().to_vec();
+        Ok(Self {
+            kid: b64url(&Sha1::digest(&cert_der)),
+            private_key_pem: key_pair.serialize_pem(),
+            cert_der,
+            not_after: params.not_after.unix_timestamp(),
+        })
+    }
+
+    /// The key id: the certificate thumbprint. Public, like everything in JWKS.
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+}
+
+/// Store a generated key with `status`.
+pub(crate) async fn store_in(conn: &mut crate::db::Conn, key: &NewKey, status: KeyStatus) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        &conn,
         "INSERT INTO signing_keys (kid, private_key_pem, cert_der, status, created_at, not_after)
          VALUES (?, ?, ?, ?, ?, ?)",
     ))
-    .bind(&kid)
-    .bind(key_pair.serialize_pem())
-    .bind(&cert_der)
+    .bind(&key.kid)
+    .bind(&key.private_key_pem)
+    .bind(&key.cert_der)
     .bind(status.as_str())
     .bind(now())
-    .bind(params.not_after.unix_timestamp())
-    .execute(pool)
+    .bind(key.not_after)
+    .execute(&mut *conn)
     .await?;
-    Ok(kid)
+    Ok(())
+}
+
+/// Generate a key + self-signed certificate and store it with `status`.
+pub async fn generate(pool: &DbPool, status: KeyStatus) -> anyhow::Result<String> {
+    let key = NewKey::generate()?;
+    let mut conn = pool.acquire().await?;
+    store_in(&mut conn, &key, status).await?;
+    Ok(key.kid)
 }
 
 /// Make sure there is an active key and a pre-published next key.
@@ -338,15 +371,81 @@ async fn try_rotate(pool: &DbPool) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// What one rotation did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rotated {
+    /// The key that signs from now on.
+    pub active: String,
+    /// The key published as the next one, if any was.
+    pub next: Option<String>,
+}
+
+/// One rotation on a connection that is already in a transaction (the engine's):
+/// active -> retired, next -> active, and `fresh`, generated before the
+/// transaction began, published as the new next.
+///
+/// It opens with a write to the `key_rotation_lock` row (migration 0008), so two
+/// rotations on Postgres or MySQL run one after the other; on SQLite the
+/// engine's `BEGIN IMMEDIATE` already holds the database. With no next key to
+/// promote (only a hand-edited table has none) `fresh` signs at once rather than
+/// leaving nothing active.
+pub(crate) async fn rotate_in(conn: &mut crate::db::Conn, fresh: &NewKey) -> anyhow::Result<Rotated> {
+    sqlx::query(crate::db::qc(
+        &conn,
+        "UPDATE key_rotation_lock SET held_at = ? WHERE id = 1",
+    ))
+    .bind(now())
+    .execute(&mut *conn)
+    .await?;
+    let next: Option<(String,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT kid FROM signing_keys WHERE status = ? ORDER BY created_at LIMIT 1",
+    ))
+    .bind(KeyStatus::Next.as_str())
+    .fetch_optional(&mut *conn)
+    .await?;
+    sqlx::query(crate::db::qc(
+        &conn,
+        "UPDATE signing_keys SET status = ?, retired_at = ? WHERE status = ?",
+    ))
+    .bind(KeyStatus::Retired.as_str())
+    .bind(now())
+    .bind(KeyStatus::Active.as_str())
+    .execute(&mut *conn)
+    .await?;
+    let Some((kid,)) = next else {
+        store_in(&mut *conn, fresh, KeyStatus::Active).await?;
+        return Ok(Rotated {
+            active: fresh.kid.clone(),
+            next: None,
+        });
+    };
+    sqlx::query(crate::db::qc(&conn, "UPDATE signing_keys SET status = ? WHERE kid = ?"))
+        .bind(KeyStatus::Active.as_str())
+        .bind(&kid)
+        .execute(&mut *conn)
+        .await?;
+    store_in(&mut *conn, fresh, KeyStatus::Next).await?;
+    Ok(Rotated {
+        active: kid,
+        next: Some(fresh.kid.clone()),
+    })
+}
+
 /// Delete keys retired more than `older_than_secs` ago (must exceed token lifetimes).
 pub async fn prune(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
-    let res = sqlx::query(crate::db::q(
-        pool,
+    let mut conn = pool.acquire().await?;
+    prune_in(&mut conn, older_than_secs).await
+}
+
+pub(crate) async fn prune_in(conn: &mut crate::db::Conn, older_than_secs: i64) -> anyhow::Result<u64> {
+    let res = sqlx::query(crate::db::qc(
+        &conn,
         "DELETE FROM signing_keys WHERE status = ? AND retired_at < ?",
     ))
     .bind(KeyStatus::Retired.as_str())
     .bind(now() - older_than_secs)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected())
 }

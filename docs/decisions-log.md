@@ -1235,3 +1235,28 @@ front-channel logout notification, then flip both in `src/routes/discovery.rs`.
 predates commit `bc217fa`. I did **not** redeploy (out of scope), so the results are
 evidence about the deployed build only. Recorded at the top of `docs/conformance.md`
 so a future reader does not over-read them.
+
+## Transactions: role grants, signing keys, the flow tester
+
+**Role grants are two kinds, not four.** `GrantRole` and `RevokeRole` each cover a
+tenant's Roles tab and the Global roles page (`RolePage::Tenant(id)` /
+`RolePage::Global`), because both pages record the same events (`admin.role.grant`,
+`admin.role.revoke`) and every kind needs its own event. Both lock
+`LockTarget::Administrators`, which serialises concurrent last-Global-Administrator
+revocations on Postgres and MySQL (TODO gap 5); SQLite's `BEGIN IMMEDIATE` already did.
+The command line (`Actor::Cli`) is not held to no-widening (`authz::BindingWriter::Operator`):
+the operator has the database. The lock-out rule still applies to it.
+
+**The flow tester's two writes have events of their own**: `admin.flow_test.callback_add`
+and `admin.flow_test.client_create`. They used to be recorded as
+`admin.app.redirect_uri.add` (and, for the test client, `admin.app.create` plus
+`admin.app.redirect_uri.add`), but each transaction kind needs its own event and those two
+belong to the applications page's kinds. The details still carry the platform, the URI and
+`purpose: flow_test`. *To reverse:* run the flow tester's writes as the applications
+page's own transactions (in a batch for the test client) and drop the two events.
+
+**Key rotation takes its new key from the caller.** The RSA key is generated before the
+transaction (`keys::NewKey::generate`) and published as the new `next` inside it. With no
+`next` to promote (only a hand-edited table) the new key signs at once rather than leaving
+nothing active. The console's audit row stays on the administrator's own tenant. The CLI's
+`key rotate` / `key prune` are not converted yet: they still write `key.rotate`.

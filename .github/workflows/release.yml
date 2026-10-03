@@ -1,0 +1,136 @@
+# Release builds for every supported platform.
+#
+# Pushing a tag `vX.Y.Z` builds the server for Linux, macOS, Windows and FreeBSD,
+# each on x86_64 (amd64) and aarch64 (arm64), and publishes them as a GitHub
+# release with a SHA-256 checksum file. It can also be run by hand from the
+# Actions tab (without publishing) to check that everything still builds.
+#
+# Native runners are used wherever GitHub has one, so nothing is cross-compiled
+# except macOS x86_64 (built on Apple silicon). FreeBSD has no hosted runners:
+# it builds inside a FreeBSD virtual machine, the arm64 one under emulation,
+# which is why that job is by far the slowest.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: rust-oidc
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64,   runner: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64,   runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: macos-amd64,   runner: macos-14,         target: x86_64-apple-darwin }
+          - { name: macos-arm64,   runner: macos-14,         target: aarch64-apple-darwin }
+          - { name: windows-amd64, runner: windows-2022,     target: x86_64-pc-windows-msvc }
+          - { name: windows-arm64, runner: windows-11-arm,   target: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aws-lc (the TLS crypto) assembles with NASM on x86_64 Windows.
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          dir="${BIN}-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/${BIN}" README.md LICENSE "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "$env:BIN-$env:GITHUB_REF_NAME-${{ matrix.name }}"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN.exe", README.md, LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  freebsd:
+    name: freebsd-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: amd64, arch: x86_64 }
+          - { name: arm64, arch: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          arch: ${{ matrix.arch }}
+          usesh: true
+          prepare: |
+            pkg install -y rust cmake gmake
+          run: |
+            cargo build --release --locked
+            dir="${BIN}-${GITHUB_REF_NAME}-freebsd-${{ matrix.name }}"
+            mkdir "$dir"
+            cp "target/release/${BIN}" README.md LICENSE "$dir/"
+            tar czf "$dir.tar.gz" "$dir"
+
+      - name: Find the package
+        run: echo "ASSET=$(ls ${BIN}-*-freebsd-${{ matrix.name }}.tar.gz)" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ matrix.name }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [build, freebsd]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

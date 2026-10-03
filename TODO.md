@@ -2,7 +2,9 @@
 
 ## Transactions: every change through one executor
 
-Agreed with the user on 2026-10-03. **Not started.**
+Agreed with the user on 2026-10-03. **Done** (2026-10-04): every command below runs
+through `src/txn`; `tests/txn_only.rs` fails if a handler writes the directory
+any other way. Locks are declared and taken sorted by the engine (decision 29).
 
 ### The rule
 

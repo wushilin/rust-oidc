@@ -5,9 +5,8 @@ the owner has made; follow them, and ask before departing from one.
 
 ## Every change is a transaction, run by the one engine
 
-This is a structural guarantee, not a convention. *Status: being introduced
-(see `TODO.md`); until it is finished, new code must follow it and old code is
-being moved to it.*
+This is a structural guarantee, not a convention. *Status: in force. `tests/txn_only.rs`
+fails if a page, route or CLI command writes the directory outside `src/txn`.*
 
 1. **One change, one transaction type.** Every administrative change (admin
    console, CLI, and a user's own changes in My Account) is a struct

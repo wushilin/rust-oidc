@@ -478,16 +478,8 @@ async fn main() -> anyhow::Result<()> {
 async fn tenant_cmd(pool: &DbPool, cmd: TenantCmd) -> anyhow::Result<()> {
     match cmd {
         TenantCmd::Create { name, domain } => {
-            let t = tenant::create(pool, &name, &domain, false).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::TenantCreate,
-                Some(&t.id),
-                json!({ "name": name, "domain": domain }),
-            )
-            .await?;
+            let create = txn::ops::tenants::CreateTenant { name, domain };
+            let t = txn::run(pool, &CLI, &create).await.into_result()?;
             print_json(json!({ "tenantId": t.id, "name": t.name }));
         }
         TenantCmd::List => {
@@ -502,16 +494,11 @@ async fn tenant_cmd(pool: &DbPool, cmd: TenantCmd) -> anyhow::Result<()> {
         }
         TenantCmd::ChangeDomain { tenant: key, domain } => {
             let t = tenant::find_for_admin(pool, &key).await?;
-            let change = tenant::change_domain(pool, &t.id, &domain).await?;
-            db::audit(
-                pool,
-                Some(&t.id),
-                Actor::Cli,
-                Event::TenantChangeDomain,
-                Some(&t.id),
-                json!({ "from": change.from, "to": change.to, "renamed": change.renamed }),
-            )
-            .await?;
+            let change = txn::ops::tenants::ChangeTenantDomain {
+                tenant_id: t.id.clone(),
+                domain,
+            };
+            txn::run(pool, &CLI, &change).await.into_result()?;
             print_json(json!({ "tenantId": t.id, "domains": tenant::domains(pool, &t.id).await? }));
         }
     }

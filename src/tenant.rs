@@ -202,6 +202,27 @@ pub async fn domains(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Vec<Strin
     Ok(rows.into_iter().map(|(d,)| d).collect())
 }
 
+/// What to tell someone whose sign-in failed with a name that is not of this
+/// tenant at all: a user of another organisation, or a typo in the domain.
+/// `None` when the name ends in one of this tenant's domains (then it is just a
+/// wrong name or password, and stays that). Says nothing about whether any such
+/// account exists anywhere.
+pub async fn not_ours_hint(pool: &DbPool, tenant: &Tenant, upn: &str) -> Option<String> {
+    let (_, domain) = upn.trim().rsplit_once('@')?;
+    let ours = domains(pool, &tenant.id).await.ok()?;
+    if ours.iter().any(|d| fold(d) == fold(domain)) {
+        return None;
+    }
+    let endings: Vec<String> = ours.iter().map(|d| format!("@{d}")).collect();
+    Some(format!(
+        "{upn} is not an account of {name}. Accounts here end in {endings}; an account of another \
+         organization signs in only there.",
+        upn = upn.trim(),
+        name = tenant.name,
+        endings = endings.join(" or "),
+    ))
+}
+
 pub fn normalize_domain(domain: &str) -> anyhow::Result<String> {
     let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     let valid = !d.is_empty()

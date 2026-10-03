@@ -329,11 +329,15 @@ async fn password(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form: &Pa
     let user = match outcome {
         AuthResult::Ok(user) => user,
         AuthResult::InvalidCredentials => {
+            let hint = tenant::not_ours_hint(&st.pool, tenant, upn).await;
             return login_page(
                 st,
                 tenant,
                 upn,
-                Some("Your account or password is incorrect. (AADSTS50126)"),
+                Some(
+                    hint.as_deref()
+                        .unwrap_or("Your account or password is incorrect. (AADSTS50126)"),
+                ),
             );
         }
         AuthResult::Locked => {

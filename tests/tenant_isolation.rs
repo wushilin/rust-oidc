@@ -159,7 +159,10 @@ mod user_isolation {
             .await;
         let denied = browser.login(&page, &a.upn, &a.password).await;
         assert_eq!(denied.status, 401);
-        assert!(denied.body.contains("AADSTS50126"));
+        // Refused, and told it is not an account of this tenant: its domain is
+        // another's.
+        assert!(denied.body.contains("is not an account of Fabrikam"), "{}", denied.body);
+        assert!(denied.location.is_none(), "no code was issued");
 
         // Tenant A's app is unknown at tenant B's authorize endpoint.
         let page = browser

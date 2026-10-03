@@ -231,7 +231,7 @@ with a server-generated <code>state</code>, <code>nonce</code> and PKCE verifier
         sign_in_html = sign_in_section(st, headers, tenant, &url, &ctx.csrf, &hidden_probe(app, &probe)).await,
         form_html = config_form(&url, &ctx.csrf, &registered, test_client.as_ref(), app, &probe),
         readiness_html = readiness_table(&readiness, base, tenant, app),
-        run_html = run_section(&probe, &readiness, is_test_client),
+        run_html = run_section(&probe, &readiness, is_test_client, &who_signs_in(st, tenant).await),
         callback_html = callback_section(
             &url,
             &ctx.csrf,
@@ -407,7 +407,20 @@ fn finding_row(f: &Finding, app_page: &str) -> String {
 }
 
 /// The start button, or the reason there is none.
-fn run_section(probe: &Probe, readiness: &Readiness, is_test_client: bool) -> String {
+/// Whose accounts can sign in to a test in this tenant: its own, and nobody
+/// else's -- not even the administrator running it, who is usually of another.
+async fn who_signs_in(st: &AppState, tenant: &Tenant) -> String {
+    let domains = crate::tenant::domains(&st.pool, &tenant.id).await.unwrap_or_default();
+    let endings: Vec<String> = domains.iter().map(|d| format!("@{d}")).collect();
+    format!(
+        "Sign in with an account of {}, one ending in {}. An account signs in only to its own tenant, \
+         so your console account cannot sign in here unless it is one of them.",
+        tenant.name,
+        endings.join(" or ")
+    )
+}
+
+fn run_section(probe: &Probe, readiness: &Readiness, is_test_client: bool, who: &str) -> String {
     if !readiness.ready() {
         return format!(
             r#"<h2>Run it</h2><p>Not yet: {} of the requirements above are not met. Each one says what to change.</p>"#,
@@ -442,13 +455,17 @@ it does sign a user in, and that sign-in is recorded in the audit log as any oth
         // carrying the last-checked settings in hidden fields, so changing a setting
         // and pressing Start silently ran the old one.
         r#"<h2>Run it</h2>
-<p>{note}</p>{client_note}
+<p>{note}</p><p><strong>{who}</strong></p>{client_note}
+<p class="muted">The ID token carries the roles of the application signed in to. To see an API's app
+roles, ask for a token for it in the scope, as <code>api://&lt;its application id&gt;/.default</code>: the
+access token then carries the roles the user holds there.</p>
 <p class="muted">This runs the settings as they are shown above right now, whether or not you
 pressed Check since changing them.</p>
 <div class="actions"><button type="submit" form="{CONFIG_FORM_ID}" name="{field}" value="{op}">{button}</button></div>"#,
         field = FlowOp::FIELD,
         op = FlowOp::Start.as_str(),
         note = e(note),
+        who = e(who),
         button = e(button),
     )
 }

@@ -1271,6 +1271,9 @@ pub async fn login(
                     return finish_sign_in(&st, &tenant_key, &headers, &params, &request, &v, &user, false).await;
                 }
                 AuthResult::InvalidCredentials => {
+                    if let Some(hint) = tenant::not_ours_hint(&st.pool, &v.tenant, &upn).await {
+                        return login_page(&st, &v, &request, &upn, Some(&hint));
+                    }
                     "Your account or password is incorrect. (AADSTS50126: Error validating credentials due to invalid username or password.)"
                 }
                 AuthResult::Locked => {

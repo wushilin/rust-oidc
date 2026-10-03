@@ -713,12 +713,16 @@ async fn sign_in(
     let user = match outcome {
         AuthResult::Ok(user) => user,
         AuthResult::InvalidCredentials => {
+            let hint = tenant::not_ours_hint(&st.pool, tenant, upn).await;
             return Err(login_page(
                 st,
                 tenant,
                 &pending,
                 upn,
-                Some("Your account or password is incorrect. (AADSTS50126)"),
+                Some(
+                    hint.as_deref()
+                        .unwrap_or("Your account or password is incorrect. (AADSTS50126)"),
+                ),
             ));
         }
         AuthResult::Locked => {

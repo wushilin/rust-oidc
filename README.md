@@ -93,19 +93,35 @@ $B app assignment-required --tenant contoso.com --app W --required true
 
 ## Configuration
 
-Every option can be passed as a flag or an environment variable.
+The recommended way is a configuration file:
 
-| Variable | Default | |
-|---|---|---|
-| `RUST_OIDC_DATABASE` | `sqlite://data/rust-oidc.db` | SQLite, PostgreSQL or MySQL URL; see [docs/databases.md](docs/databases.md) |
-| `RUST_OIDC_PUBLIC_URL` | `http://localhost:8080/rust-oidc` | External base URL. Its path is the route prefix. |
-| `RUST_OIDC_BIND` | `0.0.0.0:8080` | |
-| `RUST_OIDC_TLS_MODE` | `none` | `none`, `files` or `acme` |
-| `RUST_OIDC_TLS_CERT` / `RUST_OIDC_TLS_KEY` | | PEM files for `files` mode |
-| `RUST_OIDC_ACME_DOMAINS` | | Comma-separated, for `acme` mode (TLS-ALPN-01, needs port 443 reachable) |
-| `RUST_OIDC_ACME_EMAIL` | | |
-| `RUST_OIDC_ACME_CACHE_DIR` | `data/acme` | Keep this directory to avoid Let's Encrypt rate limits |
-| `RUST_OIDC_ACME_PRODUCTION` | `false` | Uses Let's Encrypt staging until set |
+```sh
+rust-oidc --generate-config-file config.toml   # a commented file with the settings in effect
+rust-oidc -c config.toml serve                 # -c / --config works for every command
+```
+
+`--generate-config-file` fills the file from the `RUST_OIDC_*` environment where
+set, else the defaults, so an existing env-file deployment converts with
+`set -a; . ./rust-oidc.env; set +a; rust-oidc --generate-config-file config.toml`.
+It never overwrites a file, and creates it readable by its owner only (a database
+URL can hold a password). Unknown keys are an error.
+
+With `-c`, a flag given on the command line still overrides the file, and the file
+overrides environment variables and defaults. Without `-c`, every option can be
+passed as a flag or an environment variable:
+
+| File key | Variable | Default | |
+|---|---|---|---|
+| `database.url` | `RUST_OIDC_DATABASE` | `sqlite://data/rust-oidc.db` | SQLite, PostgreSQL or MySQL URL; see [docs/databases.md](docs/databases.md) |
+| `server.public_url` | `RUST_OIDC_PUBLIC_URL` | `http://localhost:8080/rust-oidc` | External base URL. Its path is the route prefix. |
+| `server.bind` | `RUST_OIDC_BIND` | `0.0.0.0:8080` | |
+| `tls.mode` | `RUST_OIDC_TLS_MODE` | `none` | `none`, `files` or `acme` |
+| `tls.cert` / `tls.key` | `RUST_OIDC_TLS_CERT` / `RUST_OIDC_TLS_KEY` | | PEM files for `files` mode |
+| `tls.acme.domains` | `RUST_OIDC_ACME_DOMAINS` | | For `acme` mode (TLS-ALPN-01, needs port 443 reachable); comma-separated in the variable |
+| `tls.acme.email` | `RUST_OIDC_ACME_EMAIL` | | |
+| `tls.acme.cache_dir` | `RUST_OIDC_ACME_CACHE_DIR` | `data/acme` | Keep this directory to avoid Let's Encrypt rate limits |
+| `tls.acme.production` | `RUST_OIDC_ACME_PRODUCTION` | `false` | Uses Let's Encrypt staging until set |
+| `log.filter` | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | A `tracing` filter |
 
 ## Using Microsoft client libraries
 

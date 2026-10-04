@@ -3,6 +3,7 @@ pub mod admin;
 pub mod apps;
 pub mod claims;
 pub mod config;
+pub mod config_file;
 pub mod db;
 pub mod directory;
 pub mod error;

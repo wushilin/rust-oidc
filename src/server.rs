@@ -10,7 +10,8 @@ use futures::StreamExt;
 use rustls_acme::AcmeConfig;
 use rustls_acme::caches::DirCache;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TlsMode {
     /// Plain HTTP (behind a TLS-terminating proxy, or local development).
     None,
@@ -18,6 +19,19 @@ pub enum TlsMode {
     Files,
     /// Automatic certificates from Let's Encrypt (TLS-ALPN-01 on this listener).
     Acme,
+}
+
+impl TlsMode {
+    pub const ALL: &'static [TlsMode] = &[Self::None, Self::Files, Self::Acme];
+
+    /// The value on the command line and in the configuration file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Files => "files",
+            Self::Acme => "acme",
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]

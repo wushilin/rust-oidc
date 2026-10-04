@@ -1364,3 +1364,17 @@ so `unmet_authentication_requirements` (`claims_parameter_supported` stays `fals
 and Entra's own mechanism, Conditional Access authentication contexts in `acrs`.
 *To reverse:* drop the two `acr` inserts in `src/claims.rs`, `acr_values_supported` in
 discovery, and `stepped_up` in `src/routes/authorize.rs`.
+
+## Configuration file
+
+**39. `-c config.toml`: the command line beats the file, the file beats the
+environment** (requested by the owner, 2026-10-04: start from an explicit TOML file
+instead of an env file). `-c/--config` is global, so CLI commands read the same
+database. A value typed on the command line still wins, so one run can override one
+setting; environment variables and defaults lose to the file, which is the point of
+it being explicit. Without `-c` nothing changes, so existing env-file deployments
+keep working. `--generate-config-file` writes the settings in effect (environment,
+else defaults) as a commented file, mode 0600, never overwriting. Unknown keys are
+refused (`deny_unknown_fields`). The log filter moved into the file as `log.filter`;
+when the file sets it, it beats `RUST_LOG`, by the same rule. *To reverse:* drop
+`-c`; the env path is untouched.

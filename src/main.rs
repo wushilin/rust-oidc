@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use rust_oidc::db::DbPool;
 use serde_json::json;
 
@@ -12,7 +13,7 @@ use rust_oidc::config::PublicUrl;
 use rust_oidc::rbac::RoleId;
 use rust_oidc::server::{self, TlsArgs};
 use rust_oidc::txn::{self, Actor as TxnActor};
-use rust_oidc::{AppState, db, directory, groups, keys, routes, tenant, users};
+use rust_oidc::{AppState, config_file, db, directory, groups, keys, routes, tenant, users};
 
 /// Who every command-line change is made by: an operator with access to the
 /// database, recorded as `cli`.
@@ -28,8 +29,17 @@ struct Cli {
     /// Database URL (SQLite, PostgreSQL or MySQL).
     #[arg(long, global = true, env = "RUST_OIDC_DATABASE", default_value = db::DEFAULT_DATABASE_URL)]
     database: String,
+    /// Read settings from this TOML file. A flag given on the command line still
+    /// overrides it; it overrides RUST_OIDC_* environment variables and defaults.
+    #[arg(short = 'c', long = "config", global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Write a commented configuration file holding the settings in effect now
+    /// (the RUST_OIDC_* environment's where set, else the defaults), then exit.
+    /// An existing file is not overwritten.
+    #[arg(long, value_name = "FILE", conflicts_with = "config")]
+    generate_config_file: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -382,29 +392,39 @@ enum KeyCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tower_http=info,sqlx=warn".into()),
-        )
-        .init();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let cli = Cli::parse();
-    if let Command::DevCert { out, names } = cli.command {
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    if let Some(path) = &cli.generate_config_file {
+        let settings = settings_now(&cli.database)?;
+        config_file::write_new(path, &config_file::render(&settings))?;
+        println!("wrote {}", path.display());
+        return Ok(());
+    }
+    let file = cli.config.as_deref().map(config_file::load).transpose()?;
+    if let Some(file) = &file {
+        apply_config_file(&mut cli, &matches, file);
+    }
+    init_logging(file.as_ref().and_then(|f| f.log.filter.as_deref()));
+
+    let Some(command) = cli.command else {
+        bail!("no command given; run `rust-oidc --help`");
+    };
+    if let Command::DevCert { out, names } = command {
         let (cert, key) = server::write_dev_cert(&out, names)?;
         println!("wrote {} and {}", cert.display(), key.display());
         return Ok(());
     }
     ensure_db_dir(&cli.database)?;
-    let policy = if matches!(cli.command, Command::Serve { .. }) {
+    let policy = if matches!(command, Command::Serve { .. }) {
         db::FoldPolicy::FailClosed
     } else {
         db::FoldPolicy::ReportOnly
     };
     let pool = db::connect_with(&cli.database, policy).await?;
 
-    match cli.command {
+    match command {
         Command::Serve { bind, public_url, tls } => {
             let public_url = PublicUrl::parse(&public_url)?;
             keys::ensure(&pool).await?;
@@ -979,6 +999,68 @@ async fn key_cmd(pool: &DbPool, cmd: KeyCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Logging: the configuration file's filter, else `RUST_LOG`, else the default.
+fn init_logging(from_file: Option<&str>) {
+    let filter = match from_file {
+        Some(f) => tracing_subscriber::EnvFilter::new(f),
+        None => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| config_file::DEFAULT_LOG_FILTER.into()),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// A setting from the configuration file, unless it was given on the command
+/// line: the command line beats the file, the file beats the environment and
+/// the defaults (which clap has already filled in).
+fn pick<T>(matches: &ArgMatches, id: &str, current: T, from_file: Option<T>) -> T {
+    match (matches.value_source(id), from_file) {
+        (Some(ValueSource::CommandLine), _) | (_, None) => current,
+        (_, Some(value)) => value,
+    }
+}
+
+/// Lay the configuration file's settings over what clap parsed.
+fn apply_config_file(cli: &mut Cli, matches: &ArgMatches, file: &config_file::ConfigFile) {
+    cli.database = pick(matches, "database", cli.database.clone(), file.database.url.clone());
+    let (Some(Command::Serve { bind, public_url, tls }), Some(m)) =
+        (cli.command.as_mut(), matches.subcommand_matches("serve"))
+    else {
+        return;
+    };
+    *bind = pick(m, "bind", *bind, file.server.bind);
+    *public_url = pick(m, "public_url", public_url.clone(), file.server.public_url.clone());
+    let t = &file.tls;
+    tls.tls_mode = pick(m, "tls_mode", tls.tls_mode, t.mode);
+    tls.tls_cert = pick(m, "tls_cert", tls.tls_cert.clone(), t.cert.clone().map(Some));
+    tls.tls_key = pick(m, "tls_key", tls.tls_key.clone(), t.key.clone().map(Some));
+    tls.acme_domains = pick(m, "acme_domains", tls.acme_domains.clone(), t.acme.domains.clone());
+    tls.acme_email = pick(m, "acme_email", tls.acme_email.clone(), t.acme.email.clone().map(Some));
+    tls.acme_cache_dir = pick(
+        m,
+        "acme_cache_dir",
+        tls.acme_cache_dir.clone(),
+        t.acme.cache_dir.clone(),
+    );
+    tls.acme_production = pick(m, "acme_production", tls.acme_production, t.acme.production);
+}
+
+/// The server's settings as they stand without a configuration file: the
+/// environment's where set, else the defaults. What `--generate-config-file`
+/// writes.
+fn settings_now(database: &str) -> anyhow::Result<config_file::Settings> {
+    let parsed = Cli::try_parse_from(["rust-oidc", "--database", database, "serve"])?;
+    let Some(Command::Serve { bind, public_url, tls }) = parsed.command else {
+        unreachable!("parsed as serve");
+    };
+    Ok(config_file::Settings {
+        database: parsed.database,
+        bind,
+        public_url,
+        tls,
+        log_filter: std::env::var("RUST_LOG").unwrap_or_else(|_| config_file::DEFAULT_LOG_FILTER.into()),
+    })
 }
 
 fn password_or_stdin(password: Option<String>) -> anyhow::Result<String> {

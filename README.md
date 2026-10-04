@@ -55,6 +55,8 @@ metadata always use the GUID.
 | Token | `/rust-oidc/{tenant}/oauth2/v2.0/token` |
 | Logout | `/rust-oidc/{tenant}/oauth2/v2.0/logout` |
 | UserInfo | `/rust-oidc/oidc/userinfo` (accepts the "Graph" token, as in Entra) |
+| Device code | `/rust-oidc/{tenant}/oauth2/v2.0/devicecode` |
+| Auth API | `/rust-oidc/{tenant}/api/v1/authenticate` (see [Legacy application integration](#legacy-application-integration-the-auth-api)) |
 | Issuer | `https://host/rust-oidc/{tid}/v2.0` |
 | Admin console | `/rust-oidc/admin` (sign in with an administrator account) |
 
@@ -123,30 +125,142 @@ passed as a flag or an environment variable:
 | `tls.acme.production` | `RUST_OIDC_ACME_PRODUCTION` | `false` | Uses Let's Encrypt staging until set |
 | `log.filter` | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | A `tracing` filter |
 
-## Auth API: checking a password and code from a login prompt
+## Legacy application integration: the Auth API
 
-For login prompts that cannot run a browser flow, such as Linux PAM. Not part of
-Entra; see decision 40 in `docs/decisions-log.md`.
+Some things that need sign-in cannot run an OAuth browser flow: a Linux login prompt
+(PAM), SSH with keyboard-interactive, a VPN or network appliance, an old application
+with its own user-name-and-password screen. For these, rust-oidc has a built-in
+**Auth API**. An application that an administrator has trusted with it can send a
+user's **user name, password and authenticator code** and get back whether they are
+right, and on success who the user is: profile, groups and roles.
 
-1. Register an application for the login host, give it a client secret or a
-   certificate, and on its **API permissions** page grant **Auth API →
-   `Credentials.Verify`**.
-2. Assign the users or groups who may log in (*Users and groups*). They must have an
-   authenticator set up.
-3. The host gets a token (client credentials, `scope=3bc73980-9fde-4fa7-9f74-9d421f0a127d/.default`)
-   and sends each login:
+This is an extension; Entra has no such API (its answer is RADIUS through the NPS
+extension). See decision 40 in `docs/decisions-log.md`.
 
-```sh
-curl -X POST "$BASE/<tenant>/api/v1/authenticate" -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"upn": "alice@contoso.com", "password": "...", "otp": "123456"}'
+**Prefer a real OAuth flow where you can.** With the Auth API the integrating host
+sees the user's password, so a compromised host can capture it. Where the prompt can
+show a URL and a code, the device code flow (`/oauth2/v2.0/devicecode`) signs the user
+in on their own phone or browser and the host never sees the password; that is how
+Entra signs users in to Linux VMs over SSH.
+
+### What protects it
+
+- **An administrator must grant it.** The Auth API is a built-in resource, like
+  Microsoft Graph, with one application permission, `Credentials.Verify`. It is
+  granted per application, on that application's **API permissions** page; that grant
+  is the consent, and nobody else can give it. It is checked on every call, so
+  revoking it stops the application at once.
+- **Only users assigned to the calling application** (directly or through a group) can
+  be checked. An application cannot even move the lockout counter of anyone else.
+- **MFA is mandatory.** The user must have an authenticator, and the check needs a
+  fresh code from it; recovery codes are refused. A password alone confirms nothing.
+  A code is spent when a check succeeds, so it cannot be replayed.
+- **Failures say nothing.** Every failure about the user (wrong password, wrong code,
+  unknown, disabled, locked, not assigned, no authenticator, must change password,
+  throttled) gets the same answer, byte for byte. The reason is in the audit log, as
+  a failed sign-in with `via: auth_api`.
+- **Limits.** Wrong passwords count toward the account's lockout, as at sign-in.
+  Checks are limited per calling application (600 a minute) and per account (10 a
+  minute).
+
+### Set it up
+
+In the admin console, for the integrating host (one application per host or per
+kind of host):
+
+1. **Applications → New application**, e.g. "Linux Login". Note its application
+   (client) id.
+2. **Certificates & secrets**: upload a certificate (recommended) or create a client
+   secret. A self-signed certificate is enough:
+
+   ```sh
+   umask 077
+   openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
+     -days 365 -subj "/CN=linux-login"
+   ```
+
+   Upload `cert.pem` only. `key.pem` stays on the host.
+3. **API permissions**: **Auth API → `Credentials.Verify` → Grant**.
+4. **Users and groups**: assign who may log in through it. Each person needs an
+   authenticator (**My Account → set up authenticator**, or at their next sign-in if
+   MFA is required of them).
+5. Optionally, define **app roles** on the application (for example `Host.Admin`,
+   `Host.User`) and give them in the assignments; the host receives them on every
+   successful check and can map them to local privileges.
+
+### Call it
+
+Two requests. First the application signs in as itself (client credentials, with
+the certificate as a `private_key_jwt` assertion or with the secret) and gets a token
+for the Auth API; reuse it until it expires (about an hour):
+
+```
+POST {base}/{tenant}/oauth2/v2.0/token
+grant_type=client_credentials
+client_id=<application id>
+scope=3bc73980-9fde-4fa7-9f74-9d421f0a127d/.default
+client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+client_assertion=<JWT signed with key.pem: aud = the token endpoint, iss = sub = the application id, a unique jti, exp within 10 minutes, x5t = base64url SHA-1 of the certificate>
 ```
 
-A right password and fresh authenticator code answer `{"result": true, ...}` with the
-user's `oid`, `preferred_username`, `name`, `email`, `groups` (`id`, `name`) and the
-`app_roles` they hold on the calling application (`id`, `value`). Every failure about
-the user answers the same `{"result": false, "code": "invalid_credentials", ...}`; the
-reason is in the audit log. A missing grant is `403`, a bad token `401`.
+Then one check per login:
+
+```
+POST {base}/{tenant}/api/v1/authenticate
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"upn": "alice@contoso.com", "password": "...", "otp": "123456"}
+```
+
+`{tenant}` is the application's tenant, by domain or id. A complete, working shell
+client is in [`examples/auth-api/check-login.sh`](examples/auth-api/check-login.sh):
+it builds the certificate assertion with `openssl`, gets the token, asks for a login
+and exits 0 on success, 1 otherwise, which is the decision a PAM module acts on.
+
+### The answer
+
+On success:
+
+```json
+{
+  "result": true,
+  "oid": "…", "tid": "…",
+  "preferred_username": "alice@contoso.com",
+  "name": "Alice Smith", "given_name": "Alice", "family_name": "Smith",
+  "email": "alice.smith@contoso.com",
+  "groups":    [{ "id": "…", "name": "linux-admins" }],
+  "app_roles": [{ "id": "…", "value": "Host.Admin" }],
+  "amr": ["pwd", "mfa"],
+  "acr": "2"
+}
+```
+
+`groups` are the user's groups; `app_roles` the roles they hold on the calling
+application. Use either to decide what they may do on the host.
+
+Every failure about the user, `200`:
+
+```json
+{ "result": false, "code": "invalid_credentials", "msg": "The user name, password or code is not valid." }
+```
+
+Problems with the calling application are HTTP errors instead:
+
+| Status | Meaning |
+|---|---|
+| `401 invalid_token` | No token, an expired one, or one not issued for the Auth API in this tenant. |
+| `403 insufficient_scope` | The application does not hold `Credentials.Verify` (or it was revoked). A token fetched before the grant does not carry it: get a new one. |
+| `429` | The application's own limit; wait `Retry-After` seconds. |
+| `400 invalid_request` | The body is not JSON with `upn`, `password` and `otp`. |
+
+### If a check fails with credentials you know are right
+
+Look in the tenant's **Audit log** for the failed sign-in with `via: auth_api`; its
+`reason` is one of `not_assigned`, `no_authenticator`, `bad_code` (wrong, or already
+used: wait for the next code), `bad_password`, `locked`, `disabled`,
+`must_change_password` (the user must sign in once in a browser and choose a new
+password) or `throttled`.
 
 ## Using Microsoft client libraries
 
@@ -270,6 +384,8 @@ Worth knowing:
 - Refresh tokens rotate, and replaying an old one revokes the chain. Entra keeps old refresh tokens valid.
 - ID tokens include `email_verified` when an email is present.
 - Client secrets are stored as SHA-256 hashes. They are ~200-bit random values, so a slow hash adds nothing.
+- Tokens carry `acr` (`"1"` password, `"2"` with MFA), and `acr_values=2` steps a sign-in up to MFA. Entra's v2.0 tokens omit `acr` and step up through Conditional Access instead.
+- The built-in Auth API (above) has no Entra counterpart.
 
 ## License
 

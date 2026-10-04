@@ -1,0 +1,43 @@
+# The SQLite test suite, on every push and pull request.
+#
+# This is what holds the house rules (AGENT.md) whoever writes the change: among
+# the tests, tests/txn_only.rs fails when anything outside src/txn changes the
+# directory. Postgres and MySQL runs are paused by the owner; they would be added
+# here as service containers when they resume.
+
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning is a failure: the tree is kept warning-free.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Build
+        run: cargo build --all-targets
+      - name: Tests (SQLite)
+        run: cargo test --no-fail-fast

@@ -1,12 +1,15 @@
 # House rules
 
+(`CLAUDE.md` and `AGENTS.md` are links to this file, so every coding agent reads it.)
+
 Rules for anyone (human or agent) changing this repository. They are decisions
 the owner has made; follow them, and ask before departing from one.
 
 ## Every change is a transaction, run by the one engine
 
 This is a structural guarantee, not a convention. *Status: in force. `tests/txn_only.rs`
-fails if a page, route or CLI command writes the directory outside `src/txn`.*
+fails if anything outside `src/txn` and the storage modules changes the
+directory, and CI (`.github/workflows/test.yml`) runs it on every push.*
 
 1. **One change, one transaction type.** Every administrative change (admin
    console, CLI, and a user's own changes in My Account) is a struct

@@ -82,7 +82,7 @@ pub(crate) async fn create_in(
     // Looked for first, deleted accounts included (they keep their name): inside
     // a transaction the unique index would be a database failure, not a refusal.
     let taken: Option<(Option<i64>,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT deleted_at FROM users WHERE tenant_id = ? AND upn_folded = ?",
     ))
     .bind(&tenant.id)
@@ -97,7 +97,7 @@ pub(crate) async fn create_in(
     let id = new_guid();
     let ts = now();
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO users (id, tenant_id, upn, upn_folded, email, email_verified, display_name, given_name,
                             family_name, password_hash, enabled, must_change_password, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -118,7 +118,7 @@ pub(crate) async fn create_in(
     .bind(ts)
     .execute(&mut *conn)
     .await?;
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     remember_password(&mut *conn, engine, &id, &password.hash).await?;
     Ok(id)
 }
@@ -148,7 +148,7 @@ pub async fn find_by_id<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Resul
 
 pub(crate) async fn find_by_id_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<Option<User>> {
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users WHERE id = ? AND deleted_at IS NULL",
     ))
@@ -168,7 +168,7 @@ pub(crate) async fn find_in(
     user_id: &str,
 ) -> anyhow::Result<Option<User>> {
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
     ))
@@ -257,7 +257,7 @@ pub(crate) async fn authenticate_traced_in(
         locked_until: Option<i64>,
     }
     let row: Option<Row> = sqlx::query_as(
-        crate::db::qc(&conn, "SELECT id, password_hash, enabled, failed_logins, locked_until FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL"),
+        crate::db::qc(conn, "SELECT id, password_hash, enabled, failed_logins, locked_until FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL"),
     )
     .bind(&tenant.id)
     .bind(crate::util::fold(upn))
@@ -284,7 +284,7 @@ pub(crate) async fn authenticate_traced_in(
         let failures = row.failed_logins + 1;
         let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
         sqlx::query(crate::db::qc(
-            &conn,
+            conn,
             "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?",
         ))
         .bind(failures)
@@ -299,7 +299,7 @@ pub(crate) async fn authenticate_traced_in(
         return Ok((AuthResult::Disabled, trace));
     }
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?",
     ))
     .bind(&row.id)
@@ -408,7 +408,7 @@ pub(crate) async fn prepare_password_in(
 ) -> anyhow::Result<NewPassword> {
     check_length(password)?;
     let current: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT password_hash FROM users WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
     .bind(user_id)
@@ -421,7 +421,7 @@ pub(crate) async fn prepare_password_in(
     let remembered = tenant.settings.password_history.clamp(0, MAX_PASSWORD_HISTORY);
     if by != PasswordSetBy::AdminTemporary && remembered > 0 {
         let mut recent: Vec<String> = sqlx::query_as::<_, (String,)>(crate::db::qc(
-            &conn,
+            conn,
             "SELECT password_hash FROM password_history WHERE user_id = ? ORDER BY created_at DESC",
         ))
         .bind(user_id)
@@ -483,7 +483,7 @@ pub(crate) async fn store_password_in(
     user_id: &str,
     password: &NewPassword,
 ) -> anyhow::Result<bool> {
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let changed = sqlx::query(crate::db::sql_stmt(
         engine,
@@ -550,7 +550,7 @@ pub async fn must_change_password<'c>(db: impl Handle<'c>, user_id: &str) -> any
 
 pub(crate) async fn must_change_password_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<bool> {
     let row: Option<(crate::db::Flag,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT must_change_password FROM users WHERE id = ?",
     ))
     .bind(user_id)
@@ -572,7 +572,7 @@ pub(crate) async fn set_must_change_password_in(
     must: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE users SET must_change_password = ? WHERE id = ?",
     ))
     .bind(must)
@@ -638,7 +638,7 @@ pub(crate) async fn list_in(
         None => "%".to_string(),
     };
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users
          WHERE tenant_id = ? AND deleted_at IS NULL
@@ -684,7 +684,7 @@ pub(crate) async fn update_attributes_in(
     attrs: &UserAttributes<'_>,
 ) -> anyhow::Result<bool> {
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE users SET display_name = ?, given_name = ?, family_name = ?, email = ?,
                           email_verified = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
@@ -721,7 +721,7 @@ pub(crate) async fn set_enabled_in(
     user_id: &str,
     enabled: bool,
 ) -> anyhow::Result<bool> {
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
@@ -751,7 +751,7 @@ pub async fn soft_delete<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str
 }
 
 pub(crate) async fn soft_delete_in(conn: &mut crate::db::Conn, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let ts = now();
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
@@ -783,7 +783,7 @@ pub async fn restore<'c>(db: impl Handle<'c>, tenant_id: &str, upn: &str) -> any
 
 pub(crate) async fn restore_in(conn: &mut crate::db::Conn, tenant_id: &str, upn: &str) -> anyhow::Result<bool> {
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE users SET deleted_at = NULL, enabled = ?, updated_at = ?
          WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NOT NULL",
     ))
@@ -811,7 +811,7 @@ pub(crate) async fn deleted_id_in(
     upn: &str,
 ) -> anyhow::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NOT NULL
          ORDER BY deleted_at DESC",
     ))
@@ -824,7 +824,7 @@ pub(crate) async fn deleted_id_in(
 
 pub(crate) async fn restore_id_in(conn: &mut crate::db::Conn, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE users SET deleted_at = NULL, enabled = ?, updated_at = ?
          WHERE tenant_id = ? AND id = ? AND deleted_at IS NOT NULL",
     ))
@@ -845,7 +845,7 @@ pub async fn end_sessions<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Res
 }
 
 pub(crate) async fn end_sessions_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<()> {
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     revoke_access(&mut tx, engine, user_id).await?;
     tx.commit().await?;
@@ -890,7 +890,7 @@ pub(crate) async fn find_by_upn_in(
     upn: &str,
 ) -> anyhow::Result<Option<User>> {
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, tenant_id, upn, email, email_verified, display_name, given_name, family_name, enabled
          FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
     ))

@@ -429,7 +429,7 @@ pub async fn detail_post(
     };
 
     match apply(&st, &ctx, tenant, &group, op, &form, &body).await {
-        Ok(()) => {
+        Settled::Done(()) => {
             // A deleted group has no page to go back to.
             if op == MemberOp::DeleteGroup {
                 view::see_other(&groups_url(st.public_url.base(), tenant))
@@ -437,11 +437,8 @@ pub async fn detail_post(
                 view::see_other(&group_url(st.public_url.base(), tenant, &group))
             }
         }
-        Err(Settled::Refused(message)) => {
-            detail(&st, &ctx, tenant, &group, Some(&message), StatusCode::BAD_REQUEST).await
-        }
-        Err(Settled::Respond(resp)) => resp,
-        Err(Settled::Done(())) => unreachable!("a done outcome is Ok"),
+        Settled::Refused(message) => detail(&st, &ctx, tenant, &group, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Respond(resp) => resp,
     }
 }
 
@@ -459,7 +456,7 @@ fn names(raw: &str) -> Vec<&str> {
 
 /// Carry out one operation on the group: a transaction per member added or
 /// removed, so each completes or is refused on its own and the page lists the
-/// refusals. `Err` is what to show instead of going back to the group.
+/// refusals. Anything but done is what to show instead of going back to the group.
 async fn apply(
     st: &AppState,
     ctx: &AdminContext,
@@ -468,9 +465,11 @@ async fn apply(
     op: MemberOp,
     form: &Params,
     body: &[u8],
-) -> Result<(), Settled<()>> {
+) -> Settled<()> {
     let actor = ctx.actor();
-    let refused = |m: &str| Err(Settled::Refused(m.to_string()));
+    let refused = |m: &str| Settled::Refused(m.to_string());
+    // Every row done is done; otherwise the page lists what was not.
+    let finished = |problem: Option<String>| problem.map_or(Settled::Done(()), Settled::Refused);
     let mut tally = bulk::Tally::default();
     match op {
         MemberOp::Add => {
@@ -494,14 +493,14 @@ async fn apply(
                     Some(why) => tally.refuse(upn, why),
                 }
             }
-            tally.problem("added").map_or(Ok(()), |p| refused(&p))
+            finished(tally.problem("added"))
         }
         MemberOp::Remove => {
             let members = match groups::members(&st.pool, &group.id).await {
                 Ok(m) => m,
                 Err(err) => {
                     tracing::error!("group members lookup failed: {err}");
-                    return Err(Settled::Respond(view::server_error()));
+                    return Settled::Respond(view::server_error());
                 }
             };
             let ticked = bulk::Selection::read(body);
@@ -530,7 +529,7 @@ async fn apply(
                     Some(why) => tally.refuse(&member.upn, why),
                 }
             }
-            tally.problem("removed").map_or(Ok(()), |p| refused(&p))
+            finished(tally.problem("removed"))
         }
         MemberOp::DeleteGroup => {
             let delete = DeleteGroup {
@@ -538,9 +537,9 @@ async fn apply(
                 group_id: group.id.clone(),
             };
             match settle(txn::run(&st.pool, &actor, &delete).await) {
-                Settled::Done(_) => Ok(()),
-                Settled::Refused(m) => Err(Settled::Refused(m)),
-                Settled::Respond(r) => Err(Settled::Respond(r)),
+                Settled::Done(_) => Settled::Done(()),
+                Settled::Refused(m) => Settled::Refused(m),
+                Settled::Respond(r) => Settled::Respond(r),
             }
         }
     }

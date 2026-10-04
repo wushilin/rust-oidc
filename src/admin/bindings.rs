@@ -107,7 +107,7 @@ pub(crate) async fn create_in(
         anyhow::bail!("a service principal cannot hold a console role");
     }
     let id = new_guid();
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let Some((home, home_is_root)) = home_of(&mut *tx, engine, principal_type, principal_id).await? else {
         anyhow::bail!("no such user or group");
@@ -154,7 +154,7 @@ pub async fn delete<'c>(db: impl Handle<'c>, binding_id: &str) -> anyhow::Result
 }
 
 pub(crate) async fn delete_in(conn: &mut crate::db::Conn, binding_id: &str) -> anyhow::Result<bool> {
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = crate::admin::lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM role_bindings WHERE id = ?"))
@@ -173,7 +173,7 @@ async fn scope_of_in(conn: &mut crate::db::Conn, binding_id: &str, kind: ScopeKi
         ScopeKind::All => Ok(Scope::All),
         ScopeKind::Tenants => {
             let rows = sqlx::query(crate::db::qc(
-                &conn,
+                conn,
                 "SELECT rbt.tenant_id FROM role_binding_tenants rbt
                  JOIN tenants t ON t.id = rbt.tenant_id
                  WHERE rbt.binding_id = ?",
@@ -198,7 +198,7 @@ pub(crate) async fn effective_for_user_in(
     user_id: &str,
 ) -> anyhow::Result<Vec<EffectiveBinding>> {
     let rows = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, role_id, scope_kind FROM role_bindings
          WHERE (principal_type = ? AND principal_id = ?)
             OR (principal_type = ? AND principal_id IN
@@ -213,7 +213,7 @@ pub(crate) async fn effective_for_user_in(
 
     // The read-side half of the rule `create` enforces, applied with the user's
     // own tenant (a group is always in its members' tenant).
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let Some((home, home_is_root)) = home_of(&mut *conn, engine, PrincipalType::User, user_id).await? else {
         return Ok(Vec::new());
     };
@@ -256,7 +256,7 @@ pub(crate) async fn list_all_in(conn: &mut crate::db::Conn) -> anyhow::Result<Ve
     // so an unrouted statement here would stay invisible until someone added a
     // `WHERE` and broke Postgres.
     let rows = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, principal_type, principal_id, role_id, scope_kind FROM role_bindings ORDER BY created_at",
     ))
     .fetch_all(&mut *conn)
@@ -274,7 +274,7 @@ pub(crate) async fn list_for_tenant_in(
     tenant_id: &str,
 ) -> anyhow::Result<Vec<StoredBinding>> {
     let rows = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "SELECT b.id, b.principal_type, b.principal_id, b.role_id, b.scope_kind
          FROM role_bindings b
          LEFT JOIN role_binding_tenants rbt ON rbt.binding_id = b.id

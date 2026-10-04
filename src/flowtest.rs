@@ -911,7 +911,7 @@ pub async fn test_client(pool: &DbPool, tenant_id: &str) -> anyhow::Result<Optio
 
 pub(crate) async fn test_client_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<Option<Application>> {
     let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT app_id FROM flow_test_clients WHERE tenant_id = ?",
     ))
     .bind(tenant_id)
@@ -940,7 +940,7 @@ pub struct TestClient {
 pub async fn create_test_client(pool: &DbPool, url: &PublicUrl, tenant: &Tenant) -> anyhow::Result<Application> {
     let mut conn = pool.acquire().await?;
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-    let made = create_test_client_in(&mut *tx, &callback_uri(url), tenant).await?;
+    let made = create_test_client_in(&mut tx, &callback_uri(url), tenant).await?;
     tx.commit().await?;
     Ok(made.application)
 }
@@ -968,7 +968,7 @@ pub(crate) async fn create_test_client_in(
     )
     .await?;
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO flow_test_clients (tenant_id, app_id, created_at) VALUES (?, ?, ?)",
     ))
     .bind(&tenant.id)
@@ -990,13 +990,10 @@ pub async fn forget_test_client(pool: &DbPool, tenant_id: &str) -> anyhow::Resul
 }
 
 pub(crate) async fn forget_test_client_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<()> {
-    sqlx::query(crate::db::qc(
-        &conn,
-        "DELETE FROM flow_test_clients WHERE tenant_id = ?",
-    ))
-    .bind(tenant_id)
-    .execute(&mut *conn)
-    .await?;
+    sqlx::query(crate::db::qc(conn, "DELETE FROM flow_test_clients WHERE tenant_id = ?"))
+        .bind(tenant_id)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 

@@ -150,7 +150,7 @@ pub async fn policy<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<Mf
 
 pub(crate) async fn policy_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<MfaPolicy> {
     let row: Option<(Option<String>,)> =
-        sqlx::query_as(crate::db::qc(&conn, "SELECT mfa_policy FROM users WHERE id = ?"))
+        sqlx::query_as(crate::db::qc(conn, "SELECT mfa_policy FROM users WHERE id = ?"))
             .bind(user_id)
             .fetch_optional(&mut *conn)
             .await?;
@@ -177,7 +177,7 @@ pub(crate) async fn set_policy_in(
     policy: MfaPolicy,
 ) -> anyhow::Result<bool> {
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE users SET mfa_policy = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
     .bind(policy.stored())
@@ -197,7 +197,7 @@ pub async fn enrolled_at<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Resu
 
 pub(crate) async fn enrolled_at_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<Option<i64>> {
     let row: Option<(i64,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT enrolled_at FROM user_totp WHERE user_id = ?",
     ))
     .bind(user_id)
@@ -370,7 +370,7 @@ pub fn verify_new(secret: &str, code: &str) -> bool {
 /// is refused afterwards, so a code seen over someone's shoulder is spent.
 async fn verify_totp_in(conn: &mut crate::db::Conn, user_id: &str, code: &str) -> anyhow::Result<bool> {
     let row: Option<(String, i64)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT secret, last_step FROM user_totp WHERE user_id = ?",
     ))
     .bind(user_id)
@@ -387,7 +387,7 @@ async fn verify_totp_in(conn: &mut crate::db::Conn, user_id: &str, code: &str) -
     }
     // Conditional, so two posts of the same code race to one success.
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE user_totp SET last_step = ? WHERE user_id = ? AND last_step < ?",
     ))
     .bind(step)
@@ -480,7 +480,7 @@ async fn use_recovery_code_in(conn: &mut crate::db::Conn, user_id: &str, code: &
         return Ok(false);
     }
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE user_recovery_codes SET used_at = ? WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
     ))
     .bind(now())
@@ -499,7 +499,7 @@ pub async fn recovery_codes_left<'c>(db: impl Handle<'c>, user_id: &str) -> anyh
 
 pub(crate) async fn recovery_codes_left_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<i64> {
     let (n,): (i64,) = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT COUNT(*) FROM user_recovery_codes WHERE user_id = ? AND used_at IS NULL",
     ))
     .bind(user_id)
@@ -526,7 +526,7 @@ pub(crate) async fn replace_recovery_codes_in(
     if enrolled_at_in(&mut *conn, user_id).await?.is_none() {
         bail!("You have no authenticator. Set one up first; it comes with recovery codes.");
     }
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     insert_recovery_codes(&mut tx, engine, user_id, codes).await?;
     tx.commit().await?;
@@ -587,7 +587,7 @@ pub(crate) async fn enroll_in(
     secret: &str,
     codes: &NewRecoveryCodes,
 ) -> anyhow::Result<()> {
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_totp WHERE user_id = ?"))
         .bind(user_id)
@@ -619,7 +619,7 @@ pub async fn reset<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str) -> a
 
 pub(crate) async fn reset_in(conn: &mut crate::db::Conn, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
     let in_tenant: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id FROM users WHERE id = ? AND tenant_id = ?",
     ))
     .bind(user_id)
@@ -629,7 +629,7 @@ pub(crate) async fn reset_in(conn: &mut crate::db::Conn, tenant_id: &str, user_i
     if in_tenant.is_none() {
         bail!("no such account in this tenant");
     }
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let removed = sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_totp WHERE user_id = ?"))
         .bind(user_id)
@@ -679,12 +679,12 @@ pub(crate) async fn begin_in(
 ) -> anyhow::Result<String> {
     let ticket = crate::util::b64url(&random_bytes(32));
     let ts = now();
-    sqlx::query(crate::db::qc(&conn, "DELETE FROM mfa_pending WHERE expires_at < ?"))
+    sqlx::query(crate::db::qc(conn, "DELETE FROM mfa_pending WHERE expires_at < ?"))
         .bind(ts)
         .execute(&mut *conn)
         .await?;
     let secret = (purpose == Purpose::Enroll).then(new_secret);
-    sqlx::query(crate::db::qc(&conn,
+    sqlx::query(crate::db::qc(conn,
         "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at)
          VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
     ))
@@ -712,7 +712,7 @@ pub(crate) async fn pending_in(
     tenant_id: &str,
 ) -> anyhow::Result<Option<Pending>> {
     let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT user_id, tenant_id, purpose, enroll_secret FROM mfa_pending
          WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ?",
     ))
@@ -741,14 +741,14 @@ pub async fn failed_attempt<'c>(db: impl Handle<'c>, ticket: &str) -> anyhow::Re
 pub(crate) async fn failed_attempt_in(conn: &mut crate::db::Conn, ticket: &str) -> anyhow::Result<bool> {
     let hash = sha256_hex(ticket.as_bytes());
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE mfa_pending SET attempts = attempts + 1 WHERE ticket_hash = ?",
     ))
     .bind(&hash)
     .execute(&mut *conn)
     .await?;
     let row: Option<(i64,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT attempts FROM mfa_pending WHERE ticket_hash = ?",
     ))
     .bind(&hash)
@@ -764,7 +764,7 @@ pub async fn finish<'c>(db: impl Handle<'c>, ticket: &str) -> anyhow::Result<()>
 }
 
 pub(crate) async fn finish_in(conn: &mut crate::db::Conn, ticket: &str) -> anyhow::Result<()> {
-    sqlx::query(crate::db::qc(&conn, "DELETE FROM mfa_pending WHERE ticket_hash = ?"))
+    sqlx::query(crate::db::qc(conn, "DELETE FROM mfa_pending WHERE ticket_hash = ?"))
         .bind(sha256_hex(ticket.as_bytes()))
         .execute(&mut *conn)
         .await?;

@@ -81,7 +81,7 @@ pub async fn check_delete<'c>(db: impl Handle<'c>, binding_id: &str) -> Result<(
 
 pub(crate) async fn check_delete_in(conn: &mut crate::db::Conn, binding_id: &str) -> Result<(), RefusedReason> {
     let row: Option<(String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT role_id, scope_kind FROM role_bindings WHERE id = ?",
     ))
     .bind(binding_id)
@@ -97,7 +97,7 @@ pub(crate) async fn check_delete_in(conn: &mut crate::db::Conn, binding_id: &str
         return Ok(());
     }
     let (count,): (i64,) = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT COUNT(*) FROM role_bindings WHERE role_id = ? AND scope_kind = ?",
     ))
     .bind(RoleId::GlobalAdministrator.as_str())

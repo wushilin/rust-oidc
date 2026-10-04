@@ -241,7 +241,7 @@ impl NewKey {
 /// Store a generated key with `status`.
 pub(crate) async fn store_in(conn: &mut crate::db::Conn, key: &NewKey, status: KeyStatus) -> anyhow::Result<()> {
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO signing_keys (kid, private_key_pem, cert_der, status, created_at, not_after)
          VALUES (?, ?, ?, ?, ?, ?)",
     ))
@@ -391,21 +391,21 @@ pub struct Rotated {
 /// leaving nothing active.
 pub(crate) async fn rotate_in(conn: &mut crate::db::Conn, fresh: &NewKey) -> anyhow::Result<Rotated> {
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE key_rotation_lock SET held_at = ? WHERE id = 1",
     ))
     .bind(now())
     .execute(&mut *conn)
     .await?;
     let next: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT kid FROM signing_keys WHERE status = ? ORDER BY created_at LIMIT 1",
     ))
     .bind(KeyStatus::Next.as_str())
     .fetch_optional(&mut *conn)
     .await?;
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE signing_keys SET status = ?, retired_at = ? WHERE status = ?",
     ))
     .bind(KeyStatus::Retired.as_str())
@@ -420,7 +420,7 @@ pub(crate) async fn rotate_in(conn: &mut crate::db::Conn, fresh: &NewKey) -> any
             next: None,
         });
     };
-    sqlx::query(crate::db::qc(&conn, "UPDATE signing_keys SET status = ? WHERE kid = ?"))
+    sqlx::query(crate::db::qc(conn, "UPDATE signing_keys SET status = ? WHERE kid = ?"))
         .bind(KeyStatus::Active.as_str())
         .bind(&kid)
         .execute(&mut *conn)
@@ -440,7 +440,7 @@ pub async fn prune(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
 
 pub(crate) async fn prune_in(conn: &mut crate::db::Conn, older_than_secs: i64) -> anyhow::Result<u64> {
     let res = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "DELETE FROM signing_keys WHERE status = ? AND retired_at < ?",
     ))
     .bind(KeyStatus::Retired.as_str())

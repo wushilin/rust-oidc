@@ -151,7 +151,7 @@ pub async fn resolve<'c>(db: impl Handle<'c>, key: &str) -> anyhow::Result<Optio
 pub(crate) async fn resolve_in(conn: &mut crate::db::Conn, key: &str) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> = if is_guid(key) {
         sqlx::query_as(crate::db::qc(
-            &conn,
+            conn,
             "SELECT id, name, is_root, enabled, settings FROM tenants
              WHERE id = ? AND deleted_at IS NULL AND enabled = ?",
         ))
@@ -161,7 +161,7 @@ pub(crate) async fn resolve_in(conn: &mut crate::db::Conn, key: &str) -> anyhow:
         .await?
     } else {
         sqlx::query_as(crate::db::qc(
-            &conn,
+            conn,
             "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
              JOIN tenant_domains d ON d.tenant_id = t.id
              WHERE d.domain_folded = ? AND t.deleted_at IS NULL AND t.enabled = ?",
@@ -181,7 +181,7 @@ pub async fn root<'c>(db: impl Handle<'c>) -> anyhow::Result<Option<Tenant>> {
 
 pub(crate) async fn root_in(conn: &mut crate::db::Conn) -> anyhow::Result<Option<Tenant>> {
     let row: Option<TenantRow> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, name, is_root, enabled, settings FROM tenants WHERE is_root = ?",
     ))
     .bind(true)
@@ -218,7 +218,7 @@ pub async fn domains<'c>(db: impl Handle<'c>, tenant_id: &str) -> anyhow::Result
 
 pub(crate) async fn domains_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT domain FROM tenant_domains WHERE tenant_id = ? ORDER BY is_default DESC, domain",
     ))
     .bind(tenant_id)
@@ -302,7 +302,7 @@ pub(crate) async fn create_in(
     let domain = normalize_domain(domain)?;
     let id = new_guid();
     let settings = TenantSettings::default();
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
@@ -362,7 +362,7 @@ pub(crate) async fn change_domain_in(
     new_domain: &str,
 ) -> anyhow::Result<DomainChange> {
     let to = normalize_domain(new_domain)?;
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
 
     let from: Vec<(String,)> = sqlx::query_as(crate::db::sql_stmt(
@@ -492,7 +492,7 @@ pub async fn find_for_admin<'c>(db: impl Handle<'c>, key: &str) -> anyhow::Resul
 
 pub(crate) async fn find_for_admin_in(conn: &mut crate::db::Conn, key: &str) -> anyhow::Result<Tenant> {
     let row: Option<TenantRow> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT t.id, t.name, t.is_root, t.enabled, t.settings FROM tenants t
          WHERE t.deleted_at IS NULL AND (t.id = ?
                OR t.id IN (SELECT tenant_id FROM tenant_domains WHERE domain_folded = ?))",
@@ -524,7 +524,7 @@ pub(crate) async fn save_settings_in(
     settings: &TenantSettings,
 ) -> anyhow::Result<()> {
     settings.validate()?;
-    sqlx::query(crate::db::qc(&conn, "UPDATE tenants SET settings = ? WHERE id = ?"))
+    sqlx::query(crate::db::qc(conn, "UPDATE tenants SET settings = ? WHERE id = ?"))
         .bind(serde_json::to_string(settings)?)
         .bind(tenant_id)
         .execute(&mut *conn)
@@ -544,7 +544,7 @@ pub(crate) async fn set_name_in(conn: &mut crate::db::Conn, tenant_id: &str, nam
     if name.is_empty() {
         bail!("a tenant needs a name");
     }
-    sqlx::query(crate::db::qc(&conn, "UPDATE tenants SET name = ? WHERE id = ?"))
+    sqlx::query(crate::db::qc(conn, "UPDATE tenants SET name = ? WHERE id = ?"))
         .bind(name)
         .bind(tenant_id)
         .execute(&mut *conn)
@@ -574,7 +574,7 @@ pub(crate) async fn set_enabled_in(conn: &mut crate::db::Conn, tenant_id: &str, 
              have to re-enable it, and nothing outside the database could undo it"
         );
     }
-    sqlx::query(crate::db::qc(&conn, "UPDATE tenants SET enabled = ? WHERE id = ?"))
+    sqlx::query(crate::db::qc(conn, "UPDATE tenants SET enabled = ? WHERE id = ?"))
         .bind(enabled)
         .bind(&tenant.id)
         .execute(&mut *conn)
@@ -610,7 +610,7 @@ pub(crate) async fn remove_domain_in(conn: &mut crate::db::Conn, tenant_id: &str
     // `normalize_domain` admits only letters, digits, '-' and '.', so the pattern
     // can hold no LIKE wildcard.
     let (in_use,): (i64,) = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT COUNT(*) FROM users WHERE tenant_id = ? AND deleted_at IS NULL AND upn_folded LIKE ?",
     ))
     .bind(tenant_id)
@@ -621,7 +621,7 @@ pub(crate) async fn remove_domain_in(conn: &mut crate::db::Conn, tenant_id: &str
         bail!("{in_use} account(s) still use '{domain}' in their user name");
     }
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "DELETE FROM tenant_domains WHERE tenant_id = ? AND domain_folded = ?",
     ))
     .bind(tenant_id)

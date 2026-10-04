@@ -65,7 +65,8 @@ directory, and CI (`.github/workflows/test.yml`) runs it on every push.*
   not resolved to a known object, into the audit log.
 - **Migrations are additive and in place**, written for all three engines
   (SQLite, Postgres, MySQL); an applied migration never changes.
-- **Tests**: run the SQLite suite (`cargo test`) before every commit;
+- **Tests**: run the SQLite suite (`cargo test`) before every commit, with
+  `cargo fmt` and `cargo clippy --all-targets` clean (CI fails on any warning);
   Postgres/MySQL runs are paused until the owner asks for them. A security test
   must fail when the guard it covers is removed (check it).
 - **Decisions** made without asking go in `docs/decisions-log.md`.

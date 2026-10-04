@@ -63,7 +63,7 @@ pub async fn policy<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<Cr
 
 pub(crate) async fn policy_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<CrossTenantPolicy> {
     let row: Option<(Option<String>,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT cross_tenant_policy FROM users WHERE id = ?",
     ))
     .bind(user_id)
@@ -92,7 +92,7 @@ pub(crate) async fn set_policy_in(
     policy: CrossTenantPolicy,
 ) -> anyhow::Result<bool> {
     let stored = (policy != CrossTenantPolicy::Default).then_some(policy.as_str());
-    let done = sqlx::query(crate::db::qc(&conn,
+    let done = sqlx::query(crate::db::qc(conn,
         "UPDATE users SET cross_tenant_policy = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL",
     ))
     .bind(stored)
@@ -308,7 +308,7 @@ pub(crate) async fn outside_principal_in(
         PrincipalType::Group => "SELECT tenant_id FROM user_groups WHERE id = ?",
         PrincipalType::ServicePrincipal => return Ok(None),
     };
-    let row: Option<(String,)> = sqlx::query_as(crate::db::qc(&conn, sql))
+    let row: Option<(String,)> = sqlx::query_as(crate::db::qc(conn, sql))
         .bind(principal_id)
         .fetch_optional(&mut *conn)
         .await?;
@@ -466,7 +466,7 @@ pub(crate) async fn explain_in(
 
     // ---- the account ----
     let (locked_until,): (Option<i64>,) =
-        sqlx::query_as(crate::db::qc(&conn, "SELECT locked_until FROM users WHERE id = ?"))
+        sqlx::query_as(crate::db::qc(conn, "SELECT locked_until FROM users WHERE id = ?"))
             .bind(&user.id)
             .fetch_one(&mut *conn)
             .await?;
@@ -738,7 +738,7 @@ async fn assignment_paths_in(
     user_id: &str,
 ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
     let rows: Vec<(String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT principal_type, principal_id FROM app_assignments
          WHERE resource_id = ? AND ((principal_type = ? AND principal_id = ?)
             OR (principal_type = ? AND principal_id IN (SELECT group_id FROM group_members WHERE user_id = ?)))",
@@ -754,7 +754,7 @@ async fn assignment_paths_in(
     for (kind, principal_id) in rows {
         let how = if kind == PrincipalType::Group.as_str() {
             let name: Option<(String,)> =
-                sqlx::query_as(crate::db::qc(&conn, "SELECT name FROM user_groups WHERE id = ?"))
+                sqlx::query_as(crate::db::qc(conn, "SELECT name FROM user_groups WHERE id = ?"))
                     .bind(&principal_id)
                     .fetch_optional(&mut *conn)
                     .await?;
@@ -763,7 +763,7 @@ async fn assignment_paths_in(
             "directly".to_string()
         };
         let roles: Vec<(String,)> = sqlx::query_as(crate::db::qc(
-            &conn,
+            conn,
             "SELECT r.value FROM app_role_assignments a JOIN app_roles r ON r.id = a.app_role_id
              WHERE a.resource_id = ? AND a.principal_id = ? ORDER BY r.value",
         ))

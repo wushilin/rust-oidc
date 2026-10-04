@@ -32,7 +32,7 @@ pub(crate) async fn create_in(
     }
     let id = new_guid();
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO user_groups (id, tenant_id, name, name_folded, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
     ))
     .bind(&id)
@@ -99,7 +99,7 @@ pub async fn for_user<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<
 
 pub(crate) async fn for_user_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<Vec<GroupRef>> {
     let rows: Vec<(String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT g.id, g.name FROM user_groups g JOIN group_members m ON m.group_id = g.id
          WHERE m.user_id = ? ORDER BY g.name, g.id",
     ))
@@ -117,7 +117,7 @@ pub async fn find<'c>(db: impl Handle<'c>, tenant_id: &str, name: &str) -> anyho
 
 pub(crate) async fn find_in(conn: &mut crate::db::Conn, tenant_id: &str, name: &str) -> anyhow::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id FROM user_groups WHERE tenant_id = ? AND name_folded = ?",
     ))
     .bind(tenant_id)
@@ -141,7 +141,7 @@ pub async fn list<'c>(db: impl Handle<'c>, tenant_id: &str) -> anyhow::Result<Ve
 
 pub(crate) async fn list_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<Vec<Group>> {
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, name, description FROM user_groups WHERE tenant_id = ? ORDER BY name",
     ))
     .bind(tenant_id)
@@ -166,7 +166,7 @@ pub(crate) async fn find_by_id_in(
     group_id: &str,
 ) -> anyhow::Result<Option<Group>> {
     let row: Option<(String, String, Option<String>)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, name, description FROM user_groups WHERE tenant_id = ? AND id = ?",
     ))
     .bind(tenant_id)
@@ -190,7 +190,7 @@ pub async fn members<'c>(db: impl Handle<'c>, group_id: &str) -> anyhow::Result<
 
 pub(crate) async fn members_in(conn: &mut crate::db::Conn, group_id: &str) -> anyhow::Result<Vec<Member>> {
     let rows: Vec<(String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT u.id, u.upn FROM group_members m JOIN users u ON u.id = m.user_id
          WHERE m.group_id = ? AND u.deleted_at IS NULL ORDER BY u.upn",
     ))
@@ -250,7 +250,7 @@ pub(crate) async fn add_member_id_in(
         .await?
         .with_context(|| format!("group '{group_id}' not found"))?;
     let live: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
     ))
     .bind(tenant_id)
@@ -294,7 +294,7 @@ pub(crate) async fn set_for_user_in(
         .into_iter()
         .map(|g| g.id)
         .collect();
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let live: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
@@ -360,7 +360,7 @@ pub(crate) async fn remove_member_in(
     if find_by_id_in(&mut *conn, tenant_id, group_id).await?.is_none() {
         return Ok(false);
     }
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
@@ -391,7 +391,7 @@ pub(crate) async fn delete_in(conn: &mut crate::db::Conn, tenant_id: &str, group
     if find_by_id_in(&mut *conn, tenant_id, group_id).await?.is_none() {
         return Ok(false);
     }
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let (members,): (i64,) = sqlx::query_as(crate::db::sql_stmt(
         engine,
@@ -439,7 +439,7 @@ pub(crate) async fn delete_in(conn: &mut crate::db::Conn, tenant_id: &str, group
 /// The id of a live account in this tenant, by user name.
 async fn user_id_in(conn: &mut crate::db::Conn, tenant_id: &str, upn: &str) -> anyhow::Result<String> {
     let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
     ))
     .bind(tenant_id)
@@ -455,7 +455,7 @@ async fn user_id_in(conn: &mut crate::db::Conn, tenant_id: &str, upn: &str) -> a
 /// it), so the key is the backstop against a race, not the check.
 async fn insert_member_in(conn: &mut crate::db::Conn, group_id: &str, user_id: &str) -> anyhow::Result<()> {
     let held: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT group_id FROM group_members WHERE group_id = ? AND user_id = ?",
     ))
     .bind(group_id)
@@ -467,7 +467,7 @@ async fn insert_member_in(conn: &mut crate::db::Conn, group_id: &str, user_id: &
     }
     crate::db::inserted(
         sqlx::query(crate::db::qc(
-            &conn,
+            conn,
             "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
         ))
         .bind(group_id)

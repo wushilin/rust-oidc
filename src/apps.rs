@@ -74,7 +74,7 @@ pub(crate) async fn create_in(
     let sp_id = new_guid();
     let identifier_uri = format!("api://{}", application.app_id);
     let ts = now();
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
@@ -125,7 +125,7 @@ pub(crate) async fn find_in(conn: &mut crate::db::Conn, app_id: &str) -> anyhow:
         return Ok(None);
     }
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
                 allow_access_token_implicit FROM applications
          WHERE app_id = ? AND deleted_at IS NULL",
@@ -159,7 +159,7 @@ pub async fn list<'c>(db: impl Handle<'c>, tenant_id: &str) -> anyhow::Result<Ve
 
 pub(crate) async fn list_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<Vec<Application>> {
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
                 allow_access_token_implicit FROM applications
          WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
@@ -183,7 +183,7 @@ pub(crate) async fn service_principal_in(
     tenant_id: &str,
     app_id: &str,
 ) -> anyhow::Result<Option<ServicePrincipal>> {
-    Ok(sqlx::query_as(crate::db::qc(&conn,
+    Ok(sqlx::query_as(crate::db::qc(conn,
         "SELECT id, tenant_id, app_id, enabled, app_role_assignment_required, mfa_required, accept_other_tenants FROM service_principals
          WHERE tenant_id = ? AND app_id = ?",
     ))
@@ -207,7 +207,7 @@ pub(crate) async fn add_identifier_uri_in(
     // Looked for first, so a duplicate is refused by name rather than as a broken
     // constraint (which would abort a larger transaction on Postgres).
     let taken: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT uri FROM app_identifier_uris WHERE tenant_id = ? AND uri = ?",
     ))
     .bind(&app.tenant_id)
@@ -218,7 +218,7 @@ pub(crate) async fn add_identifier_uri_in(
         bail!("identifier URI '{uri}' is already used in this tenant");
     }
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO app_identifier_uris (application_id, tenant_id, uri) VALUES (?, ?, ?)",
     ))
     .bind(&app.id)
@@ -237,7 +237,7 @@ pub async fn identifier_uris<'c>(db: impl Handle<'c>, app: &Application) -> anyh
 
 pub(crate) async fn identifier_uris_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT uri FROM app_identifier_uris WHERE application_id = ? ORDER BY uri",
     ))
     .bind(&app.id)
@@ -266,7 +266,7 @@ pub(crate) async fn resolve_resource_in(
         find_in(&mut *conn, resource).await?
     } else {
         sqlx::query_as(crate::db::qc(
-            &conn,
+            conn,
             "SELECT a.id, a.app_id, a.tenant_id, a.display_name, a.allow_password_grant,
                     a.allow_id_token_implicit, a.allow_access_token_implicit FROM applications a
              JOIN app_identifier_uris u ON u.application_id = a.id
@@ -360,7 +360,7 @@ pub(crate) async fn add_prepared_secret_in(
     let ts = now();
     let end_at = ts + valid_days * 86_400;
     sqlx::query(
-        crate::db::qc(&conn, "INSERT INTO app_secrets (key_id, application_id, display_name, hint, secret_hash, start_at, end_at, created_at)
+        crate::db::qc(conn, "INSERT INTO app_secrets (key_id, application_id, display_name, hint, secret_hash, start_at, end_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
     )
     .bind(&key_id)
@@ -391,7 +391,7 @@ pub(crate) async fn remove_secret_in(
     key_id: &str,
 ) -> anyhow::Result<()> {
     let res = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "DELETE FROM app_secrets WHERE application_id = ? AND key_id = ?",
     ))
     .bind(&app.id)
@@ -422,7 +422,7 @@ pub(crate) async fn verify_secret_in(
     secret: &str,
 ) -> anyhow::Result<SecretCheck> {
     let rows: Vec<(String, i64, i64)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT secret_hash, start_at, end_at FROM app_secrets WHERE application_id = ?",
     ))
     .bind(&app.id)
@@ -583,7 +583,7 @@ async fn value_taken_in(
     app: &Application,
     value: &str,
 ) -> anyhow::Result<bool> {
-    let found: Option<(String,)> = sqlx::query_as(crate::db::qc(&conn, statement))
+    let found: Option<(String,)> = sqlx::query_as(crate::db::qc(conn, statement))
         .bind(&app.id)
         .bind(value)
         .fetch_optional(&mut *conn)
@@ -617,7 +617,7 @@ pub(crate) async fn add_role_in(
     }
     let id = new_guid();
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO app_roles (id, application_id, value, display_name, description, allowed_member_types, enabled)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     ))
@@ -659,7 +659,7 @@ pub async fn roles<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Result
 
 pub(crate) async fn roles_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<AppRole>> {
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, value, display_name, allowed_member_types, enabled FROM app_roles
          WHERE application_id = ? ORDER BY value",
     ))
@@ -724,7 +724,7 @@ async fn resolve_principal_in(
                 .await?
                 .unwrap_or_else(|| tenant.clone());
             let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
-                &conn,
+                conn,
                 "SELECT id FROM users WHERE tenant_id = ? AND upn_folded = ? AND deleted_at IS NULL",
             ))
             .bind(&home.id)
@@ -751,7 +751,7 @@ async fn resolve_principal_in(
                 None => (tenant.clone(), name.to_string()),
             };
             let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
-                &conn,
+                conn,
                 "SELECT id FROM user_groups WHERE tenant_id = ? AND name_folded = ?",
             ))
             .bind(&home.id)
@@ -809,7 +809,7 @@ pub async fn outside_assignments<'c>(db: impl Handle<'c>, sp: &ServicePrincipal)
 
 pub(crate) async fn outside_assignments_in(conn: &mut crate::db::Conn, sp: &ServicePrincipal) -> anyhow::Result<i64> {
     let (n,): (i64,) = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT COUNT(*) FROM app_assignments a
          LEFT JOIN users u ON a.principal_type = ? AND u.id = a.principal_id
          LEFT JOIN user_groups g ON a.principal_type = ? AND g.id = a.principal_id
@@ -848,7 +848,7 @@ pub(crate) async fn set_accept_other_tenants_in(
         }
     }
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE service_principals SET accept_other_tenants = ? WHERE id = ?",
     ))
     .bind(accept)
@@ -976,7 +976,7 @@ pub(crate) async fn assign_in(
         }
     }
 
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let id = ensure_assigned(
         &mut tx,
@@ -1035,7 +1035,7 @@ pub(crate) async fn assignments_in(
         return Ok(Vec::new());
     };
     let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, principal_type, principal_id FROM app_assignments WHERE tenant_id = ? AND resource_id = ?",
     ))
     .bind(tenant_id)
@@ -1048,7 +1048,7 @@ pub(crate) async fn assignments_in(
             continue;
         };
         let held: Vec<(String,)> = sqlx::query_as(crate::db::qc(
-            &conn,
+            conn,
             "SELECT r.value FROM app_role_assignments a JOIN app_roles r ON r.id = a.app_role_id
              WHERE a.resource_id = ? AND a.principal_id = ? ORDER BY r.value",
         ))
@@ -1100,7 +1100,7 @@ pub(crate) async fn unassign_in(
     let Some(sp) = service_principal_in(&mut *conn, tenant_id, &resource.app_id).await? else {
         return Ok(false);
     };
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     let found: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
@@ -1172,7 +1172,7 @@ pub(crate) async fn assign_role_in(
     // A user or group that holds a role is assigned to the application: the role
     // row never exists without the assignment it belongs to.
     if principal_type != PrincipalType::ServicePrincipal {
-        let engine = crate::db::engine_of_conn(&conn);
+        let engine = crate::db::engine_of_conn(conn);
         ensure_assigned(
             &mut *conn,
             engine,
@@ -1187,7 +1187,7 @@ pub(crate) async fn assign_role_in(
     // it is not a broken constraint (which aborts the transaction on Postgres);
     // UNIQUE (resource_id, app_role_id, principal_id) backs it.
     let held: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id FROM app_role_assignments WHERE resource_id = ? AND app_role_id = ? AND principal_id = ?",
     ))
     .bind(&resource_sp.id)
@@ -1200,7 +1200,7 @@ pub(crate) async fn assign_role_in(
     }
     crate::db::inserted(
         sqlx::query(crate::db::qc(
-            &conn,
+            conn,
             "INSERT INTO app_role_assignments
                 (id, tenant_id, resource_id, app_role_id, principal_id, principal_type, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1243,7 +1243,7 @@ pub(crate) async fn app_roles_for_service_principal_in(
     client_sp_id: &str,
 ) -> anyhow::Result<Vec<RoleRef>> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT r.value, r.id, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND a.principal_id = ? AND a.principal_type = ?
@@ -1308,7 +1308,7 @@ pub(crate) async fn add_redirect_uri_in(
 ) -> anyhow::Result<()> {
     validate_redirect_uri(platform, uri)?;
     let existing: Option<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT platform FROM app_redirect_uris WHERE application_id = ? AND uri = ?",
     ))
     .bind(&app.id)
@@ -1319,7 +1319,7 @@ pub(crate) async fn add_redirect_uri_in(
         bail!("redirect URI '{uri}' is already registered for platform {p}");
     }
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO app_redirect_uris (application_id, platform, uri) VALUES (?, ?, ?)",
     ))
     .bind(&app.id)
@@ -1352,7 +1352,7 @@ pub(crate) async fn redirect_uris_in(
     app: &Application,
 ) -> anyhow::Result<Vec<(RedirectPlatform, String)>> {
     let rows: Vec<(String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT platform, uri FROM app_redirect_uris WHERE application_id = ? ORDER BY platform, uri",
     ))
     .bind(&app.id)
@@ -1446,7 +1446,7 @@ pub(crate) async fn add_scope_in(
     }
     let id = new_guid();
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "INSERT INTO app_scopes (id, application_id, value, display_name, type, enabled) VALUES (?, ?, ?, ?, ?, ?)",
     ))
     .bind(&id)
@@ -1468,7 +1468,7 @@ pub async fn enabled_scopes<'c>(db: impl Handle<'c>, app: &Application) -> anyho
 
 pub(crate) async fn enabled_scopes_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT value FROM app_scopes WHERE application_id = ? AND enabled = ? ORDER BY value",
     ))
     .bind(&app.id)
@@ -1495,7 +1495,7 @@ pub(crate) async fn app_roles_for_user_in(
     user_id: &str,
 ) -> anyhow::Result<Vec<RoleRef>> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT DISTINCT r.value, r.id, r.allowed_member_types FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.resource_id = ? AND r.enabled = ?
@@ -1532,7 +1532,7 @@ pub(crate) async fn user_is_assigned_in(
     user_id: &str,
 ) -> anyhow::Result<bool> {
     let (n,): (i64,) = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT COUNT(*) FROM app_assignments
          WHERE resource_id = ?
            AND ((principal_type = ? AND principal_id = ?)
@@ -1567,7 +1567,7 @@ pub async fn set_mfa_required<'c>(db: impl Handle<'c>, sp_id: &str, required: bo
 
 pub(crate) async fn set_mfa_required_in(conn: &mut crate::db::Conn, sp_id: &str, required: bool) -> anyhow::Result<()> {
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE service_principals SET mfa_required = ? WHERE id = ?",
     ))
     .bind(required)
@@ -1588,7 +1588,7 @@ pub(crate) async fn set_assignment_required_in(
     required: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE service_principals SET app_role_assignment_required = ? WHERE id = ?",
     ))
     .bind(required)
@@ -1632,7 +1632,7 @@ pub(crate) async fn set_password_grant_allowed_in(
     allowed: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE applications SET allow_password_grant = ? WHERE id = ?",
     ))
     .bind(allowed)
@@ -1661,7 +1661,7 @@ pub(crate) async fn set_implicit_allowed_in(
     access_token: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "UPDATE applications SET allow_id_token_implicit = ?, allow_access_token_implicit = ? WHERE id = ?",
     ))
     .bind(id_token)
@@ -1757,7 +1757,7 @@ pub(crate) async fn add_key_credential_in(
     display_name: Option<&str>,
 ) -> anyhow::Result<String> {
     let cert = parse_certificate(cert_pem)?;
-    let engine = crate::db::engine_of_conn(&conn);
+    let engine = crate::db::engine_of_conn(conn);
     // UPDATE first, INSERT if nothing matched; a unique violation means a
     // concurrent registration inserted it meanwhile, so go round and UPDATE.
     // (sqlx's MySQL driver sets FOUND_ROWS, so an unchanged row still counts.)
@@ -1821,7 +1821,7 @@ pub(crate) async fn key_credentials_in(
     app: &Application,
 ) -> anyhow::Result<Vec<KeyCredential>> {
     Ok(sqlx::query_as::<_, KeyCredential>(crate::db::qc(
-        &conn,
+        conn,
         "SELECT key_id, display_name, public_n, public_e, not_before, not_after
          FROM app_key_credentials WHERE application_id = ? ORDER BY created_at",
     ))
@@ -1841,7 +1841,7 @@ pub(crate) async fn remove_key_credential_in(
     key_id: &str,
 ) -> anyhow::Result<bool> {
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "DELETE FROM app_key_credentials WHERE application_id = ? AND key_id = ?",
     ))
     .bind(&app.id)
@@ -1878,7 +1878,7 @@ pub async fn secrets<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Resu
 
 pub(crate) async fn secrets_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<StoredSecret>> {
     Ok(sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT key_id, display_name, hint, start_at, end_at FROM app_secrets
          WHERE application_id = ? ORDER BY created_at",
     ))
@@ -1917,7 +1917,7 @@ pub async fn scopes<'c>(db: impl Handle<'c>, app: &Application) -> anyhow::Resul
 
 pub(crate) async fn scopes_in(conn: &mut crate::db::Conn, app: &Application) -> anyhow::Result<Vec<StoredScope>> {
     let rows: Vec<ScopeRow> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT id, value, display_name, type, enabled FROM app_scopes
          WHERE application_id = ? ORDER BY value",
     ))
@@ -1955,7 +1955,7 @@ pub(crate) async fn remove_redirect_uri_in(
     uri: &str,
 ) -> anyhow::Result<bool> {
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "DELETE FROM app_redirect_uris WHERE application_id = ? AND platform = ? AND uri = ?",
     ))
     .bind(&app.id)
@@ -1990,7 +1990,7 @@ pub(crate) async fn remove_identifier_uri_in(
         bail!("an application must keep at least one Application ID URI");
     }
     sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "DELETE FROM app_identifier_uris WHERE application_id = ? AND tenant_id = ? AND uri = ?",
     ))
     .bind(&app.id)
@@ -2032,7 +2032,7 @@ pub(crate) async fn role_assignments_in(
         return Ok(Vec::new());
     };
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(crate::db::qc(
-        &conn,
+        conn,
         "SELECT a.id, r.value, a.principal_type, a.principal_id FROM app_role_assignments a
          JOIN app_roles r ON r.id = a.app_role_id
          WHERE a.tenant_id = ? AND a.resource_id = ? ORDER BY r.value",
@@ -2071,7 +2071,7 @@ async fn principal_name_in(conn: &mut crate::db::Conn, principal_type: Principal
              WHERE sp.id = ? AND a.deleted_at IS NULL"
         }
     };
-    let found: Option<(String,)> = sqlx::query_as(crate::db::qc(&conn, sql))
+    let found: Option<(String,)> = sqlx::query_as(crate::db::qc(conn, sql))
         .bind(principal_id)
         .fetch_optional(&mut *conn)
         .await
@@ -2103,7 +2103,7 @@ pub(crate) async fn remove_role_assignment_in(
         return Ok(false);
     };
     let done = sqlx::query(crate::db::qc(
-        &conn,
+        conn,
         "DELETE FROM app_role_assignments WHERE id = ? AND tenant_id = ? AND resource_id = ?",
     ))
     .bind(assignment_id)

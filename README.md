@@ -123,6 +123,31 @@ passed as a flag or an environment variable:
 | `tls.acme.production` | `RUST_OIDC_ACME_PRODUCTION` | `false` | Uses Let's Encrypt staging until set |
 | `log.filter` | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | A `tracing` filter |
 
+## Auth API: checking a password and code from a login prompt
+
+For login prompts that cannot run a browser flow, such as Linux PAM. Not part of
+Entra; see decision 40 in `docs/decisions-log.md`.
+
+1. Register an application for the login host, give it a client secret or a
+   certificate, and on its **API permissions** page grant **Auth API →
+   `Credentials.Verify`**.
+2. Assign the users or groups who may log in (*Users and groups*). They must have an
+   authenticator set up.
+3. The host gets a token (client credentials, `scope=3bc73980-9fde-4fa7-9f74-9d421f0a127d/.default`)
+   and sends each login:
+
+```sh
+curl -X POST "$BASE/<tenant>/api/v1/authenticate" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"upn": "alice@contoso.com", "password": "...", "otp": "123456"}'
+```
+
+A right password and fresh authenticator code answer `{"result": true, ...}` with the
+user's `oid`, `preferred_username`, `name`, `email`, `groups` (`id`, `name`) and the
+`app_roles` they hold on the calling application (`id`, `value`). Every failure about
+the user answers the same `{"result": false, "code": "invalid_credentials", ...}`; the
+reason is in the audit log. A missing grant is `403`, a bad token `401`.
+
 ## Using Microsoft client libraries
 
 MSAL checks that an authority is a Microsoft cloud. Turn that off:

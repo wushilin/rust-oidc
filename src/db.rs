@@ -575,6 +575,9 @@ pub enum Event {
     AdminAppUnassign,
     /// Assignment required turned on or off for an application.
     AdminAppAssignmentRequired,
+    /// An application was granted a permission of the built-in Auth API.
+    AdminAuthApiGrant,
+    AdminAuthApiRevoke,
     AdminTenantCreate,
     AdminTenantRename,
     AdminTenantEnable,
@@ -688,6 +691,8 @@ impl Event {
         Self::AdminAppAssign,
         Self::AdminAppUnassign,
         Self::AdminAppAssignmentRequired,
+        Self::AdminAuthApiGrant,
+        Self::AdminAuthApiRevoke,
         Self::AdminTenantCreate,
         Self::AdminTenantRename,
         Self::AdminTenantEnable,
@@ -793,6 +798,8 @@ impl Event {
             Self::AdminAppAssign => "admin.app.assign",
             Self::AdminAppUnassign => "admin.app.unassign",
             Self::AdminAppAssignmentRequired => "admin.app.assignment_required",
+            Self::AdminAuthApiGrant => "admin.auth_api.grant",
+            Self::AdminAuthApiRevoke => "admin.auth_api.revoke",
             Self::AdminTenantCreate => "admin.tenant.create",
             Self::AdminTenantRename => "admin.tenant.rename",
             Self::AdminTenantEnable => "admin.tenant.enable",

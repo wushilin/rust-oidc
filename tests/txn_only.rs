@@ -43,6 +43,7 @@ const STORAGE: &[(&str, &str)] = &[
     ("flowtest", "src/flowtest.rs"),
     ("scopes", "src/scopes.rs"),
     ("directory", "src/directory.rs"),
+    ("auth_api", "src/auth_api.rs"),
 ];
 
 /// Files that may write anything, besides the storage modules: the engine, and
@@ -61,6 +62,8 @@ const ALLOWED: &[(&str, &str)] = &[
     ("mfa", "check"),
     ("mfa", "failed_attempt"),
     ("mfa", "finish"),
+    // The Auth API's credential check spends the code's time step, as at sign-in.
+    ("mfa", "check_authenticator_code"),
     // The flow tester's own run state (not directory data).
     ("flowtest", "start"),
     ("flowtest", "take"),

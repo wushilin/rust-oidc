@@ -86,6 +86,15 @@ pub enum Limit {
     /// Device authorization requests, keyed per application. Counts successes
     /// too: each one inserts a `device_codes` row, so the row growth is the point.
     DeviceCodeRequest,
+    /// Auth API credential checks, keyed per calling application. Counts every
+    /// check. The caller has authenticated, so a refusal (429) tells it nothing
+    /// about any user.
+    CredentialCheck,
+    /// Auth API credential checks of one account, keyed by the account's id (so
+    /// only real accounts have a bucket). Bounds password and code guessing
+    /// against one person. Tripping it does **not** change the answer from the
+    /// generic failure: a 429 for real accounts only would say which exist.
+    CredentialCheckAccount,
 }
 
 impl Limit {
@@ -94,6 +103,8 @@ impl Limit {
         Self::UnknownClient,
         Self::UnknownUser,
         Self::DeviceCodeRequest,
+        Self::CredentialCheck,
+        Self::CredentialCheckAccount,
     ];
 
     /// Recorded in the audit row when a bucket trips.
@@ -103,6 +114,8 @@ impl Limit {
             Self::UnknownClient => "unknown_client",
             Self::UnknownUser => "unknown_user",
             Self::DeviceCodeRequest => "device_code_request",
+            Self::CredentialCheck => "credential_check",
+            Self::CredentialCheckAccount => "credential_check_account",
         }
     }
 
@@ -113,6 +126,11 @@ impl Limit {
             Self::UnknownClient => 20,
             Self::UnknownUser => 20,
             Self::DeviceCodeRequest => 60,
+            // A login host checks each login once; 600 a minute is far above
+            // any one host's real rate.
+            Self::CredentialCheck => 600,
+            // Ten tries a minute at one person's password and code.
+            Self::CredentialCheckAccount => 10,
         }
     }
 

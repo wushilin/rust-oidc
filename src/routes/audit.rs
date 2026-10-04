@@ -40,6 +40,8 @@ pub enum Channel {
     Console,
     /// My Account, the user's own page, which is not an OAuth flow either.
     MyAccount,
+    /// The Auth API's credential check, called by an application for a user.
+    AuthApi,
 }
 
 impl Channel {
@@ -51,6 +53,7 @@ impl Channel {
             Self::EndSession => "end_session",
             Self::Console => "console",
             Self::MyAccount => "my_account",
+            Self::AuthApi => "auth_api",
         }
     }
 }
@@ -100,6 +103,16 @@ pub enum SignInReason {
     Disabled,
     BadPassword,
     UnknownUser,
+    /// Auth API: the user is not assigned to the calling application.
+    NotAssigned,
+    /// Auth API: the user has no authenticator set up.
+    NoAuthenticator,
+    /// Auth API: the authenticator code was wrong, or already used.
+    BadCode,
+    /// Auth API: the user must choose a new password first.
+    MustChangePassword,
+    /// Auth API: too many checks for this account just now.
+    Throttled,
 }
 
 impl SignInReason {
@@ -109,6 +122,11 @@ impl SignInReason {
             Self::Disabled => "disabled",
             Self::BadPassword => "bad_password",
             Self::UnknownUser => "unknown_user",
+            Self::NotAssigned => "not_assigned",
+            Self::NoAuthenticator => "no_authenticator",
+            Self::BadCode => "bad_code",
+            Self::MustChangePassword => "must_change_password",
+            Self::Throttled => "throttled",
         }
     }
 }
@@ -303,7 +321,7 @@ pub async fn sign_in_failure(
         // For the password grant the authenticated client stands in; elsewhere
         // there is nobody to name.
         None => match channel {
-            Channel::Ropc => Actor::Id(client_id),
+            Channel::Ropc | Channel::AuthApi => Actor::Id(client_id),
             _ => Actor::Anonymous,
         },
     };

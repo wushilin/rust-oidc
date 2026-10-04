@@ -1,6 +1,7 @@
 pub mod access;
 pub mod admin;
 pub mod apps;
+pub mod auth_api;
 pub mod claims;
 pub mod config;
 pub mod config_file;

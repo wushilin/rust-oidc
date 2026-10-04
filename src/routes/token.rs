@@ -559,16 +559,25 @@ async fn client_credentials(
             ),
         ));
     };
-    let (resource_app, resource_sp) = apps::resolve_resource(&st.pool, &tenant.id, resource)
-        .await?
-        .ok_or_else(|| AadError::resource_not_found(resource, &tenant.name))?;
-
-    let roles = apps::app_roles_for_service_principal(&st.pool, &resource_sp.id, &client.sp.id).await?;
+    // The built-in Auth API is not a registered application: its audience is
+    // its fixed app id, and the roles are the permissions an administrator
+    // granted this client.
+    let (audience, roles) = if crate::auth_api::is_resource(resource) {
+        let granted = crate::auth_api::granted(&st.pool, &client.sp.id).await?;
+        let roles: Vec<apps::RoleRef> = granted.into_iter().map(|p| p.role()).collect();
+        (crate::auth_api::AUTH_API_APP_ID.to_string(), roles)
+    } else {
+        let (resource_app, resource_sp) = apps::resolve_resource(&st.pool, &tenant.id, resource)
+            .await?
+            .ok_or_else(|| AadError::resource_not_found(resource, &tenant.name))?;
+        let roles = apps::app_roles_for_service_principal(&st.pool, &resource_sp.id, &client.sp.id).await?;
+        (resource_app.app_id, roles)
+    };
 
     let iat = now();
     let lifetime = tenant.settings.access_token_lifetime_secs;
     let mut claims = Map::new();
-    claims.insert("aud".into(), json!(resource_app.app_id));
+    claims.insert("aud".into(), json!(audience));
     claims.insert("iss".into(), json!(st.public_url.issuer(&tenant.id)));
     claims.insert("iat".into(), json!(iat));
     claims.insert("nbf".into(), json!(iat));
@@ -587,7 +596,7 @@ async fn client_credentials(
     let details = json!({
         "grant": GrantType::ClientCredentials.as_str(),
         "clientId": client.app.app_id,
-        "resource": resource_app.app_id,
+        "resource": audience,
         "azpacr": client.azpacr.as_str(),
     });
     audit::record(
@@ -595,7 +604,7 @@ async fn client_credentials(
         &tenant.id,
         Actor::Id(&client.app.app_id),
         Event::TokenIssued,
-        Some(&resource_app.app_id),
+        Some(&audience),
         details,
     )
     .await;

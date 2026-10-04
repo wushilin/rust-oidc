@@ -1378,3 +1378,42 @@ else defaults) as a commented file, mode 0600, never overwriting. Unknown keys a
 refused (`deny_unknown_fields`). The log filter moved into the file as `log.filter`;
 when the file sets it, it beats `RUST_LOG`, by the same rule. *To reverse:* drop
 `-c`; the env path is untouched.
+
+## The Auth API
+
+**40. A built-in "Auth API" whose permission `Credentials.Verify` lets an application
+check a user's password and authenticator code** (requested by the owner, 2026-10-04,
+for Linux PAM and similar login prompts that cannot run a browser flow). Entra has no
+such API (its answer is RADIUS through the NPS extension), so this is a deliberate
+extension. It is shaped like Microsoft Graph's application permissions, so the parts
+are standard OAuth: a fixed app id (`3bc73980-9fde-4fa7-9f74-9d421f0a127d`) present in
+every tenant; an administrator grants the permission to an application on its *API
+permissions* page (that grant is the consent; no user consents); the application gets
+an app-only token with the client credentials grant for `{id}/.default`, whose `roles`
+carry the permission; it calls `POST /{tenant}/api/v1/authenticate` with that token.
+Decided with the owner: the user must be assigned to the calling application; MFA is
+mandatory (a password alone must confirm nothing); every failure about the user is
+the same answer. Decided here:
+- **Order of checks.** Assignment and "has an authenticator" are checked before the
+  password, so an application cannot move the lockout counter of a user it may not
+  ask about, and no password is ever weighed for an account without MFA.
+- **Every user failure is identical** (wrong password or code, unknown, disabled,
+  locked, not assigned, no authenticator, must change password, throttled): `200`
+  with `{"result": false, "code": "invalid_credentials", ...}`. Only caller problems
+  differ: no or bad token 401, no grant 403, the caller's own rate limit 429, a
+  malformed body 400. Reasons go to the audit log (`via: auth_api`).
+- **Authenticator codes only**; a recovery code is refused (it is for getting back
+  into an account). A code is spent, as at sign-in. Wrong passwords count toward the
+  lockout; wrong codes do not (the per-account limit bounds guessing).
+- **Limits per calling application (600/min) and per account (10/min)**, both
+  invented. Not per IP: behind the reverse proxy every caller has the proxy's
+  address (see `src/ratelimit.rs`); the caller is authenticated, so per-application is
+  the per-caller limit. The per-account limit keeps the generic answer when it trips.
+- **The grant is checked on every call**, not only in the token, so revoking it
+  stops an application at once.
+- **On success** the answer carries the profile, the user's groups (ids and names)
+  and the roles they hold on the calling application (ids and values), with
+  `amr: ["pwd","mfa"]` and `acr: "2"`.
+- **Own-tenant users only**, for now.
+*To reverse:* drop the route, the token endpoint's Auth API branch, and migration
+0019's table stays unused.

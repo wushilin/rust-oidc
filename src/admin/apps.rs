@@ -26,8 +26,8 @@ use crate::rbac::Action;
 use crate::tenant::Tenant;
 use crate::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
-    GrantAppRole, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri, RemoveRedirectUri, RevokeAppRole,
-    SaveAppFlags, UnassignApp,
+    GrantAppRole, GrantAuthApiPermission, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri,
+    RemoveRedirectUri, RevokeAppRole, RevokeAuthApiPermission, SaveAppFlags, UnassignApp,
 };
 use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
 use crate::util::now;
@@ -54,6 +54,8 @@ pub enum AppSection {
     Roles,
     Assignments,
     Permissions,
+    /// Permissions this application holds on built-in APIs (the Auth API).
+    ApiPermissions,
     /// Would this user be let in, and if not, why.
     Check,
 }
@@ -67,6 +69,7 @@ impl AppSection {
         Self::Roles,
         Self::Assignments,
         Self::Permissions,
+        Self::ApiPermissions,
         Self::Check,
     ];
 
@@ -79,6 +82,7 @@ impl AppSection {
             Self::Roles => "App roles",
             Self::Assignments => "Users and groups",
             Self::Permissions => "Application permissions",
+            Self::ApiPermissions => "API permissions",
             Self::Check => "Check sign-in",
         }
     }
@@ -93,6 +97,7 @@ impl AppSection {
             Self::Roles => "roles",
             Self::Assignments => "users",
             Self::Permissions => "permissions",
+            Self::ApiPermissions => "api-permissions",
             Self::Check => "check",
         }
     }
@@ -104,7 +109,7 @@ impl AppSection {
     /// What it takes to open it, beyond seeing the application.
     fn action(self) -> Action {
         match self {
-            Self::Assignments | Self::Permissions | Self::Check => ASSIGNMENT_READ,
+            Self::Assignments | Self::Permissions | Self::ApiPermissions | Self::Check => ASSIGNMENT_READ,
             _ => APP_READ,
         }
     }
@@ -130,6 +135,9 @@ pub enum AppOp {
     /// Grant one role to a client application (an application permission).
     RoleAssign,
     RoleUnassign,
+    /// Grant this application a permission of the built-in Auth API.
+    AuthApiGrant,
+    AuthApiRevoke,
 }
 
 impl AppOp {
@@ -145,6 +153,7 @@ impl AppOp {
             Self::RoleAdd => AppSection::Roles,
             Self::Assign | Self::Unassign => AppSection::Assignments,
             Self::RoleAssign | Self::RoleUnassign => AppSection::Permissions,
+            Self::AuthApiGrant | Self::AuthApiRevoke => AppSection::ApiPermissions,
         }
     }
 
@@ -164,6 +173,8 @@ impl AppOp {
         Self::Unassign,
         Self::RoleAssign,
         Self::RoleUnassign,
+        Self::AuthApiGrant,
+        Self::AuthApiRevoke,
     ];
 
     /// The form's `op` field.
@@ -186,6 +197,8 @@ impl AppOp {
             Self::Unassign => "unassign",
             Self::RoleAssign => "role_assign",
             Self::RoleUnassign => "role_unassign",
+            Self::AuthApiGrant => "auth_api_grant",
+            Self::AuthApiRevoke => "auth_api_revoke",
         }
     }
 
@@ -200,7 +213,12 @@ impl AppOp {
             // application without being able to mint a credential for it.
             Self::SecretAdd | Self::SecretRemove | Self::CertificateAdd | Self::CertificateRemove => APP_ROTATE,
             // Who holds a role is an assignment, not the registration.
-            Self::Assign | Self::Unassign | Self::RoleAssign | Self::RoleUnassign => ASSIGNMENT_WRITE,
+            Self::Assign
+            | Self::Unassign
+            | Self::RoleAssign
+            | Self::RoleUnassign
+            | Self::AuthApiGrant
+            | Self::AuthApiRevoke => ASSIGNMENT_WRITE,
             Self::Flags
             | Self::RedirectUriAdd
             | Self::RedirectUriRemove
@@ -232,6 +250,8 @@ impl AppOp {
             Self::Unassign => TxnKind::UnassignApp,
             Self::RoleAssign => TxnKind::GrantAppRole,
             Self::RoleUnassign => TxnKind::RevokeAppRole,
+            Self::AuthApiGrant => TxnKind::GrantAuthApiPermission,
+            Self::AuthApiRevoke => TxnKind::RevokeAuthApiPermission,
         }
     }
 }
@@ -248,6 +268,8 @@ const DISPLAY_NAME: &str = "display_name";
 const DESCRIPTION: &str = "description";
 const CONSENT: &str = "consent";
 const ROLE: &str = "role";
+/// An Auth API permission, by its value.
+const PERMISSION: &str = "permission";
 const PRINCIPAL: &str = "principal";
 const PRINCIPAL_TYPE: &str = "principal_type";
 const ASSIGNMENT: &str = "assignment";
@@ -544,6 +566,17 @@ other applications may hold. Add one under App roles, with the Application membe
                 section
             }
         }
+        AppSection::ApiPermissions => {
+            let sp = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
+                .await
+                .ok()
+                .flatten();
+            let held = match &sp {
+                Some(sp) => crate::auth_api::granted(&st.pool, &sp.id).await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            api_permissions_section(&url, &csrf, base, tenant, &held, may_assign)
+        }
         AppSection::Check => check_section(st, tenant, app, page.check, &format!("{url}/check")).await,
     };
 
@@ -658,6 +691,15 @@ async fn overview(st: &AppState, ctx: &AdminContext, tenant: &Tenant, app: &Appl
         cards.push((
             AppSection::Assignments,
             count(assigned.len(), "user or group assigned", "users and groups assigned"),
+            None,
+        ));
+        let held = match apps::service_principal(&st.pool, &tenant.id, &app.app_id).await {
+            Ok(Some(sp)) => crate::auth_api::granted(&st.pool, &sp.id).await.unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        cards.push((
+            AppSection::ApiPermissions,
+            count(held.len(), "Auth API permission", "Auth API permissions"),
             None,
         ));
         cards.push((
@@ -1399,6 +1441,61 @@ when they call this one with their own credentials.</p>
     )
 }
 
+/// The permissions this application holds on the built-in Auth API, with how to
+/// use them.
+fn api_permissions_section(
+    url: &str,
+    csrf: &str,
+    base: &str,
+    tenant: &Tenant,
+    held: &[crate::auth_api::AuthApiPermission],
+    may_assign: bool,
+) -> String {
+    use crate::auth_api::{AUTH_API_APP_ID, AUTH_API_NAME, AuthApiPermission};
+    let rows: String = AuthApiPermission::ALL
+        .iter()
+        .map(|p| {
+            let granted = held.contains(p);
+            let (state, op, label, class) = if granted {
+                ("Granted", AppOp::AuthApiRevoke, "Revoke", "danger")
+            } else {
+                ("Not granted", AppOp::AuthApiGrant, "Grant", "secondary")
+            };
+            let button = if may_assign {
+                format!(
+                    r#"<form method="post" action="{url}" class="inline">{csrf}
+<input type="hidden" name="{PERMISSION}" value="{value}">
+<button class="{class}" type="submit" name="{op_field}" value="{op}">{label}</button></form>"#,
+                    url = e(url),
+                    value = e(p.as_str()),
+                    op_field = AppOp::FIELD,
+                    op = op.as_str(),
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<tr><td><code>{value}</code></td><td>{description}</td><td>{state}</td><td>{button}</td></tr>"#,
+                value = e(p.as_str()),
+                description = e(p.description()),
+            )
+        })
+        .collect();
+    format!(
+        r#"<h2>API permissions</h2><p class="sub">Permissions this application holds on the built-in
+{name}, granted by an administrator. The application uses them with its own credentials: no user consents.</p>
+<table><tr><th>Permission</th><th>What it allows</th><th>Status</th><th></th></tr>{rows}</table>
+<h3>Using it</h3>
+<p>Get a token with the client credentials grant, <code>scope={api}/.default</code>, then send each check
+to <code>POST {endpoint}</code> with <code>Authorization: Bearer &lt;token&gt;</code> and a JSON body
+<code>{{"upn": "…", "password": "…", "otp": "…"}}</code>. Only users assigned to this application, with an
+authenticator set up, can be checked.</p>"#,
+        name = e(AUTH_API_NAME),
+        api = e(AUTH_API_APP_ID),
+        endpoint = e(&format!("{base}/{}/api/v1/authenticate", tenant.id)),
+    )
+}
+
 // ---- writes ----
 
 /// What a completed operation leaves to render.
@@ -1678,6 +1775,26 @@ async fn apply(
                 assignment_id,
             };
             redirect(st, &actor, &t).await
+        }
+        AppOp::AuthApiGrant | AppOp::AuthApiRevoke => {
+            let Some(permission) = crate::auth_api::AuthApiPermission::parse(field(form, PERMISSION)) else {
+                return invalid("choose a permission");
+            };
+            if op == AppOp::AuthApiGrant {
+                let t = GrantAuthApiPermission {
+                    tenant_id,
+                    app_id,
+                    permission,
+                };
+                redirect(st, &actor, &t).await
+            } else {
+                let t = RevokeAuthApiPermission {
+                    tenant_id,
+                    app_id,
+                    permission,
+                };
+                redirect(st, &actor, &t).await
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod auth_api;
 mod authorize;
 mod device;
 pub mod discovery;
@@ -53,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/{tenant}/oauth2/v2.0/logout", get(logout::logout).post(logout::logout))
         .route("/{tenant}/myaccount", get(myaccount::page).post(myaccount::post))
+        .route("/{tenant}/api/v1/authenticate", post(auth_api::authenticate))
         .route("/healthz", get(|| async { "ok" }))
         // The admin console. Mounted here so it sits under the public URL's path
         // prefix like every other route.

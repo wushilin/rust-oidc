@@ -550,6 +550,18 @@ impl Factor {
     }
 }
 
+/// Check an authenticator code, and only that: a recovery code is refused. For
+/// the Auth API, where a login prompt must not spend the codes kept for getting
+/// back into an account. A matching code is spent, as at sign-in.
+pub async fn check_authenticator_code<'c>(db: impl Handle<'c>, user_id: &str, typed: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    let digits = typed.trim().replace(' ', "");
+    if digits.len() != DIGITS as usize || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(false);
+    }
+    verify_totp_in(&mut conn, user_id, &digits).await
+}
+
 /// Check what someone typed at the second step: six digits are an authenticator
 /// code, anything else is tried as a recovery code.
 pub async fn check<'c>(db: impl Handle<'c>, user_id: &str, typed: &str) -> anyhow::Result<Option<Factor>> {

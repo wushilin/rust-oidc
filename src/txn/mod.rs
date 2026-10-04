@@ -402,6 +402,8 @@ transactions! {
     GrantAppRole(ops::apps::GrantAppRole),
     RevokeAppRole(ops::apps::RevokeAppRole),
     SetAssignmentRequired(ops::apps::SetAssignmentRequired),
+    GrantAuthApiPermission(ops::apps::GrantAuthApiPermission),
+    RevokeAuthApiPermission(ops::apps::RevokeAuthApiPermission),
     GrantRole(ops::roles::GrantRole),
     RevokeRole(ops::roles::RevokeRole),
     RotateKeys(ops::keys::RotateKeys),

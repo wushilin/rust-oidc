@@ -88,6 +88,8 @@ const EXPECTED: &[(&str, &str)] = &[
     ("AdminAppAssign", "admin.app.assign"),
     ("AdminAppUnassign", "admin.app.unassign"),
     ("AdminAppAssignmentRequired", "admin.app.assignment_required"),
+    ("AdminAuthApiGrant", "admin.auth_api.grant"),
+    ("AdminAuthApiRevoke", "admin.auth_api.revoke"),
     ("AdminTenantCreate", "admin.tenant.create"),
     ("AdminTenantRename", "admin.tenant.rename"),
     ("AdminTenantEnable", "admin.tenant.enable"),

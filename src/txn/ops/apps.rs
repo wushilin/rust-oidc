@@ -13,6 +13,7 @@ use crate::admin::{APP_ROTATE, APP_WRITE, ASSIGNMENT_WRITE};
 use crate::apps::{
     self, Application, MemberType, NewSecret, PreparedSecret, Principal, RedirectPlatform, ScopeConsent,
 };
+use crate::auth_api::AuthApiPermission;
 use crate::db::Event;
 use crate::directory::PrincipalType;
 use crate::routes::audit::clip;
@@ -703,6 +704,87 @@ impl Transaction for RevokeAppRole {
             &self.tenant_id,
             &self.app_id,
             json!({ "assignmentId": self.assignment_id }),
+        )
+    }
+}
+
+/// Grant an application a permission of the built-in Auth API. Granting one it
+/// already holds completes and changes nothing.
+pub struct GrantAuthApiPermission {
+    pub tenant_id: String,
+    pub app_id: String,
+    pub permission: AuthApiPermission,
+}
+
+/// The application's service principal in its home tenant, or abort.
+async fn client_sp(cx: &mut Cx<'_>, tenant_id: &str, app_id: &str) -> Step<apps::ServicePrincipal> {
+    let (tenant, app) = application(cx, tenant_id, app_id).await?;
+    let sp = apps::service_principal_in(cx.conn(), &tenant.id, &app.app_id).await;
+    match cx.check(sp)? {
+        Some(sp) => Ok(sp),
+        None => Err(cx.fail(Refusal::NotFound(NO_SUCH_APP.into()))),
+    }
+}
+
+impl Transaction for GrantAuthApiPermission {
+    type Output = ();
+    const INFO: KindInfo = KindInfo {
+        name: "Grant Auth API permission",
+        need: Need::Action(ASSIGNMENT_WRITE),
+        event: Event::AdminAuthApiGrant,
+    };
+
+    on_application!();
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
+        let sp = client_sp(cx, &self.tenant_id, &self.app_id).await?;
+        let done = crate::auth_api::grant_in(cx.conn(), &self.tenant_id, &sp.id, self.permission).await;
+        cx.check(done)?;
+        Ok(())
+    }
+
+    fn audit(&self, _: &()) -> Audit {
+        on_app(
+            &self.tenant_id,
+            &self.app_id,
+            json!({ "api": crate::auth_api::AUTH_API_APP_ID, "permission": self.permission.as_str() }),
+        )
+    }
+}
+
+/// Withdraw an Auth API permission from an application. Tokens it already holds
+/// keep the role until they expire, but the API checks the grant on every call,
+/// so it stops working at once.
+pub struct RevokeAuthApiPermission {
+    pub tenant_id: String,
+    pub app_id: String,
+    pub permission: AuthApiPermission,
+}
+
+impl Transaction for RevokeAuthApiPermission {
+    type Output = ();
+    const INFO: KindInfo = KindInfo {
+        name: "Revoke Auth API permission",
+        need: Need::Action(ASSIGNMENT_WRITE),
+        event: Event::AdminAuthApiRevoke,
+    };
+
+    on_application!();
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
+        let sp = client_sp(cx, &self.tenant_id, &self.app_id).await?;
+        let done = crate::auth_api::revoke_in(cx.conn(), &sp.id, self.permission).await;
+        let revoked = cx.check(done)?;
+        cx.ensure(revoked, || {
+            Refusal::NotFound("This application does not hold that permission.".into())
+        })
+    }
+
+    fn audit(&self, _: &()) -> Audit {
+        on_app(
+            &self.tenant_id,
+            &self.app_id,
+            json!({ "api": crate::auth_api::AUTH_API_APP_ID, "permission": self.permission.as_str() }),
         )
     }
 }

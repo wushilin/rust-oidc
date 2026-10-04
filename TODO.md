@@ -204,3 +204,60 @@ and keep their own handling.
   audit write fails changes nothing; concurrent last-Global-Administrator
   removals leave one (SQLite here; Postgres and MySQL when those runs resume).
 - `docs/decisions-log.md` records the design.
+
+## Postgres and MySQL: compatibility run
+
+**Not started.** Paused by the owner on 2026-10-01 ("the three engine run is very
+slow ... only test sqlite"); both deployments are SQLite. The last pass on all three
+engines was commit `ccc02c1` (1116 tests). Everything since has run on SQLite only.
+
+### How to run it
+
+`scripts/test-engines.sh` starts throwaway Postgres 16 and MySQL 8 containers in
+podman (on tmpfs), exports `RUST_OIDC_TEST_POSTGRES` / `RUST_OIDC_TEST_MYSQL`, and
+runs `cargo test` once per engine (`RUST_OIDC_TEST_ENGINE` picks the engine for the
+HTTP-level tests). About 12–20 minutes.
+
+### What is unverified
+
+1. **Migrations 0012–0018** (console roles, app assignments, deleted groups, MFA,
+   password change and history, cross-tenant sign-in, the `txn_locks` table) have
+   never been applied to Postgres or MySQL.
+2. **The engine's locking**, which on SQLite is a no-op (`BEGIN IMMEDIATE` holds the
+   database):
+   - `SELECT … FOR UPDATE` on `txn_locks`, `tenants`, `users`, `user_groups`,
+     `applications`;
+   - the timeouts: Postgres `SET LOCAL lock_timeout`, MySQL
+     `SET SESSION innodb_lock_wait_timeout`;
+   - classifying contention as `Busy` (`engine::is_contention`: SQLSTATE
+     `55P03`/`40P01`/`40001` and MySQL's messages).
+3. **Gap 5 for real**: two concurrent revocations of the last two Global
+   Administrators must leave one on Postgres at its default isolation level (the
+   write skew the `Administrators` lock exists for). The test
+   `concurrent_revocations_of_the_last_two_global_administrators_leave_one` has only
+   run on SQLite.
+4. **Unique violations inside a transaction**: on Postgres one aborts the whole
+   transaction. Most writes now look for duplicates first; `db::inserted` still
+   relies on catching the violation (e.g. `add_key_credential`, under a race).
+5. **SQL written since `ccc02c1`**: everything in `src/txn`, the storage `_in`
+   functions, `db::begin_write`, `deleted_id_in`, the duplicate pre-checks, `acr`
+   (no SQL), and the CLI's batches.
+
+### Tests that are SQLite-only by construction
+
+These must be skipped on the other engines, or given an equivalent per engine,
+before a three-engine run can be green:
+- `tests/txn_engine.rs` `a_transaction_whose_audit_row_fails_changes_nothing`
+  (SQLite trigger syntax) and `a_lock_not_granted_in_time_is_busy`
+  (`BEGIN IMMEDIATE` on another connection);
+- `tests/sqlite_write_wait.rs` (the SQLite lock-upgrade behaviour itself);
+- the gap tests in `tests/txn_*.rs` that hold a lock by hand.
+
+### Done when
+
+- `scripts/test-engines.sh` passes on all three engines.
+- Each SQLite-only test above is skipped on the others, or has a per-engine
+  equivalent (a Postgres/MySQL lock held by `SELECT … FOR UPDATE` on another
+  connection must make the engine answer `Busy` within the timeout).
+- Optionally: `.github/workflows/test.yml` runs the Postgres and MySQL suites as
+  service containers, so CI covers all three.

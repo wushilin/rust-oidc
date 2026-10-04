@@ -1,7 +1,6 @@
 use crate::admin::lockout;
 use crate::db::Handle;
 use anyhow::{Context, bail};
-use sqlx::Connection;
 
 use crate::tenant::Tenant;
 use crate::util::{new_guid, now};
@@ -296,7 +295,7 @@ pub(crate) async fn set_for_user_in(
         .map(|g| g.id)
         .collect();
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let live: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
         "SELECT id FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
@@ -362,7 +361,7 @@ pub(crate) async fn remove_member_in(
         return Ok(false);
     }
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
         engine,
@@ -393,7 +392,7 @@ pub(crate) async fn delete_in(conn: &mut crate::db::Conn, tenant_id: &str, group
         return Ok(false);
     }
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let (members,): (i64,) = sqlx::query_as(crate::db::sql_stmt(
         engine,
         "SELECT COUNT(*) FROM group_members WHERE group_id = ?",

@@ -18,7 +18,6 @@
 use anyhow::bail;
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
-use sqlx::Connection;
 
 use crate::apps::ServicePrincipal;
 use crate::db::Handle;
@@ -528,7 +527,7 @@ pub(crate) async fn replace_recovery_codes_in(
         bail!("You have no authenticator. Set one up first; it comes with recovery codes.");
     }
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     insert_recovery_codes(&mut tx, engine, user_id, codes).await?;
     tx.commit().await?;
     Ok(())
@@ -589,7 +588,7 @@ pub(crate) async fn enroll_in(
     codes: &NewRecoveryCodes,
 ) -> anyhow::Result<()> {
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_totp WHERE user_id = ?"))
         .bind(user_id)
         .execute(&mut *tx)
@@ -631,7 +630,7 @@ pub(crate) async fn reset_in(conn: &mut crate::db::Conn, tenant_id: &str, user_i
         bail!("no such account in this tenant");
     }
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let removed = sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM user_totp WHERE user_id = ?"))
         .bind(user_id)
         .execute(&mut *tx)

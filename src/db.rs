@@ -27,6 +27,24 @@ pub fn engine_of_conn(conn: &Conn) -> Engine {
     }
 }
 
+/// Begin the transaction of a storage function that writes.
+///
+/// Inside a transaction already (the engine's), it is a savepoint. On its own,
+/// on SQLite, it takes the write lock at once (`BEGIN IMMEDIATE`), so it waits
+/// for another writer (up to the busy timeout) instead of failing: a deferred
+/// transaction that reads and then writes cannot wait, because SQLite refuses to
+/// upgrade a read lock while another connection holds the write lock, and
+/// reports "database is locked" at once. Postgres and MySQL lock rows, not the
+/// database, so a plain `BEGIN` is right there.
+pub async fn begin_write(conn: &mut Conn) -> Result<sqlx::Transaction<'_, Db>, sqlx::Error> {
+    use sqlx::Connection;
+    if engine_of_conn(conn) == Engine::Sqlite && !conn.is_in_transaction() {
+        conn.begin_with("BEGIN IMMEDIATE").await
+    } else {
+        conn.begin().await
+    }
+}
+
 /// [`q`] for a connection.
 pub fn qc(conn: &Conn, statement: &'static str) -> sqlx::AssertSqlSafe<std::borrow::Cow<'static, str>> {
     sql_stmt(engine_of_conn(conn), statement)

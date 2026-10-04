@@ -2,7 +2,6 @@
 
 use crate::db::Handle;
 use anyhow::{Context, bail};
-use sqlx::Connection;
 use sqlx::FromRow;
 
 use crate::directory::PrincipalType;
@@ -76,7 +75,7 @@ pub(crate) async fn create_in(
     let identifier_uri = format!("api://{}", application.app_id);
     let ts = now();
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
         "INSERT INTO applications (id, app_id, tenant_id, display_name, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -978,7 +977,7 @@ pub(crate) async fn assign_in(
     }
 
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let id = ensure_assigned(
         &mut tx,
         engine,
@@ -1102,7 +1101,7 @@ pub(crate) async fn unassign_in(
         return Ok(false);
     };
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let found: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
         "SELECT principal_id FROM app_assignments WHERE id = ? AND tenant_id = ? AND resource_id = ?",

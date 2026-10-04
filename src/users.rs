@@ -2,7 +2,6 @@ use crate::admin::lockout;
 use crate::db::Handle;
 use anyhow::{Context, anyhow, bail};
 use argon2::{Argon2, PasswordHasher};
-use sqlx::Connection;
 
 use crate::tenant::{self, Tenant};
 use crate::util::{new_guid, now};
@@ -485,7 +484,7 @@ pub(crate) async fn store_password_in(
     password: &NewPassword,
 ) -> anyhow::Result<bool> {
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let changed = sqlx::query(crate::db::sql_stmt(
         engine,
         "UPDATE users SET password_hash = ?, failed_logins = 0, locked_until = NULL, must_change_password = ?,
@@ -723,7 +722,7 @@ pub(crate) async fn set_enabled_in(
     enabled: bool,
 ) -> anyhow::Result<bool> {
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
         engine,
@@ -754,7 +753,7 @@ pub async fn soft_delete<'c>(db: impl Handle<'c>, tenant_id: &str, user_id: &str
 pub(crate) async fn soft_delete_in(conn: &mut crate::db::Conn, tenant_id: &str, user_id: &str) -> anyhow::Result<bool> {
     let engine = crate::db::engine_of_conn(&conn);
     let ts = now();
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(
         engine,
@@ -847,7 +846,7 @@ pub async fn end_sessions<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Res
 
 pub(crate) async fn end_sessions_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<()> {
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     revoke_access(&mut tx, engine, user_id).await?;
     tx.commit().await?;
     Ok(())

@@ -1,7 +1,6 @@
 use crate::db::Handle;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
-use sqlx::Connection;
 use sqlx::FromRow;
 
 use crate::util::{fold, is_guid, new_guid, now};
@@ -304,7 +303,7 @@ pub(crate) async fn create_in(
     let id = new_guid();
     let settings = TenantSettings::default();
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
         "INSERT INTO tenants (id, name, is_root, enabled, settings, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -364,7 +363,7 @@ pub(crate) async fn change_domain_in(
 ) -> anyhow::Result<DomainChange> {
     let to = normalize_domain(new_domain)?;
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
 
     let from: Vec<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,

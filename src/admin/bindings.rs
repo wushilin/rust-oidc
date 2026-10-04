@@ -1,7 +1,6 @@
 //! Storage for role bindings, and expansion into effective grants.
 
 use crate::db::Handle;
-use sqlx::Connection;
 use sqlx::Row;
 
 use crate::rbac::{EffectiveBinding, RoleId, Scope, ScopeKind};
@@ -109,7 +108,7 @@ pub(crate) async fn create_in(
     }
     let id = new_guid();
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let Some((home, home_is_root)) = home_of(&mut *tx, engine, principal_type, principal_id).await? else {
         anyhow::bail!("no such user or group");
     };
@@ -156,7 +155,7 @@ pub async fn delete<'c>(db: impl Handle<'c>, binding_id: &str) -> anyhow::Result
 
 pub(crate) async fn delete_in(conn: &mut crate::db::Conn, binding_id: &str) -> anyhow::Result<bool> {
     let engine = crate::db::engine_of_conn(&conn);
-    let mut tx = conn.begin().await?;
+    let mut tx = crate::db::begin_write(&mut *conn).await?;
     let admins = crate::admin::lockout::global_administrators(&mut tx, engine).await?;
     let done = sqlx::query(crate::db::sql_stmt(engine, "DELETE FROM role_bindings WHERE id = ?"))
         .bind(binding_id)

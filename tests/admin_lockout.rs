@@ -15,7 +15,7 @@ fn locks_out(err: &anyhow::Error) -> bool {
 }
 
 async fn live(s: &TestServer, user_id: &str) -> (bool, bool) {
-    let (enabled, deleted): (i64, Option<i64>) = sqlx::query_as(rust_oidc::db::q(
+    let (enabled, deleted): (rust_oidc::db::Flag, Option<i64>) = sqlx::query_as(rust_oidc::db::q(
         &s.pool,
         "SELECT enabled, deleted_at FROM users WHERE id = ?",
     ))
@@ -23,7 +23,7 @@ async fn live(s: &TestServer, user_id: &str) -> (bool, bool) {
     .fetch_one(&s.pool)
     .await
     .unwrap();
-    (enabled != 0, deleted.is_none())
+    (bool::from(enabled), deleted.is_none())
 }
 
 /// Every storage route that could take away the last one, with the role held

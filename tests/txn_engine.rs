@@ -142,11 +142,8 @@ async fn the_last_global_administrator_stays_whoever_asks() {
 async fn a_transaction_whose_audit_row_fails_changes_nothing() {
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
-    // Break the audit table for this one write: a trigger that refuses inserts.
-    sqlx::query("CREATE TRIGGER no_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'audit is down'); END")
-        .execute(&s.pool)
-        .await
-        .unwrap();
+    // Break the audit table: every audit write fails from here on.
+    break_audit_log(&s.pool).await;
     let outcome = txn::run(&s.pool, &Actor::Cli, &create(&f.tenant.id, "bea@contoso.com")).await;
     assert!(matches!(outcome, Outcome::Failed(_)), "{:?}", outcome.map_done());
     assert!(
@@ -289,31 +286,36 @@ fn locks_are_taken_in_one_order() {
 }
 
 /// A transaction that cannot get its lock in time gives up as `Busy` and
-/// changes nothing; it does not wait for ever.
+/// changes nothing; it does not wait for ever. On Postgres and MySQL this is the
+/// engine's own row lock and lock timeout; on SQLite, the database's write lock
+/// and busy timeout.
 #[tokio::test]
 async fn a_lock_not_granted_in_time_is_busy() {
-    use sqlx::Connection;
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
-    // Another connection holds the database's write lock.
+    // Another connection holds the Administrators lock, which disabling an
+    // account declares.
     let mut holder = s.pool.acquire().await.unwrap();
-    let held = holder.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let held = hold_administrators_lock(&mut holder).await;
 
+    let disable = DisableUser {
+        tenant_id: f.tenant.id.clone(),
+        user_id: f.user_id.clone(),
+    };
     let started = std::time::Instant::now();
-    let outcome = txn::run(&s.pool, &Actor::Cli, &create(&f.tenant.id, "bea@contoso.com")).await;
-    assert!(
-        matches!(outcome, Outcome::Refused(Refusal::Busy(_))),
-        "{:?}",
-        outcome.map_done()
-    );
+    let outcome = txn::run(&s.pool, &Actor::Cli, &disable).await;
+    assert!(matches!(outcome, Outcome::Refused(Refusal::Busy(_))), "{outcome:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
     held.rollback().await.unwrap();
     assert!(
-        users::find_by_upn(&s.pool, &f.tenant.id, "bea@contoso.com")
+        users::find(&s.pool, &f.tenant.id, &f.user_id)
             .await
             .unwrap()
-            .is_none()
+            .unwrap()
+            .enabled,
+        "nothing changed"
     );
+    assert!(audit_rows(&s, Event::AdminUserDisable).await.is_empty());
 }
 
 /// Every kind of transaction is listed once, with a name and its own audit event.

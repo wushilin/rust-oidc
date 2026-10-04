@@ -198,11 +198,14 @@ async fn an_authenticator_is_set_up_replaced_and_its_codes_renewed() {
     assert!(done.body.contains("Your authenticator is set up"), "{}", done.body);
     // The old authenticator is no longer the one.
     let (user_id, _) = (f.user_id.clone(), ());
-    let row: (String,) = sqlx::query_as("SELECT secret FROM user_totp WHERE user_id = ?")
-        .bind(&user_id)
-        .fetch_one(&s.pool)
-        .await
-        .unwrap();
+    let row: (String,) = sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT secret FROM user_totp WHERE user_id = ?",
+    ))
+    .bind(&user_id)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap();
     assert_eq!(row.0, new_secret);
 }
 

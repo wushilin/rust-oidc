@@ -113,7 +113,7 @@ async fn legacy_second_domain(s: &TestServer, tenant_id: &str, domain: &str) {
 async fn upns(s: &TestServer, tenant_id: &str) -> Vec<(String, Option<String>)> {
     sqlx::query_as(rust_oidc::db::q(
         &s.pool,
-        "SELECT upn, email FROM users WHERE tenant_id = ? ORDER BY upn",
+        "SELECT upn, email FROM users WHERE tenant_id = ? ORDER BY upn_folded",
     ))
     .bind(tenant_id)
     .fetch_all(&s.pool)

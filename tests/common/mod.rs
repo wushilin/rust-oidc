@@ -719,3 +719,40 @@ pub async fn audit_rows(s: &TestServer, action: &str) -> Vec<(String, Option<Str
     .await
     .unwrap()
 }
+
+/// Make every audit write fail from now on, on any engine: the table is renamed
+/// away. For the "no audit, no change" tests.
+pub async fn break_audit_log(pool: &DbPool) {
+    sqlx::query("ALTER TABLE audit_log RENAME TO audit_log_broken")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Hold the engine's named Administrators lock on another connection until the
+/// returned transaction ends, so a transaction that declares it cannot start.
+/// On SQLite that means the database's write lock (`BEGIN IMMEDIATE`); on
+/// Postgres and MySQL, the `txn_locks` row (`SELECT ... FOR UPDATE`), which is
+/// what the engine itself takes.
+pub async fn hold_administrators_lock(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Any>,
+) -> sqlx::Transaction<'_, sqlx::Any> {
+    use sqlx::Connection;
+    let sqlite = conn.backend_name() == "SQLite";
+    if sqlite {
+        return conn.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    }
+    let postgres = conn.backend_name() == "PostgreSQL";
+    let mut tx = conn.begin().await.unwrap();
+    let sql = if postgres {
+        "SELECT name FROM txn_locks WHERE name = $1 FOR UPDATE"
+    } else {
+        "SELECT name FROM txn_locks WHERE name = ? FOR UPDATE"
+    };
+    sqlx::query(sql)
+        .bind("administrators")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx
+}

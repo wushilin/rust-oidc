@@ -19,7 +19,7 @@ async fn staffed(s: &TestServer) -> (UserFixture, Vec<String>) {
 }
 
 async fn state(s: &TestServer, user_id: &str) -> &'static str {
-    let (enabled, deleted): (i64, Option<i64>) = sqlx::query_as(rust_oidc::db::q(
+    let (enabled, deleted): (rust_oidc::db::Flag, Option<i64>) = sqlx::query_as(rust_oidc::db::q(
         &s.pool,
         "SELECT enabled, deleted_at FROM users WHERE id = ?",
     ))
@@ -27,7 +27,7 @@ async fn state(s: &TestServer, user_id: &str) -> &'static str {
     .fetch_one(&s.pool)
     .await
     .unwrap();
-    match (enabled != 0, deleted.is_none()) {
+    match (bool::from(enabled), deleted.is_none()) {
         (_, false) => "deleted",
         (true, true) => "enabled",
         (false, true) => "disabled",

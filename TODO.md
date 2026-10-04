@@ -207,9 +207,13 @@ and keep their own handling.
 
 ## Postgres and MySQL: compatibility run
 
-**Not started.** Paused by the owner on 2026-10-01 ("the three engine run is very
-slow ... only test sqlite"); both deployments are SQLite. The last pass on all three
-engines was commit `ccc02c1` (1116 tests). Everything since has run on SQLite only.
+**Done 2026-10-04**: `scripts/test-engines.sh` passes on all three engines,
+535/535 each (1605 tests). The first run found no product bugs; six test helpers
+were not portable (an integer read of a BOOLEAN column, an unwrapped `?` query, an
+`ORDER BY` on a mixed-case column that MySQL sorts differently) and were fixed. The
+SQLite-only tests below were made engine-aware. Still paused by default (owner,
+2026-10-01): the routine gate is the SQLite suite; run this before a release or a
+non-SQLite deployment. Running Postgres and MySQL in CI remains optional.
 
 ### How to run it
 
@@ -243,10 +247,11 @@ HTTP-level tests). About 12–20 minutes.
    functions, `db::begin_write`, `deleted_id_in`, the duplicate pre-checks, `acr`
    (no SQL), and the CLI's batches.
 
-### Tests that are SQLite-only by construction
+### Tests that were SQLite-only by construction (now engine-aware)
 
-These must be skipped on the other engines, or given an equivalent per engine,
-before a three-engine run can be green:
+Done: the audit-failure tests rename `audit_log` (`common::break_audit_log`), the
+busy test holds the `txn_locks` row with `SELECT … FOR UPDATE`
+(`common::hold_administrators_lock`), and the lock-upgrade test skips off SQLite:
 - `tests/txn_engine.rs` `a_transaction_whose_audit_row_fails_changes_nothing`
   (SQLite trigger syntax) and `a_lock_not_granted_in_time_is_busy`
   (`BEGIN IMMEDIATE` on another connection);

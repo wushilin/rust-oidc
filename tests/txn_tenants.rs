@@ -397,10 +397,7 @@ async fn a_disabled_tenant_has_no_settings_to_save() {
 async fn a_tenant_change_whose_audit_row_fails_changes_nothing() {
     let s = TestServer::start().await;
     let other = s.tenant("Fabrikam", "fabrikam.com").await;
-    sqlx::query("CREATE TRIGGER no_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'audit is down'); END")
-        .execute(&s.pool)
-        .await
-        .unwrap();
+    break_audit_log(&s.pool).await;
     let rename = RenameTenant {
         tenant_id: other.id.clone(),
         name: "Fabrikam Ltd".into(),

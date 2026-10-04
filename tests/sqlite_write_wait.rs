@@ -16,6 +16,12 @@ use sqlx::Connection;
 #[tokio::test]
 async fn a_read_then_write_waits_for_the_other_writer() {
     let s = TestServer::start().await;
+    if rust_oidc::db::engine_of(&s.pool) != rust_oidc::db::Engine::Sqlite {
+        // The behaviour under test is SQLite's; Postgres and MySQL lock rows, and
+        // their waits are covered by the engine's `a_lock_not_granted_in_time_is_busy`.
+        eprintln!("skipping: SQLite's lock upgrade only");
+        return;
+    }
     let f = user_fixture(&s).await;
 
     // Another connection holds the write lock, briefly.

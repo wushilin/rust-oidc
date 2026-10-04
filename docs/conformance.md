@@ -3,13 +3,24 @@
 This records what the official OpenID Foundation conformance suite reports against
 rust-oidc, and which of its complaints we accept rather than fix. It is derived from
 the three plan exports in `~/.cache/rust-oidc-conformance/results` (latest run
-**30 Sep 2026**, superseding 29 Sep): the basic, config and form_post certification
+**4 Oct 2026**, superseding 30 Sep): the basic, config and form_post certification
 plans. `compat/conformance/README.md` covers how to run them.
 
 Every module not listed below passed cleanly.
 
 **What the suite actually tests.** `compat/conformance/run.sh` points the suite at the
-*deployed* service (`https://gate.wushilin.net:9443/rust-oidc`), not at a binary built
+*deployed* service (`https://gate.wushilin.net:10443/rust-oidc` on titanl since 1 Oct;
+set `RUST_OIDC_BASE` to point it elsewhere), not at a binary built
+from the working tree. **4 Oct 2026 run** (deployed build `0daec04`, which is `HEAD`
+apart from the harness itself): **43 PASSED, 12 WARNING, 7 SKIPPED, 6 REVIEW,
+3 FAILED** across the 71 modules, against 38 / 15 / 7 / 6 / 5 on 30 Sep. Every
+warning and failure is one of the accepted items below. What changed: the
+`acr_values` module now passes (decision 38); `oidcc-server-client-secret-post` passes
+(harness fix); and `oidcc-refresh-token`, which first failed on this run, passes once
+the harness clicks *Allow* on the consent page that `prompt=consent` now shows (the
+suite adds `prompt=consent` to every `offline_access` request; the consent page
+arrived after the 30 Sep run). The 30 Sep note follows.
+
 from the working tree. At the 30 Sep run that deployment still advertised
 `"response_types_supported": ["code"]`, so it predates commit `bc217fa` (implicit and
 hybrid response types). Every result below is therefore evidence about the deployed
@@ -35,7 +46,7 @@ before certification is claimed publicly.
 |---|---|---|
 | `EnsureIdTokenDoesNotContainNonRequestedClaims` | id_token contains non-requested claims `oid`, `tid`, `uti`, `ver` | These are core Entra v2.0 claims, present in every Entra id_token. Removing them would break every client that reads `tid`/`oid`. Emitted at `src/routes/token.rs:547-554`. |
 | `EnsureIdTokenDoesNotContainEmailForScopeEmail` | `email` appears in the id_token although the suite did not request it via `claims` | Entra puts `email` in the id_token when the `email` scope is granted, without needing a `claims` request. |
-| `ValidateIdTokenACRClaimAgainstAcrValuesRequest` | `acr_values` was requested so the server SHOULD return `acr`, but did not | **Resolved 2026-10-04 (not yet re-run):** `acr` is now emitted and `acr_values` honoured — see below. |
+| `ValidateIdTokenACRClaimAgainstAcrValuesRequest` | `acr_values` was requested so the server SHOULD return `acr`, but did not | **Resolved, and passing since the 4 Oct run:** `acr` is now emitted and `acr_values` honoured — see below. |
 
 Note the spec language: `acr` is a SHOULD, and the suite raises these three as WARNING,
 not FAILURE. They do not block certification on their own.
@@ -45,8 +56,8 @@ Two levels: `"1"` = password, `"2"` = password + a second factor, advertised in
 `acr_values_supported` and derived from `amr` (`src/claims.rs`, `Acr`). Asking for
 `acr_values=2` makes an account without an authenticator set one up at that sign-in,
 and a password-only session is stepped up. The suite asks for values of its own
-(e.g. `1 2`), so the first known one is taken and unknown ones are ignored; the next
-conformance run should turn this warning into a pass. Entra itself does step-up with
+(e.g. `1 2`), so the first known one is taken and unknown ones are ignored. The 4 Oct
+run confirmed it: `oidcc-ensure-request-with-acr-values-succeeds` passes in both plans. Entra itself does step-up with
 Conditional Access authentication contexts (`acrs`), not `acr`; this is a deliberate
 divergence (decision 38).
 
@@ -122,7 +133,10 @@ Entra. Accepted, and closed.
 
 The follow-on failures in the unsigned-request-object module
 (`CheckCallbackHttpMethodIsPost`, `CheckCallbackContentTypeIsFormUrlEncoded`,
-`RejectErrorInUrlQuery`) are consequences of the same choice, not a separate form_post
+`RejectErrorInUrlQuery`, and since the 4 Oct run `ValidateIssIfPresentInAuthorizationResponse`,
+which finds no form_post response to check, plus the warning
+`CheckDiscEndpointRequestParameterSupported`, "request_parameter_supported must be:
+true") are consequences of the same choice, not a separate form_post
 bug: that module carries `response_mode=form_post` *inside* the request JWT. Since we
 never parse the JWT we never see the parameter, so the error is delivered as a query
 redirect. Error delivery does honour `response_mode` for every parameter we can actually

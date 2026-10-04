@@ -7,7 +7,7 @@ import json
 import sys
 
 fx = json.load(open(sys.argv[1]))
-base = sys.argv[2] if len(sys.argv) > 2 else "https://gate.wushilin.net:9443/rust-oidc"
+base = sys.argv[2] if len(sys.argv) > 2 else "https://gate.wushilin.net:10443/rust-oidc"
 authorize = f"{base}/*/oauth2/v2.0/authorize*"
 login_post = f"{base}/*/login*"
 
@@ -28,8 +28,16 @@ verify = {"task": "Verify Complete", "match": "*/test/*/callback*",
           "commands": [["wait", "id", "submission_complete", 10]]}
 
 
+# The consent page ("Permissions requested"), shown after the password when the
+# request says prompt=consent: the suite adds that to every request for
+# offline_access (oidcc-refresh-token). It is a page of the sign-in POST, so it
+# matches the login URL; optional, as most requests never show it.
+consent = {"task": "Consent", "optional": True, "match": login_post,
+           "commands": [["click", "xpath", "//button[@value='consent_accept']", "optional"]]}
+
+
 def flow(placeholder=None):
-    return [{"match": authorize, "tasks": [login_task(placeholder), verify]}]
+    return [{"match": authorize, "tasks": [login_task(placeholder), consent, verify]}]
 
 
 error_page = [{

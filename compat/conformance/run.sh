@@ -11,6 +11,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SUITE="${SUITE:-$HOME/conformance-suite}"
 FIXTURE="${FIXTURE:-$SUITE/rust-oidc-fixture.json}"
 WORK="${WORK:-$HOME/.cache/rust-oidc-conformance}"
+# The deployment under test: titanl serves on 10443 since 2026-10-01.
+BASE="${RUST_OIDC_BASE:-https://gate.wushilin.net:10443/rust-oidc}"
 mkdir -p "$WORK"
 
 PLANS=("$@")
@@ -26,7 +28,7 @@ cp "$HERE/compose.yml" "$WORK/compose.yml"
 mkdir -p "$WORK/mongo-data"
 (cd "$WORK" && podman-compose -p oidf up -d >/dev/null)
 
-python3 "$HERE/make_config.py" "$FIXTURE" > "$WORK/config.json"
+python3 "$HERE/make_config.py" "$FIXTURE" "$BASE" > "$WORK/config.json"
 chmod 600 "$WORK/config.json"
 
 # The plan runner writes its zip/HTML exports here but does not create the dir;

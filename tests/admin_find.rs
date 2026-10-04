@@ -319,3 +319,62 @@ async fn deleted_objects_are_found_read_only_and_a_user_can_be_restored() {
         .await;
     assert_eq!(refused.status, 403);
 }
+
+/// The built-in APIs' fixed ids name no row, yet appear in tokens and the audit
+/// log: Find by id says what they are, for anyone who may use the console.
+#[tokio::test]
+async fn built_in_ids_are_identified() {
+    let s = TestServer::start().await;
+    let f = reader_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let cases = [
+        (
+            rust_oidc::auth_api::AUTH_API_APP_ID,
+            "Built-in API",
+            "Auth API",
+            "api://auth-api",
+        ),
+        (
+            rust_oidc::scopes::GRAPH_APP_ID,
+            "Built-in API",
+            "Microsoft Graph",
+            "UserInfo",
+        ),
+        (
+            rust_oidc::auth_api::AuthApiPermission::CredentialsVerify.id(),
+            "Built-in permission",
+            "Credentials.Verify",
+            "Auth API",
+        ),
+    ];
+    for (id, kind, name, detail) in cases {
+        let page = b.get(&find(&s, id)).await;
+        assert_eq!(page.status, 200);
+        for want in [kind, name, detail, "Every tenant"] {
+            assert!(page.body.contains(want), "{id}: {want} in {}", page.body);
+        }
+        // Upper case is the same id.
+        assert!(b.get(&find(&s, &id.to_uppercase())).await.body.contains(name));
+    }
+}
+
+/// A token issued for the Auth API is recorded with the API as its target, and
+/// the audit page names it rather than printing the id.
+#[tokio::test]
+async fn the_audit_log_names_the_auth_api() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let (status, body) = s
+        .client_credentials(&f.tenant.id, &f.web, "api://auth-api/.default")
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let b = signed_in_admin(&s, &f).await;
+    let page = b.get(&s.url(&format!("/admin/tenants/{}/audit", f.tenant.id))).await;
+    assert!(page.body.contains("Auth API (built-in)"), "{}", page.body);
+    assert!(
+        page.body
+            .contains(&format!(r#"title="{}""#, rust_oidc::auth_api::AUTH_API_APP_ID)),
+        "the id stays as the tooltip: {}",
+        page.body
+    );
+}

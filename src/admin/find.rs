@@ -39,6 +39,11 @@ pub enum Kind {
     ServicePrincipal,
     AppRole,
     Scope,
+    /// An API built into rust-oidc and present in every tenant: the Auth API,
+    /// Microsoft Graph. Not a registered application, so there is no page.
+    BuiltInApi,
+    /// A permission of a built-in API, as its id appears in `role_ids`.
+    BuiltInPermission,
 }
 
 impl Kind {
@@ -51,6 +56,8 @@ impl Kind {
             Self::ServicePrincipal => "Service principal",
             Self::AppRole => "App role",
             Self::Scope => "Scope",
+            Self::BuiltInApi => "Built-in API",
+            Self::BuiltInPermission => "Built-in permission",
         }
     }
 
@@ -60,7 +67,12 @@ impl Kind {
             Self::Tenant => TENANT_READ,
             Self::User => USER_READ,
             Self::Group => GROUP_READ,
-            Self::Application | Self::ServicePrincipal | Self::AppRole | Self::Scope => APP_READ,
+            Self::Application
+            | Self::ServicePrincipal
+            | Self::AppRole
+            | Self::Scope
+            | Self::BuiltInApi
+            | Self::BuiltInPermission => APP_READ,
         }
     }
 }
@@ -71,7 +83,8 @@ pub struct Found {
     pub name: String,
     /// What else there is to say: whose role it is, which id matched.
     pub detail: String,
-    pub tenant: Tenant,
+    /// Its tenant. `None` for a built-in, which is in every tenant.
+    pub tenant: Option<Tenant>,
     /// Its page in the console, where it has one. A deleted object has none.
     pub href: Option<String>,
     /// When it was deleted, for one that was.
@@ -84,6 +97,11 @@ pub async fn lookup(st: &AppState, ctx: &AdminContext, id: &str) -> Vec<Found> {
     let id = crate::util::fold(id);
     if id.is_empty() {
         return Vec::new();
+    }
+    // The built-in ids are the same in every deployment and name no row:
+    // anyone who may use the console may know what they are.
+    if let Some(builtin) = built_in(&id) {
+        return vec![builtin];
     }
     let base = st.public_url.base();
     let pool = &st.pool;
@@ -235,13 +253,59 @@ pub async fn lookup(st: &AppState, ctx: &AdminContext, id: &str) -> Vec<Found> {
             kind,
             name,
             detail,
-            tenant: t,
+            tenant: Some(t),
             href,
             deleted_at,
         });
     }
     found
 }
+
+/// The fixed ids of the built-in APIs and their permissions, which appear in
+/// tokens and the audit log but name no row of any tenant.
+fn built_in(id: &str) -> Option<Found> {
+    use crate::auth_api::{AUTH_API_APP_ID, AUTH_API_IDENTIFIER_URI, AUTH_API_NAME, AuthApiPermission};
+    let api = |name: &str, detail: String| Found {
+        kind: Kind::BuiltInApi,
+        name: name.to_string(),
+        detail,
+        tenant: None,
+        href: None,
+        deleted_at: None,
+    };
+    if id.eq_ignore_ascii_case(AUTH_API_APP_ID) {
+        return Some(api(
+            AUTH_API_NAME,
+            format!(
+                "built into rust-oidc, the same in every tenant; also named {AUTH_API_IDENTIFIER_URI}. \
+                 Applications are granted its permissions on their API permissions page \
+                 (see \"Legacy application integration\" in the README)"
+            ),
+        ));
+    }
+    if id.eq_ignore_ascii_case(crate::scopes::GRAPH_APP_ID) {
+        return Some(api(
+            GRAPH_NAME,
+            "built in, as in Entra: the audience of tokens issued without naming an API, \
+             which the UserInfo endpoint accepts"
+                .to_string(),
+        ));
+    }
+    AuthApiPermission::ALL
+        .iter()
+        .find(|p| id.eq_ignore_ascii_case(p.id()))
+        .map(|p| Found {
+            kind: Kind::BuiltInPermission,
+            name: p.as_str().to_string(),
+            detail: format!("an application permission of the built-in {AUTH_API_NAME}"),
+            tenant: None,
+            href: None,
+            deleted_at: None,
+        })
+}
+
+/// What the console calls Microsoft Graph's built-in id.
+const GRAPH_NAME: &str = "Microsoft Graph";
 
 /// A short name for an id, for pages that would otherwise print the id alone:
 /// "alice@contoso.com" for a user, "orders-api (application)" for an app. `None`
@@ -250,6 +314,8 @@ pub async fn label(st: &AppState, ctx: &AdminContext, id: &str) -> Option<String
     let first = lookup(st, ctx, id).await.into_iter().next()?;
     let deleted = if first.deleted_at.is_some() { ", deleted" } else { "" };
     Some(match first.kind {
+        Kind::BuiltInApi => format!("{} (built-in)", first.name),
+        Kind::BuiltInPermission => format!("{} (built-in permission)", first.name),
         Kind::User if deleted.is_empty() => first.name,
         Kind::User => format!("{} (deleted)", first.name),
         kind => format!("{} ({}{deleted})", first.name, kind.label().to_lowercase()),
@@ -388,13 +454,13 @@ async fn render(st: &AppState, ctx: &AdminContext, id: &str, error: Option<&str>
                             ),
                             // Only a user comes back, and only for whoever could
                             // delete them in the first place.
-                            if f.kind == Kind::User && ctx.can_in(USER_WRITE, &f.tenant) {
+                            if let Some(tenant) = f.tenant.as_ref().filter(|t| f.kind == Kind::User && ctx.can_in(USER_WRITE, t)) {
                                 format!(
                                     r#"<form method="post" action="{url}" class="inline">{csrf}<input type="hidden" name="{ID_PARAM}" value="{id}"><input type="hidden" name="{TENANT_FIELD}" value="{tid}"><button class="secondary" type="submit" name="{OP_FIELD}" value="{op}">Restore</button></form>"#,
                                     url = e(&find_url(base)),
                                     csrf = view::csrf_input(&ctx.csrf),
                                     id = e(id),
-                                    tid = e(&f.tenant.id),
+                                    tid = e(&tenant.id),
                                     op = FindOp::Restore.as_str(),
                                 )
                             } else {
@@ -405,7 +471,7 @@ async fn render(st: &AppState, ctx: &AdminContext, id: &str, error: Option<&str>
                     format!(
                         "<tr><td>{kind}</td><td>{name}{state}</td><td>{tenant}</td><td class=\"muted\">{detail}</td><td>{restore}</td></tr>",
                         kind = e(f.kind.label()),
-                        tenant = e(&f.tenant.name),
+                        tenant = f.tenant.as_ref().map_or_else(|| "Every tenant".to_string(), |t| e(&t.name)),
                         detail = e(&f.detail),
                     )
                 })

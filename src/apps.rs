@@ -204,6 +204,9 @@ pub(crate) async fn add_identifier_uri_in(
     uri: &str,
 ) -> anyhow::Result<()> {
     url::Url::parse(uri).with_context(|| format!("identifier URI '{uri}' is not a valid URI"))?;
+    if crate::auth_api::is_reserved_identifier_uri(uri) {
+        bail!("identifier URI '{uri}' is reserved for the built-in Auth API");
+    }
     // Looked for first, so a duplicate is refused by name rather than as a broken
     // constraint (which would abort a larger transaction on Postgres).
     let taken: Option<(String,)> = sqlx::query_as(crate::db::qc(

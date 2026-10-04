@@ -20,7 +20,7 @@ KEY="key.pem"                                  # private key for cert.pem
 CERT="cert.pem"
 # -----------------------
 
-AUTH_API="3bc73980-9fde-4fa7-9f74-9d421f0a127d"   # the built-in Auth API's app id
+AUTH_API="api://auth-api"   # the built-in Auth API (or its app id, 3bc73980-9fde-4fa7-9f74-9d421f0a127d)
 
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 

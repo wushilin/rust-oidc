@@ -1417,3 +1417,12 @@ the same answer. Decided here:
 - **Own-tenant users only**, for now.
 *To reverse:* drop the route, the token endpoint's Auth API branch, and migration
 0019's table stays unused.
+
+**41. The Auth API is also `api://auth-api`, and the name is reserved** (agreed with
+the owner, 2026-10-04). Like Graph (`https://graph.microsoft.com` beside its GUID), a
+client may name it either way in `scope`; the token's audience is always the app id.
+Both names are fixed and published: a test pins them, because changing either breaks
+every integration. No application may register `api://auth-api` as an identifier URI
+(refused in `apps::add_identifier_uri_in`), and the token endpoint checks for the
+Auth API before any registered application, so the name always means the built-in
+API.

@@ -521,3 +521,44 @@ async fn the_console_grants_it_on_the_api_permissions_page() {
     );
     assert!(b.get(&url).await.body.contains("Granted"));
 }
+
+/// The readable name works like the id, and the token's audience is the id
+/// either way, as a Graph token's is whichever name was asked for.
+#[tokio::test]
+async fn the_api_can_be_named_api_auth_api() {
+    let w = world().await;
+    let (status, body) =
+        w.s.client_credentials(&w.tid(), &w.f.web, "api://auth-api/.default")
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let token = body["access_token"].as_str().unwrap().to_string();
+    let claims = decode_unverified(&token);
+    assert_eq!(claims["aud"], AUTH_API_APP_ID);
+    assert!(
+        claims["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "Credentials.Verify")
+    );
+    let (_, answer) = w.check(&token, &w.f.upn, &w.f.password, &w.code()).await;
+    assert!(answer.contains(r#""result":true"#), "{answer}");
+}
+
+/// No application can take the Auth API's name.
+#[tokio::test]
+async fn no_application_may_register_the_auth_api_name() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    for uri in ["api://auth-api", "API://Auth-API/"] {
+        let add = rust_oidc::txn::ops::apps::AddIdentifierUri {
+            tenant_id: f.tenant.id.clone(),
+            app_id: f.api.app_id.clone(),
+            uri: uri.into(),
+        };
+        match txn::run(&s.pool, &Actor::Cli, &add).await {
+            Outcome::Refused(Refusal::Invalid(m)) => assert!(m.contains("reserved"), "{m}"),
+            other => panic!("{uri}: {:?}", other.map_done()),
+        }
+    }
+}

@@ -1451,7 +1451,7 @@ fn api_permissions_section(
     held: &[crate::auth_api::AuthApiPermission],
     may_assign: bool,
 ) -> String {
-    use crate::auth_api::{AUTH_API_APP_ID, AUTH_API_NAME, AuthApiPermission};
+    use crate::auth_api::{AUTH_API_APP_ID, AUTH_API_IDENTIFIER_URI, AUTH_API_NAME, AuthApiPermission};
     let rows: String = AuthApiPermission::ALL
         .iter()
         .map(|p| {
@@ -1486,11 +1486,13 @@ fn api_permissions_section(
 {name}, granted by an administrator. The application uses them with its own credentials: no user consents.</p>
 <table><tr><th>Permission</th><th>What it allows</th><th>Status</th><th></th></tr>{rows}</table>
 <h3>Using it</h3>
-<p>Get a token with the client credentials grant, <code>scope={api}/.default</code>, then send each check
+<p>Get a token with the client credentials grant, <code>scope={uri}/.default</code> (or by its id,
+<code>{api}/.default</code>), then send each check
 to <code>POST {endpoint}</code> with <code>Authorization: Bearer &lt;token&gt;</code> and a JSON body
 <code>{{"upn": "…", "password": "…", "otp": "…"}}</code>. Only users assigned to this application, with an
 authenticator set up, can be checked.</p>"#,
         name = e(AUTH_API_NAME),
+        uri = e(AUTH_API_IDENTIFIER_URI),
         api = e(AUTH_API_APP_ID),
         endpoint = e(&format!("{base}/{}/api/v1/authenticate", tenant.id)),
     )

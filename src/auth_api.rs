@@ -18,9 +18,16 @@
 use crate::db::Handle;
 use crate::util::now;
 
-/// The Auth API's app id: the audience of its tokens and the resource a client
-/// asks for. Fixed, like Microsoft Graph's `00000003-0000-0000-c000-000000000000`.
+/// The Auth API's app id: the audience of its tokens, and one of the two names a
+/// client may ask for it by. Fixed and published, the same in every deployment,
+/// like Microsoft Graph's `00000003-0000-0000-c000-000000000000`: it must never
+/// change, or every integration breaks.
 pub const AUTH_API_APP_ID: &str = "3bc73980-9fde-4fa7-9f74-9d421f0a127d";
+
+/// The Auth API's readable name, as Graph is also `https://graph.microsoft.com`:
+/// `scope=api://auth-api/.default`. Reserved: no application may register it as
+/// an identifier URI ([`is_reserved_identifier_uri`]). Fixed like the app id.
+pub const AUTH_API_IDENTIFIER_URI: &str = "api://auth-api";
 
 /// What the console calls it.
 pub const AUTH_API_NAME: &str = "Auth API";
@@ -73,9 +80,17 @@ impl AuthApiPermission {
     }
 }
 
-/// Whether a scope's resource names the Auth API.
+/// Whether a scope's resource names the Auth API, by its app id or its
+/// identifier URI.
 pub fn is_resource(resource: &str) -> bool {
-    resource.trim_end_matches('/').eq_ignore_ascii_case(AUTH_API_APP_ID)
+    let resource = resource.trim_end_matches('/');
+    resource.eq_ignore_ascii_case(AUTH_API_APP_ID) || resource.eq_ignore_ascii_case(AUTH_API_IDENTIFIER_URI)
+}
+
+/// Whether an identifier URI is the Auth API's, which no application may take:
+/// a scope naming it must always mean the built-in API.
+pub fn is_reserved_identifier_uri(uri: &str) -> bool {
+    uri.trim_end_matches('/').eq_ignore_ascii_case(AUTH_API_IDENTIFIER_URI)
 }
 
 /// The Auth API permissions granted to a client service principal.
@@ -165,9 +180,24 @@ mod tests {
     }
 
     #[test]
-    fn the_resource_is_named_by_its_app_id() {
+    fn the_resource_is_named_by_its_app_id_or_its_identifier_uri() {
         assert!(is_resource(AUTH_API_APP_ID));
         assert!(is_resource(&AUTH_API_APP_ID.to_uppercase()));
+        assert!(is_resource("api://auth-api"));
+        assert!(is_resource("API://Auth-API/"));
+        assert!(!is_resource("api://auth-api-2"));
         assert!(!is_resource(crate::scopes::GRAPH_APP_ID));
+    }
+
+    /// The published names: changing either breaks every integration.
+    #[test]
+    fn the_published_names_do_not_change() {
+        assert_eq!(AUTH_API_APP_ID, "3bc73980-9fde-4fa7-9f74-9d421f0a127d");
+        assert_eq!(AUTH_API_IDENTIFIER_URI, "api://auth-api");
+        assert_eq!(AuthApiPermission::CredentialsVerify.as_str(), "Credentials.Verify");
+        assert_eq!(
+            AuthApiPermission::CredentialsVerify.id(),
+            "91a71692-0c7d-4a42-a890-e8b231028a6e"
+        );
     }
 }

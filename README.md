@@ -198,7 +198,7 @@ for the Auth API; reuse it until it expires (about an hour):
 POST {base}/{tenant}/oauth2/v2.0/token
 grant_type=client_credentials
 client_id=<application id>
-scope=3bc73980-9fde-4fa7-9f74-9d421f0a127d/.default
+scope=api://auth-api/.default
 client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer
 client_assertion=<JWT signed with key.pem: aud = the token endpoint, iss = sub = the application id, a unique jti, exp within 10 minutes, x5t = base64url SHA-1 of the certificate>
 ```
@@ -213,7 +213,15 @@ Content-Type: application/json
 {"upn": "alice@contoso.com", "password": "...", "otp": "123456"}
 ```
 
-`{tenant}` is the application's tenant, by domain or id. A complete, working shell
+`{tenant}` is the application's tenant, by domain or id.
+
+The Auth API has two fixed names, the same in every deployment and never changing:
+**`api://auth-api`** and its app id **`3bc73980-9fde-4fa7-9f74-9d421f0a127d`**, as
+Microsoft Graph is both `https://graph.microsoft.com` and
+`00000003-0000-0000-c000-000000000000`. Either works in `scope`; the token's `aud` is
+always the app id. No application can register `api://auth-api` as its own
+identifier URI. A token for any other API is refused (`401`), and the client
+credentials grant accepts only a `/.default` scope. A complete, working shell
 client is in [`examples/auth-api/check-login.sh`](examples/auth-api/check-login.sh):
 it builds the certificate assertion with `openssl`, gets the token, asks for a login
 and exits 0 on success, 1 otherwise, which is the decision a PAM module acts on.

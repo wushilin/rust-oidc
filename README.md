@@ -5,6 +5,30 @@ the same endpoint layout, token claims, error format and client-secret semantics
 written for Entra should work with configuration changes only. Storage is SQLite by default (PostgreSQL and MySQL are also supported, see [docs/databases.md](docs/databases.md)), and
 tenants (realms) are built in.
 
+# Screenshots
+## Multi tenant
+
+<img width="1728" height="427" alt="image" src="https://github.com/user-attachments/assets/101991e9-d348-44d3-90cf-761404601aff" />
+
+## User, group, application support
+
+<img width="1728" height="464" alt="image" src="https://github.com/user-attachments/assets/982e0379-4c76-466d-8f81-187153cac7ae" />
+
+## Rich app support
+
+<img width="1728" height="642" alt="image" src="https://github.com/user-attachments/assets/9943a2c0-5f4e-41fb-a344-9608835149ca" />
+
+## PAM for linux support for MFA
+
+<img width="893" height="126" alt="image" src="https://github.com/user-attachments/assets/c98d43aa-71c8-4675-8969-3b9569c3a709" />
+
+## And full audit log
+
+<img width="1728" height="872" alt="image" src="https://github.com/user-attachments/assets/f63658d6-b17a-4932-af8e-3a1fcb59308e" />
+
+
+
+
 **Status: phase 5.** Done:
 - Tenants, app registrations, service principals, app roles and signing keys.
 - Service-account tokens (`client_credentials`).

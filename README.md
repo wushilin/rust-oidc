@@ -137,6 +137,13 @@ right, and on success who the user is: profile, groups and roles.
 This is an extension; Entra has no such API (its answer is RADIUS through the NPS
 extension). See decision 40 in `docs/decisions-log.md`.
 
+**Linux login:** [pam-rust-oidc](https://github.com/wushilin/pam-rust-oidc) is a PAM
+module built on this API. SSH (or any PAM service) asks for the password and
+authenticator code, and the module checks them with `Credentials.Verify`; it maps
+the short Unix user name to the user's UPN, can create accounts at first login,
+and leaves local and system accounts to `pam_unix`. Its README covers sshd, sudo,
+SELinux and AppArmor, and keeping a break-glass local account.
+
 **Prefer a real OAuth flow where you can.** With the Auth API the integrating host
 sees the user's password, so a compromised host can capture it. Where the prompt can
 show a URL and a code, the device code flow (`/oauth2/v2.0/devicecode`) signs the user
@@ -221,8 +228,10 @@ Microsoft Graph is both `https://graph.microsoft.com` and
 `00000003-0000-0000-c000-000000000000`. Either works in `scope`; the token's `aud` is
 always the app id. No application can register `api://auth-api` as its own
 identifier URI. A token for any other API is refused (`401`), and the client
-credentials grant accepts only a `/.default` scope. A complete, working shell
-client is in [`examples/auth-api/check-login.sh`](examples/auth-api/check-login.sh):
+credentials grant accepts only a `/.default` scope. For Linux logins, use
+[pam-rust-oidc](https://github.com/wushilin/pam-rust-oidc) rather than writing your
+own. A complete, working shell client is in
+[`examples/auth-api/check-login.sh`](examples/auth-api/check-login.sh):
 it builds the certificate assertion with `openssl`, gets the token, asks for a login
 and exits 0 on success, 1 otherwise, which is the decision a PAM module acts on.
 

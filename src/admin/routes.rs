@@ -774,28 +774,57 @@ async fn sign_in_failed(st: &AppState, home: &Tenant, upn: &str, result: &AuthRe
     }
 }
 
-async fn signout(ctx: AdminContext, State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+/// Sign out of the console.
+///
+/// Needs only the session and the form's CSRF token, never the administrator's
+/// roles: someone signed in without any role is shown "No access" with this
+/// button, and loading the full console context would answer "No access" again
+/// instead of signing them out.
+async fn signout(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let form = parse_form(&body);
-    if let Err(resp) = ctx.check_csrf(&form) {
-        return resp;
+    let back = || {
+        let mut resp = view::see_other(&format!("{}/admin", st.public_url.base()));
+        resp.headers_mut()
+            .append(header::SET_COOKIE, session::clear_cookie(&st.public_url));
+        resp
+    };
+    // No session cookie: already signed out.
+    let Some(cookie) = crate::session::cookie(&headers, session::ADMIN_COOKIE) else {
+        return back();
+    };
+    // The token is derived from the cookie, so it is checked without loading who
+    // is signed in. Another site cannot sign anyone out.
+    let submitted = form.get(session::CSRF_FIELD).map(String::as_str).unwrap_or_default();
+    if !crate::util::ct_eq(submitted, &session::csrf_for(&cookie)) {
+        return view::bad_request(
+            "That form was stale or did not come from the console. Reload the page and try again.",
+        );
     }
-    audited(
-        &st,
-        &ctx,
-        &ctx.home_tenant.id,
-        Event::AdminSignOut,
-        Some(&ctx.user.id),
-        json!({}),
-    )
-    .await;
+    match session::find(&st.pool, &headers).await {
+        Ok(Some(sess)) => {
+            if let Ok(Some(home)) = tenant::resolve(&st.pool, &sess.home_tenant).await {
+                audit::record(
+                    &st,
+                    &home.id,
+                    Actor::Id(&sess.user_id),
+                    Event::AdminSignOut,
+                    Some(&sess.user_id),
+                    json!({}),
+                )
+                .await;
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("console sign-out lookup failed: {e}");
+            return view::server_error();
+        }
+    }
     if let Err(e) = session::end(&st.pool, &headers).await {
         tracing::error!("console sign-out failed: {e}");
         return view::server_error();
     }
-    let mut resp = view::see_other(&format!("{}/admin", st.public_url.base()));
-    resp.headers_mut()
-        .append(header::SET_COOKIE, session::clear_cookie(&st.public_url));
-    resp
+    back()
 }
 
 // ---- who the administrators are ----

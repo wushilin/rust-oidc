@@ -263,3 +263,42 @@ async fn a_spent_nonce_cannot_be_replayed() {
         replay.body
     );
 }
+
+/// Someone signed in without any administrative role sees "No access" with a
+/// Sign out button, and it must work: the session ends and the sign-in form
+/// comes back. It used to answer "No access" again and leave them signed in.
+#[tokio::test]
+async fn a_user_with_no_bindings_can_sign_out() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let page = b.get(&s.url("/admin/tenants")).await;
+    assert_eq!(page.status, 403);
+    assert!(page.body.to_lowercase().contains("no access"), "{}", page.body);
+
+    let out = b.post(&s.url("/admin/signout"), &[]).await;
+    assert_eq!(out.status, 303, "{}", out.body);
+    // Signed out: the same page now sends them to sign in, not to No access.
+    let after = b.get(&s.url("/admin/tenants")).await;
+    assert_eq!(after.status, 303, "{}", after.body);
+    assert!(
+        after.location.as_deref().is_some_and(|l| l.ends_with("/admin")),
+        "{:?}",
+        after.location
+    );
+    assert!(b.get(&s.url("/admin")).await.body.contains(r#"name="password""#));
+    let rows = audit_rows(&s, Event::AdminSignOut.as_str()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, f.user_id);
+}
+
+/// Sign-out still needs the form's CSRF token: another site cannot sign you out.
+#[tokio::test]
+async fn sign_out_without_the_csrf_token_is_refused() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let forged = b.b.post_form(&s.url("/admin/signout"), &[("csrf", "forged")]).await;
+    assert_eq!(forged.status, 400, "{}", forged.body);
+    assert_eq!(b.get(&s.url("/admin/tenants")).await.status, 200, "still signed in");
+}

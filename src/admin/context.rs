@@ -19,8 +19,6 @@
 
 // Refusal pages travel in `Err`, the way the sign-in flow already does it;
 // boxing them buys nothing here.
-#![allow(clippy::result_large_err)]
-
 use std::collections::HashMap;
 
 use axum::extract::{FromRequestParts, RawPathParams};

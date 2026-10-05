@@ -12,6 +12,8 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs these same checks before it builds anything.
+  workflow_call:
 
 permissions:
   contents: read
@@ -31,8 +33,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, so a new Rust release cannot turn CI red overnight with lints the
+      # code has never met (1.99's clippy did exactly that). Raise it on purpose:
+      # update the version here, run `cargo clippy --all-targets` on it, fix what
+      # it finds, commit both together.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Formatting

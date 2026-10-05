@@ -4,9 +4,6 @@
 //! redirect URI are shown on an error page (never redirected, to avoid open
 //! redirects); everything after that is reported to the client's redirect URI.
 
-// Pages (login form, error page) travel in `Err`; boxing them buys nothing here.
-#![allow(clippy::result_large_err)]
-
 use std::collections::HashMap;
 
 use axum::body::Bytes;

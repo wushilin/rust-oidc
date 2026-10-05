@@ -10,6 +10,10 @@
 # they are fully static and run on any distribution, old or new. FreeBSD has no hosted runners:
 # it builds inside a FreeBSD virtual machine, the arm64 one under emulation,
 # which is why that job is by far the slowest.
+#
+# Nothing is built until the tagged commit passes the same checks as every push
+# (formatting, clippy, the SQLite suite: test.yml). A tag on a commit that fails
+# them publishes nothing.
 
 name: release
 
@@ -26,7 +30,11 @@ env:
   BIN: rust-oidc
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: test
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -97,6 +105,7 @@ jobs:
           if-no-files-found: error
 
   freebsd:
+    needs: test
     name: freebsd-${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 300

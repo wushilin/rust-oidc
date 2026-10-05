@@ -1,3 +1,8 @@
+// Handlers return `Result<_, Response>`, axum's idiom for answering early. A
+// `Response` is about 128 bytes, which clippy (from 1.99) calls a large error
+// variant; boxing every early answer would cost clarity for nothing measurable.
+#![allow(clippy::result_large_err)]
+
 pub mod access;
 pub mod admin;
 pub mod apps;

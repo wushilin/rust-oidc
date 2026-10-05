@@ -29,18 +29,35 @@ tenants (realms) are built in.
 
 
 
-**Status: phase 5.** Done:
-- Tenants, app registrations, service principals, app roles and signing keys.
-- Service-account tokens (`client_credentials`).
-- Interactive sign-in: authorize and login page, auth code + PKCE, ID tokens, refresh
-  tokens, UserInfo and logout.
-- Implicit and hybrid response types, the device authorization grant, on-behalf-of,
-  certificate client authentication (`private_key_jwt`), rate limiting and an audit trail.
-- The **admin console** (web UI at `/rust-oidc/admin`), covering tenants, users, groups,
-  applications, assignments, console roles, tenant settings, signing keys and the audit
-  log.
+**Status:** complete for its scope (v0.3.x) and in use. What it does:
 
-TOTP MFA does not exist, and is the one administrative area with no page.
+- **Protocol (as in Entra v2.0):** authorization code with PKCE, implicit and hybrid
+  response types, client credentials (client secret or certificate,
+  `private_key_jwt`), rotating refresh tokens, the device authorization grant, the
+  password grant (off unless enabled per app) and on-behalf-of; discovery, JWKS,
+  UserInfo and logout; `prompt`, `max_age`, `login_hint`, and `acr` / `acr_values`
+  step-up to MFA. Entra's AADSTS error codes throughout.
+- **Directory:** tenants (one verified domain each), users, groups, app
+  registrations with redirect URIs, secrets, certificates, exposed scopes and app
+  roles; user and group assignments, application permissions, and sign-in to other
+  tenants' applications with controls on both sides.
+- **Security:** TOTP MFA with recovery codes, required per tenant, per application
+  or per user, set up at sign-in; smart lockout, password history, forced password
+  change, rate limiting, and a full audit log.
+- **Admin console** (`/rust-oidc/admin`, no JavaScript): tenants, users, groups,
+  applications, assignments, nine console roles, tenant settings, signing keys, the
+  audit log, Find by id, a flow tester and "Check sign-in". **My Account** for users:
+  profile, password, authenticator and recovery codes.
+- **Every administrative change is a transaction:** checked, applied and audited
+  together, or not at all (console, My Account and CLI alike).
+- **Legacy integration:** the [Auth API](#legacy-application-integration-the-auth-api)
+  checks a password and authenticator code for login prompts that cannot run a
+  browser flow, e.g. Linux PAM with [pam-rust-oidc](https://github.com/wushilin/pam-rust-oidc).
+- **Operations:** SQLite, PostgreSQL or MySQL; a TOML configuration file; static
+  binaries for Linux, macOS, Windows and FreeBSD on amd64 and arm64.
+
+Not supported: JWT request objects (Entra does not support them either), sign-in
+through external identity providers, SCIM provisioning, and passkeys.
 
 ## Quick start
 

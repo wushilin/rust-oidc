@@ -6,6 +6,12 @@ written for Entra should work with configuration changes only. Storage is SQLite
 tenants (realms) are built in.
 
 # Screenshots
+## Extemely resource light
+
+ProcessMaster (https://github.com/wushilin/processmaster) shows it uses only 20MiB
+<img width="786" height="770" alt="image" src="https://github.com/user-attachments/assets/ef89d7e6-6baf-4aff-96dc-8fb9c6976ee6" />
+
+
 ## Multi tenant
 
 <img width="1728" height="427" alt="image" src="https://github.com/user-attachments/assets/101991e9-d348-44d3-90cf-761404601aff" />

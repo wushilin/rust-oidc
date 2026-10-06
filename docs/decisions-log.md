@@ -1426,3 +1426,15 @@ every integration. No application may register `api://auth-api` as an identifier
 (refused in `apps::add_identifier_uri_in`), and the token endpoint checks for the
 Auth API before any registered application, so the name always means the built-in
 API.
+
+**42. The public URL's own path is a front door to My Account** (2026-10-06; the owner
+asked for a UPN-and-password page there). `GET /rust-oidc` (and `/rust-oidc/`) shows
+the usual sign-in form with no tenant named. `POST` resolves the tenant owning the
+UPN's suffix and answers `307` to that tenant's `/{tid}/myaccount`, so the browser
+re-posts the same form there: the password, second factor, forced change, lockout,
+throttling and audit stay My Account's, done in one place. The front door itself
+checks and writes nothing. A suffix no tenant owns gets My Account's own wrong-password
+words (AADSTS50126), not a separate "no such tenant", and no audit row (no tenant to
+attribute it to). `/admin/` answers `308` to `/admin`. Entra's equivalent
+(myaccount.microsoft.com) also discovers the home tenant from the username.
+*To reverse:* drop `src/routes/front_door.rs` and its routes.

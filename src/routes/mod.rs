@@ -3,6 +3,7 @@ pub mod auth_api;
 mod authorize;
 mod device;
 pub mod discovery;
+mod front_door;
 mod logout;
 mod myaccount;
 mod token;
@@ -56,6 +57,8 @@ pub fn router(state: AppState) -> Router {
         .route("/{tenant}/myaccount", get(myaccount::page).post(myaccount::post))
         .route("/{tenant}/api/v1/authenticate", post(auth_api::authenticate))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/", get(front_door::page).post(front_door::post))
+        .route("/admin/", get(front_door::admin_slash))
         // The admin console. Mounted here so it sits under the public URL's path
         // prefix like every other route.
         .merge(crate::admin::routes::router())
@@ -65,7 +68,12 @@ pub fn router(state: AppState) -> Router {
     let app = if prefix.is_empty() {
         routes
     } else {
-        Router::new().nest(prefix, routes)
+        // A nested `/` answers the prefix itself; its trailing-slash twin is
+        // the front door too.
+        Router::new()
+            .route(&format!("{prefix}/"), get(front_door::page).post(front_door::post))
+            .with_state(state.clone())
+            .nest(prefix, routes)
     };
     app.layer(TraceLayer::new_for_http())
 }

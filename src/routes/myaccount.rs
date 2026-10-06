@@ -75,7 +75,7 @@ fn with_csrf(mut resp: Response, st: &AppState, csrf: &str) -> Response {
 fn login_page(st: &AppState, tenant: &Tenant, upn: &str, error: Option<&str>) -> Response {
     let csrf = session::new_token();
     let resp = html::login(&html::LoginForm {
-        tenant_name: &tenant.name,
+        tenant_name: Some(&tenant.name),
         client_name: "My account",
         action: &url(st, tenant),
         csrf: &csrf,

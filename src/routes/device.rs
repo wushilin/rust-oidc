@@ -657,7 +657,7 @@ async fn second_step(
 fn login_page(st: &AppState, tenant: &Tenant, pending: &Pending, upn: &str, error: Option<&str>) -> Response {
     let csrf = session::new_token();
     let mut resp = html::login(&html::LoginForm {
-        tenant_name: &tenant.name,
+        tenant_name: Some(&tenant.name),
         client_name: &pending.client.display_name,
         action: &deviceauth_url(st, &tenant.id),
         csrf: &csrf,

@@ -786,7 +786,7 @@ fn form_action(st: &AppState, v: &Validated) -> String {
 fn login_page(st: &AppState, v: &Validated, request: &str, upn: &str, error: Option<&str>) -> Response {
     let csrf = session::new_token();
     let mut resp = html::login(&html::LoginForm {
-        tenant_name: &v.tenant.name,
+        tenant_name: Some(&v.tenant.name),
         client_name: &v.client.display_name,
         action: &form_action(st, v),
         csrf: &csrf,

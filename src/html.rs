@@ -89,7 +89,9 @@ const CSP_DEFAULT: &str =
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 pub struct LoginForm<'a> {
-    pub tenant_name: &'a str,
+    /// The tenant signed in to; none on the server's front door, where the
+    /// tenant is not known until the UPN is.
+    pub tenant_name: Option<&'a str>,
     pub client_name: &'a str,
     pub action: &'a str,
     pub csrf: &'a str,
@@ -124,7 +126,7 @@ pub fn login(f: &LoginForm) -> Response {
     } else {
         StatusCode::OK
     };
-    respond(status, page("Sign in", Some(f.tenant_name), &body), CSP_DEFAULT)
+    respond(status, page("Sign in", f.tenant_name, &body), CSP_DEFAULT)
 }
 
 /// What a sign-in page's form asks the login endpoint to do, carried in `op`.

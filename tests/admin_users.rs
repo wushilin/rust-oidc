@@ -308,10 +308,10 @@ async fn resetting_a_password_revokes_sessions_and_refresh_tokens() {
     rust_oidc::session::create(
         &s.pool,
         &axum::http::HeaderMap::new(),
-        &f.tenant.id,
+        &f.tenant,
         &f.user_id,
         &["pwd"],
-        3600,
+        rust_oidc::session::KeepSignedIn::No,
     )
     .await
     .unwrap();

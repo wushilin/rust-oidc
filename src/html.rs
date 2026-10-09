@@ -37,6 +37,9 @@ button { font:inherit; padding:9px 18px; border-radius:4px; border:1px solid var
 button.link { background:none; border:none; color:var(--accent); padding:0; }
 .actions { display:flex; justify-content:flex-end; align-items:center; gap:16px; margin-top:24px; }
 .error { color:var(--err); margin:12px 0 0; font-size:14px; }
+label.check { display:flex; align-items:flex-start; gap:8px; font-size:14px; margin:18px 0 0; }
+label.check input { margin:3px 0 0; }
+p.hint { color:var(--muted); font-size:13px; margin:4px 0 0 24px; }
 .account { display:flex; justify-content:space-between; align-items:center; width:100%; text-align:left; background:none; color:var(--fg); border:1px solid var(--border); padding:12px 14px; margin:8px 0; }
 ul.consent { list-style:none; padding:0; margin:12px 0; }
 ul.consent li { border:1px solid var(--border); padding:10px 14px; margin:8px 0; }
@@ -88,6 +91,38 @@ fn respond(status: StatusCode, html: String, csp: &str) -> Response {
 const CSP_DEFAULT: &str =
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
+/// The sign-in form's "Keep me signed in" box.
+pub const KEEP_SIGNED_IN: &str = "keep_signed_in";
+/// The second step's "Don't ask again on this device" box.
+pub const REMEMBER_DEVICE: &str = "remember_device";
+/// What a ticked box posts.
+const TICKED: &str = "1";
+
+/// Whether a box was ticked on the posted form.
+pub fn ticked(form: &std::collections::HashMap<String, String>, name: &str) -> bool {
+    form.get(name).is_some_and(|v| v == TICKED)
+}
+
+const SECS_PER_DAY: i64 = 86_400;
+
+/// "Keep me signed in", where the tenant offers it.
+fn keep_signed_in_box() -> String {
+    let days = crate::tenant::TenantSettings::KEEP_SIGNED_IN_SECS / SECS_PER_DAY;
+    format!(
+        r#"<label class="check"><input type="checkbox" name="{KEEP_SIGNED_IN}" value="{TICKED}"> Keep me signed in</label>
+<p class="hint">For {days} days on this browser. Don't tick this on a shared computer.</p>"#
+    )
+}
+
+/// "Don't ask again on this device", where the account's tenant offers it.
+fn remember_device_box() -> String {
+    let days = crate::tenant::TenantSettings::REMEMBER_MFA_SECS / SECS_PER_DAY;
+    format!(
+        r#"<label class="check"><input type="checkbox" name="{REMEMBER_DEVICE}" value="{TICKED}"> Don't ask again on this device for {days} days</label>
+<p class="hint">You'll still need your password. Applications that ask for a fresh sign-in will ask for a code too.</p>"#
+    )
+}
+
 pub struct LoginForm<'a> {
     /// The tenant signed in to; none on the server's front door, where the
     /// tenant is not known until the UPN is.
@@ -98,6 +133,8 @@ pub struct LoginForm<'a> {
     pub request: &'a str,
     pub upn: &'a str,
     pub error: Option<&'a str>,
+    /// Show "Keep me signed in": the tenant offers it.
+    pub offer_keep_signed_in: bool,
 }
 
 pub fn login(f: &LoginForm) -> Response {
@@ -105,6 +142,11 @@ pub fn login(f: &LoginForm) -> Response {
         .error
         .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, escape(e)))
         .unwrap_or_default();
+    let keep = if f.offer_keep_signed_in {
+        keep_signed_in_box()
+    } else {
+        String::new()
+    };
     let autofocus_upn = if f.upn.is_empty() { " autofocus" } else { "" };
     let autofocus_pw = if f.upn.is_empty() { "" } else { " autofocus" };
     let body = format!(
@@ -113,7 +155,7 @@ pub fn login(f: &LoginForm) -> Response {
 <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="request" value="{request}"><input type="hidden" name="op" value="login">
 <label for="upn">Email or username</label><input id="upn" name="upn" type="email" autocomplete="username" required value="{upn}"{autofocus_upn}>
 <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required{autofocus_pw}>
-{error}
+{keep}{error}
 <div class="actions"><button type="submit">Sign in</button></div></form>"#,
         client = escape(f.client_name),
         action = escape(f.action),
@@ -287,6 +329,8 @@ pub struct MfaVerify<'a> {
     pub op: &'a str,
     pub ticket: &'a str,
     pub error: Option<&'a str>,
+    /// Show "Don't ask again on this device": the account's tenant offers it.
+    pub offer_remember_device: bool,
 }
 
 pub fn mfa_verify(p: &MfaVerify) -> Response {
@@ -294,12 +338,17 @@ pub fn mfa_verify(p: &MfaVerify) -> Response {
         .error
         .map(|e| format!(r#"<p class="error" role="alert">{}</p>"#, escape(e)))
         .unwrap_or_default();
+    let remember = if p.offer_remember_device {
+        remember_device_box()
+    } else {
+        String::new()
+    };
     let body = format!(
         r#"<h1>Enter code</h1><p class="sub">{upn}</p>
 <form method="post" action="{action}">{hidden}<input type="hidden" name="{op_field}" value="{op}"><input type="hidden" name="{MFA_TICKET}" value="{ticket}">
 <label for="code">Code from your authenticator app</label><input id="code" name="{MFA_CODE}" type="text" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required autofocus>
 <p class="sub" style="margin-top:8px">Lost your phone? Enter one of your recovery codes instead.</p>
-{error}<div class="actions"><button type="submit">Verify</button></div></form>"#,
+{remember}{error}<div class="actions"><button type="submit">Verify</button></div></form>"#,
         upn = escape(p.upn),
         action = escape(p.action),
         hidden = p.hidden,
@@ -584,7 +633,8 @@ pub fn my_account(p: &MyAccount) -> Response {
 <p class="sub">Ask an administrator to change these.</p>
 <h2>Password</h2>{password}
 <h2>Multi-factor authentication</h2>{mfa}
-<h2>Sessions</h2><p>Sign out of every browser and application you are signed in to, this one included.</p>{everywhere}"#,
+<h2>Sessions</h2><p>Sign out of every browser and application you are signed in to, this one included.
+Browsers you told not to ask for a code again will ask again.</p>{everywhere}"#,
         upn = escape(p.upn),
         name = row("Name", p.display_name),
         given = row("Given name", p.given_name),

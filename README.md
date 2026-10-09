@@ -53,6 +53,10 @@ ProcessMaster (https://github.com/wushilin/processmaster) shows it uses only 20M
 - **Security:** TOTP MFA with recovery codes, required per tenant, per application
   or per user, set up at sign-in; smart lockout, password history, forced password
   change, rate limiting, and a full audit log.
+- **Staying signed in** (each off until a tenant turns it on): "Keep me signed in"
+  (a 30-day session) and "Don't ask again on this device" (skip the MFA code for 30
+  days, never the password). An application's `prompt=login` or `max_age` still
+  gets a fresh sign-in, code included.
 - **Admin console** (`/rust-oidc/admin`, no JavaScript): tenants, users, groups,
   applications, assignments, nine console roles, tenant settings, signing keys, the
   audit log, Find by id, a flow tester and "Check sign-in". **My Account** for users:
@@ -126,7 +130,8 @@ metadata always use the GUID.
 - **`sub` is pairwise** (different for each app). `oid` is the stable user ID.
 - **`client_info`** is returned for MSAL.
 - **Accounts lock** for 60 seconds after 10 failed sign-ins, doubling after each further failure.
-- **A password reset** revokes the user's refresh tokens and sessions.
+- **A password reset** revokes the user's refresh tokens and sessions, and forgets
+  every browser remembered for the user's MFA code.
 - **Throttling:** too many failed client authentications for one app, too many requests
   naming a client id or an account the tenant does not have, or too many device
   authorization requests for one app, get `429` with a `Retry-After` header, as Entra
@@ -388,7 +393,7 @@ all (tenant settings, group membership, audit).
 | `/admin/tenants/{tenant}/apps` | Register; secrets, certificates, redirect URIs per platform, Application ID URIs, exposed scopes, app roles, role assignments, the password-grant and implicit toggles, and which groups tokens carry | `App:Read`, `App:Write`; credentials need `App:Rotate`; assignments need `Assignment:Write` |
 | `/admin/tenants/{tenant}/roles` | Grant and revoke console roles | `RoleBinding:Read`, `RoleBinding:Write` |
 | `/admin/tenants/{tenant}/flow` | Flow tester: what a flow needs configured, then drive it and read the result | `App:Read`; registering the callback or a test client needs `App:Write` |
-| `/admin/tenants/{tenant}/settings` | Token, session and refresh-token lifetimes | `Tenant:Write` |
+| `/admin/tenants/{tenant}/settings` | Token, session and refresh-token lifetimes; who must use MFA; "Keep me signed in" and "Don't ask again on this device" | `Tenant:Write` |
 | `/admin/tenants/{tenant}/audit` | The tenant's audit log, filtered by action and target | `Audit:Read` |
 | `/admin/keys` | Signing keys, rotate and prune | `Key:Read`, `Key:Rotate`, **at `all` scope** |
 | `/admin/bindings` | Every role binding on the deployment, read-only | `RoleBinding:Read` at `all` scope |

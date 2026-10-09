@@ -456,7 +456,9 @@ async fn console_start_mfa(st: &AppState, home: &Tenant, user: &users::User, ste
     } else {
         Purpose::Verify
     };
-    match crate::mfa::begin(&st.pool, &home.id, &user.id, purpose).await {
+    // The console keeps its own short sessions and always asks an administrator
+    // for the code: neither remembering switch applies here.
+    match crate::mfa::begin(&st.pool, &home.id, &user.id, purpose, crate::session::KeepSignedIn::No).await {
         Ok(ticket) => {
             let secret = if purpose == Purpose::Enroll {
                 crate::mfa::pending(&st.pool, &ticket, &home.id)
@@ -517,6 +519,7 @@ fn console_mfa_page(
             op: crate::html::LoginOp::MfaVerify.as_str(),
             ticket,
             error,
+            offer_remember_device: false,
         }),
     };
     resp.headers_mut().append(
@@ -653,6 +656,7 @@ async fn console_finish(st: &AppState, home: &Tenant, user: &users::User, after_
             &home.id,
             &user.id,
             crate::mfa::Purpose::change_password(after_mfa),
+            crate::session::KeepSignedIn::No,
         )
         .await
         {

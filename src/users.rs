@@ -866,6 +866,15 @@ async fn revoke_access(tx: &mut sqlx::AnyConnection, engine: crate::db::Engine, 
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    // A browser remembered for the second factor would otherwise carry a
+    // signed-out account straight past its code at the next password.
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM mfa_remembered_devices WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
         "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",

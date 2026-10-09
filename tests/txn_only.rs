@@ -64,6 +64,9 @@ const ALLOWED: &[(&str, &str)] = &[
     ("mfa", "finish"),
     // The Auth API's credential check spends the code's time step, as at sign-in.
     ("mfa", "check_authenticator_code"),
+    // "Don't ask again on this device", ticked at the second step: sign-in state
+    // like a session, ended with them (users::revoke_access).
+    ("mfa", "remember_device"),
     // The flow tester's own run state (not directory data).
     ("flowtest", "start"),
     ("flowtest", "take"),
@@ -82,6 +85,7 @@ const STATE_TABLES: &[&str] = &[
     "device_codes",
     "client_assertion_jti",
     "mfa_pending",
+    "mfa_remembered_devices",
     "flow_tests",
     "audit_log",
     "server_secrets",

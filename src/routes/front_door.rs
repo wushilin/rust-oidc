@@ -37,6 +37,9 @@ fn sign_in_page(st: &AppState, upn: &str, error: Option<&str>) -> Response {
         request: "",
         upn,
         error,
+        // The tenant, and so whether it offers it, is not known until the UPN is;
+        // that tenant's own sign-in page offers it.
+        offer_keep_signed_in: false,
     });
     resp.headers_mut().append(
         header::SET_COOKIE,

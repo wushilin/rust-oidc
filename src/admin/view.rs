@@ -188,6 +188,8 @@ details.add[open] > summary::before { content:"\2212  "; }
 details.add > .fold { border:1px solid var(--line); border-radius:0 6px 6px 6px; margin-top:-1px; padding:4px 18px 18px; background:var(--surface); }
 
 /* ---- small parts ---- */
+.kind { white-space:nowrap; }
+.kind svg { width:14px; height:14px; vertical-align:-2px; margin-right:5px; fill:currentColor; }
 .pill { display:inline-block; font-size:12.5px; border:1px solid var(--line); border-radius:3px; padding:0 7px; margin:0 4px 4px 0; color:var(--muted); background:var(--surface); }
 .pill.good { border-color:var(--ok); color:var(--ok); }
 .pill.bad { border-color:var(--err); color:var(--err); font-weight:600; }
@@ -341,6 +343,33 @@ pub fn expander(label: &str, form: &str, open: bool) -> String {
         open = if open { " open" } else { "" },
         label = e(label),
     )
+}
+
+/// A directory object's type, as a table cell shows it: a small inline icon (the
+/// CSP allows inline SVG, not image files) and always the word, so the type reads
+/// without the icon.
+pub fn principal_type(kind: crate::directory::PrincipalType) -> String {
+    labelled(kind, kind.as_str())
+}
+
+/// A directory object's name with its type's icon in front.
+pub fn labelled(kind: crate::directory::PrincipalType, label: &str) -> String {
+    format!(r#"<span class="kind">{}{}</span>"#, kind_icon(kind), e(label))
+}
+
+fn kind_icon(kind: crate::directory::PrincipalType) -> String {
+    use crate::directory::PrincipalType;
+    let shapes = match kind {
+        // One head and shoulders.
+        PrincipalType::User => r#"<circle cx="8" cy="5" r="3"/><path d="M2 15c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5z"/>"#,
+        // Two, one behind the other.
+        PrincipalType::Group => {
+            r#"<circle cx="11" cy="4.5" r="2.5" opacity=".55"/><path d="M7 13c0-2.6 1.8-4.5 4-4.5s4 1.9 4 4.5z" opacity=".55"/><circle cx="6" cy="6" r="2.8"/><path d="M0 15c0-3 2.7-5 6-5s6 2 6 5z"/>"#
+        }
+        // A window.
+        PrincipalType::ServicePrincipal => r#"<path d="M1 2h14v12H1zM2.5 5v7.5h11V5z"/>"#,
+    };
+    format!(r#"<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">{shapes}</svg>"#)
 }
 
 /// The hidden field every console form carries.

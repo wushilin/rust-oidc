@@ -20,14 +20,14 @@ use crate::admin::context::{AdminContext, On};
 use crate::admin::routes::{At, Params, Settled, TenantTab, checked, chrome, field, optional, parse_form, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{APP_READ, APP_ROTATE, APP_WRITE, ASSIGNMENT_READ, ASSIGNMENT_WRITE};
-use crate::apps::{self, Application, MemberType, Principal, RedirectPlatform, ScopeConsent};
+use crate::apps::{self, Application, GroupMembershipClaims, MemberType, Principal, RedirectPlatform, ScopeConsent};
 use crate::directory::PrincipalType;
 use crate::rbac::Action;
 use crate::tenant::Tenant;
 use crate::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
     GrantAppRole, GrantAuthApiPermission, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri,
-    RemoveRedirectUri, RevokeAppRole, RevokeAuthApiPermission, SaveAppFlags, UnassignApp,
+    RemoveRedirectUri, RevokeAppRole, RevokeAuthApiPermission, SaveAppFlags, SetGroupMembershipClaims, UnassignApp,
 };
 use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
 use crate::util::now;
@@ -49,6 +49,8 @@ const SECRET_EXPIRY_WARNING_SECS: i64 = 30 * 24 * 60 * 60;
 pub enum AppSection {
     Overview,
     Authentication,
+    /// Which groups its tokens carry.
+    TokenConfiguration,
     Credentials,
     Api,
     Roles,
@@ -64,6 +66,7 @@ impl AppSection {
     pub const ALL: &'static [AppSection] = &[
         Self::Overview,
         Self::Authentication,
+        Self::TokenConfiguration,
         Self::Credentials,
         Self::Api,
         Self::Roles,
@@ -77,6 +80,7 @@ impl AppSection {
         match self {
             Self::Overview => "Overview",
             Self::Authentication => "Authentication",
+            Self::TokenConfiguration => "Token configuration",
             Self::Credentials => "Certificates & secrets",
             Self::Api => "Expose an API",
             Self::Roles => "App roles",
@@ -92,6 +96,7 @@ impl AppSection {
         match self {
             Self::Overview => "",
             Self::Authentication => "authentication",
+            Self::TokenConfiguration => "token",
             Self::Credentials => "credentials",
             Self::Api => "api",
             Self::Roles => "roles",
@@ -119,6 +124,8 @@ impl AppSection {
 pub enum AppOp {
     /// `allow_password_grant` and the two implicit toggles, saved together.
     Flags,
+    /// Which groups its tokens carry.
+    GroupClaims,
     SecretAdd,
     SecretRemove,
     CertificateAdd,
@@ -146,6 +153,7 @@ impl AppOp {
     fn section(self) -> AppSection {
         match self {
             Self::Flags | Self::RedirectUriAdd | Self::RedirectUriRemove => AppSection::Authentication,
+            Self::GroupClaims => AppSection::TokenConfiguration,
             Self::SecretAdd | Self::SecretRemove | Self::CertificateAdd | Self::CertificateRemove => {
                 AppSection::Credentials
             }
@@ -159,6 +167,7 @@ impl AppOp {
 
     pub const ALL: &'static [AppOp] = &[
         Self::Flags,
+        Self::GroupClaims,
         Self::SecretAdd,
         Self::SecretRemove,
         Self::CertificateAdd,
@@ -183,6 +192,7 @@ impl AppOp {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Flags => "flags",
+            Self::GroupClaims => "group_claims",
             Self::SecretAdd => "secret_add",
             Self::SecretRemove => "secret_remove",
             Self::CertificateAdd => "certificate_add",
@@ -220,6 +230,7 @@ impl AppOp {
             | Self::AuthApiGrant
             | Self::AuthApiRevoke => ASSIGNMENT_WRITE,
             Self::Flags
+            | Self::GroupClaims
             | Self::RedirectUriAdd
             | Self::RedirectUriRemove
             | Self::IdentifierUriAdd
@@ -236,6 +247,7 @@ impl AppOp {
         use crate::txn::TxnKind;
         match self {
             Self::Flags => TxnKind::SaveAppFlags,
+            Self::GroupClaims => TxnKind::SetGroupMembershipClaims,
             Self::SecretAdd => TxnKind::AddAppSecret,
             Self::SecretRemove => TxnKind::RemoveAppSecret,
             Self::CertificateAdd => TxnKind::AddAppCertificate,
@@ -278,6 +290,7 @@ const REQUIRE_MFA: &str = "require_mfa";
 const ACCEPT_OTHER_TENANTS: &str = "accept_other_tenants";
 const ALLOW_ID_TOKEN: &str = "allow_id_token_implicit";
 const ALLOW_ACCESS_TOKEN: &str = "allow_access_token_implicit";
+const GROUP_CLAIMS: &str = "group_membership_claims";
 /// One checkbox per [`MemberType`], named by the type itself.
 fn member_field(t: MemberType) -> String {
     format!("member_{}", t.as_str())
@@ -520,6 +533,7 @@ async fn detail(
                 flags_form(&url, &csrf, app, switches, may_write)
             )
         }
+        AppSection::TokenConfiguration => group_claims_form(&url, &csrf, app, may_write),
         AppSection::Credentials => {
             let secrets = apps::secrets(&st.pool, app).await.unwrap_or_default();
             let certificates = apps::key_credentials(&st.pool, app).await.unwrap_or_default();
@@ -875,6 +889,40 @@ fn flags_form(url: &str, csrf: &str, app: &Application, switches: Switches, may_
 }
 
 /// A one-field remove button, used by every section that removes a row by id.
+/// Token configuration: which groups the tokens carry (Entra's
+/// `groupMembershipClaims`), one choice of three.
+fn group_claims_form(url: &str, csrf: &str, app: &Application, may_write: bool) -> String {
+    let current = app.group_membership_claims;
+    let explain = r#"<p class="sub">Which of the signed-in user's groups this application's tokens carry, in the
+<code>groups</code> claim, as object ids. It decides for the ID tokens issued to this application, and for the access
+tokens issued for its API. Tokens for Microsoft Graph carry none.</p>"#;
+    if !may_write {
+        return format!(r#"<h2>Groups claim</h2>{explain}<p>{}</p>"#, e(current.label()));
+    }
+    let choices: String = GroupMembershipClaims::ALL
+        .iter()
+        .map(|g| {
+            format!(
+                r#"<label><input type="radio" name="{GROUP_CLAIMS}" value="{v}"{on}> {label}</label>"#,
+                v = e(g.as_str()),
+                on = if *g == current { " checked" } else { "" },
+                label = e(g.label()),
+            )
+        })
+        .collect();
+    format!(
+        r#"<h2>Groups claim</h2>{explain}
+<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+<fieldset class="choice"><legend>Groups in tokens</legend>{choices}</fieldset>
+<p class="muted">Groups assigned to the application are those under Users and groups. A group inside another counts
+for <em>All groups</em>, not for assigned groups: as with assignment itself, only direct members count there.</p>
+<div class="actions"><button type="submit">Save</button></div></form>"#,
+        url = e(url),
+        op_field = AppOp::FIELD,
+        op = AppOp::GroupClaims.as_str(),
+    )
+}
+
 fn remove_button(url: &str, csrf: &str, op: AppOp, field_name: &str, value: &str, label: &str) -> String {
     format!(
         r#"<form method="post" action="{url}" class="inline">{csrf}
@@ -1607,6 +1655,17 @@ async fn apply(
                 allow_password_grant: checked(form, ALLOW_PASSWORD_GRANT),
                 allow_id_token_implicit: checked(form, ALLOW_ID_TOKEN),
                 allow_access_token_implicit: checked(form, ALLOW_ACCESS_TOKEN),
+            };
+            redirect(st, &actor, &t).await
+        }
+        AppOp::GroupClaims => {
+            let Some(setting) = GroupMembershipClaims::parse(field(form, GROUP_CLAIMS)) else {
+                return invalid("choose which groups the tokens carry");
+            };
+            let t = SetGroupMembershipClaims {
+                tenant_id,
+                app_id,
+                setting,
             };
             redirect(st, &actor, &t).await
         }

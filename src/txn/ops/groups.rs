@@ -82,7 +82,13 @@ impl Transaction for DeleteGroup {
     }
 
     fn locks(&self) -> Vec<LockTarget> {
-        vec![LockTarget::Administrators, LockTarget::Group(self.group_id.clone())]
+        // The tenant too: nesting changes hold it, and one may name this group by
+        // name, which locks no group row.
+        vec![
+            LockTarget::Administrators,
+            LockTarget::Tenant(self.tenant_id.clone()),
+            LockTarget::Group(self.group_id.clone()),
+        ]
     }
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<String> {
@@ -189,6 +195,140 @@ impl Transaction for RemoveGroupMember {
             tenant_id: Some(self.tenant_id.clone()),
             target: Some(self.group_id.clone()),
             details: json!({ "userId": self.user_id }),
+        }
+    }
+}
+
+/// How a transaction names a group: the console has its id, the command line its
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupKey {
+    Id(String),
+    Name(String),
+}
+
+/// A group of the tenant named either way, or abort.
+async fn group_by(cx: &mut Cx<'_>, tenant_id: &str, key: &GroupKey) -> Step<crate::groups::Group> {
+    match key {
+        GroupKey::Id(id) => group(cx, tenant_id, id).await,
+        GroupKey::Name(name) => {
+            let found = crate::groups::find_in(cx.conn(), tenant_id, name).await;
+            let Some(id) = cx.check(found)? else {
+                return Err(cx.fail(Refusal::NotFound(format!(
+                    "Group '{}' not found in this tenant.",
+                    clip(name)
+                ))));
+            };
+            group(cx, tenant_id, &id).await
+        }
+    }
+}
+
+/// Put a group of the tenant inside another: the members of the inner group are
+/// then members of the outer one too, for the `groups` claim.
+///
+/// Locks the tenant, so nestings in one tenant run one at a time: two that are
+/// each fine alone could otherwise make a loop together.
+pub struct AddGroupToGroup {
+    pub tenant_id: String,
+    /// The outer group, by id.
+    pub group_id: String,
+    /// The group put inside it.
+    pub member: GroupKey,
+}
+
+impl Transaction for AddGroupToGroup {
+    /// The group put inside.
+    type Output = crate::groups::GroupRef;
+    const INFO: KindInfo = KindInfo {
+        name: "Add group to group",
+        need: Need::Action(GROUP_WRITE),
+        event: Event::AdminGroupNestAdd,
+    };
+
+    fn scope(&self) -> Scope {
+        Scope::Tenant(self.tenant_id.clone())
+    }
+
+    fn locks(&self) -> Vec<LockTarget> {
+        let mut locks = vec![
+            LockTarget::Tenant(self.tenant_id.clone()),
+            LockTarget::Group(self.group_id.clone()),
+        ];
+        if let GroupKey::Id(id) = &self.member {
+            locks.push(LockTarget::Group(id.clone()));
+        }
+        locks
+    }
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<crate::groups::GroupRef> {
+        let outer = group(cx, &self.tenant_id, &self.group_id).await?;
+        let inner = group_by(cx, &self.tenant_id, &self.member).await?;
+        let done = crate::groups::add_member_group_in(cx.conn(), &self.tenant_id, &outer.id, &inner.id).await;
+        let added = cx.check(done)?;
+        cx.ensure(added, || {
+            Refusal::Conflict(format!("{} is already a member of {}.", inner.name, outer.name))
+        })?;
+        Ok(crate::groups::GroupRef {
+            id: inner.id,
+            name: inner.name,
+        })
+    }
+
+    fn audit(&self, inner: &crate::groups::GroupRef) -> Audit {
+        Audit {
+            tenant_id: Some(self.tenant_id.clone()),
+            target: Some(self.group_id.clone()),
+            details: json!({ "memberGroupId": inner.id, "name": clip(&inner.name) }),
+        }
+    }
+}
+
+/// Take a group out of another.
+pub struct RemoveGroupFromGroup {
+    pub tenant_id: String,
+    /// The outer group.
+    pub group_id: String,
+    /// The group taken out of it.
+    pub member_group_id: String,
+}
+
+impl Transaction for RemoveGroupFromGroup {
+    type Output = ();
+    const INFO: KindInfo = KindInfo {
+        name: "Remove group from group",
+        need: Need::Action(GROUP_WRITE),
+        event: Event::AdminGroupNestRemove,
+    };
+
+    fn scope(&self) -> Scope {
+        Scope::Tenant(self.tenant_id.clone())
+    }
+
+    fn locks(&self) -> Vec<LockTarget> {
+        vec![
+            LockTarget::Tenant(self.tenant_id.clone()),
+            LockTarget::Group(self.group_id.clone()),
+            LockTarget::Group(self.member_group_id.clone()),
+        ]
+    }
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
+        group(cx, &self.tenant_id, &self.group_id).await?;
+        let done =
+            crate::groups::remove_member_group_in(cx.conn(), &self.tenant_id, &self.group_id, &self.member_group_id)
+                .await;
+        let removed = cx.check(done)?;
+        cx.ensure(removed, || {
+            Refusal::NotFound("That group is not a member of this group.".into())
+        })
+    }
+
+    fn audit(&self, _: &()) -> Audit {
+        Audit {
+            tenant_id: Some(self.tenant_id.clone()),
+            target: Some(self.group_id.clone()),
+            details: json!({ "memberGroupId": self.member_group_id }),
         }
     }
 }

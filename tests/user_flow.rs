@@ -759,8 +759,13 @@ async fn groups_wids_and_assignment_required() {
     use rust_oidc::{apps, directory, groups};
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
-    groups::create(&s.pool, &f.tenant, "engineering", None).await.unwrap();
+    let engineering = groups::create(&s.pool, &f.tenant, "engineering", None).await.unwrap();
     groups::add_member(&s.pool, &f.tenant, "engineering", &f.upn)
+        .await
+        .unwrap();
+    // Groups are carried only when the application asks for them.
+    let web_app = apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap();
+    apps::set_group_membership_claims(&s.pool, &web_app, apps::GroupMembershipClaims::All)
         .await
         .unwrap();
     rust_oidc::admin::bindings::create(
@@ -825,7 +830,7 @@ async fn groups_wids_and_assignment_required() {
         )
         .await;
     let id = decode_unverified(body["id_token"].as_str().unwrap());
-    assert_eq!(id["groups"], serde_json::json!(["engineering"]));
+    assert_eq!(id["groups"], serde_json::json!([engineering]), "by object id, as Entra");
     assert_eq!(id["roles"], serde_json::json!(["Reader"]), "client app roles via group");
     assert_eq!(id["wids"], serde_json::json!([directory::GLOBAL_ADMINISTRATOR]));
 }

@@ -1,11 +1,11 @@
-//! `group_ids` and `role_ids` sit beside `groups` and `roles`, same members in the
-//! same order, so an application can key on an id that survives a rename and
-//! still read the name next to it.
+//! `role_ids` sits beside `roles`, same members in the same order, so an
+//! application can key on an id that survives a rename and still read the value
+//! next to it. (`groups` carries ids itself, as in Entra; see `group_claims.rs`.)
 
 mod common;
 
 use common::*;
-use rust_oidc::{apps, groups};
+use rust_oidc::apps;
 use serde_json::Value;
 
 fn strings(v: &Value) -> Vec<String> {
@@ -32,31 +32,6 @@ async fn ropc(s: &TestServer, f: &UserFixture, client: &TestApp, scope: &str) ->
         .await;
     assert_eq!(status, 200, "{body}");
     body
-}
-
-#[tokio::test]
-async fn group_ids_line_up_with_group_names_in_both_tokens() {
-    let s = TestServer::start().await;
-    let f = user_fixture(&s).await;
-    // Created out of alphabetical order on purpose: the claim order is by name.
-    let zebra = groups::create(&s.pool, &f.tenant, "Zebra", None).await.unwrap();
-    let alpha = groups::create(&s.pool, &f.tenant, "Alpha", None).await.unwrap();
-    let mid = groups::create(&s.pool, &f.tenant, "Middle", None).await.unwrap();
-    for g in ["Zebra", "Alpha", "Middle"] {
-        groups::add_member(&s.pool, &f.tenant, g, &f.upn).await.unwrap();
-    }
-
-    let scope = format!("openid api://{}/Orders.Read", f.api.app_id);
-    let body = ropc(&s, &f, &f.web, &scope).await;
-    for token in ["access_token", "id_token"] {
-        let claims = decode_unverified(body[token].as_str().unwrap());
-        assert_eq!(strings(&claims["groups"]), ["Alpha", "Middle", "Zebra"], "{token}");
-        assert_eq!(
-            strings(&claims["group_ids"]),
-            [alpha.clone(), mid.clone(), zebra.clone()],
-            "{token}: each id sits at its name's position"
-        );
-    }
 }
 
 #[tokio::test]

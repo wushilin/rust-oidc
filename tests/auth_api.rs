@@ -124,6 +124,10 @@ async fn world() -> World {
     .unwrap();
     assign(&s, &f, Principal::User(f.upn.clone()), &["Host.Admin"]).await;
     groups::create(&s.pool, &f.tenant, "linux-admins", None).await.unwrap();
+    // The calling application carries groups only when set to.
+    apps::set_group_membership_claims(&s.pool, &web, apps::GroupMembershipClaims::All)
+        .await
+        .unwrap();
     groups::add_member(&s.pool, &f.tenant, "linux-admins", &f.upn)
         .await
         .unwrap();
@@ -150,6 +154,23 @@ async fn audit_reasons(s: &TestServer) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// The groups list follows the calling application's `groupMembershipClaims`,
+/// as its ID tokens do: by default it carries none.
+#[tokio::test]
+async fn the_groups_follow_the_calling_applications_setting() {
+    let w = world().await;
+    let web = apps::find(&w.s.pool, &w.f.web.app_id).await.unwrap().unwrap();
+    apps::set_group_membership_claims(&w.s.pool, &web, apps::GroupMembershipClaims::None)
+        .await
+        .unwrap();
+    let token = w.token().await;
+    let (status, body) = w.check(&token, &w.f.upn, &w.f.password, &w.code()).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"], true, "{body}");
+    assert_eq!(v["groups"], json!([]), "{body}");
 }
 
 #[tokio::test]

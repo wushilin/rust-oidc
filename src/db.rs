@@ -575,6 +575,8 @@ pub enum Event {
     AdminAppUnassign,
     /// Assignment required turned on or off for an application.
     AdminAppAssignmentRequired,
+    /// Which groups the application's tokens carry.
+    AdminAppGroupClaims,
     /// An application was granted a permission of the built-in Auth API.
     AdminAuthApiGrant,
     AdminAuthApiRevoke,
@@ -591,6 +593,10 @@ pub enum Event {
     AdminGroupCreate,
     AdminGroupMemberAdd,
     AdminGroupMemberRemove,
+    /// A group put inside another.
+    AdminGroupNestAdd,
+    /// A group taken out of another.
+    AdminGroupNestRemove,
     AdminGroupDelete,
     AdminUserRestore,
     AdminUserMfaReset,
@@ -691,6 +697,7 @@ impl Event {
         Self::AdminAppAssign,
         Self::AdminAppUnassign,
         Self::AdminAppAssignmentRequired,
+        Self::AdminAppGroupClaims,
         Self::AdminAuthApiGrant,
         Self::AdminAuthApiRevoke,
         Self::AdminTenantCreate,
@@ -706,6 +713,8 @@ impl Event {
         Self::AdminGroupCreate,
         Self::AdminGroupMemberAdd,
         Self::AdminGroupMemberRemove,
+        Self::AdminGroupNestAdd,
+        Self::AdminGroupNestRemove,
         Self::AdminGroupDelete,
         Self::AdminUserRestore,
         Self::AdminUserMfaReset,
@@ -798,6 +807,7 @@ impl Event {
             Self::AdminAppAssign => "admin.app.assign",
             Self::AdminAppUnassign => "admin.app.unassign",
             Self::AdminAppAssignmentRequired => "admin.app.assignment_required",
+            Self::AdminAppGroupClaims => "admin.app.group_claims",
             Self::AdminAuthApiGrant => "admin.auth_api.grant",
             Self::AdminAuthApiRevoke => "admin.auth_api.revoke",
             Self::AdminTenantCreate => "admin.tenant.create",
@@ -813,6 +823,8 @@ impl Event {
             Self::AdminGroupCreate => "admin.group.create",
             Self::AdminGroupMemberAdd => "admin.group.member.add",
             Self::AdminGroupMemberRemove => "admin.group.member.remove",
+            Self::AdminGroupNestAdd => "admin.group.nest.add",
+            Self::AdminGroupNestRemove => "admin.group.nest.remove",
             Self::AdminGroupDelete => "admin.group.delete",
             Self::AdminUserRestore => "admin.user.restore",
             Self::AdminUserMfaReset => "admin.user.mfa_reset",

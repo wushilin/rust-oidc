@@ -8,9 +8,13 @@
 //! Membership matters beyond the `groups` claim: a console role binding may name
 //! a **group** as its principal, so adding somebody to a group can hand them
 //! administrative rights. The page says so where the button is.
+//!
+//! A group's members are accounts and other groups. Its page lists both, one
+//! level only: a member group links to its own page, which lists the next level,
+//! and "Member of" links back up to the groups this one is inside.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
@@ -20,9 +24,12 @@ use crate::admin::context::{AdminContext, On};
 use crate::admin::routes::{At, Params, Settled, TenantTab, chrome, field, optional, parse_form, row_problem, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{GROUP_READ, GROUP_WRITE};
+use crate::directory::PrincipalType;
 use crate::groups::{self, Group};
 use crate::tenant::Tenant;
-use crate::txn::ops::groups::{AddGroupMember, CreateGroup, DeleteGroup, RemoveGroupMember};
+use crate::txn::ops::groups::{
+    AddGroupMember, AddGroupToGroup, CreateGroup, DeleteGroup, GroupKey, RemoveGroupFromGroup, RemoveGroupMember,
+};
 use crate::txn::{self, ops::Account};
 
 /// What a post to a group's page asks for.
@@ -30,18 +37,30 @@ use crate::txn::{self, ops::Account};
 pub enum MemberOp {
     Add,
     Remove,
+    /// Put another group of the tenant inside this one.
+    AddGroup,
+    /// Take a group out of this one.
+    RemoveGroup,
     /// Delete the group itself. Only an empty one: see [`groups::delete`].
     DeleteGroup,
 }
 
 impl MemberOp {
-    pub const ALL: &'static [MemberOp] = &[Self::Add, Self::Remove, Self::DeleteGroup];
+    pub const ALL: &'static [MemberOp] = &[
+        Self::Add,
+        Self::Remove,
+        Self::AddGroup,
+        Self::RemoveGroup,
+        Self::DeleteGroup,
+    ];
     pub const FIELD: &'static str = "op";
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Add => "member_add",
             Self::Remove => "member_remove",
+            Self::AddGroup => "member_group_add",
+            Self::RemoveGroup => "member_group_remove",
             Self::DeleteGroup => "group_delete",
         }
     }
@@ -58,6 +77,10 @@ const UPN: &str = "upn";
 const USER: &str = "user";
 /// Several user names at once, one per line or separated by commas.
 const UPNS: &str = "upns";
+/// A group, by object id, put inside or taken out of this one.
+const MEMBER_GROUP: &str = "member_group";
+/// The query parameter that narrows the members table to one type.
+const SHOW: &str = "show";
 /// The forms the tick boxes of the two tables belong to.
 const BULK_GROUPS: &str = "bulk-groups";
 const BULK_MEMBERS: &str = "bulk-members";
@@ -264,10 +287,48 @@ async fn delete_ticked(st: &AppState, ctx: &AdminContext, tenant: &Tenant, body:
 
 // ---- one group ----
 
+/// Which members the table shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Show {
+    All,
+    Groups,
+    Users,
+}
+
+impl Show {
+    pub const ALL: &'static [Show] = &[Self::All, Self::Groups, Self::Users];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Groups => "groups",
+            Self::Users => "users",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All members",
+            Self::Groups => "Groups",
+            Self::Users => "Users",
+        }
+    }
+
+    /// Anything else, or nothing, shows everyone.
+    pub fn parse(raw: &str) -> Self {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|s| s.as_str() == raw)
+            .unwrap_or(Self::All)
+    }
+}
+
 pub async fn detail_page(
     ctx: AdminContext,
     State(st): State<AppState>,
     Path((key, group_id)): Path<(String, String)>,
+    Query(query): Query<Params>,
 ) -> Response {
     if let Err(resp) = ctx.require(GROUP_READ, On::Tenant(&key)) {
         return resp;
@@ -275,8 +336,9 @@ pub async fn detail_page(
     let Some(tenant) = ctx.tenant(&key) else {
         return view::not_found();
     };
+    let show = Show::parse(field(&query, SHOW));
     match groups::find_by_id(&st.pool, &tenant.id, &group_id).await {
-        Ok(Some(group)) => detail(&st, &ctx, tenant, &group, None, StatusCode::OK).await,
+        Ok(Some(group)) => detail(&st, &ctx, tenant, &group, show, None, StatusCode::OK).await,
         Ok(None) => view::not_found(),
         Err(err) => {
             tracing::error!("group lookup failed: {err}");
@@ -290,29 +352,108 @@ async fn detail(
     ctx: &AdminContext,
     tenant: &Tenant,
     group: &Group,
+    show: Show,
     error: Option<&str>,
     status: StatusCode,
 ) -> Response {
-    let url = group_url(st.public_url.base(), tenant, group);
+    let base = st.public_url.base();
+    let url = group_url(base, tenant, group);
     let csrf = view::csrf_input(&ctx.csrf);
     let may_write = ctx.can_in(GROUP_WRITE, tenant);
     let members = groups::members(&st.pool, &group.id).await.unwrap_or_default();
+    let member_groups = groups::member_groups(&st.pool, &group.id).await.unwrap_or_default();
+    let parents = groups::parent_groups(&st.pool, &group.id).await.unwrap_or_default();
 
-    let rows: String = members
+    let count = |n: i64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    // Groups first, each linking to its own page, the next level down.
+    let group_rows: String = member_groups
         .iter()
+        .filter(|_| show != Show::Users)
+        .map(|g| {
+            let inside = match (g.groups, g.users) {
+                (0, 0) => r#"<span class="muted">empty</span>"#.to_string(),
+                (0, u) => e(&count(u, "user", "users")),
+                (n, 0) => e(&count(n, "group", "groups")),
+                (n, u) => e(&format!("{}, {}", count(u, "user", "users"), count(n, "group", "groups"))),
+            };
+            let remove = if may_write {
+                format!(
+                    r#"<form method="post" action="{url}" class="inline">{csrf}<input type="hidden" name="{MEMBER_GROUP}" value="{id}"><button class="danger" type="submit" name="{field}" value="{op}">Remove</button></form>"#,
+                    url = e(&url),
+                    id = e(&g.id),
+                    field = MemberOp::FIELD,
+                    op = MemberOp::RemoveGroup.as_str(),
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<tr>{tick}<td>{kind}</td><td><a href="{href}">{name}</a></td><td>{inside}</td><td class="muted">{id}</td><td>{remove}</td></tr>"#,
+                tick = if may_write { "<td></td>" } else { "" },
+                kind = view::principal_type(PrincipalType::Group),
+                href = e(&format!("{}/{}", groups_url(base, tenant), g.id)),
+                name = e(&g.name),
+                id = e(&g.id),
+            )
+        })
+        .collect();
+    let user_rows: String = members
+        .iter()
+        .filter(|_| show != Show::Groups)
         .map(|m| {
             format!(
-                "<tr>{tick}<td>{upn}</td><td class=\"muted\">{id}</td></tr>",
+                r#"<tr>{tick}<td>{kind}</td><td><a href="{href}">{upn}</a></td><td class="muted">&mdash;</td><td class="muted">{id}</td><td></td></tr>"#,
                 tick = if may_write {
                     bulk::cell(BULK_MEMBERS, &m.user_id, &m.upn)
                 } else {
                     String::new()
                 },
+                kind = view::principal_type(PrincipalType::User),
+                href = e(&format!("{base}/admin/tenants/{}/users/{}", tenant.id, m.user_id)),
                 upn = e(&m.upn),
                 id = e(&m.user_id),
             )
         })
         .collect();
+    let rows = format!("{group_rows}{user_rows}");
+    let filter: String = Show::ALL
+        .iter()
+        .map(|s| {
+            format!(
+                r#"<option value="{v}"{on}>{label}</option>"#,
+                v = s.as_str(),
+                on = if *s == show { " selected" } else { "" },
+                label = e(s.label()),
+            )
+        })
+        .collect();
+    let filter = format!(
+        r#"<form class="inline" method="get" action="{url}"><label for="show">Show</label>
+<select id="show" name="{SHOW}">{filter}</select><button type="submit">Apply</button></form>"#,
+        url = e(&url),
+    );
+    let summary = format!(
+        "Members: {}, {}",
+        count(member_groups.len() as i64, "group", "groups"),
+        count(members.len() as i64, "user", "users")
+    );
+    let member_of = if parents.is_empty() {
+        r#"<p class="muted">Not inside any group.</p>"#.to_string()
+    } else {
+        let links: String = parents
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"<a class="pill" href="{href}">{name}</a> "#,
+                    href = e(&format!("{}/{}", groups_url(base, tenant), p.id)),
+                    name = view::labelled(PrincipalType::Group, &p.name),
+                )
+            })
+            .collect();
+        format!(
+            r#"<p>{links}</p><p class="muted">Its members are members of these groups too, for the groups claim.</p>"#
+        )
+    };
     let remove = if may_write && !members.is_empty() {
         format!(
             r#"<form id="{BULK_MEMBERS}" method="post" action="{url}">{csrf}</form>
@@ -329,6 +470,39 @@ async fn detail(
                 "Remove",
             ),
         )
+    } else {
+        String::new()
+    };
+
+    let add_group = if may_write {
+        let candidates = groups::nestable_into(&st.pool, &tenant.id, &group.id)
+            .await
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            String::new()
+        } else {
+            let options: String = candidates
+                .iter()
+                .map(|g| format!(r#"<option value="{}">{}</option>"#, e(&g.id), e(&g.name)))
+                .collect();
+            view::expander(
+                "Add a group",
+                &format!(
+                    r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{field}" value="{op}">
+<label for="member_group">Group</label><select id="member_group" name="{MEMBER_GROUP}" required>{options}</select>
+<div class="actions"><button type="submit">Add to group</button></div>
+<p class="muted">Its members become members of this group too, for the <code>groups</code> claim of applications set
+to carry all groups. Being inside this group does not assign them to applications this group is assigned to, nor give
+them roles granted to it: those count direct members only. Groups this one is already inside are not offered, as that
+would make a loop; chains are limited to {max} levels.</p></form>"#,
+                    url = e(&url),
+                    field = MemberOp::FIELD,
+                    op = MemberOp::AddGroup.as_str(),
+                    max = groups::MAX_GROUP_NESTING_DEPTH,
+                ),
+                false,
+            )
+        }
     } else {
         String::new()
     };
@@ -356,7 +530,7 @@ Users page and added from there.</p></form>"#,
 
     let delete = if !may_write {
         String::new()
-    } else if members.is_empty() {
+    } else if members.is_empty() && member_groups.is_empty() {
         format!(
             r#"<h2>Delete</h2><p>The group has no members. Deleting it also withdraws any console role or
 application role granted to it.</p>
@@ -374,13 +548,17 @@ application role granted to it.</p>
             ),
         )
     } else {
-        r#"<h2>Delete</h2><p class="muted">A group can be deleted once it has no members.</p>"#.to_string()
+        r#"<h2>Delete</h2><p class="muted">A group can be deleted once it has no members, neither accounts nor
+groups.</p>"#
+            .to_string()
     };
 
     let body = format!(
         r#"<h1>{name}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
 <p>{description}</p>
-<h2>Members</h2><table><tr>{head}<th>User name</th><th>Object id</th></tr>{rows}</table>{remove}{add}{delete}"#,
+<h2>Members</h2><p class="sub">{summary}</p>{filter}
+<table><tr>{head}<th>Type</th><th>Name</th><th>Members</th><th>Object id</th><th></th></tr>{rows}</table>{remove}{add}{add_group}
+<h2>Member of</h2>{member_of}{delete}"#,
         head = if may_write {
             bulk::head(BULK_MEMBERS)
         } else {
@@ -437,7 +615,18 @@ pub async fn detail_post(
                 view::see_other(&group_url(st.public_url.base(), tenant, &group))
             }
         }
-        Settled::Refused(message) => detail(&st, &ctx, tenant, &group, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Refused(message) => {
+            detail(
+                &st,
+                &ctx,
+                tenant,
+                &group,
+                Show::All,
+                Some(&message),
+                StatusCode::BAD_REQUEST,
+            )
+            .await
+        }
         Settled::Respond(resp) => resp,
     }
 }
@@ -530,6 +719,28 @@ async fn apply(
                 }
             }
             finished(tally.problem("removed"))
+        }
+        MemberOp::AddGroup | MemberOp::RemoveGroup => {
+            let member_group = field(form, MEMBER_GROUP).to_string();
+            if member_group.is_empty() {
+                return refused("Choose a group.");
+            }
+            let outcome = if op == MemberOp::AddGroup {
+                let add = AddGroupToGroup {
+                    tenant_id: tenant.id.clone(),
+                    group_id: group.id.clone(),
+                    member: GroupKey::Id(member_group),
+                };
+                txn::run(&st.pool, &actor, &add).await.map_done()
+            } else {
+                let remove = RemoveGroupFromGroup {
+                    tenant_id: tenant.id.clone(),
+                    group_id: group.id.clone(),
+                    member_group_id: member_group,
+                };
+                txn::run(&st.pool, &actor, &remove).await
+            };
+            settle(outcome)
         }
         MemberOp::DeleteGroup => {
             let delete = DeleteGroup {

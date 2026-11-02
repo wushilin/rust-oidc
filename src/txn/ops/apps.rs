@@ -11,7 +11,8 @@ use serde_json::json;
 use super::tenant;
 use crate::admin::{APP_ROTATE, APP_WRITE, ASSIGNMENT_WRITE};
 use crate::apps::{
-    self, Application, MemberType, NewSecret, PreparedSecret, Principal, RedirectPlatform, ScopeConsent,
+    self, Application, GroupMembershipClaims, MemberType, NewSecret, PreparedSecret, Principal, RedirectPlatform,
+    ScopeConsent,
 };
 use crate::auth_api::AuthApiPermission;
 use crate::db::Event;
@@ -169,6 +170,39 @@ impl Transaction for SaveAppFlags {
                 "allowIdTokenImplicit": self.allow_id_token_implicit,
                 "allowAccessTokenImplicit": self.allow_access_token_implicit,
             }),
+        )
+    }
+}
+
+/// Which groups the application's tokens carry in the `groups` claim (Entra's
+/// `groupMembershipClaims`, under Token configuration).
+pub struct SetGroupMembershipClaims {
+    pub tenant_id: String,
+    pub app_id: String,
+    pub setting: GroupMembershipClaims,
+}
+
+impl Transaction for SetGroupMembershipClaims {
+    type Output = ();
+    const INFO: KindInfo = KindInfo {
+        name: "Set group claims",
+        need: Need::Action(APP_WRITE),
+        event: Event::AdminAppGroupClaims,
+    };
+
+    on_application!();
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
+        let (_, app) = application(cx, &self.tenant_id, &self.app_id).await?;
+        let done = apps::set_group_membership_claims_in(cx.conn(), &app, self.setting).await;
+        cx.check(done)
+    }
+
+    fn audit(&self, _: &()) -> Audit {
+        on_app(
+            &self.tenant_id,
+            &self.app_id,
+            json!({ "groupMembershipClaims": self.setting.as_str() }),
         )
     }
 }

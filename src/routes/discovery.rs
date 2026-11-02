@@ -143,7 +143,7 @@ pub async fn openid_configuration(
         "claims_supported": [
             "sub", "iss", "aud", "exp", "iat", "nbf", "auth_time", "nonce", "ver", "tid", "oid",
             "uti", "azp", "azpacr", "idtyp", "name", "preferred_username", "upn", "email",
-            "given_name", "family_name", "roles", "role_ids", "groups", "group_ids", "wids", "scp",
+            "given_name", "family_name", "roles", "role_ids", "groups", "wids", "scp",
             "acr", "amr", "idp", "acct"
         ],
         "tenant_region_scope": null,

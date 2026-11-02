@@ -261,7 +261,8 @@ async fn verify(
 }
 
 async fn succeeded(st: &AppState, tenant: &Tenant, app: &Application, sp: &ServicePrincipal, user: &User) -> Response {
-    let groups = match crate::groups::for_user(&st.pool, &user.id).await {
+    // The calling application's `groupMembershipClaims`, as for its ID tokens.
+    let groups = match crate::groups::for_claim(&st.pool, app.group_membership_claims, Some(&sp.id), &user.id).await {
         Ok(g) => g,
         Err(e) => return AadError::from(e).into_response(),
     };

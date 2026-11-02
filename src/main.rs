@@ -173,6 +173,27 @@ enum GroupCmd {
         #[arg(long)]
         user: String,
     },
+    /// Put a group inside another: its members count as members of the outer one
+    /// for the `groups` claim.
+    AddGroup {
+        #[arg(long)]
+        tenant: String,
+        /// The outer group, by name.
+        #[arg(long)]
+        group: String,
+        /// The group put inside it, by name.
+        #[arg(long)]
+        member: String,
+    },
+    /// Take a group out of another.
+    RemoveGroup {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        member: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,6 +273,16 @@ enum AppCmd {
         app: String,
         #[arg(long, action = clap::ArgAction::Set)]
         allowed: bool,
+    },
+    /// Which groups the app's tokens carry in the `groups` claim (Entra's
+    /// groupMembershipClaims).
+    GroupClaims {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        app: String,
+        #[arg(long, value_enum)]
+        setting: apps::GroupMembershipClaims,
     },
     /// Require users to be assigned (directly or via a group) before signing in.
     AssignmentRequired {
@@ -618,6 +649,41 @@ async fn group_cmd(pool: &DbPool, cmd: GroupCmd) -> anyhow::Result<()> {
             };
             txn::run(pool, &CLI, &add).await.into_result()?;
         }
+        GroupCmd::AddGroup {
+            tenant: key,
+            group,
+            member,
+        } => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let Some(group_id) = groups::find(pool, &t.id, &group).await? else {
+                bail!("group '{group}' not found");
+            };
+            let add = txn::ops::groups::AddGroupToGroup {
+                tenant_id: t.id.clone(),
+                group_id,
+                member: txn::ops::groups::GroupKey::Name(member),
+            };
+            txn::run(pool, &CLI, &add).await.into_result()?;
+        }
+        GroupCmd::RemoveGroup {
+            tenant: key,
+            group,
+            member,
+        } => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let Some(group_id) = groups::find(pool, &t.id, &group).await? else {
+                bail!("group '{group}' not found");
+            };
+            let Some(member_group_id) = groups::find(pool, &t.id, &member).await? else {
+                bail!("group '{member}' not found");
+            };
+            let remove = txn::ops::groups::RemoveGroupFromGroup {
+                tenant_id: t.id.clone(),
+                group_id,
+                member_group_id,
+            };
+            txn::run(pool, &CLI, &remove).await.into_result()?;
+        }
     }
     Ok(())
 }
@@ -724,6 +790,20 @@ async fn app_cmd(pool: &DbPool, cmd: AppCmd) -> anyhow::Result<()> {
             };
             let id = txn::run(pool, &CLI, &add).await.into_result()?;
             print_json(json!({ "id": id, "value": value }));
+        }
+        AppCmd::GroupClaims {
+            tenant: key,
+            app,
+            setting,
+        } => {
+            let t = tenant::find_for_admin(pool, &key).await?;
+            let a = apps::find_in_tenant(pool, &t, &app).await?;
+            let set = txn::ops::apps::SetGroupMembershipClaims {
+                tenant_id: t.id.clone(),
+                app_id: a.app_id.clone(),
+                setting,
+            };
+            txn::run(pool, &CLI, &set).await.into_result()?;
         }
         AppCmd::AssignmentRequired {
             tenant: key,

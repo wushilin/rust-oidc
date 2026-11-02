@@ -1438,3 +1438,64 @@ words (AADSTS50126), not a separate "no such tenant", and no audit row (no tenan
 attribute it to). `/admin/` answers `308` to `/admin`. Entra's equivalent
 (myaccount.microsoft.com) also discovers the home tenant from the username.
 *To reverse:* drop `src/routes/front_door.rs` and its routes.
+
+## Group claims and nested groups
+
+**43. Tokens carry groups only when the application asks: `groupMembershipClaims`**
+(agreed with the owner, 2026-10-31). Each application has Entra's setting, `None` by
+default, under the console's new Token configuration tab (and `app group-claims` on the
+command line): `None` (no `groups` claim), `All` (every group the user is in, nested ones
+included) or `ApplicationGroup` (the groups assigned to the application under Users and
+groups that the user is a direct member of). The application that receives a token
+decides: the resource's setting for an access token, the client's for an ID token, the
+calling application's for the Auth API's answer. Graph tokens carry none. No separate
+"interested groups" list: assignment is the list, as in Entra. A stored value this
+build does not know reads as `None`. No compatibility was kept (the owner: there is no
+installed base), so:
+- **`groups` carries object ids**, as Entra's does, and **`group_ids` is gone**. Names
+  are no longer in tokens. The Auth API's answer keeps `{id, name}` objects.
+- Entra's `SecurityGroup` and `DirectoryRole` values are not offered: there are no
+  distribution groups, and directory roles are already in `wids`.
+- **No overage handling yet** (Entra's 200-group cap with `_claim_names`). Deferred.
+*To reverse:* default the column to `All`.
+
+**44. Groups can contain groups; only the `groups` claim follows nesting** (agreed with
+the owner, 2026-10-31). `group_nesting` holds "parent directly contains child", the
+source of truth; `group_closure` holds every (ancestor, descendant, longest depth),
+each group its own ancestor at 0, and is what reads use, so a user's groups are one
+join. Membership flows up: a member of B, inside A, is a member of A, not of the
+groups inside B.
+- **The closure is never patched.** Every add or remove of a link rebuilds, in the same
+  transaction, the closure rows of the inner group and everything inside it, from the
+  nesting (patching would get "D inside A by two paths, one removed" wrong).
+- **Rules, on the write** (`groups::add_member_group_in`): same tenant, not inside
+  itself, no loop (the outer group must not already be inside the inner one: one
+  closure lookup), and no chain longer than `MAX_GROUP_NESTING_DEPTH` (8 links,
+  invented; Entra publishes none), refused with the reason. Reads never fail. The
+  rebuild refuses a loop or an over-long chain too, as a backstop, so a bad closure is
+  never written. MySQL cannot have the `parent <> child` CHECK (it refuses CHECKs on
+  columns with cascading foreign keys), so there only the storage layer enforces it.
+- **Locks:** adding or removing a link locks the tenant as well as both groups. Two
+  links that are each fine alone can make a loop together (A>B and C>D with B>C and
+  D>A already there) while touching four different groups, so per-group locks are not
+  enough. Nesting changes are rare; serialising them per tenant costs nothing. No
+  separate "no loops" rule in the engine: the per-write check plus the rebuild, both
+  inside the transaction and against the batch's own earlier writes, cover it.
+- **Only the claim follows nesting.** App assignment (who may sign in), the roles it
+  carries, console role bindings and the last-Global-Administrator safeguard keep
+  counting direct members, unchanged, as in Entra (assignment ignores nesting there,
+  and role-assignable groups cannot be nested). So nesting a group can never grant
+  access or administration. `ApplicationGroup` follows assignment, so it counts
+  direct members too.
+- **Deleting**: a group with groups inside it is refused like one with accounts in it
+  (they are members). A group inside others can be deleted; its rows go, and nothing
+  below it exists to be left with a stale ancestor.
+- **Console**: a group's page lists member groups (with their own member counts,
+  linking to their page) and accounts in one table with a Type column (inline SVG
+  icon plus the word; the CSP allows inline SVG), a Show filter, an "Add a group"
+  picker that leaves out groups that would make a loop, and "Member of" linking back
+  up (not breadcrumbs: a group can have several parents). A user's page lists the
+  groups they are in through nesting, and through which group.
+- CLI: `group add-group` / `group remove-group`.
+*To reverse:* drop the two tables' use; `for_claim` with `All` falls back to direct
+groups.

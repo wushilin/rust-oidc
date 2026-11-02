@@ -642,13 +642,19 @@ pub(crate) async fn explain_in(
             ),
         ));
     } else {
-        let names = crate::groups::names_for_user_in(&mut *conn, &user.id).await?;
+        // What its ID token carries, under the application's own setting.
+        let setting = app.group_membership_claims;
+        let names: Vec<String> = crate::groups::for_claim_in(&mut *conn, setting, Some(&sp.id), &user.id)
+            .await?
+            .into_iter()
+            .map(|g| g.name)
+            .collect();
         token.push(line(
             Mark::Note,
             if names.is_empty() {
-                "groups: none".to_string()
+                format!("groups ({}): none", setting.as_str())
             } else {
-                format!("groups: {}", names.join(", "))
+                format!("groups ({}): {}", setting.as_str(), names.join(", "))
             },
         ));
     }

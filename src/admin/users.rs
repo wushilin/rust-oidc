@@ -790,6 +790,40 @@ disabled or deleted from here. Another administrator can.</p>"#
     let groups = if ctx.can_in(GROUP_READ, tenant) {
         let held = crate::groups::for_user(&st.pool, &user.id).await.unwrap_or_default();
         let all = crate::groups::list(&st.pool, &tenant.id).await.unwrap_or_default();
+        let memberships = crate::groups::memberships_for_user(&st.pool, &user.id)
+            .await
+            .unwrap_or_default();
+        let group_href = |id: &str| {
+            e(&format!(
+                "{}/admin/tenants/{}/groups/{id}",
+                st.public_url.base(),
+                tenant.id
+            ))
+        };
+        // Through a group inside another: not ticked or unticked here, since only
+        // the nesting decides it.
+        let inherited: String = memberships
+            .iter()
+            .filter_map(|m| m.via.as_ref().map(|via| (m, via)))
+            .map(|(m, via)| {
+                format!(
+                    r#"<tr><td><a href="{g}">{name}</a></td><td class="muted">via <a href="{v}">{via}</a></td></tr>"#,
+                    g = group_href(&m.group.id),
+                    name = view::labelled(crate::directory::PrincipalType::Group, &m.group.name),
+                    v = group_href(&via.id),
+                    via = e(&via.name),
+                )
+            })
+            .collect();
+        let inherited = if inherited.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<h3>Through nested groups</h3><table><tr><th>Group</th><th>Why</th></tr>{inherited}</table>
+<p class="muted">These count for the <code>groups</code> claim of applications that carry all groups. They do not
+assign the account to applications, or give it roles granted to those groups.</p>"#
+            )
+        };
         if ctx.can_in(GROUP_WRITE, tenant) && !all.is_empty() {
             // Every group of the tenant, the ones they are in ticked: membership is
             // set in one go rather than group by group.
@@ -810,8 +844,8 @@ disabled or deleted from here. Another administrator can.</p>"#
                 .collect();
             format!(
                 r#"<h2>Groups</h2><form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
-<fieldset class="ticks">{boxes}</fieldset>
-<div class="actions"><button type="submit">Save groups</button></div></form>"#,
+<fieldset class="ticks"><legend>Direct member of</legend>{boxes}</fieldset>
+<div class="actions"><button type="submit">Save groups</button></div></form>{inherited}"#,
                 url = e(&url),
                 op_field = UserOp::FIELD,
                 op = UserOp::Groups.as_str(),
@@ -824,7 +858,7 @@ disabled or deleted from here. Another administrator can.</p>"#
                     .map(|g| format!(r#"<span class="pill">{}</span>"#, e(&g.name)))
                     .collect()
             };
-            format!(r#"<h2>Groups</h2><p>{pills}</p>"#)
+            format!(r#"<h2>Groups</h2><p>Direct member of: {pills}</p>{inherited}"#)
         }
     } else {
         String::new()

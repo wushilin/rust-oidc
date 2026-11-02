@@ -174,11 +174,6 @@ pub async fn issue(
     // mean nothing here, so neither is claimed; `idp` says where it is from, and
     // `acct` marks it as external (1), as Entra does for a guest.
     let outsider = user.tenant_id != *tid;
-    let user_groups = if outsider {
-        Vec::new()
-    } else {
-        groups::for_user(pool, &user.id).await?
-    };
     let wids = if outsider {
         Vec::new()
     } else {
@@ -192,6 +187,14 @@ pub async fn issue(
     let resource_roles = match &grant.resource {
         Resource::App { sp, .. } => apps::app_roles_for_user(pool, &sp.id, &user.id).await?,
         Resource::Graph => Vec::new(),
+    };
+    // The application receiving the token decides which groups it carries: the
+    // resource's setting here, the client's in the ID token. Graph gets none.
+    let access_groups = match &grant.resource {
+        Resource::App { app, sp } if !outsider => {
+            groups::for_claim(pool, app.group_membership_claims, Some(&sp.id), &user.id).await?
+        }
+        _ => Vec::new(),
     };
     let mut at = Map::new();
     at.insert("aud".into(), json!(grant.resource.audience()));
@@ -207,7 +210,7 @@ pub async fn issue(
     at.insert("amr".into(), json!(sign_in.amr));
     at.insert("azp".into(), json!(sign_in.client.app_id));
     at.insert("azpacr".into(), json!(azpacr.as_str()));
-    insert_groups(&mut at, &user_groups);
+    insert_groups(&mut at, &access_groups);
     at.insert("idtyp".into(), json!(IdType::User.as_str()));
     at.insert("name".into(), json!(name));
     at.insert("oid".into(), json!(user.id));
@@ -225,9 +228,15 @@ pub async fn issue(
     // ---- ID token ----
     let id_token = if grant.has("openid") {
         let sp = apps::service_principal(pool, tid, &sign_in.client.app_id).await?;
-        let client_roles = match sp {
+        let client_roles = match &sp {
             Some(sp) => apps::app_roles_for_user(pool, &sp.id, &user.id).await?,
             None => Vec::new(),
+        };
+        let id_groups = if outsider {
+            Vec::new()
+        } else {
+            let sp_id = sp.as_ref().map(|sp| sp.id.as_str());
+            groups::for_claim(pool, sign_in.client.group_membership_claims, sp_id, &user.id).await?
         };
         let mut id = Map::new();
         id.insert("aud".into(), json!(sign_in.client.app_id));
@@ -254,7 +263,7 @@ pub async fn issue(
             id.insert("email".into(), json!(email));
             id.insert("email_verified".into(), json!(user.email_verified));
         }
-        insert_groups(&mut id, &user_groups);
+        insert_groups(&mut id, &id_groups);
         if let Some(nonce) = nonce {
             id.insert("nonce".into(), json!(nonce));
         }
@@ -294,23 +303,13 @@ fn insert_nonempty(map: &mut Map<String, Value>, key: &str, values: &[String]) {
     }
 }
 
-/// `groups` (names, as before) and `group_ids`, the same groups in the same order.
-///
-/// Names are what this server has always emitted; Entra emits ids. An application
-/// that keys on something stable reads `group_ids[i]` for `groups[i]`. Both come
-/// from one ordered list, so they cannot fall out of step.
+/// `groups`: the object ids of the groups, as Entra emits them. Which groups is
+/// the receiving application's `groupMembershipClaims`; see [`groups::for_claim`].
 fn insert_groups(claims: &mut Map<String, Value>, groups: &[groups::GroupRef]) {
     if groups.is_empty() {
         return;
     }
-    claims.insert(
-        "groups".into(),
-        json!(groups.iter().map(|g| &g.name).collect::<Vec<_>>()),
-    );
-    claims.insert(
-        "group_ids".into(),
-        json!(groups.iter().map(|g| &g.id).collect::<Vec<_>>()),
-    );
+    claims.insert("groups".into(), json!(groups.iter().map(|g| &g.id).collect::<Vec<_>>()));
 }
 
 /// `roles` (app role values) and `role_ids`, the same roles in the same order.

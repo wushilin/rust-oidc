@@ -43,10 +43,13 @@ ProcessMaster (https://github.com/wushilin/processmaster) shows it uses only 20M
   password grant (off unless enabled per app) and on-behalf-of; discovery, JWKS,
   UserInfo and logout; `prompt`, `max_age`, `login_hint`, and `acr` / `acr_values`
   step-up to MFA. Entra's AADSTS error codes throughout.
-- **Directory:** tenants (one verified domain each), users, groups, app
+- **Directory:** tenants (one verified domain each), users, groups (which can contain
+  groups), app
   registrations with redirect URIs, secrets, certificates, exposed scopes and app
   roles; user and group assignments, application permissions, and sign-in to other
-  tenants' applications with controls on both sides.
+  tenants' applications with controls on both sides. Tokens carry the user's groups
+  only when the application asks (Entra's `groupMembershipClaims`: none, all, or the
+  groups assigned to it).
 - **Security:** TOTP MFA with recovery codes, required per tenant, per application
   or per user, set up at sign-in; smart lockout, password history, forced password
   change, rate limiting, and a full audit log.
@@ -135,6 +138,9 @@ metadata always use the GUID.
 $B user create --tenant contoso.com --upn alice@contoso.com --display-name "Alice Smith" --email alice@contoso.com
 $B group create --tenant contoso.com --name engineering
 $B group add-member --tenant contoso.com --group engineering --user alice@contoso.com
+$B group create --tenant contoso.com --name staff
+$B group add-group --tenant contoso.com --group staff --member engineering
+$B app group-claims --tenant contoso.com --app W --setting All
 $B app add-redirect-uri --tenant contoso.com --app W --platform web --uri https://portal.contoso.com/signin-oidc
 $B app add-scope --tenant contoso.com --app A --value Orders.Read
 $B app assignment-required --tenant contoso.com --app W --required true
@@ -300,7 +306,8 @@ On success:
 }
 ```
 
-`groups` are the user's groups; `app_roles` the roles they hold on the calling
+`groups` are the user's groups, as the calling application's group claims setting
+selects them (none by default); `app_roles` the roles they hold on the calling
 application. Use either to decide what they may do on the host.
 
 Every failure about the user, `200`:
@@ -377,8 +384,8 @@ all (tenant settings, group membership, audit).
 |---|---|---|
 | `/admin/tenants` | List; create, rename, enable/disable, add and withdraw verified domains | `Tenant:Read`; writes need `Tenant:Create`/`Tenant:Write` **at `all` scope** |
 | `/admin/tenants/{tenant}/users` | List, search, create, edit, enable/disable, reset password, delete | `User:Read`, `User:Write`, `User:Reset` |
-| `/admin/tenants/{tenant}/groups` | List, create, add and remove members | `Group:Read`, `Group:Write` |
-| `/admin/tenants/{tenant}/apps` | Register; secrets, certificates, redirect URIs per platform, Application ID URIs, exposed scopes, app roles, role assignments, and the password-grant and implicit toggles | `App:Read`, `App:Write`; credentials need `App:Rotate`; assignments need `Assignment:Write` |
+| `/admin/tenants/{tenant}/groups` | List, create, add and remove members (accounts and groups) | `Group:Read`, `Group:Write` |
+| `/admin/tenants/{tenant}/apps` | Register; secrets, certificates, redirect URIs per platform, Application ID URIs, exposed scopes, app roles, role assignments, the password-grant and implicit toggles, and which groups tokens carry | `App:Read`, `App:Write`; credentials need `App:Rotate`; assignments need `Assignment:Write` |
 | `/admin/tenants/{tenant}/roles` | Grant and revoke console roles | `RoleBinding:Read`, `RoleBinding:Write` |
 | `/admin/tenants/{tenant}/flow` | Flow tester: what a flow needs configured, then drive it and read the result | `App:Read`; registering the callback or a test client needs `App:Write` |
 | `/admin/tenants/{tenant}/settings` | Token, session and refresh-token lifetimes | `Tenant:Write` |
@@ -441,7 +448,9 @@ Worth knowing:
 
 ## Deliberate differences from Entra
 
-- `groups` holds group names, not object IDs.
+- Nested groups count for the `groups` claim (with `All`) but never for assignment or
+  roles, and chains are limited to 8 levels. There is no overage handling: every
+  group is listed, however many.
 - There is no interactive consent. Apps are treated as admin-consented.
 - The implicit and hybrid response types are **off by default** on every app, as in
   Entra, and enabled per app (`app implicit --id-tokens/--access-tokens`).

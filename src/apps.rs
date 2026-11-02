@@ -25,6 +25,64 @@ pub struct Application {
     /// `token`. Off by default.
     #[sqlx(try_from = "crate::db::Flag")]
     pub allow_access_token_implicit: bool,
+    /// Which groups its tokens carry in the `groups` claim. None by default.
+    #[sqlx(try_from = "String")]
+    pub group_membership_claims: GroupMembershipClaims,
+}
+
+/// Entra's `groupMembershipClaims`: which of the signed-in user's groups an
+/// application's tokens carry in the `groups` claim (as object ids). Stored in
+/// `applications.group_membership_claims`, spelled as Entra's manifest spells it.
+///
+/// The application that receives the token decides: the resource application's
+/// setting for an access token, the client's for an ID token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum GroupMembershipClaims {
+    /// No `groups` claim. The default, as in Entra.
+    #[default]
+    #[value(name = "None")]
+    None,
+    /// Every group the user is in, directly or through a group inside it.
+    #[value(name = "All")]
+    All,
+    /// Only the groups assigned to the application (under Users and groups) that
+    /// the user is a direct member of. Nesting does not count here, as it does
+    /// not for assignment itself.
+    #[value(name = "ApplicationGroup")]
+    ApplicationGroup,
+}
+
+impl GroupMembershipClaims {
+    pub const ALL: &'static [GroupMembershipClaims] = &[Self::None, Self::All, Self::ApplicationGroup];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::All => "All",
+            Self::ApplicationGroup => "ApplicationGroup",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|g| g.as_str() == raw)
+    }
+
+    /// What the console says it does.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None: tokens carry no groups",
+            Self::All => "All groups the user is in, including through nested groups",
+            Self::ApplicationGroup => "Groups assigned to the application that the user is a direct member of",
+        }
+    }
+}
+
+/// A stored value this build does not know reads as `None`: emitting fewer
+/// groups is the safe side of not understanding a setting.
+impl From<String> for GroupMembershipClaims {
+    fn from(raw: String) -> Self {
+        Self::parse(&raw).unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -70,6 +128,7 @@ pub(crate) async fn create_in(
         allow_password_grant: false,
         allow_id_token_implicit: false,
         allow_access_token_implicit: false,
+        group_membership_claims: GroupMembershipClaims::None,
     };
     let sp_id = new_guid();
     let identifier_uri = format!("api://{}", application.app_id);
@@ -127,7 +186,7 @@ pub(crate) async fn find_in(conn: &mut crate::db::Conn, app_id: &str) -> anyhow:
     Ok(sqlx::query_as(crate::db::qc(
         conn,
         "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
-                allow_access_token_implicit FROM applications
+                allow_access_token_implicit, group_membership_claims FROM applications
          WHERE app_id = ? AND deleted_at IS NULL",
     ))
     // GUIDs are stored lowercase; fold the probe so `ABC-..` still finds them.
@@ -161,7 +220,7 @@ pub(crate) async fn list_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyh
     Ok(sqlx::query_as(crate::db::qc(
         conn,
         "SELECT id, app_id, tenant_id, display_name, allow_password_grant, allow_id_token_implicit,
-                allow_access_token_implicit FROM applications
+                allow_access_token_implicit, group_membership_claims FROM applications
          WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
     ))
     .bind(tenant_id)
@@ -271,7 +330,7 @@ pub(crate) async fn resolve_resource_in(
         sqlx::query_as(crate::db::qc(
             conn,
             "SELECT a.id, a.app_id, a.tenant_id, a.display_name, a.allow_password_grant,
-                    a.allow_id_token_implicit, a.allow_access_token_implicit FROM applications a
+                    a.allow_id_token_implicit, a.allow_access_token_implicit, a.group_membership_claims FROM applications a
              JOIN app_identifier_uris u ON u.application_id = a.id
              WHERE u.tenant_id = ? AND u.uri = ? AND a.deleted_at IS NULL",
         ))
@@ -1669,6 +1728,32 @@ pub(crate) async fn set_implicit_allowed_in(
     ))
     .bind(id_token)
     .bind(access_token)
+    .bind(&app.id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Which groups this application's tokens carry (Entra's `groupMembershipClaims`).
+pub async fn set_group_membership_claims<'c>(
+    db: impl Handle<'c>,
+    app: &Application,
+    setting: GroupMembershipClaims,
+) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    set_group_membership_claims_in(&mut conn, app, setting).await
+}
+
+pub(crate) async fn set_group_membership_claims_in(
+    conn: &mut crate::db::Conn,
+    app: &Application,
+    setting: GroupMembershipClaims,
+) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        conn,
+        "UPDATE applications SET group_membership_claims = ? WHERE id = ?",
+    ))
+    .bind(setting.as_str())
     .bind(&app.id)
     .execute(&mut *conn)
     .await?;

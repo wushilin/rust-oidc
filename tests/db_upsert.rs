@@ -83,12 +83,12 @@ async fn concurrent_session_creates_for_one_cookie_all_succeed() {
             format!("{}=shared-cookie", session::SESSION_COOKIE).parse().unwrap(),
         );
         let results = contend(|_| {
-            let (p, h, tid, uid) = (pool.clone(), headers.clone(), t.id.clone(), uid.clone());
-            async move { session::create(&p, &h, &tid, &uid, &["pwd"], 3600).await }
+            let (p, h, t, uid) = (pool.clone(), headers.clone(), t.clone(), uid.clone());
+            async move { session::create(&p, &h, &t, &uid, &["pwd"], session::KeepSignedIn::No).await }
         })
         .await;
         for r in results {
-            assert_eq!(r.expect("no session create should fail"), "shared-cookie");
+            assert_eq!(r.expect("no session create should fail").cookie, "shared-cookie");
         }
         let (n,): (i64,) = sqlx::query_as(rust_oidc::db::sql_stmt(
             rust_oidc::db::engine_of(&pool),

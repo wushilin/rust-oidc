@@ -1499,3 +1499,54 @@ groups inside B.
 - CLI: `group add-group` / `group remove-group`.
 *To reverse:* drop the two tables' use; `for_claim` with `All` falls back to direct
 groups.
+
+## Staying signed in
+
+**45. "Keep me signed in" and "Don't ask again on this device"** (2026-10-09; the
+owner asked for both, thirty days each, each turned on per tenant by an admin). Two
+switches on the tenant's Settings page, `allow_keep_signed_in` and
+`allow_remember_mfa`, both off by default. Decided without asking:
+- **Entra shows "Stay signed in?" as a page after the sign-in; this is a box on the
+  sign-in page**, because the owner asked for a checkbox. The effect is Entra's: a
+  persistent session (`TenantSettings::KEEP_SIGNED_IN_SECS`, thirty days, never
+  shorter than the tenant's own session lifetime).
+- **The box is honoured only where the session's tenant offers it**: a ticked box
+  posted to a tenant that does not is a plain sign-in. The choice travels on the
+  pending second step (`mfa_pending.keep_signed_in`), so the session made after the
+  code is the kind asked for on the password page.
+- **Remembering the second factor is governed by the account's own (home) tenant**,
+  which owns its MFA rules, not the tenant signed in to. A remembered browser skips
+  only the code (never the password, never setting an authenticator up) and still
+  counts as MFA (`amr: ["pwd","mfa"]`), as Entra's "remember MFA" does. Audited as
+  `auth.mfa_verified` with `factor: remembered_device`; no new audit action.
+- **An application can always insist.** `prompt=login` ignores a remembered browser;
+  `max_age` accepts one only if the code was given within it (a remembered browser
+  dates from the code that remembered it). The same applies to `prompt=login` /
+  `max_age` for the session, as before.
+- **Checked at use, not only when remembered**: the home tenant's switch, the row's
+  expiry, and that it postdates the account's authenticator (a new authenticator is
+  not vouched for by the old).
+- **Taken back at once.** Turning "Keep me signed in" off cuts every kept session in
+  the tenant back to the ordinary lifetime counted from its creation (one already
+  older ends); turning "remember" off forgets every browser remembered for the
+  tenant's accounts. This is the one exception to "issued sessions are not shortened
+  after the fact", and the Settings page says so. Anything that ends a user's
+  sessions (`users::revoke_access`: sign out everywhere, a new password, an admin
+  reset, MFA reset, disabling, deleting) also forgets their remembered browsers, and
+  so does setting up a new authenticator. "Sign out everywhere" therefore doubles as
+  "forget my devices"; no separate button.
+- **Not in the console**: it keeps its own short admin sessions and always asks an
+  administrator for the code. **Not on the front door**: its tenant (and so whether
+  it offers the box) is not known until the UPN is; the tenant's own My Account
+  sign-in offers it. **Not for a step asked on the My Account page itself**
+  (setting an authenticator up while signed in), which is not a sign-in.
+- **One cookie serves every tenant's session**, so its Max-Age is that of the
+  longest-lived session it carries (`session::Created::max_age`): a plain sign-in in
+  one tenant must not cut short a kept one in another. Each session still ends at its
+  own `expires_at`. The remembered browser has its own cookie
+  (`rust_oidc_mfa_device`); only hashes of either are stored.
+- Remembered browsers are sign-in state (`mfa_remembered_devices` is in the
+  `txn_only` guard's state tables), written at sign-in by `mfa::remember_device` (an
+  allowed sign-in write), like sessions and pending-step tickets.
+*To reverse:* leave both switches off (the default); migration 0021's columns and
+table stay unused.

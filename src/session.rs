@@ -10,16 +10,67 @@ use crate::db::DbPool;
 use axum::http::{HeaderMap, HeaderValue, header};
 
 use crate::config::PublicUrl;
+use crate::tenant::{Tenant, TenantSettings};
 use crate::util::{b64url, now, random_bytes, sha256_hex};
 
 pub const SESSION_COOKIE: &str = "rust_oidc_session";
 pub const CSRF_COOKIE: &str = "rust_oidc_csrf";
+/// The browser's "don't ask again on this device" value (see `mfa::remember_device`).
+pub const MFA_DEVICE_COOKIE: &str = "rust_oidc_mfa_device";
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub user_id: String,
     pub auth_time: i64,
     pub amr: Vec<String>,
+    /// Whether the user asked to keep it ("Keep me signed in").
+    pub keep: KeepSignedIn,
+}
+
+/// The user's answer to "Keep me signed in", as the tenant allows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepSignedIn {
+    No,
+    Yes,
+}
+
+impl KeepSignedIn {
+    /// What the sign-in form asked for, honoured only where `tenant` (the one
+    /// the session is made in) offers it: a ticked box posted to a tenant that
+    /// does not is a plain sign-in.
+    pub fn chosen(tenant: &Tenant, ticked: bool) -> Self {
+        if ticked && tenant.settings.allow_keep_signed_in {
+            Self::Yes
+        } else {
+            Self::No
+        }
+    }
+
+    pub fn from_flag(kept: bool) -> Self {
+        if kept { Self::Yes } else { Self::No }
+    }
+
+    pub fn is_kept(self) -> bool {
+        self == Self::Yes
+    }
+
+    /// How long a session made in `tenant` lasts.
+    pub fn lifetime(self, tenant: &Tenant) -> i64 {
+        match self {
+            Self::No => tenant.settings.session_lifetime_secs,
+            Self::Yes => TenantSettings::KEEP_SIGNED_IN_SECS.max(tenant.settings.session_lifetime_secs),
+        }
+    }
+}
+
+/// A session recorded for this browser: the cookie value, and how long the
+/// cookie must live, which is as long as the longest-lived session it carries
+/// in any tenant -- one cookie serves them all, so a plain sign-in in one tenant
+/// must not cut short a kept one in another. Each session still ends at its own
+/// `expires_at`, checked by [`find`].
+pub struct Created {
+    pub cookie: String,
+    pub max_age: i64,
 }
 
 pub fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -56,9 +107,9 @@ pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow
     let Some(cookie) = cookie(headers, SESSION_COOKIE) else {
         return Ok(None);
     };
-    let row: Option<(String, i64, String)> = sqlx::query_as(crate::db::q(
+    let row: Option<(String, i64, String, crate::db::Flag)> = sqlx::query_as(crate::db::q(
         pool,
-        "SELECT s.user_id, s.auth_time, s.amr FROM sessions s JOIN users u ON u.id = s.user_id
+        "SELECT s.user_id, s.auth_time, s.amr, s.keep_signed_in FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = ?
            AND u.deleted_at IS NULL",
     ))
@@ -68,24 +119,39 @@ pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow
     .bind(true)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(user_id, auth_time, amr)| Session {
+    Ok(row.map(|(user_id, auth_time, amr, kept)| Session {
         user_id,
         auth_time,
         amr: serde_json::from_str(&amr).unwrap_or_default(),
+        keep: KeepSignedIn::from_flag(kept.into()),
     }))
 }
 
-/// Record a sign-in for this browser in `tenant_id`. Reuses the browser's
-/// cookie if it has one, so sessions in other tenants are kept. Returns the
-/// cookie value to set.
+/// Record a sign-in for this browser in `tenant`. Reuses the browser's cookie if
+/// it has one, so sessions in other tenants are kept.
 pub async fn create(
     pool: &DbPool,
     headers: &HeaderMap,
-    tenant_id: &str,
+    tenant: &Tenant,
     user_id: &str,
     amr: &[&str],
-    lifetime: i64,
+    keep: KeepSignedIn,
+) -> anyhow::Result<Created> {
+    let cookie = record(pool, headers, tenant, user_id, amr, keep).await?;
+    let max_age = cookie_lifetime(pool, &cookie).await?;
+    Ok(Created { cookie, max_age })
+}
+
+async fn record(
+    pool: &DbPool,
+    headers: &HeaderMap,
+    tenant: &Tenant,
+    user_id: &str,
+    amr: &[&str],
+    keep: KeepSignedIn,
 ) -> anyhow::Result<String> {
+    let tenant_id = tenant.id.as_str();
+    let lifetime = keep.lifetime(tenant);
     let cookie = cookie(headers, SESSION_COOKIE).unwrap_or_else(new_token);
     let ts = now();
     let engine = crate::db::engine_of(pool);
@@ -96,7 +162,7 @@ pub async fn create(
     for _ in 0..crate::db::UPSERT_ATTEMPTS {
         let updated = sqlx::query(crate::db::sql_stmt(
             engine,
-            "UPDATE sessions SET user_id = ?, auth_time = ?, amr = ?, created_at = ?, expires_at = ?
+            "UPDATE sessions SET user_id = ?, auth_time = ?, amr = ?, created_at = ?, expires_at = ?, keep_signed_in = ?
              WHERE cookie_hash = ? AND tenant_id = ?",
         ))
         .bind(user_id)
@@ -104,6 +170,7 @@ pub async fn create(
         .bind(&amr_json)
         .bind(ts)
         .bind(ts + lifetime)
+        .bind(keep.is_kept())
         .bind(&hash)
         .bind(tenant_id)
         .execute(pool)
@@ -114,8 +181,8 @@ pub async fn create(
         let done = crate::db::inserted(
             sqlx::query(crate::db::sql_stmt(
                 engine,
-                "INSERT INTO sessions (cookie_hash, tenant_id, user_id, auth_time, amr, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sessions (cookie_hash, tenant_id, user_id, auth_time, amr, created_at, expires_at, keep_signed_in)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ))
             .bind(&hash)
             .bind(tenant_id)
@@ -124,6 +191,7 @@ pub async fn create(
             .bind(&amr_json)
             .bind(ts)
             .bind(ts + lifetime)
+            .bind(keep.is_kept())
             .execute(pool)
             .await,
         )?;
@@ -135,6 +203,18 @@ pub async fn create(
         "session could not be recorded after {} attempts (concurrent writers)",
         crate::db::UPSERT_ATTEMPTS
     )
+}
+
+/// Seconds until the last of this cookie's sessions ends, in any tenant.
+async fn cookie_lifetime(pool: &DbPool, cookie: &str) -> anyhow::Result<i64> {
+    let (latest,): (Option<i64>,) = sqlx::query_as(crate::db::q(
+        pool,
+        "SELECT MAX(expires_at) FROM sessions WHERE cookie_hash = ?",
+    ))
+    .bind(sha256_hex(cookie.as_bytes()))
+    .fetch_one(pool)
+    .await?;
+    Ok(latest.map_or(0, |at| (at - now()).max(0)))
 }
 
 pub async fn end(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {

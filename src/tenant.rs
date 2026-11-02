@@ -26,6 +26,14 @@ pub struct TenantSettings {
     /// assign them. Off unless the tenant turns it on; a user's own setting
     /// can override it either way.
     pub allow_cross_tenant_sign_in: bool,
+    /// The sign-in page offers "Keep me signed in": a session the user keeps
+    /// lasts [`Self::KEEP_SIGNED_IN_SECS`] instead of `session_lifetime_secs`.
+    /// Off unless the tenant turns it on.
+    pub allow_keep_signed_in: bool,
+    /// The second-step page offers "Don't ask again on this device": a browser
+    /// remembered for an account skips its code for [`Self::REMEMBER_MFA_SECS`].
+    /// Governed by the account's own (home) tenant. Off unless turned on.
+    pub allow_remember_mfa: bool,
 }
 
 impl Default for TenantSettings {
@@ -38,6 +46,8 @@ impl Default for TenantSettings {
             require_console_mfa: false,
             password_history: Self::DEFAULT_PASSWORD_HISTORY,
             allow_cross_tenant_sign_in: false,
+            allow_keep_signed_in: false,
+            allow_remember_mfa: false,
         }
     }
 }
@@ -65,6 +75,13 @@ impl TenantSettings {
     /// up to 24, Windows Server's own maximum.
     pub const DEFAULT_PASSWORD_HISTORY: i64 = 3;
     pub const MAX_PASSWORD_HISTORY: i64 = crate::users::MAX_PASSWORD_HISTORY;
+    /// How long a session lasts when the user ticks "Keep me signed in": thirty
+    /// days, the owner's choice (2026-10-09). Never shorter than the tenant's own
+    /// session lifetime.
+    pub const KEEP_SIGNED_IN_SECS: i64 = 30 * 86_400;
+    /// How long a remembered browser skips the second factor: thirty days, the
+    /// owner's choice (2026-10-09).
+    pub const REMEMBER_MFA_SECS: i64 = 30 * 86_400;
 
     /// Refuse a combination that cannot work, rather than storing it and issuing
     /// tokens nobody can use.
@@ -529,6 +546,26 @@ pub(crate) async fn save_settings_in(
         .bind(tenant_id)
         .execute(&mut *conn)
         .await?;
+    // Turning a remembering switch off takes effect at once, not as what was
+    // remembered runs out: a tenant turns one off because it no longer wants it.
+    if !settings.allow_keep_signed_in {
+        // Kept sessions go back to the tenant's ordinary lifetime, counted from
+        // when they were made; one already older than that ends now.
+        sqlx::query(crate::db::qc(
+            conn,
+            "UPDATE sessions SET expires_at = created_at + ?, keep_signed_in = ?
+             WHERE tenant_id = ? AND keep_signed_in = ?",
+        ))
+        .bind(settings.session_lifetime_secs)
+        .bind(false)
+        .bind(tenant_id)
+        .bind(true)
+        .execute(&mut *conn)
+        .await?;
+    }
+    if !settings.allow_remember_mfa {
+        crate::mfa::forget_tenant_devices_in(&mut *conn, tenant_id).await?;
+    }
     Ok(())
 }
 

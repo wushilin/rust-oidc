@@ -31,6 +31,8 @@ const REQUIRE_MFA: &str = "require_mfa";
 const PASSWORD_HISTORY: &str = "password_history";
 const ALLOW_CROSS_TENANT: &str = "allow_cross_tenant_sign_in";
 const REQUIRE_CONSOLE_MFA: &str = "require_console_mfa";
+const ALLOW_KEEP_SIGNED_IN: &str = "allow_keep_signed_in";
+const ALLOW_REMEMBER_MFA: &str = "allow_remember_mfa";
 const ACCESS_TOKEN: &str = "access_token_lifetime_secs";
 const SESSION: &str = "session_lifetime_secs";
 const REFRESH: &str = "refresh_token_lifetime_secs";
@@ -98,9 +100,19 @@ through one of this tenant's groups. A user's own setting, on their page, can ma
 up an authenticator does so at their next sign-in, and then signs in again with it.</p>
 <label><input type="checkbox" name="{REQUIRE_CONSOLE_MFA}"{console_mfa}{disabled}> Require MFA of this tenant's administrators signing in to the console</label>
 <p class="muted">Applies whatever their own setting says.{root_note}</p>
+<h2>Staying signed in</h2>
+<label><input type="checkbox" name="{ALLOW_KEEP_SIGNED_IN}"{keep}{disabled}> Offer "Keep me signed in" on the sign-in page</label>
+<p class="muted">A session the user keeps lasts {keep_days} days on that browser instead of the session lifetime above.
+Applications that need a fresh sign-in can still ask for one (<code>prompt=login</code>, <code>max_age</code>).</p>
+<label><input type="checkbox" name="{ALLOW_REMEMBER_MFA}"{remember}{disabled}> Offer "Don't ask again on this device" when a code is entered</label>
+<p class="muted">For this tenant's accounts: a browser they remember skips the code for {remember_days} days, but
+never the password. A fresh sign-in an application asks for always asks for the code too. Signing out
+everywhere, a new password or a new authenticator forgets every remembered browser. Not in the console,
+which always asks administrators for their code.</p>
 {save}</form>
 <p class="muted">A change applies to tokens and sessions issued from now on. Those already
-issued are self-contained and cannot be shortened after the fact.</p>{manage}"#,
+issued are self-contained and cannot be shortened after the fact, with one exception: turning
+either "Staying signed in" option off takes effect at once, for what was already remembered too.</p>{manage}"#,
         error = view::error_block(error),
         manage = manage,
         url = e(&settings_url(st.public_url.base(), tenant)),
@@ -114,6 +126,10 @@ issued are self-contained and cannot be shortened after the fact.</p>{manage}"#,
         },
         max_history = TenantSettings::MAX_PASSWORD_HISTORY,
         console_mfa = if settings.require_console_mfa { " checked" } else { "" },
+        keep = if settings.allow_keep_signed_in { " checked" } else { "" },
+        remember = if settings.allow_remember_mfa { " checked" } else { "" },
+        keep_days = TenantSettings::KEEP_SIGNED_IN_SECS / SECS_PER_DAY,
+        remember_days = TenantSettings::REMEMBER_MFA_SECS / SECS_PER_DAY,
         root_note = if tenant.is_root {
             " This is the root tenant, so it covers the Global Administrators."
         } else {
@@ -154,11 +170,13 @@ issued are self-contained and cannot be shortened after the fact.</p>{manage}"#,
     )
 }
 
+const SECS_PER_DAY: i64 = 86_400;
+
 /// A number of seconds in words, so a text box full of digits is readable.
 fn humanise(secs: i64) -> String {
     const MINUTE: i64 = 60;
     const HOUR: i64 = 3_600;
-    const DAY: i64 = 86_400;
+    const DAY: i64 = SECS_PER_DAY;
     let (n, unit) = match secs {
         s if s >= DAY => (s / DAY, "day"),
         s if s >= HOUR => (s / HOUR, "hour"),
@@ -217,6 +235,8 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
             allow_cross_tenant_sign_in: checked(&form, ALLOW_CROSS_TENANT),
             require_mfa: checked(&form, REQUIRE_MFA),
             require_console_mfa: checked(&form, REQUIRE_CONSOLE_MFA),
+            allow_keep_signed_in: checked(&form, ALLOW_KEEP_SIGNED_IN),
+            allow_remember_mfa: checked(&form, ALLOW_REMEMBER_MFA),
         },
         (access, session, refresh) => {
             let message = [access.err(), session.err(), refresh.err()]

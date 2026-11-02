@@ -21,7 +21,8 @@ use sha1::Sha1;
 
 use crate::apps::ServicePrincipal;
 use crate::db::Handle;
-use crate::tenant::Tenant;
+use crate::session::KeepSignedIn;
+use crate::tenant::{Tenant, TenantSettings};
 use crate::util::{new_guid, now, random_bytes, random_string, sha256_hex};
 
 /// RFC 6238's defaults, which every authenticator app uses.
@@ -538,6 +539,8 @@ pub(crate) async fn replace_recovery_codes_in(
 pub enum Factor {
     Authenticator,
     RecoveryCode,
+    /// No code this time: the browser was remembered after an earlier one.
+    RememberedDevice,
 }
 
 impl Factor {
@@ -546,6 +549,7 @@ impl Factor {
         match self {
             Self::Authenticator => "authenticator",
             Self::RecoveryCode => "recovery_code",
+            Self::RememberedDevice => "remembered_device",
         }
     }
 }
@@ -617,6 +621,14 @@ pub(crate) async fn enroll_in(
     .execute(&mut *tx)
     .await?;
     insert_recovery_codes(&mut tx, engine, user_id, codes).await?;
+    // A browser remembered for the old authenticator is not remembered for this one.
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM mfa_remembered_devices WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -669,6 +681,9 @@ pub struct Pending {
     pub purpose: Purpose,
     /// For an enrolment: the secret being set up.
     pub enroll_secret: Option<String>,
+    /// What the user answered to "Keep me signed in" on the password page, for
+    /// the session made when this step is done.
+    pub keep: KeepSignedIn,
 }
 
 /// Start a second step for a user whose password was right (or whose session
@@ -678,9 +693,10 @@ pub async fn begin<'c>(
     tenant_id: &str,
     user_id: &str,
     purpose: Purpose,
+    keep: KeepSignedIn,
 ) -> anyhow::Result<String> {
     let mut conn = db.acquire().await?;
-    begin_in(&mut conn, tenant_id, user_id, purpose).await
+    begin_in(&mut conn, tenant_id, user_id, purpose, keep).await
 }
 
 pub(crate) async fn begin_in(
@@ -688,6 +704,7 @@ pub(crate) async fn begin_in(
     tenant_id: &str,
     user_id: &str,
     purpose: Purpose,
+    keep: KeepSignedIn,
 ) -> anyhow::Result<String> {
     let ticket = crate::util::b64url(&random_bytes(32));
     let ts = now();
@@ -697,8 +714,8 @@ pub(crate) async fn begin_in(
         .await?;
     let secret = (purpose == Purpose::Enroll).then(new_secret);
     sqlx::query(crate::db::qc(conn,
-        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at, keep_signed_in)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
     ))
     .bind(sha256_hex(ticket.as_bytes()))
     .bind(user_id)
@@ -707,6 +724,7 @@ pub(crate) async fn begin_in(
     .bind(secret)
     .bind(ts)
     .bind(ts + TICKET_LIFETIME_SECS)
+    .bind(keep.is_kept())
     .execute(&mut *conn)
     .await?;
     Ok(ticket)
@@ -723,9 +741,9 @@ pub(crate) async fn pending_in(
     ticket: &str,
     tenant_id: &str,
 ) -> anyhow::Result<Option<Pending>> {
-    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(crate::db::qc(
+    let row: Option<(String, String, String, Option<String>, crate::db::Flag)> = sqlx::query_as(crate::db::qc(
         conn,
-        "SELECT user_id, tenant_id, purpose, enroll_secret FROM mfa_pending
+        "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in FROM mfa_pending
          WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ?",
     ))
     .bind(sha256_hex(ticket.as_bytes()))
@@ -734,12 +752,13 @@ pub(crate) async fn pending_in(
     .bind(MAX_ATTEMPTS)
     .fetch_optional(&mut *conn)
     .await?;
-    Ok(row.and_then(|(user_id, tenant_id, purpose, enroll_secret)| {
+    Ok(row.and_then(|(user_id, tenant_id, purpose, enroll_secret, kept)| {
         Some(Pending {
             user_id,
             tenant_id,
             purpose: Purpose::parse(&purpose)?,
             enroll_secret,
+            keep: KeepSignedIn::from_flag(kept.into()),
         })
     }))
 }
@@ -780,6 +799,152 @@ pub(crate) async fn finish_in(conn: &mut crate::db::Conn, ticket: &str) -> anyho
         .bind(sha256_hex(ticket.as_bytes()))
         .execute(&mut *conn)
         .await?;
+    Ok(())
+}
+
+// ---- "don't ask again on this device" ----
+
+/// Whether a browser's second factor may be skipped this time.
+///
+/// Only an account with an authenticator is ever asked for a code, so only such
+/// an account is ever remembered; setting one up is never skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remembered {
+    /// Skip the code: the browser was remembered within the allowed time.
+    Yes,
+    No,
+}
+
+/// What the application asked of this sign-in that a remembered browser must
+/// not paper over.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Freshness {
+    /// `prompt=login`: the application wants the user to authenticate now, so a
+    /// remembered browser counts for nothing.
+    pub forced: bool,
+    /// `max_age`: a remembered browser counts only if it was remembered (when
+    /// the last code was given) within this many seconds.
+    pub max_age: Option<i64>,
+}
+
+/// Remember this browser for `user_id`'s second factor, where the user's own
+/// tenant `home` allows it. `existing` is the browser's device cookie, reused so
+/// one browser carries one value for every account it remembers. Returns the
+/// cookie value to set, or `None` when nothing was remembered.
+pub async fn remember_device<'c>(
+    db: impl Handle<'c>,
+    existing: Option<&str>,
+    user_id: &str,
+    home: &Tenant,
+) -> anyhow::Result<Option<String>> {
+    if !home.settings.allow_remember_mfa {
+        return Ok(None);
+    }
+    let mut conn = db.acquire().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let token = existing
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::util::b64url(&random_bytes(32)));
+    let hash = sha256_hex(token.as_bytes());
+    let ts = now();
+    let expires = ts + TenantSettings::REMEMBER_MFA_SECS;
+    // Refresh the row if the browser already remembers this account, else add it;
+    // a unique violation means a concurrent sign-in added it first.
+    for _ in 0..crate::db::UPSERT_ATTEMPTS {
+        let updated = sqlx::query(crate::db::sql_stmt(
+            engine,
+            "UPDATE mfa_remembered_devices SET tenant_id = ?, created_at = ?, expires_at = ?
+             WHERE device_hash = ? AND user_id = ?",
+        ))
+        .bind(&home.id)
+        .bind(ts)
+        .bind(expires)
+        .bind(&hash)
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
+        if updated.rows_affected() > 0 {
+            return Ok(Some(token));
+        }
+        let done = crate::db::inserted(
+            sqlx::query(crate::db::sql_stmt(
+                engine,
+                "INSERT INTO mfa_remembered_devices (device_hash, user_id, tenant_id, created_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            ))
+            .bind(&hash)
+            .bind(user_id)
+            .bind(&home.id)
+            .bind(ts)
+            .bind(expires)
+            .execute(&mut *conn)
+            .await,
+        )?;
+        if done {
+            return Ok(Some(token));
+        }
+    }
+    bail!(
+        "the device could not be remembered after {} attempts (concurrent writers)",
+        crate::db::UPSERT_ATTEMPTS
+    )
+}
+
+/// Whether the browser holding `device` may skip `user_id`'s second factor now.
+///
+/// Every condition is checked here, at use, not only when the browser was
+/// remembered: the user's own tenant must still allow it, the row must not have
+/// run out, it must postdate the account's authenticator (a new one is not
+/// vouched for by the old), and it must satisfy what the application asked for.
+pub async fn remembered<'c>(
+    db: impl Handle<'c>,
+    device: Option<&str>,
+    user_id: &str,
+    home: &Tenant,
+    freshness: Freshness,
+) -> anyhow::Result<Remembered> {
+    let Some(device) = device else {
+        return Ok(Remembered::No);
+    };
+    if !home.settings.allow_remember_mfa || freshness.forced {
+        return Ok(Remembered::No);
+    }
+    let mut conn = db.acquire().await?;
+    let Some(enrolled) = enrolled_at_in(&mut conn, user_id).await? else {
+        return Ok(Remembered::No);
+    };
+    let row: Option<(i64,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT created_at FROM mfa_remembered_devices
+         WHERE device_hash = ? AND user_id = ? AND tenant_id = ? AND expires_at > ?",
+    ))
+    .bind(sha256_hex(device.as_bytes()))
+    .bind(user_id)
+    .bind(&home.id)
+    .bind(now())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((remembered_at,)) = row else {
+        return Ok(Remembered::No);
+    };
+    let recent_enough = freshness.max_age.is_none_or(|max| now() - remembered_at <= max);
+    Ok(if remembered_at >= enrolled && recent_enough {
+        Remembered::Yes
+    } else {
+        Remembered::No
+    })
+}
+
+/// Forget every browser remembered for the accounts of `tenant_id`: its switch
+/// was turned off. Part of the settings transaction.
+pub(crate) async fn forget_tenant_devices_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        conn,
+        "DELETE FROM mfa_remembered_devices WHERE tenant_id = ?",
+    ))
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

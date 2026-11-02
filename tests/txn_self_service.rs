@@ -48,9 +48,16 @@ async fn sessions(s: &TestServer, user_id: &str) -> i64 {
 }
 
 async fn sign_in_session(s: &TestServer, f: &UserFixture) {
-    rust_oidc::session::create(&s.pool, &HeaderMap::new(), &f.tenant.id, &f.user_id, &["pwd"], 3600)
-        .await
-        .unwrap();
+    rust_oidc::session::create(
+        &s.pool,
+        &HeaderMap::new(),
+        &f.tenant,
+        &f.user_id,
+        &["pwd"],
+        rust_oidc::session::KeepSignedIn::No,
+    )
+    .await
+    .unwrap();
 }
 
 async fn password_works(s: &TestServer, f: &UserFixture, password: &str) -> bool {

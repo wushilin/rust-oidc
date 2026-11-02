@@ -27,7 +27,7 @@ use crate::claims::Amr;
 use crate::error::AadError;
 use crate::html::{self, AccountOp, LoginOp};
 use crate::mfa::{self, Purpose};
-use crate::session::{self, CSRF_COOKIE, SESSION_COOKIE};
+use crate::session::{self, CSRF_COOKIE, KeepSignedIn, SESSION_COOKIE};
 use crate::tenant::{self, Tenant};
 use crate::txn::{
     self,
@@ -58,10 +58,10 @@ fn fail(tenant: &Tenant, e: anyhow::Error) -> Response {
 
 /// The signed-in user of this browser in this tenant, with the methods their
 /// session was signed in with.
-async fn current(st: &AppState, tenant: &Tenant, headers: &HeaderMap) -> Option<(User, Vec<String>)> {
+async fn current(st: &AppState, tenant: &Tenant, headers: &HeaderMap) -> Option<(User, Vec<String>, KeepSignedIn)> {
     let s = session::find(&st.pool, headers, &tenant.id).await.ok()??;
     let user = users::find(&st.pool, &tenant.id, &s.user_id).await.ok()??;
-    user.enabled.then_some((user, s.amr))
+    user.enabled.then_some((user, s.amr, s.keep))
 }
 
 fn with_csrf(mut resp: Response, st: &AppState, csrf: &str) -> Response {
@@ -82,6 +82,7 @@ fn login_page(st: &AppState, tenant: &Tenant, upn: &str, error: Option<&str>) ->
         request: "",
         upn,
         error,
+        offer_keep_signed_in: tenant.settings.allow_keep_signed_in,
     });
     with_csrf(resp, st, &csrf)
 }
@@ -181,14 +182,23 @@ fn step_page(
             op: LoginOp::MfaVerify.as_str(),
             ticket,
             error,
+            // At sign-in only: a code asked for on the page itself is not a sign-in.
+            offer_remember_device: !voluntary && tenant.settings.allow_remember_mfa,
         }),
     };
     with_csrf(resp, st, &csrf)
 }
 
 /// Start a pending step for this user and show its page.
-async fn start(st: &AppState, tenant: &Tenant, user: &User, purpose: Purpose, voluntary: bool) -> Response {
-    match mfa::begin(&st.pool, &tenant.id, &user.id, purpose).await {
+async fn start(
+    st: &AppState,
+    tenant: &Tenant,
+    user: &User,
+    purpose: Purpose,
+    voluntary: bool,
+    keep: KeepSignedIn,
+) -> Response {
+    match mfa::begin(&st.pool, &tenant.id, &user.id, purpose, keep).await {
         Ok(ticket) => {
             let secret = match purpose {
                 Purpose::Enroll => mfa::pending(&st.pool, &ticket, &tenant.id)
@@ -223,9 +233,16 @@ fn step_purpose(step: mfa::Step) -> Option<Purpose> {
 
 /// The steps after the password: a new password if one must be chosen, then the
 /// session, and back to the page.
-async fn finish(st: &AppState, tenant: &Tenant, headers: &HeaderMap, user: &User, after_mfa: bool) -> Response {
+async fn finish(
+    st: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    user: &User,
+    after_mfa: bool,
+    keep: KeepSignedIn,
+) -> Response {
     match users::must_change_password(&st.pool, &user.id).await {
-        Ok(true) => return start(st, tenant, user, Purpose::change_password(after_mfa), false).await,
+        Ok(true) => return start(st, tenant, user, Purpose::change_password(after_mfa), false, keep).await,
         Ok(false) => {}
         Err(e) => return fail(tenant, e),
     }
@@ -234,7 +251,7 @@ async fn finish(st: &AppState, tenant: &Tenant, headers: &HeaderMap, user: &User
     } else {
         vec![Amr::Pwd.as_str()]
     };
-    signed_in(st, tenant, headers, user, &amr, PLAIN).await
+    signed_in(st, tenant, headers, user, &amr, keep, PLAIN).await
 }
 
 /// Make (or remake) this browser's session and show the page.
@@ -244,26 +261,27 @@ async fn signed_in(
     headers: &HeaderMap,
     user: &User,
     amr: &[&str],
+    keep: KeepSignedIn,
     shown: Shown<'_>,
 ) -> Response {
-    let lifetime = tenant.settings.session_lifetime_secs;
-    let cookie = match session::create(&st.pool, headers, &tenant.id, &user.id, amr, lifetime).await {
-        Ok(c) => c,
-        Err(e) => return fail(tenant, e),
-    };
+    let session::Created { cookie, max_age } =
+        match session::create(&st.pool, headers, tenant, &user.id, amr, keep).await {
+            Ok(c) => c,
+            Err(e) => return fail(tenant, e),
+        };
     audit::record(
         st,
         &tenant.id,
         Actor::Id(&user.id),
         Event::SignIn,
         Some(&user.id),
-        json!({ "via": Channel::MyAccount.as_str() }),
+        json!({ "via": Channel::MyAccount.as_str(), "keepSignedIn": keep.is_kept() }),
     )
     .await;
     let mut resp = dashboard(st, tenant, user, shown).await;
     resp.headers_mut().append(
         header::SET_COOKIE,
-        session::set_cookie(&st.public_url, SESSION_COOKIE, &cookie, lifetime),
+        session::set_cookie(&st.public_url, SESSION_COOKIE, &cookie, max_age),
     );
     resp
 }
@@ -273,7 +291,7 @@ pub async fn page(State(st): State<AppState>, Path(tenant_key): Path<String>, he
     let Ok(Some(tenant)) = tenant::resolve(&st.pool, &tenant_key).await else {
         return html::error(None, "That account page is not valid.");
     };
-    let Some((user, amr)) = current(&st, &tenant, &headers).await else {
+    let Some((user, amr, keep)) = current(&st, &tenant, &headers).await else {
         return login_page(&st, &tenant, "", None);
     };
     // A session from an application's sign-in still needs a second factor here,
@@ -282,7 +300,7 @@ pub async fn page(State(st): State<AppState>, Path(tenant_key): Path<String>, he
         match mfa::step(&st.pool, &tenant, &user.id, mfa::At::MyAccount).await {
             Ok(step) => {
                 if let Some(purpose) = step_purpose(step) {
-                    return start(&st, &tenant, &user, purpose, false).await;
+                    return start(&st, &tenant, &user, purpose, false, keep).await;
                 }
             }
             Err(e) => return fail(&tenant, e),
@@ -311,10 +329,10 @@ pub async fn post(
     }
     let op = get(&form, "op");
     if let Some(account_op) = AccountOp::parse(op) {
-        let Some((user, amr)) = current(&st, &tenant, &headers).await else {
+        let Some((user, amr, keep)) = current(&st, &tenant, &headers).await else {
             return login_page(&st, &tenant, "", None);
         };
-        return action(&st, &tenant, &headers, &form, &user, &amr, account_op).await;
+        return action(&st, &tenant, &headers, &form, &user, &amr, keep, account_op).await;
     }
     match LoginOp::parse(op) {
         Some(op @ (LoginOp::MfaVerify | LoginOp::MfaEnroll | LoginOp::ChangePassword)) => {
@@ -358,10 +376,19 @@ async fn password(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form: &Pa
             return login_page(st, tenant, upn, Some("Your account has been disabled. (AADSTS50057)"));
         }
     };
+    let keep = KeepSignedIn::chosen(tenant, html::ticked(form, html::KEEP_SIGNED_IN));
     match mfa::step(&st.pool, tenant, &user.id, mfa::At::MyAccount).await {
+        // A code is skipped on a browser remembered for it; setting an
+        // authenticator up never is. My Account carries no prompt or max_age.
+        Ok(mfa::Step::Verify)
+            if super::authorize::device_remembered(st, headers, &user, tenant, mfa::Freshness::default()).await =>
+        {
+            super::authorize::audit_remembered(st, &tenant.id, &user, Channel::MyAccount).await;
+            finish(st, tenant, headers, &user, true, keep).await
+        }
         Ok(step) => match step_purpose(step) {
-            Some(purpose) => start(st, tenant, &user, purpose, false).await,
-            None => finish(st, tenant, headers, &user, false).await,
+            Some(purpose) => start(st, tenant, &user, purpose, false, keep).await,
+            None => finish(st, tenant, headers, &user, false, keep).await,
         },
         Err(e) => fail(tenant, e),
     }
@@ -381,7 +408,7 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
     };
     // A step started from the page belongs to whoever is signed in on it.
     let signed_in_here = current(st, tenant, headers).await;
-    if voluntary && signed_in_here.as_ref().is_none_or(|(u, _)| u.id != user.id) {
+    if voluntary && signed_in_here.as_ref().is_none_or(|(u, _, _)| u.id != user.id) {
         return login_page(st, tenant, "", Some(EXPIRED));
     }
     let fits = match op {
@@ -399,16 +426,26 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
         Purpose::Verify => match mfa::check(&st.pool, &user.id, typed).await {
             Ok(Some(factor)) => {
                 let _ = mfa::finish(&st.pool, ticket).await;
+                let device = if voluntary {
+                    None
+                } else {
+                    super::authorize::remember_if_asked(st, headers, form, &user, tenant).await
+                };
                 audit::record(
                     st,
                     &tenant.id,
                     Actor::Id(&user.id),
                     Event::MfaVerified,
                     Some(&user.id),
-                    json!({ "via": Channel::MyAccount.as_str(), "factor": factor.as_str() }),
+                    json!({
+                        "via": Channel::MyAccount.as_str(),
+                        "factor": factor.as_str(),
+                        "rememberDevice": device.is_some(),
+                    }),
                 )
                 .await;
-                finish(st, tenant, headers, &user, true).await
+                let resp = finish(st, tenant, headers, &user, true, waiting.keep).await;
+                super::authorize::with_device_cookie(st, resp, device)
             }
             Ok(None) => {
                 super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::MyAccount).await;
@@ -465,7 +502,7 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
                     error: None,
                     new_codes: Some(&codes),
                 };
-                return signed_in(st, tenant, headers, &user, &amr, shown).await;
+                return signed_in(st, tenant, headers, &user, &amr, waiting.keep, shown).await;
             }
             // Set up at sign-in: signed out, and back in with it.
             let mut resp = html::mfa_enrolled(&tenant.name, &codes, &url(st, tenant));
@@ -504,7 +541,7 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
             if waiting.purpose == Purpose::ChangePasswordAfterMfa {
                 amr.push(Amr::Mfa.as_str());
             }
-            signed_in(st, tenant, headers, &user, &amr, PLAIN).await
+            signed_in(st, tenant, headers, &user, &amr, waiting.keep, PLAIN).await
         }
     }
 }
@@ -518,6 +555,7 @@ async fn action(
     form: &Params,
     user: &User,
     amr: &[String],
+    keep: KeepSignedIn,
     op: AccountOp,
 ) -> Response {
     let refuse = |message: &str| {
@@ -563,16 +601,16 @@ async fn action(
                 error: None,
                 new_codes: None,
             };
-            signed_in(st, tenant, headers, user, &amr, shown).await
+            signed_in(st, tenant, headers, user, &amr, keep, shown).await
         }
         AccountOp::MfaSetup => {
             if mfa::enrolled_at(&st.pool, &user.id).await.unwrap_or(None).is_some() {
                 return refuse("You already have an authenticator. To move to a new phone, use New phone below.").await;
             }
-            start(st, tenant, user, Purpose::Enroll, true).await
+            start(st, tenant, user, Purpose::Enroll, true, keep).await
         }
         AccountOp::MfaReplace => match mfa::check(&st.pool, &user.id, typed).await {
-            Ok(Some(_)) => start(st, tenant, user, Purpose::Enroll, true).await,
+            Ok(Some(_)) => start(st, tenant, user, Purpose::Enroll, true, keep).await,
             Ok(None) => {
                 super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::MyAccount).await;
                 refuse("That code didn't work.").await

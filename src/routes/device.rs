@@ -376,7 +376,7 @@ async fn step_after_code(st: &AppState, tenant: &Tenant, headers: &HeaderMap, us
                 return refused;
             }
             match second_step_needed(st, tenant, &pending, &s.user_id, &s.amr).await {
-                Some(step) => start_mfa(st, tenant, &pending, &s.user_id, step).await,
+                Some(step) => start_mfa(st, tenant, &pending, &s.user_id, step, s.keep).await,
                 None => approval_page(st, tenant, &pending, &s.user_id).await,
             }
         }
@@ -435,7 +435,14 @@ async fn second_step_needed(
     }
 }
 
-async fn start_mfa(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &str, step: mfa::Step) -> Response {
+async fn start_mfa(
+    st: &AppState,
+    tenant: &Tenant,
+    pending: &Pending,
+    user_id: &str,
+    step: mfa::Step,
+    keep: session::KeepSignedIn,
+) -> Response {
     let purpose = if step == mfa::Step::Enroll {
         Purpose::Enroll
     } else {
@@ -445,7 +452,7 @@ async fn start_mfa(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &
         Ok(Some(u)) => u,
         _ => return login_page(st, tenant, pending, "", None),
     };
-    match mfa::begin(&st.pool, &tenant.id, user_id, purpose).await {
+    match mfa::begin(&st.pool, &tenant.id, user_id, purpose, keep).await {
         Ok(ticket) => {
             let secret = if purpose == Purpose::Enroll {
                 mfa::pending(&st.pool, &ticket, &tenant.id)
@@ -459,7 +466,8 @@ async fn start_mfa(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &
             let home = access::home_of(&st.pool, &user).await.ok().flatten();
             let issuer = home.as_ref().map_or(tenant.name.as_str(), |t| t.name.as_str());
             let enroll = secret.as_deref().map(|s| (s, issuer));
-            mfa_page(st, tenant, pending, &user.upn, purpose, &ticket, enroll, None)
+            let offer = home.as_ref().is_some_and(|h| h.settings.allow_remember_mfa);
+            mfa_page(st, tenant, pending, &user.upn, purpose, &ticket, enroll, offer, None)
         }
         Err(e) => html::error(Some(&tenant.name), &AadError::from(e).description()),
     }
@@ -476,6 +484,8 @@ fn mfa_page(
     // The secret being set up, and the name of the account's own tenant, which
     // the authenticator app lists it under.
     enroll: Option<(&str, &str)>,
+    // Offer "Don't ask again on this device": the account's own tenant allows it.
+    offer_remember_device: bool,
     error: Option<&str>,
 ) -> Response {
     let csrf = session::new_token();
@@ -508,6 +518,7 @@ fn mfa_page(
             op: html::LoginOp::MfaVerify.as_str(),
             ticket,
             error,
+            offer_remember_device,
         }),
     };
     resp.headers_mut().append(
@@ -579,25 +590,31 @@ async fn second_step(
             if waiting.purpose == Purpose::ChangePasswordAfterMfa {
                 amr.push(Amr::Mfa.as_str());
             }
-            establish(st, tenant, headers, &pending, &user, &amr)
+            establish(st, tenant, headers, &pending, &user, &amr, waiting.keep)
                 .await
                 .unwrap_or_else(|r| r)
         }
         Purpose::Verify => match mfa::check(&st.pool, &user.id, &typed).await {
             Ok(Some(factor)) => {
                 let _ = mfa::finish(&st.pool, &ticket).await;
+                let device = super::authorize::remember_if_asked(st, headers, form, &user, &home).await;
                 audit::record(
                     st,
                     &tenant.id,
                     Actor::Id(&user.id),
                     Event::MfaVerified,
                     Some(&user.id),
-                    json!({ "via": Channel::Device.as_str(), "factor": factor.as_str() }),
+                    json!({
+                        "via": Channel::Device.as_str(),
+                        "factor": factor.as_str(),
+                        "rememberDevice": device.is_some(),
+                    }),
                 )
                 .await;
-                finish_sign_in(st, tenant, headers, &pending, &user, true)
+                let resp = finish_sign_in(st, tenant, headers, &pending, &user, true, waiting.keep)
                     .await
-                    .unwrap_or_else(|r| r)
+                    .unwrap_or_else(|r| r);
+                super::authorize::with_device_cookie(st, resp, device)
             }
             Ok(None) => {
                 super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::Device).await;
@@ -610,6 +627,7 @@ async fn second_step(
                         Purpose::Verify,
                         &ticket,
                         None,
+                        home.settings.allow_remember_mfa,
                         Some(MFA_WRONG),
                     ),
                     _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
@@ -629,6 +647,7 @@ async fn second_step(
                         Purpose::Enroll,
                         &ticket,
                         Some((&secret, &home.name)),
+                        false,
                         Some(MFA_WRONG),
                     ),
                     _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
@@ -664,6 +683,7 @@ fn login_page(st: &AppState, tenant: &Tenant, pending: &Pending, upn: &str, erro
         request: &pending.user_code,
         upn,
         error,
+        offer_keep_signed_in: tenant.settings.allow_keep_signed_in,
     });
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -779,11 +799,21 @@ async fn sign_in(
     };
 
     gate(st, tenant, &pending, &user.id).await?;
+    let keep = session::KeepSignedIn::chosen(tenant, html::ticked(form, html::KEEP_SIGNED_IN));
     // A second step, where one is needed, before there is any session.
     if let Some(step) = second_step_needed(st, tenant, &pending, &user.id, &[]).await {
-        return Ok(start_mfa(st, tenant, &pending, &user.id, step).await);
+        // A code is skipped on a browser remembered for it; setting an
+        // authenticator up never is. A device code carries no prompt or max_age.
+        if step == mfa::Step::Verify
+            && let Ok(Some(home)) = access::home_of(&st.pool, &user).await
+            && super::authorize::device_remembered(st, headers, &user, &home, mfa::Freshness::default()).await
+        {
+            super::authorize::audit_remembered(st, &tenant.id, &user, Channel::Device).await;
+            return finish_sign_in(st, tenant, headers, &pending, &user, true, keep).await;
+        }
+        return Ok(start_mfa(st, tenant, &pending, &user.id, step, keep).await);
     }
-    finish_sign_in(st, tenant, headers, &pending, &user, false).await
+    finish_sign_in(st, tenant, headers, &pending, &user, false, keep).await
 }
 
 /// After the password (and second factor, if any): a new password first if the
@@ -795,9 +825,18 @@ async fn finish_sign_in(
     pending: &Pending,
     user: &users::User,
     after_mfa: bool,
+    keep: session::KeepSignedIn,
 ) -> Result<Response, Response> {
     if users::must_change_password(&st.pool, &user.id).await.unwrap_or(false) {
-        return match mfa::begin(&st.pool, &tenant.id, &user.id, Purpose::change_password(after_mfa)).await {
+        return match mfa::begin(
+            &st.pool,
+            &tenant.id,
+            &user.id,
+            Purpose::change_password(after_mfa),
+            keep,
+        )
+        .await
+        {
             Ok(ticket) => Ok(change_page(st, tenant, pending, &user.upn, &ticket, None)),
             Err(e) => Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
         };
@@ -807,7 +846,7 @@ async fn finish_sign_in(
     } else {
         &[Amr::Pwd.as_str()]
     };
-    establish(st, tenant, headers, pending, user, amr).await
+    establish(st, tenant, headers, pending, user, amr, keep).await
 }
 
 fn change_page(
@@ -849,10 +888,10 @@ async fn establish(
     pending: &Pending,
     user: &users::User,
     amr: &[&str],
+    keep: session::KeepSignedIn,
 ) -> Result<Response, Response> {
     // Start a browser session so the next code does not ask again.
-    let lifetime = tenant.settings.session_lifetime_secs;
-    let cookie = session::create(&st.pool, headers, &tenant.id, &user.id, amr, lifetime)
+    let session::Created { cookie, max_age } = session::create(&st.pool, headers, tenant, &user.id, amr, keep)
         .await
         .map_err(|e| html::error(Some(&tenant.name), &AadError::from(e).description()))?;
     let details = json!({ "via": Channel::Device.as_str(), "clientId": pending.client.app_id });
@@ -871,7 +910,7 @@ async fn establish(
         Actor::Id(&user.id),
         Event::SessionCreate,
         Some(&user.id),
-        json!({}),
+        json!({ "keepSignedIn": keep.is_kept() }),
     )
     .await;
 
@@ -887,7 +926,7 @@ async fn establish(
     let h = resp.headers_mut();
     h.append(
         header::SET_COOKIE,
-        session::set_cookie(&st.public_url, session::SESSION_COOKIE, &cookie, lifetime),
+        session::set_cookie(&st.public_url, session::SESSION_COOKIE, &cookie, max_age),
     );
     Ok(resp)
 }
@@ -914,7 +953,7 @@ async fn decide(
     if status == DeviceStatus::Approved
         && let Some(step) = second_step_needed(st, tenant, &pending, &s.user_id, &s.amr).await
     {
-        return start_mfa(st, tenant, &pending, &s.user_id, step).await;
+        return start_mfa(st, tenant, &pending, &s.user_id, step, s.keep).await;
     }
     let client_id = pending.client.app_id.as_str();
     if status == DeviceStatus::Denied {

@@ -82,3 +82,38 @@ async fn indexed_columns_are_matched_case_sensitively() {
         assert_eq!(n, 0, "action must not fold case on {:?}", db::engine_of(pool));
     }
 }
+
+/// The hourly trim keeps each tenant's rows for that tenant's own retention, and
+/// rows that belong to no tenant for the root tenant's.
+#[tokio::test]
+async fn trim_applies_each_tenants_own_retention() {
+    use rust_oidc::tenant::{self, TenantSettings};
+    for pool in common::all_engine_pools().await {
+        let pool: &db::DbPool = &pool;
+        let day = 86_400;
+        let ts = now();
+        let root = tenant::create(pool, "Root", "root.example", true).await.unwrap();
+        let short = tenant::create(pool, "Short", "short.example", false).await.unwrap();
+        let keep = |days| TenantSettings {
+            audit_retention_days: days,
+            ..TenantSettings::default()
+        };
+        tenant::save_settings(pool, &root.id, &keep(30)).await.unwrap();
+        tenant::save_settings(pool, &short.id, &keep(7)).await.unwrap();
+        let gone = format!("t-{}", uuid::Uuid::new_v4());
+
+        // Short keeps 7 days, root 30; a deleted tenant's rows follow root.
+        insert_at(pool, &short.id, "auth.sign_in", ts - 8 * day).await;
+        insert_at(pool, &short.id, "auth.sign_in", ts - 6 * day).await;
+        insert_at(pool, &root.id, "auth.sign_in", ts - 8 * day).await;
+        insert_at(pool, &root.id, "auth.sign_in", ts - 31 * day).await;
+        insert_at(pool, &gone, "auth.sign_in", ts - 29 * day).await;
+        insert_at(pool, &gone, "auth.sign_in", ts - 31 * day).await;
+
+        assert_eq!(db::trim_audit(pool).await.unwrap(), 3);
+        assert_eq!(count(pool, &short.id).await, 1, "short keeps only its last 7 days");
+        assert_eq!(count(pool, &root.id).await, 1, "root keeps 30 days");
+        assert_eq!(count(pool, &gone).await, 1, "an unowned row follows root");
+        assert_eq!(db::trim_audit(pool).await.unwrap(), 0);
+    }
+}

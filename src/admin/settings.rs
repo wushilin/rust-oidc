@@ -33,6 +33,7 @@ const ALLOW_CROSS_TENANT: &str = "allow_cross_tenant_sign_in";
 const REQUIRE_CONSOLE_MFA: &str = "require_console_mfa";
 const ALLOW_KEEP_SIGNED_IN: &str = "allow_keep_signed_in";
 const ALLOW_REMEMBER_MFA: &str = "allow_remember_mfa";
+const AUDIT_RETENTION: &str = "audit_retention_days";
 const ACCESS_TOKEN: &str = "access_token_lifetime_secs";
 const SESSION: &str = "session_lifetime_secs";
 const REFRESH: &str = "refresh_token_lifetime_secs";
@@ -109,6 +110,9 @@ Applications that need a fresh sign-in can still ask for one (<code>prompt=login
 never the password. A fresh sign-in an application asks for always asks for the code too. Signing out
 everywhere, a new password or a new authenticator forgets every remembered browser. Not in the console,
 which always asks administrators for their code.</p>
+<h2>Audit log</h2>
+<label for="{AUDIT_RETENTION}">Keep audit entries for (days)</label><input id="{AUDIT_RETENTION}" name="{AUDIT_RETENTION}" type="text" value="{retention}"{disabled}>
+<p class="muted">Between {min_retention} and {max_retention} days. Older entries for this tenant are deleted every hour.</p>
 {save}</form>
 <p class="muted">A change applies to tokens and sessions issued from now on. Those already
 issued are self-contained and cannot be shortened after the fact, with one exception: turning
@@ -119,6 +123,9 @@ either "Staying signed in" option off takes effect at once, for what was already
         csrf = view::csrf_input(&ctx.csrf),
         mfa = if settings.require_mfa { " checked" } else { "" },
         history = settings.password_history,
+        retention = settings.audit_retention_days,
+        min_retention = TenantSettings::MIN_AUDIT_RETENTION_DAYS,
+        max_retention = TenantSettings::MAX_AUDIT_RETENTION_DAYS,
         cross = if settings.allow_cross_tenant_sign_in {
             " checked"
         } else {
@@ -237,6 +244,24 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
             require_console_mfa: checked(&form, REQUIRE_CONSOLE_MFA),
             allow_keep_signed_in: checked(&form, ALLOW_KEEP_SIGNED_IN),
             allow_remember_mfa: checked(&form, ALLOW_REMEMBER_MFA),
+            // Left out of the form, it keeps what the tenant has.
+            audit_retention_days: match field(&form, AUDIT_RETENTION).trim() {
+                "" => tenant.settings.audit_retention_days,
+                raw => match raw.parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return render(
+                            &st,
+                            &ctx,
+                            tenant,
+                            &tenant.settings,
+                            Some("the audit retention must be a whole number of days"),
+                            StatusCode::BAD_REQUEST,
+                        )
+                        .await;
+                    }
+                },
+            },
         },
         (access, session, refresh) => {
             let message = [access.err(), session.err(), refresh.err()]

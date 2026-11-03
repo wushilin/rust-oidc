@@ -463,6 +463,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!("no root tenant yet; run `rust-oidc bootstrap`");
             }
             tracing::info!(base = public_url.base(), "public URL");
+            tokio::spawn(trim_audit_hourly(pool.clone()));
             let app = routes::router(AppState::new(pool, public_url));
             server::serve(app, bind, &tls).await?;
         }
@@ -1168,4 +1169,19 @@ fn ensure_db_dir(url: &str) -> anyhow::Result<()> {
 
 fn print_json(value: serde_json::Value) {
     println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+}
+
+/// Apply every tenant's audit retention now and then every
+/// [`db::AUDIT_TRIM_INTERVAL`], for as long as the server runs. A failed run is
+/// logged and the next one tries again.
+async fn trim_audit_hourly(pool: DbPool) {
+    let mut every = tokio::time::interval(db::AUDIT_TRIM_INTERVAL);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        match db::trim_audit(&pool).await {
+            Ok(deleted) => tracing::info!(deleted, "audit retention applied"),
+            Err(e) => tracing::warn!("audit retention failed: {e:#}"),
+        }
+    }
 }

@@ -983,12 +983,13 @@ pub async fn audit_for_tenant(
         .collect())
 }
 
-/// Delete audit rows older than `older_than_secs`.
+/// Delete audit rows older than `older_than_secs`, in every tenant: the
+/// `audit prune` CLI, for an operator who wants less than the tenants keep.
 ///
 /// The table is append-only and grows without bound, and unauthenticated
 /// requests can append to it (a failed client authentication is an event), so
-/// retention is not optional. There is no scheduler in this process, so this
-/// follows `keys::prune`: an operator or cron calls the CLI.
+/// retention is not optional. While the server runs, [`trim_audit`] applies each
+/// tenant's own retention every [`AUDIT_TRIM_INTERVAL`].
 pub async fn prune_audit(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<u64> {
     let res = sqlx::query(q(pool, "DELETE FROM audit_log WHERE created_at < ?"))
         .bind(crate::util::now() - older_than_secs)
@@ -996,6 +997,55 @@ pub async fn prune_audit(pool: &DbPool, older_than_secs: i64) -> anyhow::Result<
         .await?;
     Ok(res.rows_affected())
 }
+
+/// How often the server applies each tenant's audit retention.
+pub const AUDIT_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// Apply each tenant's audit retention ([`TenantSettings::audit_retention_days`]):
+/// delete the tenant's rows older than it keeps. Rows that belong to no tenant
+/// (platform events, or a tenant since deleted) follow the root tenant's
+/// retention, or the default when there is no root yet. Returns the rows deleted.
+///
+/// [`TenantSettings::audit_retention_days`]: crate::tenant::TenantSettings::audit_retention_days
+pub async fn trim_audit(pool: &DbPool) -> anyhow::Result<u64> {
+    use crate::tenant::TenantSettings;
+    let tenants: Vec<(String, bool, String)> = sqlx::query_as(q(pool, "SELECT id, is_root, settings FROM tenants"))
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(id, is_root, settings): (String, Flag, String)| (id, bool::from(is_root), settings))
+        .collect();
+    let now = crate::util::now();
+    let cutoff = |days: i64| now - days * SECS_PER_DAY;
+    let mut deleted = 0;
+    let mut unowned_days = TenantSettings::DEFAULT_AUDIT_RETENTION_DAYS;
+    for (id, is_root, raw) in &tenants {
+        let days = serde_json::from_str::<TenantSettings>(raw)
+            .unwrap_or_default()
+            .audit_retention_days;
+        if *is_root {
+            unowned_days = days;
+        }
+        deleted += sqlx::query(q(pool, "DELETE FROM audit_log WHERE tenant_id = ? AND created_at < ?"))
+            .bind(id)
+            .bind(cutoff(days))
+            .execute(pool)
+            .await?
+            .rows_affected();
+    }
+    deleted += sqlx::query(q(
+        pool,
+        "DELETE FROM audit_log WHERE created_at < ?
+         AND (tenant_id IS NULL OR tenant_id NOT IN (SELECT id FROM tenants))",
+    ))
+    .bind(cutoff(unowned_days))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
+const SECS_PER_DAY: i64 = 86_400;
 
 #[cfg(test)]
 mod tests {

@@ -1550,3 +1550,30 @@ switches on the tenant's Settings page, `allow_keep_signed_in` and
   allowed sign-in write), like sessions and pending-step tickets.
 *To reverse:* leave both switches off (the default); migration 0021's columns and
 table stay unused.
+
+## Audit retention and the Auth API log line
+
+**46. Each tenant keeps its audit log for its own number of days, trimmed hourly**
+(2026-11-03; the owner asked for a per-tenant retention setting with an hourly
+trim). `TenantSettings::audit_retention_days`, on the tenant's Settings page under
+"Audit log". Decided without asking:
+- **Ninety days by default**, from one day to ten years. Settings are stored as JSON,
+  so existing tenants get the default with no migration, and the trim deletes
+  nothing on a deployment whose log is younger than that.
+- **The server runs the trim** (`db::trim_audit`) at start and then every hour
+  (`db::AUDIT_TRIM_INTERVAL`), and logs how many rows it deleted. A failed run is
+  logged and retried at the next hour. The trim is retention, not a directory
+  change, so it is not a transaction and writes no audit row of its own, like
+  `audit prune`, which stays for an operator who wants less than the tenants keep.
+- **Rows that belong to no tenant** (platform events, or a tenant since deleted)
+  follow the root tenant's retention, or the default when there is no root.
+
+**47. The Auth API logs what it was sent to the server log** (2026-11-03; the owner
+asked for it). Each credential check writes one `info` line with the tenant, the
+calling application, the UPN in full, the password with every character but the
+first and last masked (two characters or fewer are masked entirely), the code as
+sent, and the result. This is the process log, not the audit log, whose rule
+against secrets still holds. The code is good for one time step only. Note that
+the masked form shows the password's length and two of its characters: whoever
+reads the server log reads that too.
+*To reverse:* remove the `tracing::info!` in `routes::auth_api::authenticate`.

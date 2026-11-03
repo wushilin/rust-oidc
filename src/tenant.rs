@@ -34,6 +34,9 @@ pub struct TenantSettings {
     /// remembered for an account skips its code for [`Self::REMEMBER_MFA_SECS`].
     /// Governed by the account's own (home) tenant. Off unless turned on.
     pub allow_remember_mfa: bool,
+    /// How many days this tenant's audit rows are kept. Older rows are deleted
+    /// by the hourly trim ([`crate::db::trim_audit`]) while the server runs.
+    pub audit_retention_days: i64,
 }
 
 impl Default for TenantSettings {
@@ -48,6 +51,7 @@ impl Default for TenantSettings {
             allow_cross_tenant_sign_in: false,
             allow_keep_signed_in: false,
             allow_remember_mfa: false,
+            audit_retention_days: Self::DEFAULT_AUDIT_RETENTION_DAYS,
         }
     }
 }
@@ -82,6 +86,12 @@ impl TenantSettings {
     /// How long a remembered browser skips the second factor: thirty days, the
     /// owner's choice (2026-10-09).
     pub const REMEMBER_MFA_SECS: i64 = 30 * 86_400;
+    /// Audit retention: ninety days by default (Entra keeps sign-in and audit
+    /// logs for thirty days with Entra ID P1/P2; ninety is the window the
+    /// `audit prune` CLI has always suggested), from one day to ten years.
+    pub const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
+    pub const MIN_AUDIT_RETENTION_DAYS: i64 = 1;
+    pub const MAX_AUDIT_RETENTION_DAYS: i64 = 3_650;
 
     /// Refuse a combination that cannot work, rather than storing it and issuing
     /// tokens nobody can use.
@@ -115,6 +125,13 @@ impl TenantSettings {
             bail!(
                 "the number of remembered passwords must be between 0 and {}",
                 Self::MAX_PASSWORD_HISTORY
+            );
+        }
+        if !(Self::MIN_AUDIT_RETENTION_DAYS..=Self::MAX_AUDIT_RETENTION_DAYS).contains(&self.audit_retention_days) {
+            bail!(
+                "the audit retention must be between {} and {} days",
+                Self::MIN_AUDIT_RETENTION_DAYS,
+                Self::MAX_AUDIT_RETENTION_DAYS
             );
         }
         // A refresh token that expires before the access token it mints is a
@@ -702,6 +719,14 @@ mod tests {
             },
             TenantSettings {
                 refresh_token_lifetime_secs: TenantSettings::MAX_REFRESH_SECS + 1,
+                ..Default::default()
+            },
+            TenantSettings {
+                audit_retention_days: TenantSettings::MIN_AUDIT_RETENTION_DAYS - 1,
+                ..Default::default()
+            },
+            TenantSettings {
+                audit_retention_days: TenantSettings::MAX_AUDIT_RETENTION_DAYS + 1,
                 ..Default::default()
             },
         ];

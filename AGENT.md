@@ -27,8 +27,16 @@ directory, and CI (`.github/workflows/test.yml`) runs it on every push.*
 5. **One standard result.** The engine returns an `Outcome`: done (committed),
    refused (rolled back, the actor can fix it), or failed (rolled back, our
    fault). Pages and the CLI turn an `Outcome` into a response one way only.
-6. **No audit, no change.** The audit row is written inside the transaction. If
-   it cannot be written, the whole change rolls back.
+6. **No audit, no change.** Every transaction is audit logged, without
+   exception: each kind has its own `Event` (`KindInfo::event`), and
+   `Transaction::audit` has no default, so a new kind cannot compile without
+   saying what its row records. The engine writes the row itself, inside the
+   transaction, for every completed run and every member of a batch; no
+   transaction writes or skips its own. If the row cannot be written, the whole
+   change rolls back. A new kind of change (a new table, or a new relation such
+   as nested groups or Auth API grants) is a new transaction with its own event;
+   a new field of something already changed by one (a tenant setting) goes in
+   that transaction and in its audit details. Never a write from a handler.
 7. **Batches commit once.** Several transactions run as a batch share one
    context; nothing commits until the last succeeds, and any abort rolls back
    the batch. The console's bulk buttons run one transaction per row instead.

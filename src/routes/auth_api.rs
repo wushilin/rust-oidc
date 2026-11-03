@@ -50,6 +50,26 @@ use crate::users::{self, AuthResult, User};
 const FAILED_CODE: &str = "invalid_credentials";
 const FAILED_MESSAGE: &str = "The user name, password or code is not valid.";
 
+/// The character that stands in for the hidden part of a password in the log.
+const MASK: char = '*';
+
+/// A password for the server log: its first and last characters, with every
+/// character between them masked (`password@` becomes `p*******@`). Two
+/// characters or fewer are masked entirely, as showing them would show it all.
+fn mask_password(password: &str) -> String {
+    let chars: Vec<char> = password.chars().collect();
+    match chars.as_slice() {
+        [first, middle @ .., last] if !middle.is_empty() => {
+            let mut out = String::with_capacity(password.len());
+            out.push(*first);
+            out.extend(std::iter::repeat_n(MASK, middle.len()));
+            out.push(*last);
+            out
+        }
+        _ => std::iter::repeat_n(MASK, chars.len()).collect(),
+    }
+}
+
 /// What the caller sends.
 #[derive(Deserialize)]
 struct Check {
@@ -195,7 +215,20 @@ pub async fn authenticate(
             "The body must be a JSON object with the strings upn, password and otp.",
         );
     };
-    match verify(&st, &tenant, &app, &sp, &check).await {
+    // The server log (not the audit log) shows what was sent, for an operator
+    // working out why a prompt fails. The code is shown as sent: it is good for
+    // one time step only.
+    let verified = verify(&st, &tenant, &app, &sp, &check).await;
+    tracing::info!(
+        tenant = %tenant.id,
+        client_id = %app.app_id,
+        upn = %check.upn,
+        password = %mask_password(&check.password),
+        otp = %check.otp,
+        result = matches!(verified, Ok(Some(_))),
+        "auth api credential check"
+    );
+    match verified {
         Ok(Some(user)) => succeeded(&st, &tenant, &app, &sp, &user).await,
         Ok(None) => failed(),
         Err(e) => AadError::from(e).into_response(),
@@ -296,4 +329,23 @@ async fn succeeded(st: &AppState, tenant: &Tenant, app: &Application, sp: &Servi
         "acr": Acr::Mfa.as_str(),
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_password;
+
+    #[test]
+    fn masks_all_but_the_ends() {
+        assert_eq!(mask_password("password@"), "p*******@");
+        assert_eq!(mask_password("abc"), "a*c");
+        assert_eq!(mask_password("pässwörd"), "p******d");
+    }
+
+    #[test]
+    fn short_passwords_are_masked_entirely() {
+        assert_eq!(mask_password(""), "");
+        assert_eq!(mask_password("a"), "*");
+        assert_eq!(mask_password("ab"), "**");
+    }
 }

@@ -22,18 +22,20 @@ pub fn escape(s: &str) -> String {
 }
 
 const STYLE: &str = r#"
-:root { --bg:#f3f4f6; --card:#fff; --fg:#1b1b1b; --muted:#5f6368; --accent:#0f6cbd; --err:#b3261e; --border:#d0d4da; }
-@media (prefers-color-scheme: dark) { :root { --bg:#16181c; --card:#212429; --fg:#e8eaed; --muted:#a0a4ab; --accent:#4f9ae8; --err:#f2b8b5; --border:#3a3f46; } }
+/* The same palette, type and card as the admin console's sign-in
+   (src/admin/view.rs), so every sign-in page looks like one product. */
+:root { --bg:#f3f5f7; --card:#fff; --fg:#17222b; --muted:#5c6b77; --accent:#0d6b73; --on-accent:#fff; --err:#b3261e; --border:#d3dae0; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f161b; --card:#172129; --fg:#e3e9ed; --muted:#91a1ad; --accent:#56c2c9; --on-accent:#06262a; --err:#f2a39c; --border:#2a3843; } }
 * { box-sizing:border-box; }
-body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; }
+body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--fg); font:14.5px/1.55 "Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,"Helvetica Neue",sans-serif; }
 main { width:100%; max-width:420px; margin:16px; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:36px 40px; }
 .tenant { color:var(--muted); font-size:13px; margin:0 0 20px; }
-h1 { font-size:22px; font-weight:600; margin:0 0 6px; }
+h1 { font-size:22px; font-weight:650; letter-spacing:-.015em; margin:0 0 6px; }
 p.sub { color:var(--muted); margin:0 0 20px; }
-label { display:block; font-size:13px; margin:14px 0 4px; }
+label { display:block; font-size:13px; font-weight:600; margin:14px 0 4px; }
 input[type=text], input[type=email], input[type=password] { width:100%; padding:9px 10px; font:inherit; color:var(--fg); background:transparent; border:1px solid var(--border); border-radius:4px; }
 input:focus { outline:2px solid var(--accent); outline-offset:-1px; border-color:transparent; }
-button { font:inherit; padding:9px 18px; border-radius:4px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+button { font:inherit; font-weight:600; padding:9px 18px; border-radius:4px; border:1px solid var(--accent); background:var(--accent); color:var(--on-accent); cursor:pointer; }
 button.link { background:none; border:none; color:var(--accent); padding:0; }
 .actions { display:flex; justify-content:flex-end; align-items:center; gap:16px; margin-top:24px; }
 .error { color:var(--err); margin:12px 0 0; font-size:14px; }
@@ -54,7 +56,7 @@ ol.steps { padding-left:20px; margin:12px 0; } ol.steps li { margin:10px 0; }
 .qr { display:flex; justify-content:center; margin:12px 0; } .qr svg { width:200px; height:200px; background:#fff; padding:6px; border-radius:4px; }
 .key { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.06em; word-break:break-all; background:var(--bg); padding:6px 8px; border-radius:4px; }
 ul.codes { list-style:none; padding:0; margin:12px 0; display:grid; grid-template-columns:1fr 1fr; gap:6px 18px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:15px; }
-a.button { display:inline-block; padding:9px 18px; border-radius:4px; background:var(--accent); color:#fff; text-decoration:none; }
+a.button { display:inline-block; padding:9px 18px; border-radius:4px; background:var(--accent); color:var(--on-accent); font-weight:600; text-decoration:none; }
 "#;
 
 /// [`page`] with room for a page of sections rather than one form.

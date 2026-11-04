@@ -1594,3 +1594,31 @@ from its `_sqlx_migrations`) and checks that the three engines share one gap-fre
 numbering, so a mismatch fails in CI instead of on the server. Add a line when a
 migration is first deployed; never edit one.
 *To reverse:* delete the test.
+
+## Console layout
+
+**49. Full-width pages, a side menu for an application, one sign-in card, and a
+tenant Configuration tab** (2026-11-03; the owner asked for the width, the tab and
+consistent sign-in pages, and agreed the side menu).
+- **Width**: the band and the page share one width, centred, up to 1680px
+  (`--page`). It was 1160px, left-aligned, which left the right of a wide screen
+  empty. Paragraphs keep their 76-character measure and single inputs their 440px;
+  forms with several short fields (a user's attributes) put them side by side.
+- **Application sections in a side menu**, grouped Manage / Access / Troubleshoot,
+  as Entra's app registration blade. Ten tabs wrapped onto two rows; a menu does not,
+  however many sections there are. Under 900px it becomes one row that scrolls
+  sideways. CSS only (grid, `position: sticky`).
+- **Table headings stay in view** while a long table scrolls.
+- **Breadcrumbs** on user and group pages, as the application page had.
+- **One sign-in card.** The user-facing sign-in pages (`src/html.rs`) take the
+  console's palette and type; the console's sign-in takes their card (420px,
+  vertically centred, button at the bottom right). They were blue and teal, of
+  different sizes, one centred and one near the top.
+- **Tenant Configuration tab** (`TENANT_READ`): the tenant id, issuer, discovery
+  document, domains and every endpoint with the id filled in, the Auth API and My
+  Account addresses, and paste-ready blocks for a generic OpenID Connect library,
+  Microsoft.Identity.Web (`Instance`/`TenantId`) and MSAL (`authority`). Values are
+  selected whole by one click (`user-select: all`); no copy button, as the console
+  runs no script. Addresses come from `routes::discovery::Endpoint`, as on the
+  deployment's Configuration page, so the two cannot disagree.
+*To reverse:* restore `max-width:1160px` on `main` and the `subtabs` row.

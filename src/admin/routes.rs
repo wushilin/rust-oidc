@@ -112,6 +112,10 @@ pub fn router() -> Router<AppState> {
             "/admin/tenants/{tenant}/settings",
             get(settings_pages::page).post(settings_pages::post),
         )
+        .route(
+            "/admin/tenants/{tenant}/configuration",
+            get(crate::admin::configuration::tenant_page),
+        )
         .route("/admin/tenants/{tenant}/audit", get(audit_pages::page))
         .route(
             "/admin/tenants/{tenant}/flow",
@@ -146,6 +150,8 @@ pub enum TenantTab {
     Roles,
     Flow,
     Settings,
+    /// Addresses and values to configure an application with, for this tenant.
+    Configuration,
     Audit,
 }
 
@@ -158,6 +164,7 @@ impl TenantTab {
         Self::Roles,
         Self::Flow,
         Self::Settings,
+        Self::Configuration,
         Self::Audit,
     ];
 
@@ -169,6 +176,7 @@ impl TenantTab {
             Self::Roles => "Roles",
             Self::Flow => "Flow tester",
             Self::Settings => "Settings",
+            Self::Configuration => "Configuration",
             Self::Audit => "Audit log",
         }
     }
@@ -182,6 +190,7 @@ impl TenantTab {
             Self::Roles => "roles",
             Self::Flow => "flow",
             Self::Settings => "settings",
+            Self::Configuration => "configuration",
             Self::Audit => "audit",
         }
     }
@@ -196,7 +205,7 @@ impl TenantTab {
             // administers applications, not something to view.
             Self::Flow => APP_WRITE,
             Self::Roles => BINDING_READ,
-            Self::Settings => TENANT_READ,
+            Self::Settings | Self::Configuration => TENANT_READ,
             Self::Audit => AUDIT_READ,
         }
     }

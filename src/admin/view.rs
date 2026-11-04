@@ -23,7 +23,7 @@ pub fn e(s: &str) -> String {
 const STYLE: &str = r#"
 /* Layout: a band across the top holding the product, the tenant in view and the
    tab strip; the active tab is the colour of the page, so it reads as joined to
-   it. Content is left-aligned under the tabs. One accent (petrol) for actions;
+   it. Content shares one centred width with the band. One accent (petrol) for actions;
    amber is kept for one thing only, the tenant in view. System fonts: the
    content security policy allows no web fonts. */
 :root {
@@ -31,6 +31,7 @@ const STYLE: &str = r#"
   --accent:#0d6b73; --on-accent:#fff; --hover:#dce2e7;
   --chip:#fff4d6; --chip-line:#dcb24a; --chip-ink:#5e4300;
   --err:#b3261e; --ok:#1b7a43;
+  --page:1680px;
   --mono:ui-monospace,"SFMono-Regular","Cascadia Mono","Segoe UI Mono",Menlo,Consolas,monospace;
   /* kept for markup that still names them */
   --card:var(--surface); --fg:var(--ink); --border:var(--line);
@@ -48,6 +49,9 @@ code { font-family:var(--mono); font-size:.92em; }
 
 /* ---- the band: product, tenant in view, who, tabs ---- */
 header.top { background:var(--band); border-bottom:1px solid var(--line); }
+/* The band's contents and the page share one width, centred: full width up to a
+   cap past which lines and tables only get harder to follow. */
+.bar, nav.tabs, main { width:100%; max-width:var(--page); margin-left:auto; margin-right:auto; }
 .bar { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; justify-content:space-between; padding:12px 24px 10px; }
 .brand { font-size:15px; font-weight:650; letter-spacing:-.01em; color:var(--ink); text-decoration:none; }
 .ctx { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; font-size:13px; color:var(--muted); }
@@ -64,7 +68,7 @@ nav.tabs a.up { padding-left:0; margin-right:8px; color:var(--accent); }
 nav.tabs a.up:hover { background:transparent; text-decoration:underline; }
 
 /* ---- page ---- */
-main { max-width:1160px; padding:26px 24px 72px; }
+main { padding:26px 24px 72px; }
 h1 { font-size:24px; font-weight:650; letter-spacing:-.015em; line-height:1.2; margin:0 0 4px; }
 h2 { font-size:17px; font-weight:650; margin:34px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
 h3 { font-size:14px; font-weight:650; margin:20px 0 6px; }
@@ -77,7 +81,9 @@ p.empty { color:var(--muted); margin:0 0 12px; padding:12px 14px; border:1px das
 /* ---- tables: the only boxed thing on a page ---- */
 table { border-collapse:separate; border-spacing:0; width:100%; background:var(--surface); border:1px solid var(--line); border-radius:6px; margin:0 0 12px; }
 th, td { text-align:left; padding:9px 14px; border-bottom:1px solid var(--line); vertical-align:top; }
-th { font-size:12.5px; font-weight:600; color:var(--muted); white-space:nowrap; }
+th { font-size:12.5px; font-weight:600; color:var(--muted); white-space:nowrap; position:sticky; top:0; z-index:1; background:var(--surface); }
+tr:first-child th:first-child { border-top-left-radius:6px; }
+tr:first-child th:last-child { border-top-right-radius:6px; }
 tr:last-child td { border-bottom:none; }
 td button { padding:4px 10px; font-size:13px; }
 td form.inline + form.inline { margin-left:6px; }
@@ -110,11 +116,29 @@ fieldset.choice:not(:has(input.some:checked)) .when-some { display:none; }
 form.pick-principal:has(input.is-group:checked) .when-user,
 form.pick-principal:not(:has(input.is-group:checked)) .when-group { display:none; }
 /* An object's own sections, under the tenant's tabs. */
-nav.subtabs { display:flex; flex-wrap:wrap; gap:2px 4px; border-bottom:1px solid var(--line); margin:4px 0 22px; }
-nav.subtabs a { padding:7px 12px; border-radius:4px 4px 0 0; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; margin-bottom:-1px; }
+nav.subtabs { display:flex; overflow-x:auto; gap:2px 4px; border-bottom:1px solid var(--line); margin:4px 0 22px; }
+nav.subtabs a { flex:none; white-space:nowrap; padding:7px 12px; border-radius:4px 4px 0 0; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; margin-bottom:-1px; }
 nav.subtabs a:hover { color:var(--ink); background:var(--hover); }
 nav.subtabs a.active { color:var(--ink); border-bottom-color:var(--accent); font-weight:600; }
 p.crumb { margin:0 0 4px; font-size:13px; }
+/* An object's sections as a menu down the side (Entra's blade menu): it does not
+   wrap however many sections there are. The content sits beside it. */
+.split { display:grid; grid-template-columns:232px minmax(0, 1fr); gap:32px; align-items:start; margin-top:18px; }
+nav.side { position:sticky; top:16px; display:flex; flex-direction:column; gap:1px; padding:10px 0; border-right:1px solid var(--line); }
+nav.side .group { margin:14px 0 4px; padding:0 14px; font-size:11.5px; font-weight:650; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+nav.side .group:first-child { margin-top:0; }
+nav.side a { display:block; padding:6px 14px; color:var(--ink); text-decoration:none; font-size:14px; border-left:3px solid transparent; border-radius:0 4px 4px 0; margin-right:10px; }
+nav.side a:hover { background:var(--hover); }
+nav.side a.active { border-left-color:var(--accent); background:var(--hover); font-weight:600; }
+.pane > h2:first-child { margin-top:0; padding-top:0; border-top:none; }
+/* Narrow screens: the menu becomes one row that scrolls sideways. */
+@media (max-width:900px) {
+  .split { display:block; }
+  nav.side { position:static; flex-direction:row; overflow-x:auto; padding:0; border-right:none; border-bottom:1px solid var(--line); margin-bottom:20px; }
+  nav.side .group { display:none; }
+  nav.side a { flex:none; white-space:nowrap; border-left:none; border-bottom:2px solid transparent; border-radius:4px 4px 0 0; margin:0 0 -1px; }
+  nav.side a.active { border-bottom-color:var(--accent); background:transparent; }
+}
 /* The overview's tiles: one per section, saying what is in it. */
 .tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:12px; margin:18px 0; }
 a.tile { display:flex; flex-direction:column; gap:4px; padding:14px 16px; background:var(--surface); border:1px solid var(--line); border-radius:6px; color:var(--ink); text-decoration:none; }
@@ -170,12 +194,18 @@ dl.roles dd { margin:0; color:var(--muted); }
 .upn .suffix select { width:auto; max-width:260px; }
 .upn input:invalid ~ .suffix { display:none; }
 /* Short fields side by side, each under its own label. */
-.fields { display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:0 18px; max-width:980px; }
+.fields { display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:0 18px; max-width:1200px; }
 .fields input, .fields select { max-width:none; }
 /* A list's own controls: find something on the left, make something on the right. */
 .toolbar { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; justify-content:space-between; margin:0 0 12px; }
 .toolbar form { display:flex; gap:8px; align-items:center; flex:1 1 320px; max-width:520px; }
 .toolbar form input { max-width:none; }
+/* A list's filter: one compact row, label, choice and button side by side. */
+form.filter, .toolbar form.filter { display:flex; flex:none; max-width:none; gap:8px; align-items:center; }
+form.filter label { margin:0; }
+form.filter select { width:auto; min-width:160px; padding:4px 8px; }
+form.filter button { padding:4px 12px; font-size:13px; }
+.toolbar > p.sub { margin:0; }
 a.button { display:inline-block; padding:7px 14px; border-radius:4px; border:1px solid var(--accent); background:var(--accent); color:var(--on-accent); font-weight:600; text-decoration:none; }
 
 /* An add-form folded away until wanted, so a page reads as its tables. */
@@ -202,9 +232,20 @@ dl.facts dt { color:var(--muted); }
 dl.facts dd { margin:0; word-break:break-all; font-family:var(--mono); font-size:13px; }
 pre.raw { margin:0 0 14px; padding:12px 14px; background:var(--surface); border:1px solid var(--line); border-radius:6px; font:13px/1.55 var(--mono); white-space:pre-wrap; word-break:break-all; }
 code.wrap { font:13px/1.45 var(--mono); word-break:break-all; }
+/* A value to copy: one click selects all of it, with no script. */
+code.copy { user-select:all; cursor:copy; word-break:break-all; padding:1px 4px; border-radius:3px; }
+code.copy:hover { background:var(--hover); }
+pre.copy { user-select:all; cursor:copy; }
 .id { font-family:var(--mono); font-size:12.5px; color:var(--muted); word-break:break-all; }
-.card { background:var(--surface); border:1px solid var(--line); border-radius:6px; padding:24px 28px; max-width:440px; margin:64px auto; }
-.card h1 { font-size:20px; }
+/* A page that is only a card (sign-in, no access): the same card, in the same
+   place, as the sign-in pages users see (src/html.rs). */
+main:has(> .card) { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:16px; }
+.card { width:100%; max-width:420px; background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:36px 40px; }
+.card h1 { font-size:22px; margin:0 0 6px; }
+.card p.sub { margin:0 0 20px; }
+.card input[type=text], .card input[type=email], .card input[type=password] { max-width:none; padding:9px 10px; }
+.card .actions { justify-content:flex-end; margin-top:24px; }
+.card button { padding:9px 18px; }
 @media (max-width:640px) {
   .bar, nav.tabs { padding-left:16px; padding-right:16px; }
   main { padding:20px 16px 56px; }

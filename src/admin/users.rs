@@ -607,11 +607,13 @@ async fn detail(
 
     let attributes = format!(
         r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{attrs}">
-<label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}"{disabled}>
-<label for="given_name">Given name</label><input id="given_name" name="given_name" type="text" value="{given}"{disabled}>
-<label for="family_name">Family name</label><input id="family_name" name="family_name" type="text" value="{family}"{disabled}>
-<label for="email">Email address</label><input id="email" name="email" type="text" value="{email}"{disabled}>
-<p class="muted">A contact address, not the sign-in name.</p>
+<div class="fields">
+<div><label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}"{disabled}></div>
+<div><label for="given_name">Given name</label><input id="given_name" name="given_name" type="text" value="{given}"{disabled}></div>
+<div><label for="family_name">Family name</label><input id="family_name" name="family_name" type="text" value="{family}"{disabled}></div>
+<div><label for="email">Email address</label><input id="email" name="email" type="text" value="{email}"{disabled}>
+<p class="muted">A contact address, not the sign-in name.</p></div>
+</div>
 <label><input type="checkbox" name="email_verified"{verified}{disabled}> Email verified</label>
 {save}</form>"#,
         url = e(&url),
@@ -878,8 +880,9 @@ assign the account to applications, or give it roles granted to those groups.</p
     };
 
     let body = format!(
-        r#"<h1>{upn}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
+        r#"<p class="crumb"><a href="{list}">Users</a></p><h1>{upn}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
 <h2>Attributes</h2>{attributes}{state}{reset}{mfa}{other_tenants}{groups}{history}"#,
+        list = e(&format!("{base}/admin/tenants/{}/users", tenant.id)),
         upn = e(&user.upn),
         tenant_name = e(&tenant.name),
         id = e(&user.id),

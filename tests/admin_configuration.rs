@@ -87,3 +87,61 @@ async fn the_page_is_a_global_administrators() {
     let tenants = b.get(&s.url("/admin/tenants")).await;
     assert!(!tenants.body.contains(">Configuration<"), "no tab: {}", tenants.body);
 }
+
+/// A tenant's own Configuration tab: every address of its discovery document,
+/// with its id filled in, ready to copy; nothing of another tenant.
+#[tokio::test]
+async fn a_tenants_configuration_tab_gives_its_own_addresses() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let other = s.tenant("Fabrikam", "fabrikam.test").await;
+    let b = signed_in_admin(&s, &f).await;
+
+    let page = b
+        .get(&s.url(&format!("/admin/tenants/{}/configuration", f.tenant.id)))
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let document: Value = reqwest::get(s.url(&format!("/{}/v2.0/.well-known/openid-configuration", f.tenant.id)))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for key in [
+        "issuer",
+        "authorization_endpoint",
+        "token_endpoint",
+        "device_authorization_endpoint",
+        "jwks_uri",
+        "userinfo_endpoint",
+        "end_session_endpoint",
+    ] {
+        let address = document[key].as_str().unwrap();
+        assert!(
+            page.body.contains(&format!(r#"<code class="copy">{address}</code>"#)),
+            "{key}: {address} is not on the page: {}",
+            page.body
+        );
+    }
+    assert!(
+        page.body
+            .contains(&format!(r#"<code class="copy">{}</code>"#, f.tenant.id))
+    );
+    assert!(
+        page.body
+            .contains(&format!("&quot;TenantId&quot;: &quot;{}&quot;", f.tenant.id)),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains(&other.id), "another tenant's id: {}", page.body);
+
+    // It is one of the tenant's tabs.
+    let users = b.get(&s.url(&format!("/admin/tenants/{}/users", f.tenant.id))).await;
+    assert!(
+        users
+            .body
+            .contains(&format!("/admin/tenants/{}/configuration\"", f.tenant.id)),
+        "{}",
+        users.body
+    );
+}

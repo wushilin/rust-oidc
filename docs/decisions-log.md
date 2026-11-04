@@ -1577,3 +1577,20 @@ against secrets still holds. The code is good for one time step only. Note that
 the masked form shows the password's length and two of its characters: whoever
 reads the server log reads that too.
 *To reverse:* remove the `tracing::info!` in `routes::auth_api::authenticate`.
+
+## Migration order
+
+**48. The deployed database follows `main`'s numbering; applied migrations are pinned**
+(2026-11-04). The deployed service had applied the "remember" migration as version
+20 on 2026-10-09, from a build committed only later (PR #2, as `0021_remember`),
+while group claims took number 20 on `main` (PR #1). A build of `main` would not
+start there ("migration 20 was previously applied but has been modified"). On
+2026-11-03, to deploy 0.4.1, the deployed database's `_sqlx_migrations` rows were
+swapped to match `main` (20 group claims nesting, 21 remember); the two migrations
+touch different tables, so the schema was already right either way. `main`'s files
+are byte-identical to what those rows record. `tests/migration_pins.rs` now pins
+every migration the deployed service has applied (version, name, SHA-384, copied
+from its `_sqlx_migrations`) and checks that the three engines share one gap-free
+numbering, so a mismatch fails in CI instead of on the server. Add a line when a
+migration is first deployed; never edit one.
+*To reverse:* delete the test.

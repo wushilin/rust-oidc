@@ -47,7 +47,7 @@ async fn an_admin_reset_makes_the_user_choose_a_new_password_at_sign_in() {
     let user = user_fixture_in(&s, f.tenant.clone(), "bob@contoso.com").await;
     let admin = signed_in_admin(&s, &f).await;
     let url = s.url(&format!("/admin/tenants/{}/users/{}", f.tenant.id, user.user_id));
-    let page = admin.get(&url).await;
+    let page = admin.get(&format!("{url}/password")).await;
     assert!(
         page.body.contains(r#"name="require_change" checked"#),
         "ticked by default: {}",
@@ -164,9 +164,13 @@ async fn the_last_few_passwords_cannot_be_used_again() {
         let err = set(old, PasswordSetBy::User).await.unwrap_err();
         assert!(err.downcast_ref::<PasswordReused>().is_some(), "{old}: {err}");
     }
-    // An administrator's temporary password is exempt; one the user keeps is not.
+    // An administrator's password is exempt, temporary or not: refusing it would
+    // tell the administrator one of the account's recent passwords.
     set("Second-Pass-2", PasswordSetBy::AdminTemporary).await.unwrap();
-    assert!(set("Third-Pass-3", PasswordSetBy::Admin).await.is_err());
+    set("Third-Pass-3", PasswordSetBy::Admin).await.unwrap();
+    // What an administrator sets is still remembered: the user cannot choose it.
+    let err = set("Third-Pass-3", PasswordSetBy::User).await.unwrap_err();
+    assert!(err.downcast_ref::<PasswordReused>().is_some(), "{err}");
 
     // Fewer remembered: older ones are free again; none: anything goes.
     let mut settings = fresh_tenant(&s, &f).await.settings;

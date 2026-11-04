@@ -85,6 +85,10 @@ pub fn router() -> Router<AppState> {
             get(user_pages::detail_page).post(user_pages::detail_post),
         )
         .route(
+            "/admin/tenants/{tenant}/users/{user}/{section}",
+            get(user_pages::section_page),
+        )
+        .route(
             "/admin/tenants/{tenant}/groups",
             get(group_pages::list_page).post(group_pages::create_group),
         )

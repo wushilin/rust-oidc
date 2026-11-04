@@ -269,7 +269,8 @@ async fn a_users_groups_are_set_together_on_their_page() {
     let b = signed_in_admin(&s, &f).await;
     let url = s.url(&format!("/admin/tenants/{}/users/{}", f.tenant.id, bob));
 
-    let page = b.get(&url).await;
+    // The tick boxes are on the account's Groups section; the form posts to the account.
+    let page = b.get(&format!("{url}/groups")).await;
     assert!(
         page.body.contains(&format!(r#"name="group" value="{}" checked"#, g[0])),
         "the one they are in is ticked: {}",

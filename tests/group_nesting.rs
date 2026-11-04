@@ -421,7 +421,10 @@ async fn the_console_nests_and_lists_groups() {
 
     // The user's page shows the inherited group and why.
     let user_page = b
-        .get(&w.s.url(&format!("/admin/tenants/{}/users/{}", w.f.tenant.id, w.f.user_id)))
+        .get(&w.s.url(&format!(
+            "/admin/tenants/{}/users/{}/groups",
+            w.f.tenant.id, w.f.user_id
+        )))
         .await;
     assert!(user_page.body.contains("Through nested groups"), "{}", user_page.body);
     assert!(user_page.body.contains(">Backend</a>"), "{}", user_page.body);

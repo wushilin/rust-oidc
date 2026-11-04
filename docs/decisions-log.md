@@ -1622,3 +1622,30 @@ consistent sign-in pages, and agreed the side menu).
   runs no script. Addresses come from `routes::discovery::Endpoint`, as on the
   deployment's Configuration page, so the two cannot disagree.
 *To reverse:* restore `max-width:1160px` on `main` and the `subtabs` row.
+
+## The user page, by section
+
+**50. A user's page has a side menu, and says at the top whether the account can
+sign in** (2026-11-04; the owner asked for a page like the application's, and for
+the account's state to be visible). Decided without asking:
+- **Sections**, each at its own address under the account (`UserSection`):
+  Overview, and under *Manage* Properties, Groups and Other organizations, under
+  *Sign-in* Password and Authentication methods, and under *Activity* a link to the
+  audit log filtered to the account. Groups needs `Group:Read`, as before. Forms
+  still post to the account's own address; after a change the page returns to the
+  section the form was in.
+- **The account's standing is shown on every section**, as a pill beside its name:
+  *Sign-in enabled*, *Sign-in disabled*, or *Locked out*, plus *Must choose a new
+  password* when that is pending. A disabled account also gets a banner with the
+  Enable button; a locked-out one a banner saying until when and after how many
+  wrong passwords. The list's State column uses the same pills.
+- **Enable, disable and delete are on the overview**, under "Account".
+- No new transaction or storage write: `users::sign_in_state` is a read.
+
+**51. An administrator's password is not checked against the account's recent
+passwords** (2026-11-04; the owner's reasoning: refusing it tells the administrator
+that the password was one the account recently had). This replaces decision 152's
+rule that only an administrator's *temporary* password was exempt: now
+`PasswordSetBy::held_to_history` is true only for the user's own choice. What an
+administrator sets is still remembered, so the user cannot choose it again
+themselves.

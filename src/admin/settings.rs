@@ -90,7 +90,8 @@ async fn render(
 <h2>Passwords</h2>
 <label for="{PASSWORD_HISTORY}">Remembered passwords</label><input id="{PASSWORD_HISTORY}" name="{PASSWORD_HISTORY}" type="text" value="{history}"{disabled}>
 <p class="muted">A new password may not be one of the account's last this many. Between 0 (off) and {max_history}.
-A temporary password set by an administrator is exempt; the one the user then chooses is not.</p>
+A password an administrator sets is exempt (refusing it would tell them one the account recently had), but it is
+remembered, so the user cannot choose it again.</p>
 <h2>Other organizations</h2>
 <label><input type="checkbox" name="{ALLOW_CROSS_TENANT}"{cross}{disabled}> Allow this tenant's accounts to sign in to applications of other tenants</label>
 <p class="muted">Only to applications that accept other tenants and have assigned the account, directly or

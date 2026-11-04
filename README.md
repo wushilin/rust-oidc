@@ -391,6 +391,7 @@ all (tenant settings, group membership, audit).
 | `/admin/tenants/{tenant}/users` | List, search, create, edit, enable/disable, reset password, delete | `User:Read`, `User:Write`, `User:Reset` |
 | `/admin/tenants/{tenant}/groups` | List, create, add and remove members (accounts and groups) | `Group:Read`, `Group:Write` |
 | `/admin/tenants/{tenant}/apps` | Register; secrets, certificates, redirect URIs per platform, Application ID URIs, exposed scopes, app roles, role assignments, the password-grant and implicit toggles, and which groups tokens carry | `App:Read`, `App:Write`; credentials need `App:Rotate`; assignments need `Assignment:Write` |
+| `/admin/tenants/{tenant}/configuration` | This tenant's issuer, discovery document and endpoints, ready to copy | `Tenant:Read` |
 | `/admin/tenants/{tenant}/roles` | Grant and revoke console roles | `RoleBinding:Read`, `RoleBinding:Write` |
 | `/admin/tenants/{tenant}/flow` | Flow tester: what a flow needs configured, then drive it and read the result | `App:Read`; registering the callback or a test client needs `App:Write` |
 | `/admin/tenants/{tenant}/settings` | Token, session and refresh-token lifetimes; who must use MFA; "Keep me signed in" and "Don't ask again on this device" | `Tenant:Write` |

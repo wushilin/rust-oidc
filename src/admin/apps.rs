@@ -111,6 +111,18 @@ impl AppSection {
         Self::ALL.iter().copied().find(|s| s.path() == raw)
     }
 
+    /// The heading it sits under in the side menu; the overview has none.
+    fn group(self) -> Option<&'static str> {
+        match self {
+            Self::Overview => None,
+            Self::Authentication | Self::TokenConfiguration | Self::Credentials | Self::Api | Self::Roles => {
+                Some("Manage")
+            }
+            Self::Assignments | Self::Permissions | Self::ApiPermissions => Some("Access"),
+            Self::Check => Some("Troubleshoot"),
+        }
+    }
+
     /// What it takes to open it, beyond seeing the application.
     fn action(self) -> Action {
         match self {
@@ -606,27 +618,33 @@ other applications may hold. Add one under App roles, with the Application membe
         })
         .unwrap_or_default();
 
-    // The application's own row of tabs, under the tenant's.
-    let subtabs: String = AppSection::ALL
-        .iter()
-        .filter(|s| ctx.can_in(s.action(), tenant))
-        .map(|s| {
-            let href = e(&section_url(base, tenant, app, *s));
-            if *s == section {
-                format!(
-                    r#"<a class="active" aria-current="page" href="{href}">{}</a>"#,
-                    e(s.label())
-                )
-            } else {
-                format!(r#"<a href="{href}">{}</a>"#, e(s.label()))
+    // The application's own sections, as a menu down the side, under a heading
+    // per group: Entra's blade menu. A group heading shows only above a section
+    // the administrator may open.
+    let mut menu = String::new();
+    let mut heading = None;
+    for s in AppSection::ALL.iter().filter(|s| ctx.can_in(s.action(), tenant)) {
+        if s.group() != heading {
+            heading = s.group();
+            if let Some(h) = heading {
+                menu.push_str(&format!(r#"<div class="group">{}</div>"#, e(h)));
             }
-        })
-        .collect();
+        }
+        let href = e(&section_url(base, tenant, app, *s));
+        menu.push_str(&if *s == section {
+            format!(
+                r#"<a class="active" aria-current="page" href="{href}">{}</a>"#,
+                e(s.label())
+            )
+        } else {
+            format!(r#"<a href="{href}">{}</a>"#, e(s.label()))
+        });
+    }
 
     let body = format!(
         r#"<p class="crumb"><a href="{list}">Applications</a></p><h1>{name}</h1><p class="sub">{tenant_name} &middot; application registration</p>
-<nav class="subtabs" aria-label="Application">{subtabs}</nav>
-{reveal}{error}{content}"#,
+<div class="split"><nav class="side" aria-label="Application">{menu}</nav>
+<div class="pane">{reveal}{error}{content}</div></div>"#,
         list = e(&format!("{base}/admin/tenants/{}/apps", tenant.id)),
         name = e(&app.display_name),
         tenant_name = e(&tenant.name),

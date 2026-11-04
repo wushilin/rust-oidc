@@ -428,8 +428,8 @@ async fn detail(
         })
         .collect();
     let filter = format!(
-        r#"<form class="inline" method="get" action="{url}"><label for="show">Show</label>
-<select id="show" name="{SHOW}">{filter}</select><button type="submit">Apply</button></form>"#,
+        r#"<form class="filter" method="get" action="{url}"><label for="show">Show</label>
+<select id="show" name="{SHOW}">{filter}</select><button class="secondary" type="submit">Apply</button></form>"#,
         url = e(&url),
     );
     let summary = format!(
@@ -554,9 +554,9 @@ groups.</p>"#
     };
 
     let body = format!(
-        r#"<h1>{name}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
+        r#"<p class="crumb"><a href="{list}">Groups</a></p><h1>{name}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
 <p>{description}</p>
-<h2>Members</h2><p class="sub">{summary}</p>{filter}
+<h2>Members</h2><div class="toolbar"><p class="sub">{summary}</p>{filter}</div>
 <table><tr>{head}<th>Type</th><th>Name</th><th>Members</th><th>Object id</th><th></th></tr>{rows}</table>{remove}{add}{add_group}
 <h2>Member of</h2>{member_of}{delete}"#,
         head = if may_write {
@@ -564,6 +564,7 @@ groups.</p>"#
         } else {
             String::new()
         },
+        list = e(&groups_url(base, tenant)),
         name = e(&group.name),
         tenant_name = e(&tenant.name),
         id = e(&group.id),

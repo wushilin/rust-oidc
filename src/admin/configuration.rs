@@ -5,14 +5,14 @@
 //! [`crate::routes::discovery`], the same definitions the discovery document is
 //! built from, so this page cannot say something the server does not do.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
 use crate::AppState;
 use crate::admin::TENANT_READ;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, PlatformTab, chrome};
+use crate::admin::routes::{At, PlatformTab, TenantTab, chrome};
 use crate::admin::view::{self, e};
 use crate::routes::Prompt;
 use crate::routes::discovery::{self, Endpoint};
@@ -116,6 +116,131 @@ are signed with are on the Signing keys tab, and applications fetch them from th
     );
     view::page(
         &chrome(&st, &ctx, At::Platform(PlatformTab::Configuration)),
+        StatusCode::OK,
+        "Configuration",
+        &body,
+    )
+}
+
+/// A value to copy: selected whole by one click (no script).
+fn copy(value: &str) -> String {
+    format!(r#"<code class="copy">{}</code>"#, e(value))
+}
+
+/// One tenant's configuration, with its id in every address: what an application
+/// registered in it is configured with, ready to copy.
+pub async fn tenant_page(ctx: AdminContext, State(st): State<AppState>, Path(key): Path<String>) -> Response {
+    if let Err(resp) = ctx.require(TENANT_READ, On::Tenant(&key)) {
+        return resp;
+    }
+    let Some(t) = ctx.tenant(&key) else {
+        return view::not_found();
+    };
+    let domains = match tenant::domains(&st.pool, &t.id).await {
+        Ok(d) => d,
+        Err(err) => {
+            tracing::error!("tenant domains could not be read: {err}");
+            return view::server_error();
+        }
+    };
+    let url = &st.public_url;
+    let tid = t.id.as_str();
+    let issuer = Endpoint::Issuer.url(url, tid);
+    let discovery_url = Endpoint::Discovery.url(url, tid);
+
+    let rows = |items: &[(&str, String)]| -> String {
+        items
+            .iter()
+            .map(|(what, value)| format!("<tr><td>{}</td><td>{}</td></tr>", e(what), copy(value)))
+            .collect()
+    };
+    let tenant_rows = rows(&[
+        ("Tenant id", t.id.clone()),
+        ("Issuer", issuer.clone()),
+        ("Discovery document", discovery_url.clone()),
+    ]);
+    let domain_rows: String = domains
+        .iter()
+        .map(|d| format!("<tr><td>Verified domain</td><td>{}</td></tr>", copy(d)))
+        .collect();
+    let endpoints: String = Endpoint::ALL
+        .iter()
+        .map(|endpoint| {
+            format!(
+                "<tr><td>{label}</td><td>{address}</td><td class=\"muted\">{key}</td></tr>",
+                label = e(endpoint.label()),
+                address = copy(&endpoint.url(url, tid)),
+                key = endpoint.metadata_key().map(e).unwrap_or_default(),
+            )
+        })
+        .collect();
+    // Not in the discovery document: the last column says so by being empty.
+    let more: String = [
+        (
+            "Auth API (credential check)",
+            url.tenant_url(tid, "api/v1/authenticate"),
+        ),
+        ("My Account, for this tenant's users", url.tenant_url(tid, "myaccount")),
+    ]
+    .iter()
+    .map(|(what, value)| format!("<tr><td>{}</td><td>{}</td><td></td></tr>", e(what), copy(value)))
+    .collect();
+
+    // What the usual libraries are given, filled in. Each is a block to paste.
+    let base = format!("{}/", url.base().trim_end_matches('/'));
+    let generic = format!("issuer = {issuer}\ndiscovery = {discovery_url}\nclient_id = <application (client) id>");
+    let identity_web = format!(
+        "\"AzureAd\": {{\n  \"Instance\": \"{base}\",\n  \"TenantId\": \"{tid}\",\n  \"ClientId\": \"<application (client) id>\"\n}}"
+    );
+    let msal = format!(
+        "authority = {}",
+        Endpoint::Issuer.url(url, tid).trim_end_matches("/v2.0")
+    );
+    let snippet = |title: &str, note: &str, text: &str| {
+        format!(
+            r#"<h3>{}</h3><p class="muted">{}</p><pre class="raw copy">{}</pre>"#,
+            e(title),
+            e(note),
+            e(text)
+        )
+    };
+    let snippets = format!(
+        "{}{}{}",
+        snippet(
+            "Any OpenID Connect library",
+            "Most need only the issuer or the discovery document and find everything else.",
+            &generic
+        ),
+        snippet(
+            "Microsoft.Identity.Web (appsettings.json)",
+            "Instance and TenantId, as for Entra ID.",
+            &identity_web
+        ),
+        snippet(
+            "MSAL",
+            "The authority, as for Entra ID: the tenant's address without /v2.0.",
+            &msal
+        ),
+    );
+
+    let body = format!(
+        r#"<h1>Configuration</h1><p class="sub">{name}: what an application registered here is configured
+with. Click a value to select it. Tokens name the issuer by the tenant id, so configure the id rather than a
+domain.</p>
+<h2>This tenant</h2>
+<table><tr><th>Setting</th><th>Value</th></tr>{tenant_rows}{domain_rows}</table>
+<h2>Endpoints</h2>
+<table><tr><th>What</th><th>Address</th><th>In the discovery document</th></tr>{endpoints}{more_rows}</table>
+<h2>For common libraries</h2>{snippets}
+<p class="muted">An application also needs its own application (client) id and, unless it is a public
+client, a secret or certificate: those are on its page under Applications. What the server supports
+(grant types, response types, signing algorithms) is the same for every tenant and is on the
+deployment's Configuration page.</p>"#,
+        name = e(&t.name),
+        more_rows = more,
+    );
+    view::page(
+        &chrome(&st, &ctx, At::Tenant(t, TenantTab::Configuration)),
         StatusCode::OK,
         "Configuration",
         &body,

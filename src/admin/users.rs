@@ -29,6 +29,7 @@ use crate::txn::ops::users::{
 };
 use crate::txn::{self, Outcome, Refusal};
 use crate::users::{self, NewPassword, User};
+use crate::util::now;
 
 /// What a post to the user detail page asks for. An enum rather than a bare
 /// string so a new operation cannot be added without deciding which action
@@ -228,9 +229,9 @@ async fn list(
                 upn = e(&u.upn),
                 name = e(u.display_name.as_deref().unwrap_or("")),
                 state = if u.enabled {
-                    "Enabled"
+                    r#"<span class="pill good">Enabled</span>"#
                 } else {
-                    r#"<span class="pill">disabled</span>"#
+                    r#"<span class="pill bad">Disabled</span>"#
                 },
             )
         })
@@ -566,19 +567,176 @@ pub async fn create_user(
 
 // ---- detail ----
 
+/// A part of an account's page, each at its own address, with a menu down the
+/// side as on an application's page. Entra's user blades split the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserSection {
+    /// Who the account is, whether it can sign in, and a card per section.
+    Overview,
+    /// Names and contact details.
+    Properties,
+    Groups,
+    /// Signing in to other tenants' applications.
+    Organizations,
+    Password,
+    /// The authenticator and the account's MFA requirement.
+    Authentication,
+}
+
+impl UserSection {
+    pub const ALL: &'static [UserSection] = &[
+        Self::Overview,
+        Self::Properties,
+        Self::Groups,
+        Self::Organizations,
+        Self::Password,
+        Self::Authentication,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Properties => "Properties",
+            Self::Groups => "Groups",
+            Self::Organizations => "Other organizations",
+            Self::Password => "Password",
+            Self::Authentication => "Authentication methods",
+        }
+    }
+
+    /// The last part of its address; the overview is the account's own.
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Overview => "",
+            Self::Properties => "properties",
+            Self::Groups => "groups",
+            Self::Organizations => "organizations",
+            Self::Password => "password",
+            Self::Authentication => "authentication",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|s| s.path() == raw)
+    }
+
+    /// The heading it sits under in the side menu; the overview has none.
+    fn group(self) -> Option<&'static str> {
+        match self {
+            Self::Overview => None,
+            Self::Properties | Self::Groups | Self::Organizations => Some(MENU_MANAGE),
+            Self::Password | Self::Authentication => Some(MENU_SIGN_IN),
+        }
+    }
+
+    /// What it takes to open it, beyond seeing the account.
+    fn action(self) -> crate::rbac::Action {
+        match self {
+            Self::Groups => GROUP_READ,
+            _ => USER_READ,
+        }
+    }
+}
+
+const MENU_MANAGE: &str = "Manage";
+const MENU_SIGN_IN: &str = "Sign-in";
+const MENU_ACTIVITY: &str = "Activity";
+
+impl UserOp {
+    /// The section the operation's form is in, and where the page returns to.
+    fn section(self) -> UserSection {
+        match self {
+            Self::Attributes => UserSection::Properties,
+            Self::Enable | Self::Disable | Self::Delete => UserSection::Overview,
+            Self::Reset => UserSection::Password,
+            Self::Groups => UserSection::Groups,
+            Self::MfaPolicy | Self::MfaReset => UserSection::Authentication,
+            Self::CrossTenant => UserSection::Organizations,
+        }
+    }
+}
+
+/// Whether the account can sign in now, which the page shows at the top of every
+/// section: an administrator must never have to infer it from a button label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    Enabled,
+    Disabled,
+    /// Enabled, but locked out after too many wrong passwords, until then.
+    LockedOut(i64),
+}
+
+impl Standing {
+    fn of(user: &User, state: Option<&users::SignInState>, at: i64) -> Self {
+        if !user.enabled {
+            return Self::Disabled;
+        }
+        match state.and_then(|s| s.locked_at(at)) {
+            Some(until) => Self::LockedOut(until),
+            None => Self::Enabled,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "Sign-in enabled",
+            Self::Disabled => "Sign-in disabled",
+            Self::LockedOut(_) => "Locked out",
+        }
+    }
+
+    fn pill(self) -> String {
+        let class = match self {
+            Self::Enabled => "good",
+            Self::Disabled | Self::LockedOut(_) => "bad",
+        };
+        format!(r#"<span class="pill {class}">{}</span>"#, e(self.label()))
+    }
+}
+
+fn user_url(base: &str, tenant: &Tenant, user: &User) -> String {
+    format!("{}/{}", users_url(base, tenant), user.id)
+}
+
+fn section_url(base: &str, tenant: &Tenant, user: &User, section: UserSection) -> String {
+    match section {
+        UserSection::Overview => user_url(base, tenant, user),
+        other => format!("{}/{}", user_url(base, tenant, user), other.path()),
+    }
+}
+
 pub async fn detail_page(
     ctx: AdminContext,
     State(st): State<AppState>,
     Path((key, user_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = ctx.require(USER_READ, On::Tenant(&key)) {
-        return resp;
-    }
-    let Some(tenant) = ctx.tenant(&key) else {
+    show(&st, &ctx, &key, &user_id, UserSection::Overview).await
+}
+
+/// One section of an account's page.
+pub async fn section_page(
+    ctx: AdminContext,
+    State(st): State<AppState>,
+    Path((key, user_id, section)): Path<(String, String, String)>,
+) -> Response {
+    let Some(section) = UserSection::parse(&section).filter(|s| *s != UserSection::Overview) else {
         return view::not_found();
     };
-    match users::find(&st.pool, &tenant.id, &user_id).await {
-        Ok(Some(user)) => detail(&st, &ctx, tenant, &user, None, StatusCode::OK).await,
+    show(&st, &ctx, &key, &user_id, section).await
+}
+
+async fn show(st: &AppState, ctx: &AdminContext, key: &str, user_id: &str, section: UserSection) -> Response {
+    if let Err(resp) = ctx.require(USER_READ, On::Tenant(key)) {
+        return resp;
+    }
+    if let Err(resp) = ctx.require(section.action(), On::Tenant(key)) {
+        return resp;
+    }
+    let Some(tenant) = ctx.tenant(key) else {
+        return view::not_found();
+    };
+    match users::find(&st.pool, &tenant.id, user_id).await {
+        Ok(Some(user)) => detail(st, ctx, tenant, &user, section, None, StatusCode::OK).await,
         Ok(None) => view::not_found(),
         Err(err) => {
             tracing::error!("user lookup failed: {err}");
@@ -587,27 +745,338 @@ pub async fn detail_page(
     }
 }
 
+/// What every section's renderer is given.
+struct Here<'a> {
+    st: &'a AppState,
+    ctx: &'a AdminContext,
+    tenant: &'a Tenant,
+    user: &'a User,
+    /// Where the page's forms post.
+    url: String,
+    csrf: String,
+    state: Option<users::SignInState>,
+    standing: Standing,
+}
+
+impl Here<'_> {
+    fn may_write(&self) -> bool {
+        self.ctx.can_in(USER_WRITE, self.tenant)
+    }
+
+    fn may_reset(&self) -> bool {
+        self.ctx.can_in(USER_RESET, self.tenant)
+    }
+
+    /// Whether this is the administrator's own account, which they may not
+    /// disable or delete.
+    fn is_self(&self) -> bool {
+        self.user.id == self.ctx.user.id
+    }
+
+    /// A form posting one operation, with the given fields and button.
+    fn op_form(&self, op: UserOp, inner: &str) -> String {
+        format!(
+            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{field}" value="{op}">{inner}</form>"#,
+            url = e(&self.url),
+            csrf = self.csrf,
+            field = UserOp::FIELD,
+            op = op.as_str(),
+        )
+    }
+
+    /// A one-button form, laid out in a row.
+    fn op_button(&self, op: UserOp, class: &str, label: &str) -> String {
+        format!(
+            r#"<form method="post" action="{url}" class="inline">{csrf}<button class="{class}" type="submit" name="{field}" value="{op}">{label}</button></form>"#,
+            url = e(&self.url),
+            csrf = self.csrf,
+            field = UserOp::FIELD,
+            op = op.as_str(),
+            label = e(label),
+        )
+    }
+}
+
 async fn detail(
     st: &AppState,
     ctx: &AdminContext,
     tenant: &Tenant,
     user: &User,
+    section: UserSection,
     error: Option<&str>,
     status: StatusCode,
 ) -> Response {
     let base = st.public_url.base();
-    let url = format!("{}/{}", users_url(base, tenant), user.id);
-    let csrf = view::csrf_input(&ctx.csrf);
-    let may_write = ctx.can_in(USER_WRITE, tenant);
-    let may_reset = ctx.can_in(USER_RESET, tenant);
-    let error = error
-        .map(|m| format!(r#"<p class="error" role="alert">{}</p>"#, e(m)))
-        .unwrap_or_default();
-    let disabled = if may_write { "" } else { " disabled" };
+    let state = users::sign_in_state(&st.pool, &tenant.id, &user.id)
+        .await
+        .unwrap_or(None);
+    let standing = Standing::of(user, state.as_ref(), now());
+    let here = Here {
+        st,
+        ctx,
+        tenant,
+        user,
+        url: user_url(base, tenant, user),
+        csrf: view::csrf_input(&ctx.csrf),
+        state,
+        standing,
+    };
 
-    let attributes = format!(
-        r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{attrs}">
-<div class="fields">
+    let content = match section {
+        UserSection::Overview => overview(&here).await,
+        UserSection::Properties => properties(&here),
+        UserSection::Groups => groups(&here).await,
+        UserSection::Organizations => organizations(&here).await,
+        UserSection::Password => password(&here),
+        UserSection::Authentication => authentication(&here).await,
+    };
+
+    // The account's sections down the side, under a heading per group. A heading
+    // shows only above a section the administrator may open.
+    let mut menu = String::new();
+    let mut heading = None;
+    let mut open_group = |menu: &mut String, group: Option<&'static str>| {
+        if group != heading {
+            heading = group;
+            if let Some(h) = group {
+                menu.push_str(&format!(r#"<div class="group">{}</div>"#, e(h)));
+            }
+        }
+    };
+    for s in UserSection::ALL.iter().filter(|s| ctx.can_in(s.action(), tenant)) {
+        open_group(&mut menu, s.group());
+        let href = e(&section_url(base, tenant, user, *s));
+        menu.push_str(&if *s == section {
+            format!(
+                r#"<a class="active" aria-current="page" href="{href}">{}</a>"#,
+                e(s.label())
+            )
+        } else {
+            format!(r#"<a href="{href}">{}</a>"#, e(s.label()))
+        });
+    }
+    // The `(target)` index on `audit_log` exists for exactly this question, so
+    // the page that can answer it is linked from the person it is about.
+    if ctx.can_in(crate::admin::AUDIT_READ, tenant) {
+        open_group(&mut menu, Some(MENU_ACTIVITY));
+        menu.push_str(&format!(
+            r#"<a href="{}">Audit log</a>"#,
+            e(&format!("{base}/admin/tenants/{}/audit?target={}", tenant.id, user.id))
+        ));
+    }
+
+    let name = user.display_name.as_deref().filter(|n| !n.is_empty());
+    let body = format!(
+        r#"<p class="crumb"><a href="{list}">Users</a></p><h1>{title}</h1>
+<p class="sub">{subtitle}{tenant_name} &middot; user</p><p>{pills}</p>
+<div class="split"><nav class="side" aria-label="User">{menu}</nav>
+<div class="pane">{banner}{error}{content}</div></div>"#,
+        list = e(&users_url(base, tenant)),
+        title = e(name.unwrap_or(&user.upn)),
+        subtitle = if name.is_some() {
+            format!("{} &middot; ", e(&user.upn))
+        } else {
+            String::new()
+        },
+        tenant_name = e(&tenant.name),
+        pills = pills(&here),
+        banner = banner(&here),
+        error = view::error_block(error),
+    );
+    view::page(
+        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Users)),
+        status,
+        &format!("{} \u{b7} {}", user.upn, section.label()),
+        &body,
+    )
+}
+
+/// The account's standing, and anything else that stops or changes its next
+/// sign-in, as pills beside its name.
+fn pills(here: &Here<'_>) -> String {
+    let mut out = here.standing.pill();
+    if here.state.as_ref().is_some_and(|s| s.must_change_password) {
+        out.push_str(r#"<span class="pill">Must choose a new password</span>"#);
+    }
+    out
+}
+
+/// What is wrong with the account's sign-in, said once at the top of every
+/// section, with the way to put it right where the administrator may.
+fn banner(here: &Here<'_>) -> String {
+    match here.standing {
+        Standing::Enabled => String::new(),
+        Standing::Disabled => {
+            let enable = if here.may_write() {
+                here.op_button(UserOp::Enable, "", "Enable sign-in")
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<div class="banner bad"><span><strong>Sign-in is disabled.</strong> This account cannot sign in
+or get tokens, and it has no sessions.</span>{enable}</div>"#
+            )
+        }
+        Standing::LockedOut(until) => {
+            let failed = here.state.as_ref().map(|s| s.failed_logins).unwrap_or_default();
+            format!(
+                r#"<div class="banner bad"><span><strong>Locked out</strong> until {until} after {failed} wrong
+password{s}. It unlocks by itself then, or at once when its password is reset.</span></div>"#,
+                until = e(&view::ts(until)),
+                s = if failed == 1 { "" } else { "s" },
+            )
+        }
+    }
+}
+
+/// The overview: who the account is, a card per section saying what is in it,
+/// and what can be done to the account as a whole.
+async fn overview(here: &Here<'_>) -> String {
+    let (st, tenant, user) = (here.st, here.tenant, here.user);
+    let base = st.public_url.base();
+    let opt = |v: &Option<String>| {
+        v.as_deref()
+            .filter(|v| !v.is_empty())
+            .map(e)
+            .unwrap_or_else(|| "&mdash;".into())
+    };
+    let created = here
+        .state
+        .as_ref()
+        .map(|s| e(&view::ts(s.created_at)))
+        .unwrap_or_default();
+    let facts = format!(
+        r#"<dl class="facts"><dt>User name</dt><dd>{upn}</dd><dt>Object id</dt><dd>{id}</dd>
+<dt>Display name</dt><dd>{display}</dd><dt>Email address</dt><dd>{email}</dd>
+<dt>Created</dt><dd>{created}</dd><dt>Tenant</dt><dd>{tenant_name}</dd></dl>"#,
+        upn = e(&user.upn),
+        id = e(&user.id),
+        display = opt(&user.display_name),
+        email = opt(&user.email),
+        tenant_name = e(&tenant.name),
+    );
+
+    let enrolled = crate::mfa::enrolled_at(&st.pool, &user.id).await.unwrap_or(None);
+    let policy = crate::mfa::policy(&st.pool, &user.id)
+        .await
+        .unwrap_or(crate::mfa::MfaPolicy::Default);
+    let cross = crate::access::policy(&st.pool, &user.id)
+        .await
+        .unwrap_or(crate::access::CrossTenantPolicy::Default);
+    let must_change = here.state.as_ref().is_some_and(|s| s.must_change_password);
+
+    // (section, summary, a warning when something needs attention)
+    let mut cards: Vec<(UserSection, String, Option<&str>)> = vec![(
+        UserSection::Properties,
+        user.email
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(|m| {
+                format!(
+                    "{m}{}",
+                    if user.email_verified {
+                        ", verified"
+                    } else {
+                        ", not verified"
+                    }
+                )
+            })
+            .unwrap_or_else(|| "No email address".into()),
+        None,
+    )];
+    if here.ctx.can_in(GROUP_READ, tenant) {
+        let memberships = crate::groups::memberships_for_user(&st.pool, &user.id)
+            .await
+            .unwrap_or_default();
+        let direct = memberships.iter().filter(|m| m.via.is_none()).count();
+        let nested = memberships.len() - direct;
+        let summary = match (direct, nested) {
+            (0, 0) => "In no groups".to_string(),
+            (d, 0) => format!("Direct member of {d} group{}", if d == 1 { "" } else { "s" }),
+            (d, n) => format!("Direct member of {d}, {n} more through nesting"),
+        };
+        cards.push((UserSection::Groups, summary, None));
+    }
+    cards.push((UserSection::Organizations, cross.label().to_string(), None));
+    cards.push((
+        UserSection::Password,
+        if must_change {
+            "Set by an administrator; not yet replaced".into()
+        } else {
+            "Chosen by the user or kept as set".into()
+        },
+        must_change.then_some("Must choose a new password"),
+    ));
+    cards.push((
+        UserSection::Authentication,
+        match enrolled {
+            Some(at) => format!("Authenticator set up {}", view::ts(at)),
+            None => "No authenticator".into(),
+        },
+        (enrolled.is_none() && (policy == crate::mfa::MfaPolicy::Required || tenant.settings.enforces_mfa()))
+            .then_some("MFA required, not set up"),
+    ));
+    let cards: String = cards
+        .iter()
+        .map(|(section, summary, warning)| {
+            format!(
+                r#"<a class="tile" href="{href}"><strong>{label}</strong><span>{summary}</span>{warning}</a>"#,
+                href = e(&section_url(base, tenant, user, *section)),
+                label = e(section.label()),
+                summary = e(summary),
+                warning = warning
+                    .map(|w| format!(r#"<span class="pill bad">{}</span>"#, e(w)))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    format!(
+        r#"{facts}<div class="tiles">{cards}</div>{account}"#,
+        account = account_actions(here)
+    )
+}
+
+/// Enable, disable and delete: what is done to the account as a whole.
+fn account_actions(here: &Here<'_>) -> String {
+    if !here.may_write() {
+        return String::new();
+    }
+    if here.is_self() {
+        return r#"<h2>Account</h2><p class="muted">This is the account you are signed in with, so it cannot be
+disabled or deleted from here. Another administrator can.</p>"#
+            .to_string();
+    }
+    let toggle = if here.user.enabled {
+        here.op_button(UserOp::Disable, "secondary", "Disable sign-in")
+    } else {
+        here.op_button(UserOp::Enable, "", "Enable sign-in")
+    };
+    let delete = view::confirm_post(
+        "delete-user",
+        "Delete user\u{2026}",
+        &format!("Delete {}?", here.user.upn),
+        "They can no longer sign in, and their sessions end. An administrator can restore a deleted account.",
+        &here.url,
+        &here.csrf,
+        UserOp::FIELD,
+        UserOp::Delete.as_str(),
+        "Delete",
+    );
+    format!(
+        r#"<h2>Account</h2><p>{standing}. <span class="muted">Disabling ends the account's sessions and refresh
+tokens at once; enabling it again lets it sign in, with nothing else changed.</span></p>
+<div class="actions">{toggle}{delete}</div>"#,
+        standing = e(here.standing.label()),
+    )
+}
+
+fn properties(here: &Here<'_>) -> String {
+    let user = here.user;
+    let may_write = here.may_write();
+    let disabled = if may_write { "" } else { " disabled" };
+    let inner = format!(
+        r#"<div class="fields">
 <div><label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}"{disabled}></div>
 <div><label for="given_name">Given name</label><input id="given_name" name="given_name" type="text" value="{given}"{disabled}></div>
 <div><label for="family_name">Family name</label><input id="family_name" name="family_name" type="text" value="{family}"{disabled}></div>
@@ -615,10 +1084,7 @@ async fn detail(
 <p class="muted">A contact address, not the sign-in name.</p></div>
 </div>
 <label><input type="checkbox" name="email_verified"{verified}{disabled}> Email verified</label>
-{save}</form>"#,
-        url = e(&url),
-        op_field = UserOp::FIELD,
-        attrs = UserOp::Attributes.as_str(),
+{save}"#,
         display = e(user.display_name.as_deref().unwrap_or("")),
         given = e(user.given_name.as_deref().unwrap_or("")),
         family = e(user.family_name.as_deref().unwrap_or("")),
@@ -630,269 +1096,238 @@ async fn detail(
             r#"<p class="muted">Your roles allow reading this user but not changing them.</p>"#
         },
     );
+    format!(
+        r#"<h2>Properties</h2><dl class="facts"><dt>User name</dt><dd>{upn}</dd><dt>Object id</dt><dd>{id}</dd></dl>{form}"#,
+        upn = e(&user.upn),
+        id = e(&user.id),
+        form = here.op_form(UserOp::Attributes, &inner),
+    )
+}
 
-    let state = if may_write && user.id == ctx.user.id {
-        r#"<h2>Sign-in</h2><p class="muted">This is the account you are signed in with, so it cannot be
-disabled or deleted from here. Another administrator can.</p>"#
-            .to_string()
-    } else if may_write {
-        let (op, label) = if user.enabled {
-            (UserOp::Disable, "Disable sign-in")
-        } else {
-            (UserOp::Enable, "Enable sign-in")
-        };
-        format!(
-            r#"<h2>Sign-in</h2><form method="post" action="{url}" class="inline">{csrf}
-<button class="secondary" type="submit" name="{op_field}" value="{op}">{label}</button></form>
-{delete}"#,
-            url = e(&url),
-            op_field = UserOp::FIELD,
-            op = op.as_str(),
-            delete = view::confirm_post(
-                "delete-user",
-                "Delete user\u{2026}",
-                &format!("Delete {}?", user.upn),
-                "They can no longer sign in, and their sessions end. An administrator can restore a deleted account.",
-                &url,
-                &csrf,
-                UserOp::FIELD,
-                UserOp::Delete.as_str(),
-                "Delete",
-            ),
-        )
+fn password(here: &Here<'_>) -> String {
+    let must_change = here.state.as_ref().is_some_and(|s| s.must_change_password);
+    let changed = here
+        .state
+        .as_ref()
+        .map(|s| s.updated_at)
+        .map(|t| format!(" The account was last changed {}.", view::ts(t)))
+        .unwrap_or_default();
+    let status = if must_change {
+        "The current password was set by an administrator, and the user has yet to choose their own: they are asked to at their next sign-in."
     } else {
-        String::new()
+        "The user signs in with their own password, or one an administrator set for them to keep."
     };
-
-    let reset = if may_reset {
-        format!(
-            r#"<h2>Password</h2><form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{reset}">
-<label for="password">New password</label><input id="password" name="password" type="password" required>
+    let form = if here.may_reset() {
+        here.op_form(
+            UserOp::Reset,
+            &format!(
+                r#"<label for="password">New password</label><input id="password" name="password" type="password" autocomplete="new-password" required>
 <label><input type="checkbox" name="{REQUIRE_CHANGE}" checked> Require them to choose a new password at their next sign-in</label>
 <div class="actions"><button type="submit">Reset password</button></div>
-<p class="muted">A reset signs the user out everywhere and revokes their refresh tokens.{pending}</p></form>"#,
-            url = e(&url),
-            op_field = UserOp::FIELD,
-            reset = UserOp::Reset.as_str(),
-            pending = if users::must_change_password(&st.pool, &user.id).await.unwrap_or(false) {
-                " They have yet to choose their own password since the last reset."
-            } else {
-                ""
-            },
+<p class="muted">At least {min} characters. A reset signs the user out everywhere, revokes their refresh tokens and
+ends a lockout. It is not checked against the account's recent passwords, which would tell you what they were,
+but it is remembered, so the user cannot choose it again themselves.</p>"#,
+                min = users::MIN_PASSWORD_CHARS,
+            ),
         )
     } else {
-        String::new()
+        r#"<p class="muted">Your roles do not allow resetting passwords.</p>"#.to_string()
     };
+    format!(
+        r#"<h2>Password</h2><p>{status}<span class="muted">{changed}</span></p><h3>Reset password</h3>{form}"#,
+        status = e(status),
+        changed = e(&changed),
+    )
+}
 
-    let mfa = {
-        let enrolled = crate::mfa::enrolled_at(&st.pool, &user.id).await.unwrap_or(None);
-        let left = crate::mfa::recovery_codes_left(&st.pool, &user.id).await.unwrap_or(0);
-        let policy = crate::mfa::policy(&st.pool, &user.id)
-            .await
-            .unwrap_or(crate::mfa::MfaPolicy::Default);
-        let status = match enrolled {
-            Some(at) => format!(
-                "Authenticator set up {}. {left} unused recovery code{}.",
-                view::ts(at),
-                if left == 1 { "" } else { "s" }
-            ),
-            None => "No authenticator set up.".to_string(),
-        };
-        let tenant_rule = if tenant.settings.require_mfa {
-            "This tenant requires MFA of everyone."
-        } else {
-            "This tenant does not require MFA of everyone."
-        };
-        let setting = if may_write {
-            let options: String = crate::mfa::MfaPolicy::ALL
-                .iter()
-                .map(|p| {
-                    format!(
-                        r#"<option value="{v}"{sel}>{label}</option>"#,
-                        v = e(p.as_str()),
-                        sel = if *p == policy { " selected" } else { "" },
-                        label = e(p.label()),
-                    )
-                })
-                .collect();
-            format!(
-                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
-<label for="mfa_policy">Requirement</label><select id="mfa_policy" name="{MFA_POLICY}">{options}</select>
-<p class="muted">{tenant_rule} An application can also require it.</p>
-<div class="actions"><button type="submit">Save</button></div></form>"#,
-                url = e(&url),
-                op_field = UserOp::FIELD,
-                op = UserOp::MfaPolicy.as_str(),
-            )
-        } else {
-            format!(
-                r#"<p>Requirement: {}. <span class="muted">{tenant_rule}</span></p>"#,
-                e(policy.label())
-            )
-        };
-        let reset = if may_reset && enrolled.is_some() {
-            view::confirm_post(
-                "mfa-reset",
-                "Reset MFA\u{2026}",
-                &format!("Remove the authenticator of {}?", user.upn),
-                "Their authenticator and recovery codes are removed and they are signed out everywhere. \
-                 If MFA is required of them, they set up a new authenticator at their next sign-in.",
-                &url,
-                &csrf,
-                UserOp::FIELD,
-                UserOp::MfaReset.as_str(),
-                "Reset MFA",
-            )
-        } else {
-            String::new()
-        };
+async fn authentication(here: &Here<'_>) -> String {
+    let (st, tenant, user) = (here.st, here.tenant, here.user);
+    let enrolled = crate::mfa::enrolled_at(&st.pool, &user.id).await.unwrap_or(None);
+    let left = crate::mfa::recovery_codes_left(&st.pool, &user.id).await.unwrap_or(0);
+    let policy = crate::mfa::policy(&st.pool, &user.id)
+        .await
+        .unwrap_or(crate::mfa::MfaPolicy::Default);
+    let status = match enrolled {
+        Some(at) => format!(
+            "Authenticator set up {}. {left} unused recovery code{}.",
+            view::ts(at),
+            if left == 1 { "" } else { "s" }
+        ),
+        None => "No authenticator set up.".to_string(),
+    };
+    let enforced = tenant.settings.enforces_mfa();
+    let tenant_rule = if enforced {
+        "This tenant enforces MFA: every sign-in uses it, whatever this account's own setting."
+    } else if tenant.settings.require_mfa {
+        "This tenant requires MFA of everyone by default."
+    } else {
+        "This tenant does not require MFA of everyone by default."
+    };
+    let setting = if enforced {
+        // Shown as required and greyed: the account's own setting is kept as it
+        // is, and applies again if the tenant goes back to Permissive.
         format!(
-            r#"<h2>Multi-factor authentication</h2><p>{}</p>{setting}{reset}"#,
-            e(&status)
+            r#"<label for="mfa_policy">Requirement</label><select id="mfa_policy" disabled><option selected>Required (enforced by the tenant)</option></select>
+<p class="muted">{tenant_rule} Its own setting, {own}, applies again if the tenant goes back to Permissive.</p>"#,
+            own = e(&policy.label().to_lowercase()),
         )
-    };
-
-    let other_tenants = {
-        use crate::access::CrossTenantPolicy;
-        let own = crate::access::policy(&st.pool, &user.id)
-            .await
-            .unwrap_or(CrossTenantPolicy::Default);
-        let tenant_rule = if tenant.settings.allow_cross_tenant_sign_in {
-            "This tenant allows its accounts to sign in to other tenants' applications that assign them."
-        } else {
-            "This tenant does not allow its accounts to sign in to other tenants' applications."
-        };
-        let setting = if may_write {
-            let options: String = CrossTenantPolicy::ALL
-                .iter()
-                .map(|p| {
-                    format!(
-                        r#"<option value="{v}"{sel}>{label}</option>"#,
-                        v = e(p.as_str()),
-                        sel = if *p == own { " selected" } else { "" },
-                        label = e(p.label()),
-                    )
-                })
-                .collect();
-            format!(
-                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
-<label for="cross_tenant">Signing in to other tenants' applications</label><select id="cross_tenant" name="{CROSS_TENANT}">{options}</select>
-<p class="muted">{tenant_rule} Only applications that accept other tenants and assign this account let it in.</p>
-<div class="actions"><button type="submit">Save</button></div></form>"#,
-                url = e(&url),
-                op_field = UserOp::FIELD,
-                op = UserOp::CrossTenant.as_str(),
-            )
-        } else {
-            format!(r#"<p>{}. <span class="muted">{tenant_rule}</span></p>"#, e(own.label()))
-        };
-        format!(r#"<h2>Other organizations</h2>{setting}"#)
-    };
-
-    let groups = if ctx.can_in(GROUP_READ, tenant) {
-        let held = crate::groups::for_user(&st.pool, &user.id).await.unwrap_or_default();
-        let all = crate::groups::list(&st.pool, &tenant.id).await.unwrap_or_default();
-        let memberships = crate::groups::memberships_for_user(&st.pool, &user.id)
-            .await
-            .unwrap_or_default();
-        let group_href = |id: &str| {
-            e(&format!(
-                "{}/admin/tenants/{}/groups/{id}",
-                st.public_url.base(),
-                tenant.id
-            ))
-        };
-        // Through a group inside another: not ticked or unticked here, since only
-        // the nesting decides it.
-        let inherited: String = memberships
+    } else if here.may_write() {
+        let options: String = crate::mfa::MfaPolicy::ALL
             .iter()
-            .filter_map(|m| m.via.as_ref().map(|via| (m, via)))
-            .map(|(m, via)| {
+            .map(|p| {
                 format!(
-                    r#"<tr><td><a href="{g}">{name}</a></td><td class="muted">via <a href="{v}">{via}</a></td></tr>"#,
-                    g = group_href(&m.group.id),
-                    name = view::labelled(crate::directory::PrincipalType::Group, &m.group.name),
-                    v = group_href(&via.id),
-                    via = e(&via.name),
+                    r#"<option value="{v}"{sel}>{label}</option>"#,
+                    v = e(p.as_str()),
+                    sel = if *p == policy { " selected" } else { "" },
+                    label = e(p.label()),
                 )
             })
             .collect();
-        let inherited = if inherited.is_empty() {
-            String::new()
-        } else {
-            format!(
-                r#"<h3>Through nested groups</h3><table><tr><th>Group</th><th>Why</th></tr>{inherited}</table>
-<p class="muted">These count for the <code>groups</code> claim of applications that carry all groups. They do not
-assign the account to applications, or give it roles granted to those groups.</p>"#
-            )
-        };
-        if ctx.can_in(GROUP_WRITE, tenant) && !all.is_empty() {
-            // Every group of the tenant, the ones they are in ticked: membership is
-            // set in one go rather than group by group.
-            let boxes: String = all
-                .iter()
-                .map(|g| {
-                    format!(
-                        r#"<label><input type="checkbox" name="{GROUP}" value="{id}"{on}> {name}</label>"#,
-                        id = e(&g.id),
-                        name = e(&g.name),
-                        on = if held.iter().any(|h| h.id == g.id) {
-                            " checked"
-                        } else {
-                            ""
-                        },
-                    )
-                })
-                .collect();
-            format!(
-                r#"<h2>Groups</h2><form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
-<fieldset class="ticks"><legend>Direct member of</legend>{boxes}</fieldset>
-<div class="actions"><button type="submit">Save groups</button></div></form>{inherited}"#,
-                url = e(&url),
-                op_field = UserOp::FIELD,
-                op = UserOp::Groups.as_str(),
-            )
-        } else {
-            let pills = if held.is_empty() {
-                r#"<span class="muted">None</span>"#.to_string()
-            } else {
-                held.iter()
-                    .map(|g| format!(r#"<span class="pill">{}</span>"#, e(&g.name)))
-                    .collect()
-            };
-            format!(r#"<h2>Groups</h2><p>Direct member of: {pills}</p>{inherited}"#)
-        }
+        here.op_form(
+            UserOp::MfaPolicy,
+            &format!(
+                r#"<label for="mfa_policy">Requirement</label><select id="mfa_policy" name="{MFA_POLICY}">{options}</select>
+<p class="muted">{tenant_rule} An application can also require it.</p>
+<div class="actions"><button type="submit">Save</button></div>"#
+            ),
+        )
     } else {
-        String::new()
-    };
-
-    // The `(target)` index on `audit_log` exists for exactly this question, so
-    // the page that can answer it is linked from the person it is about.
-    let history = if ctx.can_in(crate::admin::AUDIT_READ, tenant) {
         format!(
-            r#"<h2>History</h2><p><a href="{base}/admin/tenants/{tid}/audit?target={id}">Audit entries about this account</a></p>"#,
-            base = e(base),
-            tid = e(&tenant.id),
-            id = e(&user.id),
+            r#"<p>Requirement: {}. <span class="muted">{tenant_rule}</span></p>"#,
+            e(policy.label())
+        )
+    };
+    let reset = if here.may_reset() && enrolled.is_some() {
+        view::confirm_post(
+            "mfa-reset",
+            "Reset MFA\u{2026}",
+            &format!("Remove the authenticator of {}?", user.upn),
+            "Their authenticator and recovery codes are removed and they are signed out everywhere. \
+             If MFA is required of them, they set up a new authenticator at their next sign-in.",
+            &here.url,
+            &here.csrf,
+            UserOp::FIELD,
+            UserOp::MfaReset.as_str(),
+            "Reset MFA",
         )
     } else {
         String::new()
     };
-
-    let body = format!(
-        r#"<p class="crumb"><a href="{list}">Users</a></p><h1>{upn}</h1><p class="sub">{tenant_name} &middot; object id {id}</p>{error}
-<h2>Attributes</h2>{attributes}{state}{reset}{mfa}{other_tenants}{groups}{history}"#,
-        list = e(&format!("{base}/admin/tenants/{}/users", tenant.id)),
-        upn = e(&user.upn),
-        tenant_name = e(&tenant.name),
-        id = e(&user.id),
-    );
-    view::page(
-        &chrome(st, ctx, At::Tenant(tenant, TenantTab::Users)),
-        status,
-        &user.upn,
-        &body,
+    format!(
+        r#"<h2>Authentication methods</h2><p>{}</p>{reset}<h3>Multi-factor authentication</h3>{setting}"#,
+        e(&status)
     )
+}
+
+async fn organizations(here: &Here<'_>) -> String {
+    use crate::access::CrossTenantPolicy;
+    let own = crate::access::policy(&here.st.pool, &here.user.id)
+        .await
+        .unwrap_or(CrossTenantPolicy::Default);
+    let tenant_rule = if here.tenant.settings.allow_cross_tenant_sign_in {
+        "This tenant allows its accounts to sign in to other tenants' applications that assign them."
+    } else {
+        "This tenant does not allow its accounts to sign in to other tenants' applications."
+    };
+    let setting = if here.may_write() {
+        let options: String = CrossTenantPolicy::ALL
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"<option value="{v}"{sel}>{label}</option>"#,
+                    v = e(p.as_str()),
+                    sel = if *p == own { " selected" } else { "" },
+                    label = e(p.label()),
+                )
+            })
+            .collect();
+        here.op_form(
+            UserOp::CrossTenant,
+            &format!(
+                r#"<label for="cross_tenant">Signing in to other tenants' applications</label><select id="cross_tenant" name="{CROSS_TENANT}">{options}</select>
+<p class="muted">{tenant_rule} Only applications that accept other tenants and assign this account let it in.</p>
+<div class="actions"><button type="submit">Save</button></div>"#
+            ),
+        )
+    } else {
+        format!(r#"<p>{}. <span class="muted">{tenant_rule}</span></p>"#, e(own.label()))
+    };
+    format!(r#"<h2>Other organizations</h2>{setting}"#)
+}
+
+async fn groups(here: &Here<'_>) -> String {
+    let (st, ctx, tenant, user) = (here.st, here.ctx, here.tenant, here.user);
+    let held = crate::groups::for_user(&st.pool, &user.id).await.unwrap_or_default();
+    let all = crate::groups::list(&st.pool, &tenant.id).await.unwrap_or_default();
+    let memberships = crate::groups::memberships_for_user(&st.pool, &user.id)
+        .await
+        .unwrap_or_default();
+    let group_href = |id: &str| {
+        e(&format!(
+            "{}/admin/tenants/{}/groups/{id}",
+            st.public_url.base(),
+            tenant.id
+        ))
+    };
+    // Through a group inside another: not ticked or unticked here, since only
+    // the nesting decides it.
+    let inherited: String = memberships
+        .iter()
+        .filter_map(|m| m.via.as_ref().map(|via| (m, via)))
+        .map(|(m, via)| {
+            format!(
+                r#"<tr><td><a href="{g}">{name}</a></td><td class="muted">via <a href="{v}">{via}</a></td></tr>"#,
+                g = group_href(&m.group.id),
+                name = view::labelled(crate::directory::PrincipalType::Group, &m.group.name),
+                v = group_href(&via.id),
+                via = e(&via.name),
+            )
+        })
+        .collect();
+    let inherited = if inherited.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<h3>Through nested groups</h3><table><tr><th>Group</th><th>Why</th></tr>{inherited}</table>
+<p class="muted">These count for the <code>groups</code> claim of applications that carry all groups. They do not
+assign the account to applications, or give it roles granted to those groups.</p>"#
+        )
+    };
+    let direct = if ctx.can_in(GROUP_WRITE, tenant) && !all.is_empty() {
+        // Every group of the tenant, the ones they are in ticked: membership is
+        // set in one go rather than group by group.
+        let boxes: String = all
+            .iter()
+            .map(|g| {
+                format!(
+                    r#"<label><input type="checkbox" name="{GROUP}" value="{id}"{on}> {name}</label>"#,
+                    id = e(&g.id),
+                    name = e(&g.name),
+                    on = if held.iter().any(|h| h.id == g.id) {
+                        " checked"
+                    } else {
+                        ""
+                    },
+                )
+            })
+            .collect();
+        here.op_form(
+            UserOp::Groups,
+            &format!(
+                r#"<fieldset class="ticks"><legend>Direct member of</legend>{boxes}</fieldset>
+<div class="actions"><button type="submit">Save groups</button></div>"#
+            ),
+        )
+    } else if held.is_empty() {
+        r#"<p>Direct member of: <span class="muted">None</span></p>"#.to_string()
+    } else {
+        let links: String = held
+            .iter()
+            .map(|g| format!(r#"<a class="pill" href="{}">{}</a>"#, group_href(&g.id), e(&g.name)))
+            .collect();
+        format!(r#"<p>Direct member of: {links}</p>"#)
+    };
+    format!(r#"<h2>Groups</h2>{direct}{inherited}"#)
 }
 
 pub async fn detail_post(
@@ -938,10 +1373,21 @@ pub async fn detail_post(
             if op == UserOp::Delete {
                 view::see_other(&users_url(base, tenant))
             } else {
-                view::see_other(&format!("{}/{}", users_url(base, tenant), user.id))
+                view::see_other(&section_url(base, tenant, &user, op.section()))
             }
         }
-        Settled::Refused(message) => detail(&st, &ctx, tenant, &user, Some(&message), StatusCode::BAD_REQUEST).await,
+        Settled::Refused(message) => {
+            detail(
+                &st,
+                &ctx,
+                tenant,
+                &user,
+                op.section(),
+                Some(&message),
+                StatusCode::BAD_REQUEST,
+            )
+            .await
+        }
         Settled::Respond(resp) => resp,
     }
 }

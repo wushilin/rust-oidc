@@ -4,6 +4,8 @@
 //! redirect URI are shown on an error page (never redirected, to avoid open
 //! redirects); everything after that is reported to the client's redirect URI.
 
+use crate::routes::audit::SignInReason;
+use crate::users::Attempt;
 use std::collections::HashMap;
 
 use axum::body::Bytes;
@@ -941,12 +943,43 @@ async fn start_mfa(
             let home = access::home_of(&st.pool, user).await.ok().flatten();
             let issuer = home.as_ref().map_or(v.tenant.name.as_str(), |t| t.name.as_str());
             let enroll = secret.as_deref().map(|s| (s, issuer));
-            let offer = home.as_ref().is_some_and(|h| h.settings.allow_remember_mfa);
+            let offer = home.as_ref().is_some_and(|h| may_remember(h, &v.tenant));
             mfa_page(st, v, request, &user.upn, purpose, &ticket, enroll, offer, None)
         }
         Err(e) => html::error(Some(&v.tenant.name), &AadError::from(e).description()),
     }
 }
+
+/// "Set up an authenticator?", with its own ticket so the answer carries on the
+/// sign-in the password made.
+async fn suggest_mfa(st: &AppState, v: &Validated, request: &str, user: &User, keep: KeepSignedIn) -> Response {
+    let ticket = match mfa::begin(&st.pool, &v.tenant.id, &user.id, Purpose::Suggest, keep).await {
+        Ok(t) => t,
+        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+    };
+    let csrf = session::new_token();
+    let hidden = format!(
+        r#"<input type="hidden" name="csrf" value="{}"><input type="hidden" name="request" value="{}">"#,
+        html::escape(&csrf),
+        html::escape(request)
+    );
+    let mut resp = html::mfa_suggest(&html::MfaSuggest {
+        tenant_name: &v.tenant.name,
+        upn: &user.upn,
+        action: &form_action(st, v),
+        hidden: &hidden,
+        op_field: "op",
+        ticket: &ticket,
+        snooze_days: TenantSettings::MFA_SETUP_SNOOZE_SECS / SECS_PER_DAY,
+    });
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        session::set_cookie(&st.public_url, CSRF_COOKIE, &csrf, 3600),
+    );
+    resp
+}
+
+const SECS_PER_DAY: i64 = 86_400;
 
 /// The last part of a sign-in whose password (and second factor, if any) are
 /// done: a new password first if the account must choose one, then the session.
@@ -1096,6 +1129,13 @@ async fn second_step(
         Ok(None) => return login_page(st, v, request, "", Some(MFA_EXPIRED)),
         Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
     };
+    // A code page after a wrong password: never a sign-in, whatever is posted.
+    if !pending.password_right {
+        if pending.purpose != Purpose::Verify || op != html::LoginOp::MfaVerify {
+            return login_page(st, v, request, "", Some(MFA_EXPIRED));
+        }
+        return unverified_second_step(st, request, v, &ticket, &pending, &typed).await;
+    }
     let user = match users::find_by_id(&st.pool, &pending.user_id).await {
         Ok(Some(u)) if u.enabled => u,
         _ => return login_page(st, v, request, "", Some(MFA_EXPIRED)),
@@ -1106,6 +1146,7 @@ async fn second_step(
     };
     let fits = match op {
         html::LoginOp::MfaEnroll => pending.purpose == Purpose::Enroll,
+        html::LoginOp::MfaSetupNow | html::LoginOp::MfaSetupLater => pending.purpose == Purpose::Suggest,
         html::LoginOp::ChangePassword => {
             matches!(
                 pending.purpose,
@@ -1118,6 +1159,19 @@ async fn second_step(
         return login_page(st, v, request, "", Some(MFA_EXPIRED));
     }
     match pending.purpose {
+        // "Set up an authenticator?": now goes on to setting one up, as when one
+        // is required; "Not now" carries on with the sign-in the password made.
+        Purpose::Suggest => {
+            let _ = mfa::finish(&st.pool, &ticket).await;
+            if op == html::LoginOp::MfaSetupNow {
+                return start_mfa(st, v, request, &user, mfa::Step::Enroll, pending.keep).await;
+            }
+            if let Err(e) = mfa::snooze_setup(&st.pool, &user.id).await {
+                // Not remembering the answer only means asking again next time.
+                tracing::error!("snoozing the authenticator suggestion failed: {e}");
+            }
+            finish_sign_in(st, tenant_key, headers, params, request, v, &user, false, pending.keep).await
+        }
         Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa => {
             let new = form.get(html::NEW_PASSWORD).cloned().unwrap_or_default();
             let confirm = form.get(html::CONFIRM_PASSWORD).cloned().unwrap_or_default();
@@ -1146,6 +1200,10 @@ async fn second_step(
         Purpose::Verify => match mfa::check(&st.pool, &user.id, &typed).await {
             Ok(Some(factor)) => {
                 let _ = mfa::finish(&st.pool, &ticket).await;
+                // Both factors right: the count the password left alone is cleared.
+                if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
+                    return html::error(Some(&v.tenant.name), &AadError::from(e).description());
+                }
                 let device = remember_if_asked(st, headers, form, &user, &home).await;
                 audit::record(
                     st,
@@ -1165,6 +1223,26 @@ async fn second_step(
             }
             Ok(None) => {
                 wrong_code(st, &v.tenant.id, &user.id, Channel::Authorize).await;
+                // A right password with a wrong code: what lockout is for.
+                match users::settle_attempt(&st.pool, &user.id, Attempt::Failed).await {
+                    Ok(true) => {
+                        let details = serde_json::json!({
+                            "via": Channel::Authorize.as_str(),
+                            "clientId": v.client.app_id,
+                        });
+                        audit::record(
+                            st,
+                            &v.tenant.id,
+                            Actor::Id(&user.id),
+                            Event::Lockout,
+                            Some(&user.id),
+                            details,
+                        )
+                        .await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+                }
                 match mfa::failed_attempt(&st.pool, &ticket).await {
                     Ok(true) => mfa_page(
                         st,
@@ -1174,7 +1252,7 @@ async fn second_step(
                         Purpose::Verify,
                         &ticket,
                         None,
-                        home.settings.allow_remember_mfa,
+                        may_remember(&home, &v.tenant),
                         Some(MFA_WRONG),
                     ),
                     _ => login_page(st, v, request, "", Some(MFA_EXPIRED)),
@@ -1279,15 +1357,26 @@ pub(crate) fn with_device_cookie(st: &AppState, mut resp: Response, device: Opti
     resp
 }
 
-/// Whether this browser may skip `user`'s code this time. A failure to look is
-/// treated as "no": the user is asked for the code.
+/// Whether "Don't ask again on this device" is offered and trusted for a sign-in
+/// of an account of `home` to `resource`: the account's own tenant allows it, and
+/// neither tenant enforces MFA, which asks for a code at every sign-in.
+pub(crate) fn may_remember(home: &Tenant, resource: &Tenant) -> bool {
+    home.settings.remembers_mfa() && !resource.settings.enforces_mfa()
+}
+
+/// Whether this browser may skip `user`'s code this time, signing in to
+/// `resource`. A failure to look is treated as "no": the user is asked for the code.
 pub(crate) async fn device_remembered(
     st: &AppState,
     headers: &HeaderMap,
     user: &User,
     home: &Tenant,
+    resource: &Tenant,
     freshness: mfa::Freshness,
 ) -> bool {
+    if !may_remember(home, resource) {
+        return false;
+    }
     let device = session::cookie(headers, MFA_DEVICE_COOKIE);
     matches!(
         mfa::remembered(&st.pool, device.as_deref(), &user.id, home, freshness).await,
@@ -1355,7 +1444,13 @@ pub async fn login(
             run(&st, &tenant_key, &headers, &params, &request, Interaction::ChoseAccount).await
         }
         Some(html::LoginOp::Other) => return login_page(&st, &v, &request, "", None),
-        Some(op @ (html::LoginOp::MfaVerify | html::LoginOp::MfaEnroll | html::LoginOp::ChangePassword)) => {
+        Some(
+            op @ (html::LoginOp::MfaVerify
+            | html::LoginOp::MfaEnroll
+            | html::LoginOp::ChangePassword
+            | html::LoginOp::MfaSetupNow
+            | html::LoginOp::MfaSetupLater),
+        ) => {
             return second_step(&st, &tenant_key, &headers, &params, &request, &v, &form, op).await;
         }
         Some(html::LoginOp::ConsentAccept) => {
@@ -1375,69 +1470,340 @@ pub async fn login(
         None => {
             let upn = form.get("upn").map(|s| s.trim().to_string()).unwrap_or_default();
             let password = form.get("password").cloned().unwrap_or_default();
-            let (outcome, trace) = match access::authenticate(&st.pool, &v.tenant, Some(&v.sp), &upn, &password).await {
-                Ok(o) => o,
-                Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
-            };
-            audit::sign_in_failure(
+            return password_step(
                 &st,
-                &v.tenant.id,
+                &tenant_key,
+                &headers,
+                &params,
+                &request,
+                &v,
+                &form,
                 &upn,
+                &password,
+            )
+            .await;
+        }
+    };
+    match result {
+        Ok(resp) | Err(resp) => resp,
+    }
+}
+
+/// The AADSTS50126 answer to a wrong password, the same whatever else was wrong.
+const BAD_CREDENTIALS: &str = "Your account or password is incorrect. (AADSTS50126: Error validating credentials due to invalid username or password.)";
+
+/// The password page posted: the first step of a sign-in.
+///
+/// A right password that will be asked for a code settles nothing yet: the code
+/// does. Where MFA is enforced, a wrong password leads to the same code page
+/// (as does a name that names no account), and the attempt counts toward
+/// lockout only when exactly one of the two is right (decision 55). Everywhere
+/// else a wrong password counts at once, as before.
+#[allow(clippy::too_many_arguments)]
+async fn password_step(
+    st: &AppState,
+    tenant_key: &str,
+    headers: &HeaderMap,
+    params: &Params,
+    request: &str,
+    v: &Validated,
+    form: &HashMap<String, String>,
+    upn: &str,
+    password: &str,
+) -> Response {
+    let fail = |e: anyhow::Error| html::error(Some(&v.tenant.name), &AadError::from(e).description());
+    let (outcome, mut trace) =
+        match access::authenticate_deferred(&st.pool, &v.tenant, Some(&v.sp), upn, password).await {
+            Ok(o) => o,
+            Err(e) => return fail(e),
+        };
+    let keep = KeepSignedIn::chosen(&v.tenant, html::ticked(form, html::KEEP_SIGNED_IN));
+    match outcome {
+        AuthResult::Ok(user) => {
+            let home = match access::home_of(&st.pool, &user).await {
+                Ok(Some(h)) => h,
+                Ok(None) => return fail(anyhow::anyhow!("the account's tenant is gone")),
+                Err(e) => return fail(e),
+            };
+            let step = match mfa::step(&st.pool, &home, &user.id, mfa::At::App(&v.sp)).await {
+                Ok(step) => stepped_up(step, params),
+                Err(e) => return fail(e),
+            };
+            let remembered = step == mfa::Step::Verify
+                && device_remembered(st, headers, &user, &home, &v.tenant, freshness(params)).await;
+            // A code comes next: the counter waits for it, and so does whether
+            // the account may use this application (which a refusal now would
+            // say only to someone with the right password). The authorize
+            // request is decided again, in full, once the code is right.
+            if step == mfa::Step::Verify && !remembered {
+                return start_mfa(st, v, request, &user, step, keep).await;
+            }
+            // The password is all this sign-in asks: it settles the count now.
+            if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
+                return fail(e);
+            }
+            // May they use this application? Answered before setting an
+            // authenticator up, so nobody does that only to be refused.
+            let decision = match access::decide(&st.pool, &v.tenant, &v.sp, &user).await {
+                Ok(d) => d,
+                Err(e) => return fail(e),
+            };
+            if let Some(refusal) = decision.refusal {
+                return refused_page(v, &decision.home, refusal);
+            }
+            if remembered {
+                audit_remembered(st, &v.tenant.id, &user, Channel::Authorize).await;
+                return finish_sign_in(st, tenant_key, headers, params, request, v, &user, true, keep).await;
+            }
+            if step != mfa::Step::Done {
+                return start_mfa(st, v, request, &user, step, keep).await;
+            }
+            // Nothing requires a second factor: offer one, where the account's
+            // own tenant asks for that.
+            if mfa::suggest_setup(&st.pool, &decision.home, &user.id)
+                .await
+                .unwrap_or(false)
+            {
+                return suggest_mfa(st, v, request, &user, keep).await;
+            }
+            finish_sign_in(st, tenant_key, headers, params, request, v, &user, false, keep).await
+        }
+        AuthResult::InvalidCredentials => {
+            if let Some(hint) = tenant::not_ours_hint(&st.pool, &v.tenant, upn, v.sp.accept_other_tenants).await {
+                audit::sign_in_failure(
+                    st,
+                    &v.tenant.id,
+                    upn,
+                    &outcome,
+                    &trace,
+                    Channel::Authorize,
+                    &v.client.app_id,
+                )
+                .await;
+                return login_page(st, v, request, upn, Some(&hint));
+            }
+            match unverified_code_page(st, headers, params, request, v, trace.user_id.as_deref(), upn, keep).await {
+                Ok(Some(page)) => {
+                    // Audited when the code decides why it failed. An unknown name
+                    // has nothing for the code to decide, so it is audited now.
+                    if trace.user_id.is_none() {
+                        audit::sign_in_failure(
+                            st,
+                            &v.tenant.id,
+                            upn,
+                            &outcome,
+                            &trace,
+                            Channel::Authorize,
+                            &v.client.app_id,
+                        )
+                        .await;
+                    }
+                    page
+                }
+                Ok(None) => {
+                    // No code to wait for: the wrong password counts now.
+                    if let Some(id) = trace.user_id.as_deref() {
+                        trace.lockout_triggered = match users::settle_attempt(&st.pool, id, Attempt::Failed).await {
+                            Ok(locked) => locked,
+                            Err(e) => return fail(e),
+                        };
+                    }
+                    audit::sign_in_failure(
+                        st,
+                        &v.tenant.id,
+                        upn,
+                        &outcome,
+                        &trace,
+                        Channel::Authorize,
+                        &v.client.app_id,
+                    )
+                    .await;
+                    login_page(st, v, request, upn, Some(BAD_CREDENTIALS))
+                }
+                Err(e) => fail(e),
+            }
+        }
+        AuthResult::Locked => {
+            audit::sign_in_failure(
+                st,
+                &v.tenant.id,
+                upn,
                 &outcome,
                 &trace,
                 Channel::Authorize,
                 &v.client.app_id,
             )
             .await;
-            let message = match outcome {
-                AuthResult::Ok(user) => {
-                    // May they use this application? Answered before any second
-                    // step, so nobody sets up an authenticator only to be refused.
-                    let decision = match access::decide(&st.pool, &v.tenant, &v.sp, &user).await {
-                        Ok(d) => d,
-                        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
-                    };
-                    if let Some(refusal) = decision.refusal {
-                        return refused_page(&v, &decision.home, refusal);
-                    }
-                    let keep = KeepSignedIn::chosen(&v.tenant, html::ticked(&form, html::KEEP_SIGNED_IN));
-                    // A second step, where one is needed, before there is any session.
-                    let step = match mfa::step(&st.pool, &decision.home, &user.id, mfa::At::App(&v.sp)).await {
-                        Ok(step) => stepped_up(step, &params),
-                        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
-                    };
-                    // A code is skipped on a browser remembered for it; setting an
-                    // authenticator up never is.
-                    if step == mfa::Step::Verify
-                        && device_remembered(&st, &headers, &user, &decision.home, freshness(&params)).await
-                    {
-                        audit_remembered(&st, &v.tenant.id, &user, Channel::Authorize).await;
-                        return finish_sign_in(&st, &tenant_key, &headers, &params, &request, &v, &user, true, keep)
-                            .await;
-                    }
-                    if step != mfa::Step::Done {
-                        return start_mfa(&st, &v, &request, &user, step, keep).await;
-                    }
-                    return finish_sign_in(&st, &tenant_key, &headers, &params, &request, &v, &user, false, keep).await;
-                }
-                AuthResult::InvalidCredentials => {
-                    if let Some(hint) =
-                        tenant::not_ours_hint(&st.pool, &v.tenant, &upn, v.sp.accept_other_tenants).await
-                    {
-                        return login_page(&st, &v, &request, &upn, Some(&hint));
-                    }
-                    "Your account or password is incorrect. (AADSTS50126: Error validating credentials due to invalid username or password.)"
-                }
-                AuthResult::Locked => {
-                    "Your account is temporarily locked to prevent unauthorized use. Try again later. (AADSTS50053)"
-                }
-                AuthResult::Disabled => "Your account has been disabled. (AADSTS50057: The user account is disabled.)",
+            login_page(
+                st,
+                v,
+                request,
+                upn,
+                Some("Your account is temporarily locked to prevent unauthorized use. Try again later. (AADSTS50053)"),
+            )
+        }
+        AuthResult::Disabled => {
+            audit::sign_in_failure(
+                st,
+                &v.tenant.id,
+                upn,
+                &outcome,
+                &trace,
+                Channel::Authorize,
+                &v.client.app_id,
+            )
+            .await;
+            login_page(
+                st,
+                v,
+                request,
+                upn,
+                Some("Your account has been disabled. (AADSTS50057: The user account is disabled.)"),
+            )
+        }
+    }
+}
+
+/// After a wrong password, where MFA is enforced for the sign-in: the code page a
+/// right password would have led to. `None` elsewhere, or where it would not
+/// have led to one (a remembered browser is never trusted under Enforced, so
+/// that leaves an account still to set an authenticator up), and the wrong
+/// password counts at once.
+///
+/// Only under Enforced, because only there can every name get the page: an
+/// unknown name (`user_id` `None`) is given it too, as nearly every account of
+/// such a tenant has an authenticator. In a Permissive tenant most accounts may
+/// have none, so a code page after a wrong password would say "this account
+/// exists and has an authenticator", where today an unknown name and a wrong
+/// password read the same.
+#[allow(clippy::too_many_arguments)]
+async fn unverified_code_page(
+    st: &AppState,
+    headers: &HeaderMap,
+    params: &Params,
+    request: &str,
+    v: &Validated,
+    user_id: Option<&str>,
+    upn: &str,
+    keep: KeepSignedIn,
+) -> anyhow::Result<Option<Response>> {
+    let (shown_upn, home) = match user_id {
+        Some(id) => {
+            let Some(user) = users::find_by_id(&st.pool, id).await? else {
+                return Ok(None);
             };
-            return login_page(&st, &v, &request, &upn, Some(message));
+            let Some(home) = access::home_of(&st.pool, &user).await? else {
+                return Ok(None);
+            };
+            let enforced = home.settings.enforces_mfa() || v.tenant.settings.enforces_mfa();
+            if !enforced
+                || mfa::step(&st.pool, &home, &user.id, mfa::At::App(&v.sp)).await? != mfa::Step::Verify
+                || device_remembered(st, headers, &user, &home, &v.tenant, freshness(params)).await
+            {
+                return Ok(None);
+            }
+            (user.upn, home)
+        }
+        None if v.tenant.settings.enforces_mfa() => (upn.to_string(), v.tenant.clone()),
+        None => return Ok(None),
+    };
+    let ticket = mfa::begin_unverified(&st.pool, &v.tenant.id, user_id, keep).await?;
+    let offer = may_remember(&home, &v.tenant);
+    Ok(Some(mfa_page(
+        st,
+        v,
+        request,
+        &shown_upn,
+        Purpose::Verify,
+        &ticket,
+        None,
+        offer,
+        None,
+    )))
+}
+
+/// A code posted on a page shown after a wrong password. It never signs anyone
+/// in, and it answers a wrong code exactly as a right password's page would.
+/// A right code makes the attempt count toward lockout (the code is in the
+/// caller's hands); a wrong one does not (someone holding neither factor).
+#[allow(clippy::too_many_arguments)]
+async fn unverified_second_step(
+    st: &AppState,
+    request: &str,
+    v: &Validated,
+    ticket: &str,
+    pending: &mfa::Pending,
+    typed: &str,
+) -> Response {
+    let fail = |e: anyhow::Error| html::error(Some(&v.tenant.name), &AadError::from(e).description());
+    let user = if pending.user_id.is_empty() {
+        None
+    } else {
+        match users::find_by_id(&st.pool, &pending.user_id).await {
+            Ok(u) => u,
+            Err(e) => return fail(e),
         }
     };
-    match result {
-        Ok(resp) | Err(resp) => resp,
+    let offer = match &user {
+        Some(u) => match access::home_of(&st.pool, u).await {
+            Ok(Some(home)) => may_remember(&home, &v.tenant),
+            _ => false,
+        },
+        None => may_remember(&v.tenant, &v.tenant),
+    };
+    let code_right = match &user {
+        Some(u) => match mfa::check(&st.pool, &u.id, typed).await {
+            Ok(factor) => factor.is_some(),
+            Err(e) => return fail(e),
+        },
+        None => false,
+    };
+    if code_right && let Some(u) = &user {
+        let _ = mfa::finish(&st.pool, ticket).await;
+        let locked = match users::settle_attempt(&st.pool, &u.id, Attempt::Failed).await {
+            Ok(locked) => locked,
+            Err(e) => return fail(e),
+        };
+        audit::known_sign_in_failure(
+            st,
+            &v.tenant.id,
+            &u.id,
+            &u.upn,
+            SignInReason::BadPassword,
+            Channel::Authorize,
+            Some(&v.client.app_id),
+            locked,
+        )
+        .await;
+        return login_page(st, v, request, &u.upn, Some(BAD_CREDENTIALS));
+    }
+    if let Some(u) = &user {
+        audit::known_sign_in_failure(
+            st,
+            &v.tenant.id,
+            &u.id,
+            &u.upn,
+            SignInReason::BadPasswordAndCode,
+            Channel::Authorize,
+            Some(&v.client.app_id),
+            false,
+        )
+        .await;
+    }
+    let upn = user.as_ref().map(|u| u.upn.clone()).unwrap_or_default();
+    match mfa::failed_attempt(&st.pool, ticket).await {
+        Ok(true) => mfa_page(
+            st,
+            v,
+            request,
+            &upn,
+            Purpose::Verify,
+            ticket,
+            None,
+            offer,
+            Some(MFA_WRONG),
+        ),
+        _ => login_page(st, v, request, "", Some(MFA_EXPIRED)),
     }
 }
 

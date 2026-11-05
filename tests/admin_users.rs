@@ -475,3 +475,122 @@ async fn a_deleted_row_cannot_sign_in_even_while_it_still_says_enabled() {
             .is_empty()
     );
 }
+
+// ---- the account's page, by section ----
+
+/// Every section says whether the account can sign in, and a disabled one says
+/// so with the way to enable it: never left to be inferred from a button.
+#[tokio::test]
+async fn every_section_shows_whether_the_account_can_sign_in() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let target = make_user(&s, &f.tenant, "gina@contoso.com").await;
+    let url = s.url(&format!("/admin/tenants/{}/users/{target}", f.tenant.id));
+    let sections = [
+        "",
+        "/properties",
+        "/groups",
+        "/organizations",
+        "/password",
+        "/authentication",
+    ];
+
+    for section in sections {
+        let page = b.get(&format!("{url}{section}")).await;
+        assert_eq!(page.status, 200, "{section}: {}", page.body);
+        assert!(page.body.contains("Sign-in enabled"), "{section}: {}", page.body);
+        assert!(!page.body.contains("Sign-in is disabled"), "{section}");
+        // The side menu, with this section marked.
+        assert!(
+            page.body.contains(r#"<nav class="side" aria-label="User">"#),
+            "{section}"
+        );
+        assert!(page.body.contains(r#"aria-current="page""#), "{section}");
+    }
+
+    assert_eq!(b.post(&url, &[("op", "disable")]).await.status, 303);
+    for section in sections {
+        let page = b.get(&format!("{url}{section}")).await;
+        assert!(page.body.contains("Sign-in disabled"), "{section}: {}", page.body);
+        assert!(page.body.contains("Sign-in is disabled."), "{section}: {}", page.body);
+        assert!(
+            page.body.contains(r#"value="enable">Enable sign-in"#),
+            "{section}: {}",
+            page.body
+        );
+    }
+    let list = b.get(&s.url(&format!("/admin/tenants/{}/users", f.tenant.id))).await;
+    assert!(
+        list.body.contains(r#"<span class="pill bad">Disabled</span>"#),
+        "{}",
+        list.body
+    );
+}
+
+#[tokio::test]
+async fn a_locked_out_account_says_until_when() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let target = make_user(&s, &f.tenant, "hal@contoso.com").await;
+    for _ in 0..12 {
+        users::authenticate(&s.pool, &f.tenant, "hal@contoso.com", "wrong-password-0")
+            .await
+            .unwrap();
+    }
+    let page = b
+        .get(&s.url(&format!("/admin/tenants/{}/users/{target}", f.tenant.id)))
+        .await;
+    assert!(
+        page.body.contains(r#"<span class="pill bad">Locked out</span>"#),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("<strong>Locked out</strong> until"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn an_unknown_section_is_not_found() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let url = s.url(&format!("/admin/tenants/{}/users/{}", f.tenant.id, f.user_id));
+    assert_eq!(b.get(&format!("{url}/nonsense")).await.status, 404);
+}
+
+/// An administrator's reset is not checked against the account's recent
+/// passwords: a refusal would tell the administrator one of them. The user is
+/// still held to them.
+#[tokio::test]
+async fn an_admin_reset_is_not_told_about_recent_passwords() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let target = make_user(&s, &f.tenant, "ivy@contoso.com").await;
+    let url = s.url(&format!("/admin/tenants/{}/users/{target}", f.tenant.id));
+
+    // Its current password, as a reset to keep and as a temporary one.
+    for require_change in [false, true] {
+        let mut form = vec![("op", "reset"), ("password", "Correct-Horse-9")];
+        if require_change {
+            form.push(("require_change", "on"));
+        }
+        let page = b.post(&url, &form).await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        assert!(!page.body.contains("used recently"), "{}", page.body);
+    }
+    // After a reset the page returns to the Password section.
+    let page = b.post(&url, &[("op", "reset"), ("password", "Correct-Horse-9")]).await;
+    assert!(
+        page.location.as_deref().is_some_and(|l| l.ends_with("/password")),
+        "{:?}",
+        page.location
+    );
+
+    let t = rust_oidc::tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    let err = users::change_password(&s.pool, &t, &target, "Correct-Horse-9", users::PasswordSetBy::User)
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<users::PasswordReused>().is_some(), "{err}");
+}

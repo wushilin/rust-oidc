@@ -379,7 +379,7 @@ async fn an_admin_reset_removes_the_authenticator_and_the_next_sign_in_enrols_ag
     let b = signed_in_admin(&s, &f).await;
     let url = s.url(&format!("/admin/tenants/{}/users/{}", f.tenant.id, user.user_id));
 
-    let page = b.get(&url).await;
+    let page = b.get(&format!("{url}/authentication")).await;
     assert!(page.body.contains("Authenticator set up"), "{}", page.body);
     assert!(page.body.contains("10 unused recovery codes"), "{}", page.body);
     assert!(

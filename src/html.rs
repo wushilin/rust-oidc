@@ -190,6 +190,10 @@ pub enum LoginOp {
     MfaEnroll,
     /// A new password, chosen at sign-in because the old one must be replaced.
     ChangePassword,
+    /// "Set up an authenticator?": yes, now.
+    MfaSetupNow,
+    /// "Set up an authenticator?": not now; carry on signing in.
+    MfaSetupLater,
 }
 
 impl LoginOp {
@@ -201,6 +205,8 @@ impl LoginOp {
         Self::MfaVerify,
         Self::MfaEnroll,
         Self::ChangePassword,
+        Self::MfaSetupNow,
+        Self::MfaSetupLater,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -212,6 +218,8 @@ impl LoginOp {
             Self::MfaVerify => "mfa_verify",
             Self::MfaEnroll => "mfa_enroll",
             Self::ChangePassword => "change_password",
+            Self::MfaSetupNow => "mfa_setup_now",
+            Self::MfaSetupLater => "mfa_setup_later",
         }
     }
 
@@ -364,6 +372,44 @@ pub fn mfa_verify(p: &MfaVerify) -> Response {
         StatusCode::OK
     };
     respond(status, page("Enter code", Some(p.tenant_name), &body), CSP_DEFAULT)
+}
+
+/// "Set up an authenticator?", after a password, where nothing requires one.
+pub struct MfaSuggest<'a> {
+    pub tenant_name: &'a str,
+    pub upn: &'a str,
+    pub action: &'a str,
+    pub hidden: &'a str,
+    pub op_field: &'a str,
+    pub ticket: &'a str,
+    /// How many days "Not now" puts it off.
+    pub snooze_days: i64,
+}
+
+pub fn mfa_suggest(p: &MfaSuggest) -> Response {
+    let body = format!(
+        r#"<h1>Protect your account</h1><p class="sub">{upn}</p>
+<p>Add a second step to signing in: a code from an authenticator app on your phone. Someone who learns your
+password still cannot sign in as you.</p>
+<p class="sub">It takes a minute. After setting it up you sign in again, with your password and a code.</p>
+<form method="post" action="{action}">{hidden}<input type="hidden" name="{MFA_TICKET}" value="{ticket}">
+<div class="actions"><button type="submit" name="{op_field}" value="{now}">Set it up now</button>
+<button class="secondary" type="submit" name="{op_field}" value="{later}">Not now</button></div>
+<p class="sub">Not now carries on signing you in, and asks again in {days} days.</p></form>"#,
+        upn = escape(p.upn),
+        action = escape(p.action),
+        hidden = p.hidden,
+        op_field = escape(p.op_field),
+        ticket = escape(p.ticket),
+        now = LoginOp::MfaSetupNow.as_str(),
+        later = LoginOp::MfaSetupLater.as_str(),
+        days = p.snooze_days,
+    );
+    respond(
+        StatusCode::OK,
+        page("Protect your account", Some(p.tenant_name), &body),
+        CSP_DEFAULT,
+    )
 }
 
 /// Setting up an authenticator: the QR code, the key for typing in, and the box

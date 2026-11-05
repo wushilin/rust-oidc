@@ -538,6 +538,7 @@ async fn detail(
             let switches = Switches {
                 mfa_required: sp.as_ref().is_some_and(|sp| sp.mfa_required),
                 accept_other_tenants: sp.as_ref().is_some_and(|sp| sp.accept_other_tenants),
+                mfa_enforced: tenant.settings.enforces_mfa(),
             };
             format!(
                 "{}{}",
@@ -781,6 +782,8 @@ flow needs before it runs anything.</p>"#,
 struct Switches {
     mfa_required: bool,
     accept_other_tenants: bool,
+    /// The tenant enforces MFA, so the application's own switch has no effect.
+    mfa_enforced: bool,
 }
 
 /// Check sign-in: a user name in, and every check that decides it out, from
@@ -873,13 +876,29 @@ fn flags_form(url: &str, csrf: &str, app: &Application, switches: Switches, may_
             "Accounts and groups of other tenants can then be assigned under Users and groups, and only those \
              assigned can sign in. Their own tenant must also allow it. This cannot be turned off while any are assigned.",
         ),
-        mfa = checkbox(
-            REQUIRE_MFA,
-            switches.mfa_required,
-            "Require multi-factor authentication",
-            "Everyone signing in to this application must use MFA, whatever their own or the tenant's setting. \
-             Whoever has not set up an authenticator does so at that sign-in.",
-        ),
+        mfa = if switches.mfa_enforced {
+            // Shown ticked and greyed; what is stored is posted back unchanged, so
+            // the switch is still as it was if the tenant stops enforcing.
+            format!(
+                r#"<label><input type="checkbox" checked disabled> Require multi-factor authentication</label>{kept}
+<p class="muted">This tenant enforces MFA, so everyone signing in to this application uses it whatever this
+switch says. The application's own setting ({own}) applies again if the tenant goes back to Permissive.</p>"#,
+                kept = if switches.mfa_required {
+                    format!(r#"<input type="hidden" name="{REQUIRE_MFA}" value="on">"#)
+                } else {
+                    String::new()
+                },
+                own = if switches.mfa_required { "on" } else { "off" },
+            )
+        } else {
+            checkbox(
+                REQUIRE_MFA,
+                switches.mfa_required,
+                "Require multi-factor authentication",
+                "Everyone signing in to this application must use MFA, whatever their own or the tenant's setting. \
+                 Whoever has not set up an authenticator does so at that sign-in.",
+            )
+        },
         password = checkbox(
             ALLOW_PASSWORD_GRANT,
             app.allow_password_grant,

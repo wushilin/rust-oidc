@@ -183,7 +183,7 @@ fn step_page(
             ticket,
             error,
             // At sign-in only: a code asked for on the page itself is not a sign-in.
-            offer_remember_device: !voluntary && tenant.settings.allow_remember_mfa,
+            offer_remember_device: !voluntary && tenant.settings.remembers_mfa(),
         }),
     };
     with_csrf(resp, st, &csrf)
@@ -381,7 +381,8 @@ async fn password(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form: &Pa
         // A code is skipped on a browser remembered for it; setting an
         // authenticator up never is. My Account carries no prompt or max_age.
         Ok(mfa::Step::Verify)
-            if super::authorize::device_remembered(st, headers, &user, tenant, mfa::Freshness::default()).await =>
+            if super::authorize::device_remembered(st, headers, &user, tenant, tenant, mfa::Freshness::default())
+                .await =>
         {
             super::authorize::audit_remembered(st, &tenant.id, &user, Channel::MyAccount).await;
             finish(st, tenant, headers, &user, true, keep).await
@@ -423,6 +424,8 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
         return login_page(st, tenant, "", Some(EXPIRED));
     }
     match waiting.purpose {
+        // My Account has its own page for setting one up; it never suggests one.
+        Purpose::Suggest => login_page(st, tenant, "", Some(EXPIRED)),
         Purpose::Verify => match mfa::check(&st.pool, &user.id, typed).await {
             Ok(Some(factor)) => {
                 let _ = mfa::finish(&st.pool, ticket).await;

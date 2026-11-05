@@ -5,6 +5,43 @@ use sqlx::FromRow;
 
 use crate::util::{fold, is_guid, new_guid, now};
 
+/// How a tenant decides whether a sign-in needs a second factor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MfaMode {
+    /// The account's own setting, the application's switch and the tenant's
+    /// default ([`TenantSettings::require_mfa`]) decide. An account with an
+    /// authenticator is always asked for a code.
+    #[default]
+    Permissive,
+    /// Every sign-in needs a second factor: to the tenant's applications, by its
+    /// accounts anywhere, to My Account, the console and the Auth API. Nobody is
+    /// exempt, and a remembered browser is not trusted in place of a code.
+    Enforced,
+}
+
+impl MfaMode {
+    pub const ALL: &'static [MfaMode] = &[Self::Permissive, Self::Enforced];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permissive => "permissive",
+            Self::Enforced => "enforced",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|m| m.as_str() == raw)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Permissive => "Permissive",
+            Self::Enforced => "Enforced",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TenantSettings {
@@ -14,9 +51,14 @@ pub struct TenantSettings {
     pub session_lifetime_secs: i64,
     /// Refresh token inactivity lifetime (Entra: 90 days).
     pub refresh_token_lifetime_secs: i64,
-    /// Require MFA of everyone signing in to this tenant's applications, unless a
-    /// user's own setting says otherwise.
+    /// Enforced or permissive; see [`MfaMode`].
+    pub mfa_mode: MfaMode,
+    /// Permissive only: require MFA of everyone signing in to this tenant's
+    /// applications by default, unless a user's own setting says otherwise.
     pub require_mfa: bool,
+    /// Permissive only: offer an account without an authenticator to set one up
+    /// when it signs in, with "Not now" ([`Self::MFA_SETUP_SNOOZE_SECS`]).
+    pub suggest_mfa_setup: bool,
     /// Require MFA of this tenant's administrators signing in to the console.
     pub require_console_mfa: bool,
     /// How many of a user's own recent passwords a new one may not repeat. Zero
@@ -45,7 +87,9 @@ impl Default for TenantSettings {
             access_token_lifetime_secs: 3599,
             session_lifetime_secs: 86_400,
             refresh_token_lifetime_secs: 90 * 86_400,
+            mfa_mode: MfaMode::Permissive,
             require_mfa: false,
+            suggest_mfa_setup: false,
             require_console_mfa: false,
             password_history: Self::DEFAULT_PASSWORD_HISTORY,
             allow_cross_tenant_sign_in: false,
@@ -86,6 +130,36 @@ impl TenantSettings {
     /// How long a remembered browser skips the second factor: thirty days, the
     /// owner's choice (2026-10-09).
     pub const REMEMBER_MFA_SECS: i64 = 30 * 86_400;
+    /// How long "Not now" puts off the offer to set an authenticator up: three
+    /// days, so the offer comes back about twice a week.
+    pub const MFA_SETUP_SNOOZE_SECS: i64 = 3 * 86_400;
+
+    /// What a tenant created from now on starts with: the defaults, with MFA
+    /// required of its administrators in the console. Tenants created before
+    /// keep what they had.
+    pub fn for_new_tenant() -> Self {
+        Self {
+            require_console_mfa: true,
+            ..Self::default()
+        }
+    }
+
+    /// Every sign-in needs a second factor.
+    pub fn enforces_mfa(&self) -> bool {
+        self.mfa_mode == MfaMode::Enforced
+    }
+
+    /// A browser may be remembered in place of the code: the switch is on and
+    /// MFA is not enforced, which never trusts one.
+    pub fn remembers_mfa(&self) -> bool {
+        self.allow_remember_mfa && !self.enforces_mfa()
+    }
+
+    /// Accounts without an authenticator are offered to set one up at sign-in.
+    /// Enforced has no offer to make: setting one up is required.
+    pub fn suggests_mfa_setup(&self) -> bool {
+        self.suggest_mfa_setup && !self.enforces_mfa()
+    }
     /// Audit retention: ninety days by default (Entra keeps sign-in and audit
     /// logs for thirty days with Entra ID P1/P2; ninety is the window the
     /// `audit prune` CLI has always suggested), from one day to ten years.
@@ -335,7 +409,7 @@ pub(crate) async fn create_in(
 ) -> anyhow::Result<Tenant> {
     let domain = normalize_domain(domain)?;
     let id = new_guid();
-    let settings = TenantSettings::default();
+    let settings = TenantSettings::for_new_tenant();
     let engine = crate::db::engine_of_conn(conn);
     let mut tx = crate::db::begin_write(&mut *conn).await?;
     sqlx::query(crate::db::sql_stmt(
@@ -580,10 +654,24 @@ pub(crate) async fn save_settings_in(
         .execute(&mut *conn)
         .await?;
     }
-    if !settings.allow_remember_mfa {
+    // Off, or not trusted under Enforced: forgotten either way, so turning
+    // Enforced off again does not bring old remembered browsers back.
+    if !settings.remembers_mfa() {
         crate::mfa::forget_tenant_devices_in(&mut *conn, tenant_id).await?;
     }
     Ok(())
+}
+
+/// Whether a tenant enforces MFA, by id: for a sign-in to an application of a
+/// tenant other than the account's own.
+pub(crate) async fn enforces_mfa_in(conn: &mut crate::db::Conn, tenant_id: &str) -> anyhow::Result<bool> {
+    let row: Option<(String,)> = sqlx::query_as(crate::db::qc(conn, "SELECT settings FROM tenants WHERE id = ?"))
+        .bind(tenant_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(row
+        .and_then(|(raw,)| serde_json::from_str::<TenantSettings>(&raw).ok())
+        .is_some_and(|s| s.enforces_mfa()))
 }
 
 /// Rename a tenant. The display name only: the id and the verified domains are

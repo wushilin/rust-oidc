@@ -1622,3 +1622,134 @@ consistent sign-in pages, and agreed the side menu).
   runs no script. Addresses come from `routes::discovery::Endpoint`, as on the
   deployment's Configuration page, so the two cannot disagree.
 *To reverse:* restore `max-width:1160px` on `main` and the `subtabs` row.
+
+## The user page, by section
+
+**50. A user's page has a side menu, and says at the top whether the account can
+sign in** (2026-11-04; the owner asked for a page like the application's, and for
+the account's state to be visible). Decided without asking:
+- **Sections**, each at its own address under the account (`UserSection`):
+  Overview, and under *Manage* Properties, Groups and Other organizations, under
+  *Sign-in* Password and Authentication methods, and under *Activity* a link to the
+  audit log filtered to the account. Groups needs `Group:Read`, as before. Forms
+  still post to the account's own address; after a change the page returns to the
+  section the form was in.
+- **The account's standing is shown on every section**, as a pill beside its name:
+  *Sign-in enabled*, *Sign-in disabled*, or *Locked out*, plus *Must choose a new
+  password* when that is pending. A disabled account also gets a banner with the
+  Enable button; a locked-out one a banner saying until when and after how many
+  wrong passwords. The list's State column uses the same pills.
+- **Enable, disable and delete are on the overview**, under "Account".
+- No new transaction or storage write: `users::sign_in_state` is a read.
+
+**51. An administrator's password is not checked against the account's recent
+passwords** (2026-11-04; the owner's reasoning: refusing it tells the administrator
+that the password was one the account recently had). This replaces decision 152's
+rule that only an administrator's *temporary* password was exempt: now
+`PasswordSetBy::held_to_history` is true only for the user's own choice. What an
+administrator sets is still remembered, so the user cannot choose it again
+themselves.
+
+## Lockout through the Auth API
+
+**52. The Auth API counts toward lockout only when exactly one factor is right**
+(2026-11-05; agreed with the owner, whose concern was that anyone could lock an
+administrator out by trying ssh logins at their name). The Auth API always takes
+the password and the authenticator code together, so it can tell someone holding
+one factor from someone holding neither:
+
+| Password | Code | Lockout counter |
+|---|---|---|
+| right | right | cleared |
+| wrong | right | +1 (the code is in the caller's hands) |
+| right | wrong | +1 (the password is known: what lockout is for) |
+| wrong | wrong | unchanged (audited as `bad_password_and_code`) |
+
+Decided without asking:
+- **Both are always checked**, whatever the other was, so neither the answer nor
+  the time it takes says which was wrong (`users::authenticate_deferred`, then the
+  code, then `users::settle_attempt`).
+- **A right code is spent even when the password was wrong**, so a code someone has
+  seen buys one guess at the password, not one per time step.
+- **A right password does not clear the count unless the code is right too**:
+  otherwise a known password with guessed codes would never lock.
+- The per-account limit (ten checks a minute) still applies to every check, so an
+  attack running at an account slows that account's own checks while it runs. It
+  never locks the account.
+- Browser and console sign-in are unchanged: the password is the whole first step
+  there, and a wrong one counts at once (`users::Counting::Now`).
+
+## MFA mode
+
+**53. A tenant's MFA is Enforced or Permissive** (2026-11-05; agreed with the owner,
+who first proposed a third mode, Disabled, and dropped it: it would have made the
+Auth API either unusable or a password checker, and made an application's own "Require
+MFA" either ignored or a refusal). `TenantSettings::mfa_mode`, on Settings:
+- **Permissive** (the default, and what every existing tenant becomes): as before.
+  The account's own setting, the tenant's default (`require_mfa`, now labelled
+  "Permissive: require MFA of everyone by default") and the application's switch
+  decide. An account with an authenticator is always asked for a code.
+- **Enforced**: every sign-in needs a second factor: to the tenant's applications
+  (by its own accounts and other tenants'), by its accounts anywhere, to My Account,
+  the console and the Auth API. Nobody is exempt; the user's and the application's
+  own settings are shown greyed and kept as they are, applying again if the tenant
+  goes back to Permissive.
+- **Enforced never trusts a remembered browser** (the owner's choice): "Don't ask
+  again on this device" is not offered, a remembered browser is not accepted in
+  place of a code (`TenantSettings::remembers_mfa`, checked at use for the account's
+  own tenant and the tenant signed in to), and saving Enforced forgets every
+  browser remembered for the tenant's accounts, so going back to Permissive does not
+  bring them back.
+- **Cross-tenant: Enforced in either tenant requires MFA.** With no Disabled mode,
+  the two can never conflict.
+- **The console's own switch stays**, in either mode, and is **on for tenants created
+  from now on** (`TenantSettings::for_new_tenant`). Tenants created before keep
+  what they had, so nobody is made to set an authenticator up by an upgrade.
+- The audit row of a settings change now also carries `mfaMode`, `requireMfa`,
+  `suggestMfaSetup` and `requireConsoleMfa`.
+
+**54. "Set up an authenticator?" at sign-in, with "Not now"** (2026-11-05; the owner
+asked for a nudge in Permissive). `TenantSettings::suggest_mfa_setup`, off by default.
+Like Entra's registration campaign: after the password, an account of the tenant with
+no authenticator, signing in where nothing requires MFA, is asked whether to set one
+up. Decided without asking:
+- **"Not now"** carries on with the sign-in (`amr: ["pwd"]`) and is not asked again
+  for three days (`TenantSettings::MFA_SETUP_SNOOZE_SECS`), kept in
+  `mfa_setup_snoozed` (migration 0022), sign-in state like remembered browsers.
+- **"Set it up now"** goes on to the same setup page as when MFA is required, which
+  ends by signing the user out to sign in again with the new authenticator, as setting
+  one up at sign-in always has.
+- **Only at application sign-in**: not on a device-code sign-in, not in the console,
+  not for My Account (which has its own setup page). Never under Enforced, where
+  setting one up is required, not offered.
+- No audit row for the answer: it changes nothing but when the offer comes back.
+
+**55. Browser and console sign-in under Enforced: lockout only when exactly one
+factor is right** (2026-11-05; the owner asked for the Auth API's rule, decision 52,
+at web sign-in too). Where MFA is enforced for a sign-in (the account's tenant or the
+application's), a wrong password leads to the same code page a right one would, and
+the attempt counts toward lockout only when exactly one of the password and the code
+is right. Decided without asking:
+- **Only under Enforced.** Everywhere else a wrong password counts at once, as before.
+  A code page after a wrong password must be shown for unknown names too, or it says
+  which names exist; in a Permissive tenant many accounts have no authenticator, and
+  then an error after a wrong password would say "this account exists and has none",
+  where today an unknown name and a wrong password read the same
+  (`tests/audit_log.rs` pins that). Under Enforced nearly every account has one, so
+  the leftover signal (an account still to set one up) is small and short-lived.
+- **Unknown names get the code page too** (`mfa::begin_unverified` with no account);
+  every code is wrong there, answered as a real account's wrong code is.
+- **A code page after a wrong password never signs anyone in**
+  (`Pending::password_right`, migration 0023). A right code there counts toward
+  lockout and says the password was wrong (AADSTS50126); a wrong one counts nothing
+  and is answered "That code didn't work", as on a right password's page.
+- **A right password no longer clears the count until the code is right too**, at
+  application sign-in and in the console, and each wrong code after a right password
+  counts (`users::Counting::Deferred`, `users::settle_attempt`). This applies in both
+  modes: a code given after a right password is never a stranger's.
+- **Whether the account may use the application is answered after the code** for an
+  account that will be asked one; refusing it before would tell someone with only
+  the password that the password was right. The authorize request is checked again in
+  full once the code is right, so a refusal still comes, then.
+- **Device-code sign-in and My Account are unchanged** for now: a wrong password
+  there counts at once in both modes.

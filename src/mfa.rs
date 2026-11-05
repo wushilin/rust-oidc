@@ -111,6 +111,9 @@ pub enum Purpose {
     /// Choosing a new password, after a password and a second factor: the
     /// session that follows carries both.
     ChangePasswordAfterMfa,
+    /// "Set up an authenticator?", after a password alone, where nothing
+    /// requires one: set it up now, or "Not now".
+    Suggest,
 }
 
 impl Purpose {
@@ -120,6 +123,7 @@ impl Purpose {
             Self::Enroll => "enroll",
             Self::ChangePassword => "change_password",
             Self::ChangePasswordAfterMfa => "change_password_mfa",
+            Self::Suggest => "suggest",
         }
     }
 
@@ -129,6 +133,7 @@ impl Purpose {
             Self::Enroll,
             Self::ChangePassword,
             Self::ChangePasswordAfterMfa,
+            Self::Suggest,
         ]
         .into_iter()
         .find(|p| p.as_str() == raw)
@@ -208,6 +213,10 @@ pub(crate) async fn enrolled_at_in(conn: &mut crate::db::Conn, user_id: &str) ->
 }
 
 /// Whether MFA is required of this user here. `tenant` is the user's own.
+///
+/// Enforced, in the account's own tenant or in the tenant of the application
+/// signed in to, requires it whatever else says; otherwise the account's own
+/// setting (or the tenant's default) and the place's own switch decide.
 pub async fn required<'c>(db: impl Handle<'c>, tenant: &Tenant, user_id: &str, at: At<'_>) -> anyhow::Result<bool> {
     let mut conn = db.acquire().await?;
     required_in(&mut conn, tenant, user_id, at).await
@@ -219,6 +228,15 @@ pub(crate) async fn required_in(
     user_id: &str,
     at: At<'_>,
 ) -> anyhow::Result<bool> {
+    if tenant.settings.enforces_mfa() {
+        return Ok(true);
+    }
+    if let At::App(sp) = &at
+        && sp.tenant_id != tenant.id
+        && crate::tenant::enforces_mfa_in(&mut *conn, &sp.tenant_id).await?
+    {
+        return Ok(true);
+    }
     let base = match policy_in(&mut *conn, user_id).await? {
         MfaPolicy::Required => true,
         MfaPolicy::NotRequired => false,
@@ -252,6 +270,57 @@ pub(crate) async fn step_in(
     } else {
         Step::Done
     })
+}
+
+/// Whether to offer this account to set an authenticator up as it signs in:
+/// its own tenant `home` offers it, it has none yet, and it has not answered
+/// "Not now" within [`TenantSettings::MFA_SETUP_SNOOZE_SECS`]. Asked only where
+/// nothing requires MFA (otherwise setting one up is not an offer).
+///
+/// [`TenantSettings::MFA_SETUP_SNOOZE_SECS`]: crate::tenant::TenantSettings::MFA_SETUP_SNOOZE_SECS
+pub async fn suggest_setup<'c>(db: impl Handle<'c>, home: &Tenant, user_id: &str) -> anyhow::Result<bool> {
+    if !home.settings.suggests_mfa_setup() {
+        return Ok(false);
+    }
+    let mut conn = db.acquire().await?;
+    if enrolled_at_in(&mut conn, user_id).await?.is_some() {
+        return Ok(false);
+    }
+    let snoozed: Option<(i64,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT snoozed_until FROM mfa_setup_snoozed WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(!snoozed.is_some_and(|(until,)| until > now()))
+}
+
+/// "Not now": do not offer this account to set an authenticator up again until
+/// [`TenantSettings::MFA_SETUP_SNOOZE_SECS`] have passed.
+///
+/// [`TenantSettings::MFA_SETUP_SNOOZE_SECS`]: crate::tenant::TenantSettings::MFA_SETUP_SNOOZE_SECS
+pub async fn snooze_setup<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = crate::db::begin_write(&mut conn).await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM mfa_setup_snoozed WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "INSERT INTO mfa_setup_snoozed (user_id, snoozed_until) VALUES (?, ?)",
+    ))
+    .bind(user_id)
+    .bind(now() + crate::tenant::TenantSettings::MFA_SETUP_SNOOZE_SECS)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ---- TOTP ----
@@ -684,6 +753,10 @@ pub struct Pending {
     /// What the user answered to "Keep me signed in" on the password page, for
     /// the session made when this step is done.
     pub keep: KeepSignedIn,
+    /// False for a code page shown after a wrong password ([`begin_unverified`]):
+    /// it never ends in a sign-in. Its `user_id` is empty when the name named
+    /// no account.
+    pub password_right: bool,
 }
 
 /// Start a second step for a user whose password was right (or whose session
@@ -730,6 +803,36 @@ pub(crate) async fn begin_in(
     Ok(ticket)
 }
 
+/// A code page for a sign-in whose password was wrong, or whose name named no
+/// account (`user_id` `None`): shown exactly as a right password's would be, so
+/// the sign-in never says which was wrong. It never ends in a sign-in; the code
+/// decides only whether the attempt counts toward lockout.
+pub async fn begin_unverified<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    user_id: Option<&str>,
+    keep: KeepSignedIn,
+) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    let ticket = crate::util::b64url(&random_bytes(32));
+    let ts = now();
+    sqlx::query(crate::db::qc(&conn,
+        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at, keep_signed_in, password_right)
+         VALUES (?, ?, ?, ?, NULL, 0, ?, ?, ?, ?)",
+    ))
+    .bind(sha256_hex(ticket.as_bytes()))
+    .bind(user_id.unwrap_or_default())
+    .bind(tenant_id)
+    .bind(Purpose::Verify.as_str())
+    .bind(ts)
+    .bind(ts + TICKET_LIFETIME_SECS)
+    .bind(keep.is_kept())
+    .bind(false)
+    .execute(&mut *conn)
+    .await?;
+    Ok(ticket)
+}
+
 /// The live second step a ticket names, in this tenant.
 pub async fn pending<'c>(db: impl Handle<'c>, ticket: &str, tenant_id: &str) -> anyhow::Result<Option<Pending>> {
     let mut conn = db.acquire().await?;
@@ -741,26 +844,31 @@ pub(crate) async fn pending_in(
     ticket: &str,
     tenant_id: &str,
 ) -> anyhow::Result<Option<Pending>> {
-    let row: Option<(String, String, String, Option<String>, crate::db::Flag)> = sqlx::query_as(crate::db::qc(
-        conn,
-        "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in FROM mfa_pending
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, String, String, Option<String>, crate::db::Flag, crate::db::Flag)> =
+        sqlx::query_as(crate::db::qc(
+            conn,
+            "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right FROM mfa_pending
          WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ?",
-    ))
-    .bind(sha256_hex(ticket.as_bytes()))
-    .bind(tenant_id)
-    .bind(now())
-    .bind(MAX_ATTEMPTS)
-    .fetch_optional(&mut *conn)
-    .await?;
-    Ok(row.and_then(|(user_id, tenant_id, purpose, enroll_secret, kept)| {
-        Some(Pending {
-            user_id,
-            tenant_id,
-            purpose: Purpose::parse(&purpose)?,
-            enroll_secret,
-            keep: KeepSignedIn::from_flag(kept.into()),
-        })
-    }))
+        ))
+        .bind(sha256_hex(ticket.as_bytes()))
+        .bind(tenant_id)
+        .bind(now())
+        .bind(MAX_ATTEMPTS)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(
+        row.and_then(|(user_id, tenant_id, purpose, enroll_secret, kept, right)| {
+            Some(Pending {
+                user_id,
+                tenant_id,
+                purpose: Purpose::parse(&purpose)?,
+                enroll_secret,
+                keep: KeepSignedIn::from_flag(kept.into()),
+                password_right: right.into(),
+            })
+        }),
+    )
 }
 
 /// Count a wrong code. `false` once the ticket has had its last attempt.
@@ -837,7 +945,7 @@ pub async fn remember_device<'c>(
     user_id: &str,
     home: &Tenant,
 ) -> anyhow::Result<Option<String>> {
-    if !home.settings.allow_remember_mfa {
+    if !home.settings.remembers_mfa() {
         return Ok(None);
     }
     let mut conn = db.acquire().await?;
@@ -906,7 +1014,7 @@ pub async fn remembered<'c>(
     let Some(device) = device else {
         return Ok(Remembered::No);
     };
-    if !home.settings.allow_remember_mfa || freshness.forced {
+    if !home.settings.remembers_mfa() || freshness.forced {
         return Ok(Remembered::No);
     }
     let mut conn = db.acquire().await?;

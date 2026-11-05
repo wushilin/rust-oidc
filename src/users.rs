@@ -247,6 +247,112 @@ pub(crate) async fn authenticate_traced_in(
     upn: &str,
     password: &str,
 ) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    check_password_in(conn, tenant, upn, password, Counting::Now).await
+}
+
+/// When a password check moves the account's lockout counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counting {
+    /// At once: a wrong password counts, a right one clears the count. For a
+    /// sign-in where the password is the whole first step.
+    Now,
+    /// Not here: neither a wrong password nor a right one touches the count.
+    /// The caller settles it with [`settle_attempt`] once it has checked the
+    /// second factor sent with the password (the Auth API).
+    Deferred,
+}
+
+/// [`authenticate_traced`] with the lockout counter left alone: the caller
+/// settles the attempt with [`settle_attempt`]. A locked account is still
+/// refused, and a disabled one still reported.
+pub async fn authenticate_deferred<'c>(
+    db: impl Handle<'c>,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    let mut conn = db.acquire().await?;
+    check_password_in(&mut conn, tenant, upn, password, Counting::Deferred).await
+}
+
+pub(crate) async fn authenticate_deferred_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    check_password_in(conn, tenant, upn, password, Counting::Deferred).await
+}
+
+/// How a deferred sign-in attempt ended, for the lockout counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// Every factor was right: the count is cleared.
+    Succeeded,
+    /// Counts toward lockout.
+    Failed,
+}
+
+/// Settle a deferred attempt ([`authenticate_deferred`]) on the account's
+/// lockout counter. True when this attempt locked the account.
+pub async fn settle_attempt<'c>(db: impl Handle<'c>, user_id: &str, attempt: Attempt) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    match attempt {
+        Attempt::Succeeded => {
+            clear_failures_in(&mut conn, user_id).await?;
+            Ok(false)
+        }
+        Attempt::Failed => {
+            let row: Option<(i64,)> = sqlx::query_as(crate::db::qc(
+                &conn,
+                "SELECT failed_logins FROM users WHERE id = ? AND deleted_at IS NULL",
+            ))
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            match row {
+                Some((failed,)) => count_failure_in(&mut conn, user_id, failed, now()).await,
+                None => Ok(false),
+            }
+        }
+    }
+}
+
+/// One more wrong attempt, locking the account at the threshold. True when this
+/// one locked it.
+async fn count_failure_in(conn: &mut crate::db::Conn, user_id: &str, failed: i64, ts: i64) -> anyhow::Result<bool> {
+    let failures = failed + 1;
+    let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
+    sqlx::query(crate::db::qc(
+        conn,
+        "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?",
+    ))
+    .bind(failures)
+    .bind(locked_until)
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(locked_until.is_some())
+}
+
+async fn clear_failures_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        conn,
+        "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn check_password_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+    counting: Counting,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
     #[derive(sqlx::FromRow)]
     struct Row {
         id: String,
@@ -281,30 +387,17 @@ pub(crate) async fn authenticate_traced_in(
         .as_deref()
         .is_some_and(|h| verify_password(password, h));
     if !ok {
-        let failures = row.failed_logins + 1;
-        let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
-        sqlx::query(crate::db::qc(
-            conn,
-            "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?",
-        ))
-        .bind(failures)
-        .bind(locked_until)
-        .bind(&row.id)
-        .execute(&mut *conn)
-        .await?;
-        trace.lockout_triggered = locked_until.is_some();
+        if counting == Counting::Now {
+            trace.lockout_triggered = count_failure_in(&mut *conn, &row.id, row.failed_logins, ts).await?;
+        }
         return Ok((AuthResult::InvalidCredentials, trace));
     }
     if !row.enabled {
         return Ok((AuthResult::Disabled, trace));
     }
-    sqlx::query(crate::db::qc(
-        conn,
-        "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?",
-    ))
-    .bind(&row.id)
-    .execute(&mut *conn)
-    .await?;
+    if counting == Counting::Now {
+        clear_failures_in(&mut *conn, &row.id).await?;
+    }
     let user = find_in(&mut *conn, &tenant.id, &row.id)
         .await?
         .context("user vanished")?;
@@ -322,10 +415,23 @@ pub enum PasswordSetBy {
     /// An administrator's temporary password: the user must replace it at their
     /// next sign-in. Not held to the history rule; the replacement is.
     AdminTemporary,
-    /// An administrator setting a password the user keeps.
+    /// An administrator setting a password the user keeps. Not held to the
+    /// history rule either.
     Admin,
     /// The user, choosing their own.
     User,
+}
+
+impl PasswordSetBy {
+    /// Whether the new password is checked against the account's recent ones.
+    /// Only the user's own choice is: refusing an administrator's would tell the
+    /// administrator a password the account recently had.
+    pub fn held_to_history(self) -> bool {
+        match self {
+            Self::User => true,
+            Self::Admin | Self::AdminTemporary => false,
+        }
+    }
 }
 
 /// The most passwords a tenant may remember, and how many are kept per user.
@@ -419,7 +525,7 @@ pub(crate) async fn prepare_password_in(
         bail!("no such account in this tenant");
     };
     let remembered = tenant.settings.password_history.clamp(0, MAX_PASSWORD_HISTORY);
-    if by != PasswordSetBy::AdminTemporary && remembered > 0 {
+    if by.held_to_history() && remembered > 0 {
         let mut recent: Vec<String> = sqlx::query_as::<_, (String,)>(crate::db::qc(
             conn,
             "SELECT password_hash FROM password_history WHERE user_id = ? ORDER BY created_at DESC",
@@ -540,6 +646,45 @@ async fn remember_password(
             .await?;
     }
     Ok(())
+}
+
+/// What decides whether an account can sign in right now, besides `enabled`:
+/// for the console's account page.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SignInState {
+    /// Wrong passwords since the last good one.
+    pub failed_logins: i64,
+    /// Set while the account is locked out after too many wrong passwords.
+    pub locked_until: Option<i64>,
+    #[sqlx(try_from = "crate::db::Flag")]
+    pub must_change_password: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl SignInState {
+    /// Locked out at `at`: a lockout ends by itself when its time is up.
+    pub fn locked_at(&self, at: i64) -> Option<i64> {
+        self.locked_until.filter(|until| *until > at)
+    }
+}
+
+/// The sign-in state of a live account of the tenant.
+pub async fn sign_in_state<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    user_id: &str,
+) -> anyhow::Result<Option<SignInState>> {
+    let mut conn = db.acquire().await?;
+    Ok(sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT failed_logins, locked_until, must_change_password, created_at, updated_at
+         FROM users WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
+    ))
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?)
 }
 
 /// Whether the user must choose a new password before anything is issued to them.

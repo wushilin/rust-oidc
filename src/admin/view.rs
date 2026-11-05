@@ -140,6 +140,8 @@ nav.side a.active { border-left-color:var(--accent); background:var(--hover); fo
   nav.side a.active { border-bottom-color:var(--accent); background:transparent; }
 }
 /* The overview's tiles: one per section, saying what is in it. */
+/* Settings: what applies only in Permissive fades while Enforced is picked, with no script. */
+form:has(input[name="mfa_mode"][value="enforced"]:checked) .when-permissive { opacity:.5; }
 .tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:12px; margin:18px 0; }
 a.tile { display:flex; flex-direction:column; gap:4px; padding:14px 16px; background:var(--surface); border:1px solid var(--line); border-radius:6px; color:var(--ink); text-decoration:none; }
 a.tile:hover { border-color:var(--accent); }

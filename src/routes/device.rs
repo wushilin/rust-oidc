@@ -466,7 +466,7 @@ async fn start_mfa(
             let home = access::home_of(&st.pool, &user).await.ok().flatten();
             let issuer = home.as_ref().map_or(tenant.name.as_str(), |t| t.name.as_str());
             let enroll = secret.as_deref().map(|s| (s, issuer));
-            let offer = home.as_ref().is_some_and(|h| h.settings.allow_remember_mfa);
+            let offer = home.as_ref().is_some_and(|h| super::authorize::may_remember(h, tenant));
             mfa_page(st, tenant, pending, &user.upn, purpose, &ticket, enroll, offer, None)
         }
         Err(e) => html::error(Some(&tenant.name), &AadError::from(e).description()),
@@ -569,6 +569,8 @@ async fn second_step(
         return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED));
     }
     match waiting.purpose {
+        // A device sign-in never offers setting one up as a suggestion.
+        Purpose::Suggest => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
         Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa => {
             let new = get(form, html::NEW_PASSWORD).unwrap_or_default();
             let confirm = get(form, html::CONFIRM_PASSWORD).unwrap_or_default();
@@ -627,7 +629,7 @@ async fn second_step(
                         Purpose::Verify,
                         &ticket,
                         None,
-                        home.settings.allow_remember_mfa,
+                        super::authorize::may_remember(&home, tenant),
                         Some(MFA_WRONG),
                     ),
                     _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
@@ -806,7 +808,7 @@ async fn sign_in(
         // authenticator up never is. A device code carries no prompt or max_age.
         if step == mfa::Step::Verify
             && let Ok(Some(home)) = access::home_of(&st.pool, &user).await
-            && super::authorize::device_remembered(st, headers, &user, &home, mfa::Freshness::default()).await
+            && super::authorize::device_remembered(st, headers, &user, &home, tenant, mfa::Freshness::default()).await
         {
             super::authorize::audit_remembered(st, &tenant.id, &user, Channel::Device).await;
             return finish_sign_in(st, tenant, headers, &pending, &user, true, keep).await;

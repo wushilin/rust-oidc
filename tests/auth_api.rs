@@ -255,9 +255,23 @@ async fn every_failure_about_the_user_is_the_same_answer() {
     let (eve, eve_secret) = w.second_user("eve@contoso.com").await;
     users::set_must_change_password(&w.s.pool, &eve, true).await.unwrap();
     let recovery = mfa::replace_recovery_codes(&w.s.pool, &w.f.user_id).await.unwrap();
+    // A wrong password with a right code spends the code, so it is fay's, not
+    // alice's, whose next code the end of the test needs.
+    let (_, fay_secret) = w.second_user("fay@contoso.com").await;
 
     let cases: Vec<(&str, String, String, String)> = vec![
-        ("wrong password", upn.clone(), "Wrong-Horse-9".into(), w.code()),
+        (
+            "wrong password",
+            "fay@contoso.com".into(),
+            "Wrong-Horse-9".into(),
+            mfa::code_for(&fay_secret, now() + mfa::STEP_SECS),
+        ),
+        (
+            "wrong password and code",
+            upn.clone(),
+            "Wrong-Horse-9".into(),
+            "000000".into(),
+        ),
         ("wrong code", upn.clone(), pw.clone(), "000000".into()),
         ("recovery code", upn.clone(), pw.clone(), recovery[0].clone()),
         ("unknown user", "nobody@contoso.com".into(), pw.clone(), w.code()),
@@ -291,6 +305,7 @@ async fn every_failure_about_the_user_is_the_same_answer() {
     for reason in [
         "bad_password",
         "bad_code",
+        "bad_password_and_code",
         "unknown_user",
         "not_assigned",
         "no_authenticator",
@@ -582,4 +597,94 @@ async fn no_application_may_register_the_auth_api_name() {
             other => panic!("{uri}: {:?}", other.map_done()),
         }
     }
+}
+
+// ---- lockout: only when exactly one factor is right ----
+
+async fn failed_logins(w: &World, user_id: &str) -> (i64, Option<i64>) {
+    sqlx::query_as(rust_oidc::db::q(
+        &w.s.pool,
+        "SELECT failed_logins, locked_until FROM users WHERE id = ?",
+    ))
+    .bind(user_id)
+    .fetch_one(&w.s.pool)
+    .await
+    .unwrap()
+}
+
+/// Someone holding neither the password nor the code cannot lock the account,
+/// however often they try (ssh at an admin's name).
+#[tokio::test]
+async fn both_factors_wrong_never_counts_toward_lockout() {
+    let w = world().await;
+    let token = w.token().await;
+    // Nine: the tenth check of the minute is the per-account limit's.
+    for _ in 0..9 {
+        let (_, body) = w.check(&token, &w.f.upn, "Wrong-Horse-9", "000000").await;
+        assert_eq!(body, FAILED);
+    }
+    assert_eq!(failed_logins(&w, &w.f.user_id).await, (0, None));
+    let (_, body) = w.check(&token, &w.f.upn, &w.f.password, &w.code()).await;
+    assert!(body.contains(r#""result":true"#), "{body}");
+}
+
+/// A right password with a wrong code is the case lockout is for: it counts,
+/// and the right password does not clear the count on the way.
+#[tokio::test]
+async fn a_right_password_with_a_wrong_code_counts_and_locks() {
+    let w = world().await;
+    let token = w.token().await;
+    for i in 1..=9 {
+        let (_, body) = w.check(&token, &w.f.upn, &w.f.password, "000000").await;
+        assert_eq!(body, FAILED);
+        assert_eq!(failed_logins(&w, &w.f.user_id).await.0, i, "after {i}");
+    }
+    assert!(failed_logins(&w, &w.f.user_id).await.1.is_none(), "nine do not lock");
+    let (_, body) = w.check(&token, &w.f.upn, &w.f.password, "000000").await;
+    assert_eq!(body, FAILED);
+    assert!(
+        failed_logins(&w, &w.f.user_id).await.1.is_some_and(|t| t > now()),
+        "the tenth locks"
+    );
+    let (lockouts,): (i64,) = sqlx::query_as(rust_oidc::db::q(
+        &w.s.pool,
+        "SELECT COUNT(*) FROM audit_log WHERE action = ? AND target = ?",
+    ))
+    .bind(Event::Lockout.as_str())
+    .bind(&w.f.user_id)
+    .fetch_one(&w.s.pool)
+    .await
+    .unwrap();
+    assert_eq!(lockouts, 1);
+}
+
+/// A right code with a wrong password counts too, and spends the code.
+#[tokio::test]
+async fn a_right_code_with_a_wrong_password_counts_and_is_spent() {
+    let w = world().await;
+    let token = w.token().await;
+    let code = w.code();
+    let (_, body) = w.check(&token, &w.f.upn, "Wrong-Horse-9", &code).await;
+    assert_eq!(body, FAILED);
+    assert_eq!(failed_logins(&w, &w.f.user_id).await.0, 1);
+    // The same code with the right password: already used.
+    let (_, body) = w.check(&token, &w.f.upn, &w.f.password, &code).await;
+    assert_eq!(body, FAILED);
+    assert_eq!(failed_logins(&w, &w.f.user_id).await.0, 2);
+    let reasons = audit_reasons(&w.s).await;
+    assert!(reasons.iter().any(|r| r == "bad_password"), "{reasons:?}");
+    assert!(reasons.iter().any(|r| r == "bad_code"), "{reasons:?}");
+}
+
+/// Both right clears the count.
+#[tokio::test]
+async fn a_success_clears_the_count() {
+    let w = world().await;
+    let token = w.token().await;
+    let (_, body) = w.check(&token, &w.f.upn, &w.f.password, "000000").await;
+    assert_eq!(body, FAILED);
+    assert_eq!(failed_logins(&w, &w.f.user_id).await.0, 1);
+    let (_, body) = w.check(&token, &w.f.upn, &w.f.password, &w.code()).await;
+    assert!(body.contains(r#""result":true"#), "{body}");
+    assert_eq!(failed_logins(&w, &w.f.user_id).await, (0, None));
 }

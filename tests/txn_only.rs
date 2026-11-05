@@ -56,6 +56,14 @@ const ALLOWED: &[(&str, &str)] = &[
     // Sign-in: failed-attempt counters and lockout.
     ("users", "authenticate"),
     ("users", "authenticate_traced"),
+    // The Auth API's check: the password without touching the counter, then
+    // the counter settled once the code is checked too.
+    ("users", "authenticate_deferred"),
+    ("users", "settle_attempt"),
+    // Browser sign-in, the same: the password deferred, a code page shown even
+    // after a wrong one, then the counter settled.
+    ("access", "authenticate_deferred"),
+    ("mfa", "begin_unverified"),
     ("access", "authenticate"),
     // The second sign-in step: its ticket, attempts, and the code's time step.
     ("mfa", "begin"),
@@ -67,6 +75,8 @@ const ALLOWED: &[(&str, &str)] = &[
     // "Don't ask again on this device", ticked at the second step: sign-in state
     // like a session, ended with them (users::revoke_access).
     ("mfa", "remember_device"),
+    // "Not now" to setting an authenticator up, at sign-in: sign-in state.
+    ("mfa", "snooze_setup"),
     // The flow tester's own run state (not directory data).
     ("flowtest", "start"),
     ("flowtest", "take"),
@@ -86,6 +96,7 @@ const STATE_TABLES: &[&str] = &[
     "client_assertion_jti",
     "mfa_pending",
     "mfa_remembered_devices",
+    "mfa_setup_snoozed",
     "flow_tests",
     "audit_log",
     "server_secrets",

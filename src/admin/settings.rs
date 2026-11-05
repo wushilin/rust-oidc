@@ -114,8 +114,9 @@ asked for a code.</p>
 <p class="muted">A user's own setting, on their page, can make an exception either way. Whoever has not set
 up an authenticator does so at their next sign-in, and then signs in again with it.</p>
 <label><input type="checkbox" name="{SUGGEST_MFA_SETUP}"{suggest}{disabled}> Permissive: offer to set up an authenticator at sign-in</label>
-<p class="muted">Someone without an authenticator is asked, after their password, whether to set one up now.
-"Not now" carries on with the sign-in and asks again after {snooze_days} days.</p>
+<p class="muted">Someone without an authenticator signing in to an application is asked, after their password,
+whether to set one up now. "Not now" carries on with the sign-in and asks again after {snooze_days} days. They
+can also set one up on their My Account page at any time.</p>
 </div>
 <label><input type="checkbox" name="{REQUIRE_CONSOLE_MFA}"{console_mfa}{disabled}> Require MFA of this tenant's administrators signing in to the console</label>
 <p class="muted">Applies whatever their own setting says, and in either mode.{root_note}</p>

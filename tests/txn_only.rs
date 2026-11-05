@@ -71,6 +71,8 @@ const ALLOWED: &[(&str, &str)] = &[
     // "Don't ask again on this device", ticked at the second step: sign-in state
     // like a session, ended with them (users::revoke_access).
     ("mfa", "remember_device"),
+    // "Not now" to setting an authenticator up, at sign-in: sign-in state.
+    ("mfa", "snooze_setup"),
     // The flow tester's own run state (not directory data).
     ("flowtest", "start"),
     ("flowtest", "take"),
@@ -90,6 +92,7 @@ const STATE_TABLES: &[&str] = &[
     "client_assertion_jti",
     "mfa_pending",
     "mfa_remembered_devices",
+    "mfa_setup_snoozed",
     "flow_tests",
     "audit_log",
     "server_secrets",

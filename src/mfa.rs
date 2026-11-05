@@ -111,6 +111,9 @@ pub enum Purpose {
     /// Choosing a new password, after a password and a second factor: the
     /// session that follows carries both.
     ChangePasswordAfterMfa,
+    /// "Set up an authenticator?", after a password alone, where nothing
+    /// requires one: set it up now, or "Not now".
+    Suggest,
 }
 
 impl Purpose {
@@ -120,6 +123,7 @@ impl Purpose {
             Self::Enroll => "enroll",
             Self::ChangePassword => "change_password",
             Self::ChangePasswordAfterMfa => "change_password_mfa",
+            Self::Suggest => "suggest",
         }
     }
 
@@ -129,6 +133,7 @@ impl Purpose {
             Self::Enroll,
             Self::ChangePassword,
             Self::ChangePasswordAfterMfa,
+            Self::Suggest,
         ]
         .into_iter()
         .find(|p| p.as_str() == raw)
@@ -265,6 +270,57 @@ pub(crate) async fn step_in(
     } else {
         Step::Done
     })
+}
+
+/// Whether to offer this account to set an authenticator up as it signs in:
+/// its own tenant `home` offers it, it has none yet, and it has not answered
+/// "Not now" within [`TenantSettings::MFA_SETUP_SNOOZE_SECS`]. Asked only where
+/// nothing requires MFA (otherwise setting one up is not an offer).
+///
+/// [`TenantSettings::MFA_SETUP_SNOOZE_SECS`]: crate::tenant::TenantSettings::MFA_SETUP_SNOOZE_SECS
+pub async fn suggest_setup<'c>(db: impl Handle<'c>, home: &Tenant, user_id: &str) -> anyhow::Result<bool> {
+    if !home.settings.suggests_mfa_setup() {
+        return Ok(false);
+    }
+    let mut conn = db.acquire().await?;
+    if enrolled_at_in(&mut conn, user_id).await?.is_some() {
+        return Ok(false);
+    }
+    let snoozed: Option<(i64,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT snoozed_until FROM mfa_setup_snoozed WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(!snoozed.is_some_and(|(until,)| until > now()))
+}
+
+/// "Not now": do not offer this account to set an authenticator up again until
+/// [`TenantSettings::MFA_SETUP_SNOOZE_SECS`] have passed.
+///
+/// [`TenantSettings::MFA_SETUP_SNOOZE_SECS`]: crate::tenant::TenantSettings::MFA_SETUP_SNOOZE_SECS
+pub async fn snooze_setup<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = crate::db::begin_write(&mut conn).await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM mfa_setup_snoozed WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "INSERT INTO mfa_setup_snoozed (user_id, snoozed_until) VALUES (?, ?)",
+    ))
+    .bind(user_id)
+    .bind(now() + crate::tenant::TenantSettings::MFA_SETUP_SNOOZE_SECS)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ---- TOTP ----

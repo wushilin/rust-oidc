@@ -424,6 +424,8 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
         return login_page(st, tenant, "", Some(EXPIRED));
     }
     match waiting.purpose {
+        // My Account has its own page for setting one up; it never suggests one.
+        Purpose::Suggest => login_page(st, tenant, "", Some(EXPIRED)),
         Purpose::Verify => match mfa::check(&st.pool, &user.id, typed).await {
             Ok(Some(factor)) => {
                 let _ = mfa::finish(&st.pool, ticket).await;

@@ -1707,3 +1707,19 @@ MFA" either ignored or a refusal). `TenantSettings::mfa_mode`, on Settings:
   what they had, so nobody is made to set an authenticator up by an upgrade.
 - The audit row of a settings change now also carries `mfaMode`, `requireMfa`,
   `suggestMfaSetup` and `requireConsoleMfa`.
+
+**54. "Set up an authenticator?" at sign-in, with "Not now"** (2026-11-05; the owner
+asked for a nudge in Permissive). `TenantSettings::suggest_mfa_setup`, off by default.
+Like Entra's registration campaign: after the password, an account of the tenant with
+no authenticator, signing in where nothing requires MFA, is asked whether to set one
+up. Decided without asking:
+- **"Not now"** carries on with the sign-in (`amr: ["pwd"]`) and is not asked again
+  for three days (`TenantSettings::MFA_SETUP_SNOOZE_SECS`), kept in
+  `mfa_setup_snoozed` (migration 0022), sign-in state like remembered browsers.
+- **"Set it up now"** goes on to the same setup page as when MFA is required, which
+  ends by signing the user out to sign in again with the new authenticator, as setting
+  one up at sign-in always has.
+- **Only at application sign-in**: not on a device-code sign-in, not in the console,
+  not for My Account (which has its own setup page). Never under Enforced, where
+  setting one up is required, not offered.
+- No audit row for the answer: it changes nothing but when the offer comes back.

@@ -574,6 +574,8 @@ async fn console_second_step(st: &AppState, form: &Params, op: crate::html::Logi
         return sign_in_page(st, "", Some(MFA_EXPIRED));
     }
     match waiting.purpose {
+        // The console never offers setting one up as a suggestion: it never fits.
+        Purpose::Suggest => sign_in_page(st, "", Some(MFA_EXPIRED)),
         Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa => {
             let new = field(form, crate::html::NEW_PASSWORD);
             let confirm = field(form, crate::html::CONFIRM_PASSWORD);

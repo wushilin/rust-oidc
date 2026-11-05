@@ -569,6 +569,8 @@ async fn second_step(
         return login_page(st, tenant, &pending, "", Some(MFA_EXPIRED));
     }
     match waiting.purpose {
+        // A device sign-in never offers setting one up as a suggestion.
+        Purpose::Suggest => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
         Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa => {
             let new = get(form, html::NEW_PASSWORD).unwrap_or_default();
             let confirm = get(form, html::CONFIRM_PASSWORD).unwrap_or_default();

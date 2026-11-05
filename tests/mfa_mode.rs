@@ -199,3 +199,105 @@ async fn the_settings_page_sets_the_mode() {
         .await;
     assert!(user.body.contains("Required (enforced by the tenant)"), "{}", user.body);
 }
+
+// ---- "Set up an authenticator?" at sign-in ----
+
+fn params<'a>(f: &'a UserFixture, challenge: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("client_id", f.web.app_id.as_str()),
+        ("response_type", "code"),
+        ("redirect_uri", REDIRECT),
+        ("scope", "openid profile"),
+        ("state", "st-suggest"),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+    ]
+}
+
+async fn suggest(s: &TestServer, f: &UserFixture, on: bool) {
+    let mut t = tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    t.settings.suggest_mfa_setup = on;
+    tenant::save_settings(&s.pool, &f.tenant.id, &t.settings).await.unwrap();
+}
+
+/// Sign in with the password, landing wherever the sign-in goes next.
+async fn password(s: &TestServer, f: &UserFixture) -> (Browser, Page) {
+    let (_, challenge) = pkce();
+    let b = Browser::new();
+    let login = b.authorize(s, &f.tenant.id, &params(f, &challenge)).await;
+    let next = b.login(&login, &f.upn, &f.password).await;
+    (b, next)
+}
+
+/// Answer the suggestion page with one of its two buttons.
+async fn answer(b: &Browser, page: &Page, op: &str) -> Page {
+    let mut form: Vec<(&str, String)> = vec![("op", op.to_string())];
+    for name in ["csrf", "request", "mfa_ticket"] {
+        form.push((name, page.field(name).unwrap_or_default()));
+    }
+    let form: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    b.post_form(&page.form_action(), &form).await
+}
+
+#[tokio::test]
+async fn not_now_carries_on_and_is_not_asked_again_for_a_while() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    suggest(&s, &f, true).await;
+
+    let (b, page) = password(&s, &f).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Protect your account"), "{}", page.body);
+    let done = answer(&b, &page, "mfa_setup_later").await;
+    assert_eq!(done.status, 302, "signed in: {}", done.body);
+    assert!(done.redirect_params().contains_key("code"));
+
+    // Asked again only after the snooze.
+    let (_, again) = password(&s, &f).await;
+    assert_eq!(again.status, 302, "not asked again yet: {}", again.body);
+    let (until,): (i64,) = sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT snoozed_until FROM mfa_setup_snoozed WHERE user_id = ?",
+    ))
+    .bind(&f.user_id)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap();
+    let left = until - rust_oidc::util::now();
+    assert!(left > TenantSettings::MFA_SETUP_SNOOZE_SECS - 60, "{left}");
+}
+
+#[tokio::test]
+async fn set_it_up_now_goes_on_to_setting_one_up() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    suggest(&s, &f, true).await;
+    let (b, page) = password(&s, &f).await;
+    let enrol = answer(&b, &page, "mfa_setup_now").await;
+    assert_eq!(enrol.status, 200, "{}", enrol.body);
+    assert!(enrol.body.contains("Set up your authenticator"), "{}", enrol.body);
+}
+
+/// Off (the default), with an authenticator, or under Enforced, there is no offer.
+#[tokio::test]
+async fn there_is_no_offer_where_it_does_not_apply() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    let (_, page) = password(&s, &f).await;
+    assert_eq!(page.status, 302, "off by default: {}", page.body);
+
+    suggest(&s, &f, true).await;
+    set_mode(&s, &f.tenant.id, MfaMode::Enforced).await;
+    let (_, page) = password(&s, &f).await;
+    assert!(
+        page.body.contains("Set up your authenticator"),
+        "required, not offered: {}",
+        page.body
+    );
+    assert!(!page.body.contains("Not now"), "{}", page.body);
+
+    set_mode(&s, &f.tenant.id, MfaMode::Permissive).await;
+    mfa::enroll(&s.pool, &f.user_id, &mfa::new_secret()).await.unwrap();
+    let (_, page) = password(&s, &f).await;
+    assert!(page.body.contains("Enter code"), "{}", page.body);
+}

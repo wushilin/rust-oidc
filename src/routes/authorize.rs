@@ -948,6 +948,37 @@ async fn start_mfa(
     }
 }
 
+/// "Set up an authenticator?", with its own ticket so the answer carries on the
+/// sign-in the password made.
+async fn suggest_mfa(st: &AppState, v: &Validated, request: &str, user: &User, keep: KeepSignedIn) -> Response {
+    let ticket = match mfa::begin(&st.pool, &v.tenant.id, &user.id, Purpose::Suggest, keep).await {
+        Ok(t) => t,
+        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+    };
+    let csrf = session::new_token();
+    let hidden = format!(
+        r#"<input type="hidden" name="csrf" value="{}"><input type="hidden" name="request" value="{}">"#,
+        html::escape(&csrf),
+        html::escape(request)
+    );
+    let mut resp = html::mfa_suggest(&html::MfaSuggest {
+        tenant_name: &v.tenant.name,
+        upn: &user.upn,
+        action: &form_action(st, v),
+        hidden: &hidden,
+        op_field: "op",
+        ticket: &ticket,
+        snooze_days: TenantSettings::MFA_SETUP_SNOOZE_SECS / SECS_PER_DAY,
+    });
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        session::set_cookie(&st.public_url, CSRF_COOKIE, &csrf, 3600),
+    );
+    resp
+}
+
+const SECS_PER_DAY: i64 = 86_400;
+
 /// The last part of a sign-in whose password (and second factor, if any) are
 /// done: a new password first if the account must choose one, then the session.
 #[allow(clippy::too_many_arguments)]
@@ -1106,6 +1137,7 @@ async fn second_step(
     };
     let fits = match op {
         html::LoginOp::MfaEnroll => pending.purpose == Purpose::Enroll,
+        html::LoginOp::MfaSetupNow | html::LoginOp::MfaSetupLater => pending.purpose == Purpose::Suggest,
         html::LoginOp::ChangePassword => {
             matches!(
                 pending.purpose,
@@ -1118,6 +1150,19 @@ async fn second_step(
         return login_page(st, v, request, "", Some(MFA_EXPIRED));
     }
     match pending.purpose {
+        // "Set up an authenticator?": now goes on to setting one up, as when one
+        // is required; "Not now" carries on with the sign-in the password made.
+        Purpose::Suggest => {
+            let _ = mfa::finish(&st.pool, &ticket).await;
+            if op == html::LoginOp::MfaSetupNow {
+                return start_mfa(st, v, request, &user, mfa::Step::Enroll, pending.keep).await;
+            }
+            if let Err(e) = mfa::snooze_setup(&st.pool, &user.id).await {
+                // Not remembering the answer only means asking again next time.
+                tracing::error!("snoozing the authenticator suggestion failed: {e}");
+            }
+            finish_sign_in(st, tenant_key, headers, params, request, v, &user, false, pending.keep).await
+        }
         Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa => {
             let new = form.get(html::NEW_PASSWORD).cloned().unwrap_or_default();
             let confirm = form.get(html::CONFIRM_PASSWORD).cloned().unwrap_or_default();
@@ -1366,7 +1411,13 @@ pub async fn login(
             run(&st, &tenant_key, &headers, &params, &request, Interaction::ChoseAccount).await
         }
         Some(html::LoginOp::Other) => return login_page(&st, &v, &request, "", None),
-        Some(op @ (html::LoginOp::MfaVerify | html::LoginOp::MfaEnroll | html::LoginOp::ChangePassword)) => {
+        Some(
+            op @ (html::LoginOp::MfaVerify
+            | html::LoginOp::MfaEnroll
+            | html::LoginOp::ChangePassword
+            | html::LoginOp::MfaSetupNow
+            | html::LoginOp::MfaSetupLater),
+        ) => {
             return second_step(&st, &tenant_key, &headers, &params, &request, &v, &form, op).await;
         }
         Some(html::LoginOp::ConsentAccept) => {
@@ -1428,6 +1479,14 @@ pub async fn login(
                     }
                     if step != mfa::Step::Done {
                         return start_mfa(&st, &v, &request, &user, step, keep).await;
+                    }
+                    // Nothing requires a second factor: offer one, where the
+                    // account's own tenant asks for that.
+                    if mfa::suggest_setup(&st.pool, &decision.home, &user.id)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        return suggest_mfa(&st, &v, &request, &user, keep).await;
                     }
                     return finish_sign_in(&st, &tenant_key, &headers, &params, &request, &v, &user, false, keep).await;
                 }

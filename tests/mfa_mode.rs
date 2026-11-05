@@ -301,3 +301,167 @@ async fn there_is_no_offer_where_it_does_not_apply() {
     let (_, page) = password(&s, &f).await;
     assert!(page.body.contains("Enter code"), "{}", page.body);
 }
+
+// ---- browser sign-in under Enforced: lockout only when exactly one factor is right ----
+
+const WRONG_CODE_PAGE: &str = "Check the time on your phone";
+
+/// Alice with an authenticator, in a tenant that enforces MFA.
+async fn enforced_alice(s: &TestServer) -> (UserFixture, String) {
+    let f = user_fixture(s).await;
+    let secret = mfa::new_secret();
+    mfa::enroll(&s.pool, &f.user_id, &secret).await.unwrap();
+    set_mode(s, &f.tenant.id, MfaMode::Enforced).await;
+    (f, secret)
+}
+
+async fn sign_in(s: &TestServer, f: &UserFixture, upn: &str, password: &str) -> (Browser, Page) {
+    let (_, challenge) = pkce();
+    let b = Browser::new();
+    let login = b.authorize(s, &f.tenant.id, &params(f, &challenge)).await;
+    let next = b.login(&login, upn, password).await;
+    (b, next)
+}
+
+async fn send_code(b: &Browser, page: &Page, code: &str) -> Page {
+    let mut form: Vec<(String, String)> = Vec::new();
+    for name in ["csrf", "request", "op", "mfa_ticket"] {
+        if let Some(v) = page.field(name) {
+            form.push((name.to_string(), v));
+        }
+    }
+    form.push(("code".into(), code.into()));
+    let form: Vec<(&str, &str)> = form.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    b.post_form(&page.form_action(), &form).await
+}
+
+async fn counter(s: &TestServer, user_id: &str) -> (i64, Option<i64>) {
+    sqlx::query_as(rust_oidc::db::q(
+        &s.pool,
+        "SELECT failed_logins, locked_until FROM users WHERE id = ?",
+    ))
+    .bind(user_id)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap()
+}
+
+/// Someone with neither the password nor the code cannot lock the account, and
+/// is never told which was wrong.
+#[tokio::test]
+async fn neither_factor_never_locks_and_never_says_which() {
+    let s = TestServer::start().await;
+    let (f, secret) = enforced_alice(&s).await;
+    for _ in 0..12 {
+        let (b, page) = sign_in(&s, &f, &f.upn, "Wrong-Horse-9").await;
+        assert_eq!(page.status, 200, "a code page, as for a right password: {}", page.body);
+        assert!(page.body.contains("Enter code"), "{}", page.body);
+        let after = send_code(&b, &page, "000000").await;
+        assert!(after.body.contains(WRONG_CODE_PAGE), "{}", after.body);
+    }
+    assert_eq!(counter(&s, &f.user_id).await, (0, None), "never counted");
+    // And alice still signs in.
+    let (b, page) = sign_in(&s, &f, &f.upn, &f.password).await;
+    let done = send_code(
+        &b,
+        &page,
+        &mfa::code_for(&secret, rust_oidc::util::now() + mfa::STEP_SECS),
+    )
+    .await;
+    assert_eq!(done.status, 302, "{}", done.body);
+}
+
+/// A right code with a wrong password counts, and is told the password was wrong.
+#[tokio::test]
+async fn a_right_code_with_a_wrong_password_counts() {
+    let s = TestServer::start().await;
+    let (f, secret) = enforced_alice(&s).await;
+    let (b, page) = sign_in(&s, &f, &f.upn, "Wrong-Horse-9").await;
+    let code = mfa::code_for(&secret, rust_oidc::util::now() + mfa::STEP_SECS);
+    let after = send_code(&b, &page, &code).await;
+    assert!(after.body.contains("AADSTS50126"), "{}", after.body);
+    assert_eq!(counter(&s, &f.user_id).await.0, 1);
+}
+
+/// A right password with a wrong code counts; both right clear the count.
+#[tokio::test]
+async fn a_right_password_with_a_wrong_code_counts_and_success_clears() {
+    let s = TestServer::start().await;
+    let (f, secret) = enforced_alice(&s).await;
+    let (b, page) = sign_in(&s, &f, &f.upn, &f.password).await;
+    assert_eq!(counter(&s, &f.user_id).await.0, 0, "the password alone settles nothing");
+    let after = send_code(&b, &page, "000000").await;
+    assert!(after.body.contains(WRONG_CODE_PAGE), "{}", after.body);
+    assert_eq!(counter(&s, &f.user_id).await.0, 1);
+    let done = send_code(
+        &b,
+        &after,
+        &mfa::code_for(&secret, rust_oidc::util::now() + mfa::STEP_SECS),
+    )
+    .await;
+    assert_eq!(done.status, 302, "{}", done.body);
+    assert_eq!(counter(&s, &f.user_id).await, (0, None));
+}
+
+/// A name that names no account gets the same code page, and the same answer
+/// to a code, as a real account with a wrong password.
+#[tokio::test]
+async fn an_unknown_name_looks_like_a_wrong_password() {
+    let s = TestServer::start().await;
+    let (f, _) = enforced_alice(&s).await;
+    let (b, page) = sign_in(&s, &f, "nobody@contoso.com", "Wrong-Horse-9").await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Enter code"), "{}", page.body);
+    let after = send_code(&b, &page, "123456").await;
+    assert!(after.body.contains(WRONG_CODE_PAGE), "{}", after.body);
+}
+
+/// In Permissive a wrong password counts at once, as before: a code page there
+/// would say which accounts exist and have an authenticator.
+#[tokio::test]
+async fn permissive_counts_a_wrong_password_at_once() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    mfa::enroll(&s.pool, &f.user_id, &mfa::new_secret()).await.unwrap();
+    let (_, page) = sign_in(&s, &f, &f.upn, "Wrong-Horse-9").await;
+    assert!(page.body.contains("AADSTS50126"), "{}", page.body);
+    assert_eq!(counter(&s, &f.user_id).await.0, 1);
+}
+
+/// The console, under Enforced: someone without the password or the code
+/// cannot lock an administrator out from the console's own sign-in page.
+#[tokio::test]
+async fn the_console_cannot_be_used_to_lock_an_administrator_out() {
+    use rust_oidc::admin::session::CSRF_FIELD;
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    mfa::enroll(&s.pool, &f.user_id, &mfa::new_secret()).await.unwrap();
+    set_mode(&s, &f.tenant.id, MfaMode::Enforced).await;
+    for _ in 0..12 {
+        let b = Browser::new();
+        let form = b.get(&s.url("/admin")).await;
+        let nonce = form.field(CSRF_FIELD).expect("a login nonce");
+        let page = b
+            .post_form(
+                &s.url("/admin/signin"),
+                &[
+                    ("upn", f.upn.as_str()),
+                    ("password", "Wrong-Horse-9"),
+                    (CSRF_FIELD, nonce.as_str()),
+                ],
+            )
+            .await;
+        assert!(page.body.contains("Enter code"), "{}", page.body);
+        let mut fields: Vec<(String, String)> = Vec::new();
+        for name in [CSRF_FIELD, "tenant", "op", "mfa_ticket"] {
+            if let Some(v) = page.field(name) {
+                fields.push((name.to_string(), v));
+            }
+        }
+        fields.push(("code".into(), "000000".into()));
+        let fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let after = b.post_form(&s.url("/admin/signin"), &fields).await;
+        assert!(after.body.contains(WRONG_CODE_PAGE), "{}", after.body);
+    }
+    assert_eq!(counter(&s, &f.user_id).await, (0, None));
+}

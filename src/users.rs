@@ -275,6 +275,15 @@ pub async fn authenticate_deferred<'c>(
     check_password_in(&mut conn, tenant, upn, password, Counting::Deferred).await
 }
 
+pub(crate) async fn authenticate_deferred_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    check_password_in(conn, tenant, upn, password, Counting::Deferred).await
+}
+
 /// How a deferred sign-in attempt ended, for the lockout counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {

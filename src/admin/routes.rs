@@ -28,7 +28,7 @@ use crate::admin::{keys as key_pages, settings as settings_pages, tenants as ten
 use crate::db::{Actor, Event};
 use crate::routes::audit::{self, Channel, SignInReason};
 use crate::tenant::{self, Tenant};
-use crate::users::{self, AuthResult};
+use crate::users::{self, Attempt, AuthResult};
 
 /// Form fields, parsed the same way the sign-in flow parses them.
 pub type Params = HashMap<String, String>;
@@ -433,27 +433,161 @@ async fn signin(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> 
         }
     };
 
-    let outcome = users::authenticate_traced(&st.pool, &home, upn, password).await;
-    let (result, trace) = match outcome {
+    // The lockout counter is settled once it is known what the attempt had
+    // right: with the code, where one is asked (decision 55).
+    let outcome = users::authenticate_deferred(&st.pool, &home, upn, password).await;
+    let (result, mut trace) = match outcome {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("console sign-in failed: {e}");
             return view::server_error();
         }
     };
-    let AuthResult::Ok(user) = result else {
-        sign_in_failed(&st, &home, upn, &result, &trace).await;
-        return sign_in_page(&st, upn, Some(SIGN_IN_FAILED));
+    let user = match result {
+        AuthResult::Ok(user) => user,
+        AuthResult::InvalidCredentials => {
+            // Under Enforced, the code page a right password would lead to, so
+            // the page never says which of the two was wrong.
+            if let Some(page) = console_unverified_page(&st, &home, trace.user_id.as_deref(), upn).await {
+                if trace.user_id.is_none() {
+                    sign_in_failed(&st, &home, upn, &result, &trace).await;
+                }
+                return page;
+            }
+            if let Some(id) = trace.user_id.as_deref() {
+                match users::settle_attempt(&st.pool, id, Attempt::Failed).await {
+                    Ok(locked) => trace.lockout_triggered = locked,
+                    Err(e) => {
+                        tracing::error!("console sign-in failed: {e}");
+                        return view::server_error();
+                    }
+                }
+            }
+            sign_in_failed(&st, &home, upn, &result, &trace).await;
+            return sign_in_page(&st, upn, Some(SIGN_IN_FAILED));
+        }
+        AuthResult::Locked | AuthResult::Disabled => {
+            sign_in_failed(&st, &home, upn, &result, &trace).await;
+            return sign_in_page(&st, upn, Some(SIGN_IN_FAILED));
+        }
     };
 
     // A second step, where the account or the console needs one.
-    match crate::mfa::step(&st.pool, &home, &user.id, crate::mfa::At::Console).await {
-        Ok(crate::mfa::Step::Done) => console_finish(&st, &home, &user, false).await,
-        Ok(step) => console_start_mfa(&st, &home, &user, step).await,
+    let step = match crate::mfa::step(&st.pool, &home, &user.id, crate::mfa::At::Console).await {
+        Ok(step) => step,
         Err(e) => {
             tracing::error!("MFA lookup failed during console sign-in: {e}");
-            view::server_error()
+            return view::server_error();
         }
+    };
+    // A code comes next: the counter waits for it. Otherwise the password was
+    // all this sign-in asks, and settles it now.
+    if step != crate::mfa::Step::Verify
+        && let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await
+    {
+        tracing::error!("console sign-in failed: {e}");
+        return view::server_error();
+    }
+    match step {
+        crate::mfa::Step::Done => console_finish(&st, &home, &user, false).await,
+        step => console_start_mfa(&st, &home, &user, step).await,
+    }
+}
+
+/// After a wrong password, where the account's tenant enforces MFA: the code page
+/// a right password would have led to, for an account with an authenticator and
+/// for a name that names no account. `None` elsewhere, and the wrong password
+/// counts at once. Only under Enforced, as at application sign-in
+/// (`routes::authorize`): elsewhere the page would say which accounts exist.
+async fn console_unverified_page(st: &AppState, home: &Tenant, user_id: Option<&str>, upn: &str) -> Option<Response> {
+    if !home.settings.enforces_mfa() {
+        return None;
+    }
+    let shown = match user_id {
+        Some(id) => {
+            let user = users::find(&st.pool, &home.id, id).await.ok().flatten()?;
+            let step = crate::mfa::step(&st.pool, home, id, crate::mfa::At::Console)
+                .await
+                .ok()?;
+            if step != crate::mfa::Step::Verify {
+                return None;
+            }
+            user.upn
+        }
+        None => upn.to_string(),
+    };
+    match crate::mfa::begin_unverified(&st.pool, &home.id, user_id, crate::session::KeepSignedIn::No).await {
+        Ok(ticket) => Some(console_mfa_page(
+            st,
+            home,
+            &shown,
+            crate::mfa::Purpose::Verify,
+            &ticket,
+            None,
+            None,
+        )),
+        Err(e) => {
+            tracing::error!("MFA could not start during console sign-in: {e}");
+            Some(view::server_error())
+        }
+    }
+}
+
+/// A code posted on a console code page shown after a wrong password: never a
+/// sign-in. A right code counts toward lockout, a wrong one does not, and a wrong
+/// one is answered exactly as on a right password's page.
+async fn console_unverified_step(
+    st: &AppState,
+    home: &Tenant,
+    ticket: &str,
+    waiting: &crate::mfa::Pending,
+    typed: &str,
+) -> Response {
+    use crate::mfa::Purpose;
+    let user = if waiting.user_id.is_empty() {
+        None
+    } else {
+        users::find(&st.pool, &home.id, &waiting.user_id).await.ok().flatten()
+    };
+    let code_right = match &user {
+        Some(u) => matches!(crate::mfa::check(&st.pool, &u.id, typed).await, Ok(Some(_))),
+        None => false,
+    };
+    if let (true, Some(u)) = (code_right, &user) {
+        let _ = crate::mfa::finish(&st.pool, ticket).await;
+        let locked = users::settle_attempt(&st.pool, &u.id, Attempt::Failed)
+            .await
+            .unwrap_or(false);
+        audit::known_sign_in_failure(
+            st,
+            &home.id,
+            &u.id,
+            &u.upn,
+            SignInReason::BadPassword,
+            Channel::Console,
+            None,
+            locked,
+        )
+        .await;
+        return sign_in_page(st, &u.upn, Some(SIGN_IN_FAILED));
+    }
+    if let Some(u) = &user {
+        audit::known_sign_in_failure(
+            st,
+            &home.id,
+            &u.id,
+            &u.upn,
+            SignInReason::BadPasswordAndCode,
+            Channel::Console,
+            None,
+            false,
+        )
+        .await;
+    }
+    let upn = user.as_ref().map(|u| u.upn.clone()).unwrap_or_default();
+    match crate::mfa::failed_attempt(&st.pool, ticket).await {
+        Ok(true) => console_mfa_page(st, home, &upn, Purpose::Verify, ticket, None, Some(MFA_WRONG)),
+        _ => sign_in_page(st, &upn, Some(MFA_EXPIRED)),
     }
 }
 
@@ -556,6 +690,13 @@ async fn console_second_step(st: &AppState, form: &Params, op: crate::html::Logi
     let Ok(Some(waiting)) = crate::mfa::pending(&st.pool, ticket, &home.id).await else {
         return sign_in_page(st, "", Some(MFA_EXPIRED));
     };
+    // A code page after a wrong password: never a sign-in, whatever is posted.
+    if !waiting.password_right {
+        if waiting.purpose != Purpose::Verify || op != crate::html::LoginOp::MfaVerify {
+            return sign_in_page(st, "", Some(MFA_EXPIRED));
+        }
+        return console_unverified_step(st, &home, ticket, &waiting, typed).await;
+    }
     let user = match users::find(&st.pool, &home.id, &waiting.user_id).await {
         Ok(Some(u)) if u.enabled => u,
         _ => return sign_in_page(st, "", Some(MFA_EXPIRED)),
@@ -598,6 +739,11 @@ async fn console_second_step(st: &AppState, form: &Params, op: crate::html::Logi
         Purpose::Verify => match crate::mfa::check(&st.pool, &user.id, typed).await {
             Ok(Some(factor)) => {
                 let _ = crate::mfa::finish(&st.pool, ticket).await;
+                // Both factors right: the count the password left alone is cleared.
+                if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
+                    tracing::error!("console sign-in failed: {e}");
+                    return view::server_error();
+                }
                 audit::record(
                     st,
                     &home.id,
@@ -619,6 +765,19 @@ async fn console_second_step(st: &AppState, form: &Params, op: crate::html::Logi
                     json!({ "via": Channel::Console.as_str() }),
                 )
                 .await;
+                // A right password with a wrong code: what lockout is for.
+                if let Ok(true) = users::settle_attempt(&st.pool, &user.id, Attempt::Failed).await {
+                    let details = json!({ "via": Channel::Console.as_str() });
+                    audit::record(
+                        st,
+                        &home.id,
+                        Actor::Id(&user.id),
+                        crate::db::Event::Lockout,
+                        Some(&user.id),
+                        details,
+                    )
+                    .await;
+                }
                 match crate::mfa::failed_attempt(&st.pool, ticket).await {
                     Ok(true) => console_mfa_page(st, &home, &user.upn, Purpose::Verify, ticket, None, Some(MFA_WRONG)),
                     _ => sign_in_page(st, &user.upn, Some(MFA_EXPIRED)),

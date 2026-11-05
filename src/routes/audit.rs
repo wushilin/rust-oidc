@@ -286,6 +286,50 @@ pub async fn record(
 /// which distinguishes an unknown account from a wrong password even though
 /// the HTTP response does not) and `auth.lockout` when this attempt tripped it.
 /// `client_id` is the OAuth client involved, when known.
+/// A failed sign-in of a known account, for a reason [`sign_in_failure`] does not
+/// derive from the password check alone: the code decided it. `locked` when this
+/// attempt locked the account.
+#[allow(clippy::too_many_arguments)]
+pub async fn known_sign_in_failure(
+    st: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    upn: &str,
+    reason: SignInReason,
+    channel: Channel,
+    // The application signed in to; `None` for the console, which records its
+    // failures as its own event.
+    client_id: Option<&str>,
+    locked: bool,
+) {
+    let event = match client_id {
+        Some(_) => Event::SignInFailed,
+        None => Event::AdminSignInFailed,
+    };
+    let mut details = serde_json::json!({
+        "reason": reason.as_str(),
+        "via": channel.as_str(),
+        "upn": clip(upn),
+    });
+    let mut lockout = serde_json::json!({ "via": channel.as_str() });
+    if let Some(id) = client_id {
+        details["clientId"] = id.into();
+        lockout["clientId"] = id.into();
+    }
+    record(st, tenant_id, Actor::Id(user_id), event, Some(user_id), details).await;
+    if locked {
+        record(
+            st,
+            tenant_id,
+            Actor::Id(user_id),
+            Event::Lockout,
+            Some(user_id),
+            lockout,
+        )
+        .await;
+    }
+}
+
 pub async fn sign_in_failure(
     st: &AppState,
     tenant_id: &str,

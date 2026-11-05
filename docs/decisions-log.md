@@ -1723,3 +1723,33 @@ up. Decided without asking:
   not for My Account (which has its own setup page). Never under Enforced, where
   setting one up is required, not offered.
 - No audit row for the answer: it changes nothing but when the offer comes back.
+
+**55. Browser and console sign-in under Enforced: lockout only when exactly one
+factor is right** (2026-11-05; the owner asked for the Auth API's rule, decision 52,
+at web sign-in too). Where MFA is enforced for a sign-in (the account's tenant or the
+application's), a wrong password leads to the same code page a right one would, and
+the attempt counts toward lockout only when exactly one of the password and the code
+is right. Decided without asking:
+- **Only under Enforced.** Everywhere else a wrong password counts at once, as before.
+  A code page after a wrong password must be shown for unknown names too, or it says
+  which names exist; in a Permissive tenant many accounts have no authenticator, and
+  then an error after a wrong password would say "this account exists and has none",
+  where today an unknown name and a wrong password read the same
+  (`tests/audit_log.rs` pins that). Under Enforced nearly every account has one, so
+  the leftover signal (an account still to set one up) is small and short-lived.
+- **Unknown names get the code page too** (`mfa::begin_unverified` with no account);
+  every code is wrong there, answered as a real account's wrong code is.
+- **A code page after a wrong password never signs anyone in**
+  (`Pending::password_right`, migration 0023). A right code there counts toward
+  lockout and says the password was wrong (AADSTS50126); a wrong one counts nothing
+  and is answered "That code didn't work", as on a right password's page.
+- **A right password no longer clears the count until the code is right too**, at
+  application sign-in and in the console, and each wrong code after a right password
+  counts (`users::Counting::Deferred`, `users::settle_attempt`). This applies in both
+  modes: a code given after a right password is never a stranger's.
+- **Whether the account may use the application is answered after the code** for an
+  account that will be asked one; refusing it before would tell someone with only
+  the password that the password was right. The authorize request is checked again in
+  full once the code is right, so a refusal still comes, then.
+- **Device-code sign-in and My Account are unchanged** for now: a wrong password
+  there counts at once in both modes.

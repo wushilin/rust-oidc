@@ -60,6 +60,10 @@ const ALLOWED: &[(&str, &str)] = &[
     // the counter settled once the code is checked too.
     ("users", "authenticate_deferred"),
     ("users", "settle_attempt"),
+    // Browser sign-in, the same: the password deferred, a code page shown even
+    // after a wrong one, then the counter settled.
+    ("access", "authenticate_deferred"),
+    ("mfa", "begin_unverified"),
     ("access", "authenticate"),
     // The second sign-in step: its ticket, attempts, and the code's time step.
     ("mfa", "begin"),

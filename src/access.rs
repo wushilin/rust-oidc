@@ -276,13 +276,38 @@ pub(crate) async fn authenticate_in(
     upn: &str,
     password: &str,
 ) -> anyhow::Result<(AuthResult, AuthTrace)> {
-    let home = match upn.trim().rsplit_once('@') {
+    let home = home_for_sign_in_in(&mut *conn, app_tenant, sp, upn).await?;
+    users::authenticate_traced_in(&mut *conn, home.as_ref().unwrap_or(app_tenant), upn, password).await
+}
+
+/// [`authenticate`] with the lockout counter left alone, for a sign-in that
+/// settles it once the code is checked too ([`users::settle_attempt`]).
+pub async fn authenticate_deferred<'c>(
+    db: impl Handle<'c>,
+    app_tenant: &Tenant,
+    sp: Option<&ServicePrincipal>,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    let mut conn = db.acquire().await?;
+    let home = home_for_sign_in_in(&mut conn, app_tenant, sp, upn).await?;
+    users::authenticate_deferred_in(&mut conn, home.as_ref().unwrap_or(app_tenant), upn, password).await
+}
+
+/// The tenant whose account a sign-in name names, when it is another tenant's
+/// and the application accepts other tenants' accounts.
+async fn home_for_sign_in_in(
+    conn: &mut crate::db::Conn,
+    app_tenant: &Tenant,
+    sp: Option<&ServicePrincipal>,
+    upn: &str,
+) -> anyhow::Result<Option<Tenant>> {
+    Ok(match upn.trim().rsplit_once('@') {
         Some((_, domain)) if sp.is_some_and(|sp| sp.accept_other_tenants) => tenant::resolve_in(&mut *conn, domain)
             .await?
             .filter(|t| t.id != app_tenant.id),
         _ => None,
-    };
-    users::authenticate_traced_in(&mut *conn, home.as_ref().unwrap_or(app_tenant), upn, password).await
+    })
 }
 
 /// For an assignment's principal: its tenant's name if it is not `tenant_id`'s,

@@ -753,6 +753,10 @@ pub struct Pending {
     /// What the user answered to "Keep me signed in" on the password page, for
     /// the session made when this step is done.
     pub keep: KeepSignedIn,
+    /// False for a code page shown after a wrong password ([`begin_unverified`]):
+    /// it never ends in a sign-in. Its `user_id` is empty when the name named
+    /// no account.
+    pub password_right: bool,
 }
 
 /// Start a second step for a user whose password was right (or whose session
@@ -799,6 +803,36 @@ pub(crate) async fn begin_in(
     Ok(ticket)
 }
 
+/// A code page for a sign-in whose password was wrong, or whose name named no
+/// account (`user_id` `None`): shown exactly as a right password's would be, so
+/// the sign-in never says which was wrong. It never ends in a sign-in; the code
+/// decides only whether the attempt counts toward lockout.
+pub async fn begin_unverified<'c>(
+    db: impl Handle<'c>,
+    tenant_id: &str,
+    user_id: Option<&str>,
+    keep: KeepSignedIn,
+) -> anyhow::Result<String> {
+    let mut conn = db.acquire().await?;
+    let ticket = crate::util::b64url(&random_bytes(32));
+    let ts = now();
+    sqlx::query(crate::db::qc(&conn,
+        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at, keep_signed_in, password_right)
+         VALUES (?, ?, ?, ?, NULL, 0, ?, ?, ?, ?)",
+    ))
+    .bind(sha256_hex(ticket.as_bytes()))
+    .bind(user_id.unwrap_or_default())
+    .bind(tenant_id)
+    .bind(Purpose::Verify.as_str())
+    .bind(ts)
+    .bind(ts + TICKET_LIFETIME_SECS)
+    .bind(keep.is_kept())
+    .bind(false)
+    .execute(&mut *conn)
+    .await?;
+    Ok(ticket)
+}
+
 /// The live second step a ticket names, in this tenant.
 pub async fn pending<'c>(db: impl Handle<'c>, ticket: &str, tenant_id: &str) -> anyhow::Result<Option<Pending>> {
     let mut conn = db.acquire().await?;
@@ -810,26 +844,31 @@ pub(crate) async fn pending_in(
     ticket: &str,
     tenant_id: &str,
 ) -> anyhow::Result<Option<Pending>> {
-    let row: Option<(String, String, String, Option<String>, crate::db::Flag)> = sqlx::query_as(crate::db::qc(
-        conn,
-        "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in FROM mfa_pending
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, String, String, Option<String>, crate::db::Flag, crate::db::Flag)> =
+        sqlx::query_as(crate::db::qc(
+            conn,
+            "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right FROM mfa_pending
          WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ?",
-    ))
-    .bind(sha256_hex(ticket.as_bytes()))
-    .bind(tenant_id)
-    .bind(now())
-    .bind(MAX_ATTEMPTS)
-    .fetch_optional(&mut *conn)
-    .await?;
-    Ok(row.and_then(|(user_id, tenant_id, purpose, enroll_secret, kept)| {
-        Some(Pending {
-            user_id,
-            tenant_id,
-            purpose: Purpose::parse(&purpose)?,
-            enroll_secret,
-            keep: KeepSignedIn::from_flag(kept.into()),
-        })
-    }))
+        ))
+        .bind(sha256_hex(ticket.as_bytes()))
+        .bind(tenant_id)
+        .bind(now())
+        .bind(MAX_ATTEMPTS)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(
+        row.and_then(|(user_id, tenant_id, purpose, enroll_secret, kept, right)| {
+            Some(Pending {
+                user_id,
+                tenant_id,
+                purpose: Purpose::parse(&purpose)?,
+                enroll_secret,
+                keep: KeepSignedIn::from_flag(kept.into()),
+                password_right: right.into(),
+            })
+        }),
+    )
 }
 
 /// Count a wrong code. `false` once the ticket has had its last attempt.

@@ -1649,3 +1649,32 @@ rule that only an administrator's *temporary* password was exempt: now
 `PasswordSetBy::held_to_history` is true only for the user's own choice. What an
 administrator sets is still remembered, so the user cannot choose it again
 themselves.
+
+## Lockout through the Auth API
+
+**52. The Auth API counts toward lockout only when exactly one factor is right**
+(2026-11-05; agreed with the owner, whose concern was that anyone could lock an
+administrator out by trying ssh logins at their name). The Auth API always takes
+the password and the authenticator code together, so it can tell someone holding
+one factor from someone holding neither:
+
+| Password | Code | Lockout counter |
+|---|---|---|
+| right | right | cleared |
+| wrong | right | +1 (the code is in the caller's hands) |
+| right | wrong | +1 (the password is known: what lockout is for) |
+| wrong | wrong | unchanged (audited as `bad_password_and_code`) |
+
+Decided without asking:
+- **Both are always checked**, whatever the other was, so neither the answer nor
+  the time it takes says which was wrong (`users::authenticate_deferred`, then the
+  code, then `users::settle_attempt`).
+- **A right code is spent even when the password was wrong**, so a code someone has
+  seen buys one guess at the password, not one per time step.
+- **A right password does not clear the count unless the code is right too**:
+  otherwise a known password with guessed codes would never lock.
+- The per-account limit (ten checks a minute) still applies to every check, so an
+  attack running at an account slows that account's own checks while it runs. It
+  never locks the account.
+- Browser and console sign-in are unchanged: the password is the whole first step
+  there, and a wrong one counts at once (`users::Counting::Now`).

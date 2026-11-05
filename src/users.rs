@@ -247,6 +247,103 @@ pub(crate) async fn authenticate_traced_in(
     upn: &str,
     password: &str,
 ) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    check_password_in(conn, tenant, upn, password, Counting::Now).await
+}
+
+/// When a password check moves the account's lockout counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counting {
+    /// At once: a wrong password counts, a right one clears the count. For a
+    /// sign-in where the password is the whole first step.
+    Now,
+    /// Not here: neither a wrong password nor a right one touches the count.
+    /// The caller settles it with [`settle_attempt`] once it has checked the
+    /// second factor sent with the password (the Auth API).
+    Deferred,
+}
+
+/// [`authenticate_traced`] with the lockout counter left alone: the caller
+/// settles the attempt with [`settle_attempt`]. A locked account is still
+/// refused, and a disabled one still reported.
+pub async fn authenticate_deferred<'c>(
+    db: impl Handle<'c>,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
+    let mut conn = db.acquire().await?;
+    check_password_in(&mut conn, tenant, upn, password, Counting::Deferred).await
+}
+
+/// How a deferred sign-in attempt ended, for the lockout counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// Every factor was right: the count is cleared.
+    Succeeded,
+    /// Counts toward lockout.
+    Failed,
+}
+
+/// Settle a deferred attempt ([`authenticate_deferred`]) on the account's
+/// lockout counter. True when this attempt locked the account.
+pub async fn settle_attempt<'c>(db: impl Handle<'c>, user_id: &str, attempt: Attempt) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    match attempt {
+        Attempt::Succeeded => {
+            clear_failures_in(&mut conn, user_id).await?;
+            Ok(false)
+        }
+        Attempt::Failed => {
+            let row: Option<(i64,)> = sqlx::query_as(crate::db::qc(
+                &conn,
+                "SELECT failed_logins FROM users WHERE id = ? AND deleted_at IS NULL",
+            ))
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            match row {
+                Some((failed,)) => count_failure_in(&mut conn, user_id, failed, now()).await,
+                None => Ok(false),
+            }
+        }
+    }
+}
+
+/// One more wrong attempt, locking the account at the threshold. True when this
+/// one locked it.
+async fn count_failure_in(conn: &mut crate::db::Conn, user_id: &str, failed: i64, ts: i64) -> anyhow::Result<bool> {
+    let failures = failed + 1;
+    let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
+    sqlx::query(crate::db::qc(
+        conn,
+        "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?",
+    ))
+    .bind(failures)
+    .bind(locked_until)
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(locked_until.is_some())
+}
+
+async fn clear_failures_in(conn: &mut crate::db::Conn, user_id: &str) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        conn,
+        "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn check_password_in(
+    conn: &mut crate::db::Conn,
+    tenant: &Tenant,
+    upn: &str,
+    password: &str,
+    counting: Counting,
+) -> anyhow::Result<(AuthResult, AuthTrace)> {
     #[derive(sqlx::FromRow)]
     struct Row {
         id: String,
@@ -281,30 +378,17 @@ pub(crate) async fn authenticate_traced_in(
         .as_deref()
         .is_some_and(|h| verify_password(password, h));
     if !ok {
-        let failures = row.failed_logins + 1;
-        let locked_until = (failures >= LOCKOUT_THRESHOLD).then(|| ts + lockout_secs(failures));
-        sqlx::query(crate::db::qc(
-            conn,
-            "UPDATE users SET failed_logins = ?, locked_until = ? WHERE id = ?",
-        ))
-        .bind(failures)
-        .bind(locked_until)
-        .bind(&row.id)
-        .execute(&mut *conn)
-        .await?;
-        trace.lockout_triggered = locked_until.is_some();
+        if counting == Counting::Now {
+            trace.lockout_triggered = count_failure_in(&mut *conn, &row.id, row.failed_logins, ts).await?;
+        }
         return Ok((AuthResult::InvalidCredentials, trace));
     }
     if !row.enabled {
         return Ok((AuthResult::Disabled, trace));
     }
-    sqlx::query(crate::db::qc(
-        conn,
-        "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?",
-    ))
-    .bind(&row.id)
-    .execute(&mut *conn)
-    .await?;
+    if counting == Counting::Now {
+        clear_failures_in(&mut *conn, &row.id).await?;
+    }
     let user = find_in(&mut *conn, &tenant.id, &row.id)
         .await?
         .context("user vanished")?;

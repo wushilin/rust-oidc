@@ -23,8 +23,11 @@
 //!   which are disabled, or whether a password was right. The reason goes to the
 //!   audit log.
 //!
-//! Wrong passwords count toward the account's lockout, as at sign-in. Checks are
-//! limited per calling application and per account ([`Limit::CredentialCheck`],
+//! A check counts toward the account's lockout only when exactly one of the two
+//! factors is right: a right code with a wrong password, or a right password
+//! with a wrong code. Both wrong is someone holding neither, who must not be
+//! able to lock the account; both right clears the count. Checks are limited
+//! per calling application and per account ([`Limit::CredentialCheck`],
 //! [`Limit::CredentialCheckAccount`]).
 
 use axum::Json;
@@ -44,7 +47,7 @@ use crate::error::AadError;
 use crate::ratelimit::{Hit, Limit, app_key};
 use crate::routes::audit::{self, Channel, SignInReason, clip};
 use crate::tenant::{self, Tenant};
-use crate::users::{self, AuthResult, User};
+use crate::users::{self, Attempt, AuthResult, User};
 
 /// The one answer to every failed check about the user.
 const FAILED_CODE: &str = "invalid_credentials";
@@ -263,12 +266,54 @@ async fn verify(
             return Ok(None);
         }
     }
-    // The password, held to lockout as at sign-in. An unknown name is checked
-    // too (against a dummy hash), so it takes as long as a known one.
-    let (result, trace) = users::authenticate_traced(&st.pool, tenant, &check.upn, &check.password).await?;
-    let user = match result {
-        AuthResult::Ok(user) => user,
-        other => {
+    // The password, then the code, both checked whatever the other was: the
+    // answer never says which was wrong, and neither does the time it takes. An
+    // unknown name is checked too (against a dummy hash), so it takes as long as
+    // a known one.
+    let (result, mut trace) = users::authenticate_deferred(&st.pool, tenant, &check.upn, &check.password).await?;
+    let code_right = match (&result, trace.user_id.as_deref()) {
+        // A right code is spent even when the password was wrong, so a code
+        // someone has seen buys one guess at the password, not many.
+        (AuthResult::Ok(_) | AuthResult::InvalidCredentials, Some(id)) => {
+            crate::mfa::check_authenticator_code(&st.pool, id, &check.otp).await?
+        }
+        _ => false,
+    };
+    let user = match (result, Factors::of_code(code_right)) {
+        (AuthResult::Ok(user), Factors::CodeRight) => user,
+        // The password is known to the caller: what lockout is for.
+        (AuthResult::Ok(user), Factors::CodeWrong) => {
+            let locked = users::settle_attempt(&st.pool, &user.id, Attempt::Failed).await?;
+            record_failure(st, tenant, &user, app, SignInReason::BadCode).await;
+            if locked {
+                record_lockout(st, tenant, &user.id, app).await;
+            }
+            return Ok(None);
+        }
+        (AuthResult::InvalidCredentials, factors) if trace.user_id.is_some() => {
+            let user_id = trace.user_id.clone().unwrap_or_default();
+            if factors == Factors::CodeWrong {
+                // Neither factor: someone with nothing cannot lock the account.
+                if let Some(user) = users::find(&st.pool, &tenant.id, &user_id).await? {
+                    record_failure(st, tenant, &user, app, SignInReason::BadPasswordAndCode).await;
+                }
+                return Ok(None);
+            }
+            // The code is in the caller's hands: the password is what stands.
+            trace.lockout_triggered = users::settle_attempt(&st.pool, &user_id, Attempt::Failed).await?;
+            audit::sign_in_failure(
+                st,
+                &tenant.id,
+                &check.upn,
+                &AuthResult::InvalidCredentials,
+                &trace,
+                Channel::AuthApi,
+                &app.app_id,
+            )
+            .await;
+            return Ok(None);
+        }
+        (other, _) => {
             audit::sign_in_failure(
                 st,
                 &tenant.id,
@@ -286,11 +331,35 @@ async fn verify(
         record_failure(st, tenant, &user, app, SignInReason::MustChangePassword).await;
         return Ok(None);
     }
-    if !crate::mfa::check_authenticator_code(&st.pool, &user.id, &check.otp).await? {
-        record_failure(st, tenant, &user, app, SignInReason::BadCode).await;
-        return Ok(None);
-    }
+    users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await?;
     Ok(Some(user))
+}
+
+/// Whether the code sent with the password was right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Factors {
+    CodeRight,
+    CodeWrong,
+}
+
+impl Factors {
+    fn of_code(right: bool) -> Self {
+        if right { Self::CodeRight } else { Self::CodeWrong }
+    }
+}
+
+/// This check locked the account.
+async fn record_lockout(st: &AppState, tenant: &Tenant, user_id: &str, app: &Application) {
+    let details = json!({ "via": Channel::AuthApi.as_str(), "clientId": app.app_id });
+    audit::record(
+        st,
+        &tenant.id,
+        Actor::Id(user_id),
+        Event::Lockout,
+        Some(user_id),
+        details,
+    )
+    .await;
 }
 
 async fn succeeded(st: &AppState, tenant: &Tenant, app: &Application, sp: &ServicePrincipal, user: &User) -> Response {

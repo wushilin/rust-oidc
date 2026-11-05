@@ -107,8 +107,12 @@ pub enum SignInReason {
     NotAssigned,
     /// Auth API: the user has no authenticator set up.
     NoAuthenticator,
-    /// Auth API: the authenticator code was wrong, or already used.
+    /// Auth API: the authenticator code was wrong, or already used. The
+    /// password was right, so it counts toward lockout.
     BadCode,
+    /// Auth API: the password and the code were both wrong. Someone holding
+    /// neither factor; not counted toward lockout.
+    BadPasswordAndCode,
     /// Auth API: the user must choose a new password first.
     MustChangePassword,
     /// Auth API: too many checks for this account just now.
@@ -125,6 +129,7 @@ impl SignInReason {
             Self::NotAssigned => "not_assigned",
             Self::NoAuthenticator => "no_authenticator",
             Self::BadCode => "bad_code",
+            Self::BadPasswordAndCode => "bad_password_and_code",
             Self::MustChangePassword => "must_change_password",
             Self::Throttled => "throttled",
         }

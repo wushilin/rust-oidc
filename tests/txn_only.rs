@@ -56,6 +56,10 @@ const ALLOWED: &[(&str, &str)] = &[
     // Sign-in: failed-attempt counters and lockout.
     ("users", "authenticate"),
     ("users", "authenticate_traced"),
+    // The Auth API's check: the password without touching the counter, then
+    // the counter settled once the code is checked too.
+    ("users", "authenticate_deferred"),
+    ("users", "settle_attempt"),
     ("access", "authenticate"),
     // The second sign-in step: its ticket, attempts, and the code's time step.
     ("mfa", "begin"),

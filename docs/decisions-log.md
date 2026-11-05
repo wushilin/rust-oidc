@@ -1678,3 +1678,32 @@ Decided without asking:
   never locks the account.
 - Browser and console sign-in are unchanged: the password is the whole first step
   there, and a wrong one counts at once (`users::Counting::Now`).
+
+## MFA mode
+
+**53. A tenant's MFA is Enforced or Permissive** (2026-11-05; agreed with the owner,
+who first proposed a third mode, Disabled, and dropped it: it would have made the
+Auth API either unusable or a password checker, and made an application's own "Require
+MFA" either ignored or a refusal). `TenantSettings::mfa_mode`, on Settings:
+- **Permissive** (the default, and what every existing tenant becomes): as before.
+  The account's own setting, the tenant's default (`require_mfa`, now labelled
+  "Permissive: require MFA of everyone by default") and the application's switch
+  decide. An account with an authenticator is always asked for a code.
+- **Enforced**: every sign-in needs a second factor: to the tenant's applications
+  (by its own accounts and other tenants'), by its accounts anywhere, to My Account,
+  the console and the Auth API. Nobody is exempt; the user's and the application's
+  own settings are shown greyed and kept as they are, applying again if the tenant
+  goes back to Permissive.
+- **Enforced never trusts a remembered browser** (the owner's choice): "Don't ask
+  again on this device" is not offered, a remembered browser is not accepted in
+  place of a code (`TenantSettings::remembers_mfa`, checked at use for the account's
+  own tenant and the tenant signed in to), and saving Enforced forgets every
+  browser remembered for the tenant's accounts, so going back to Permissive does not
+  bring them back.
+- **Cross-tenant: Enforced in either tenant requires MFA.** With no Disabled mode,
+  the two can never conflict.
+- **The console's own switch stays**, in either mode, and is **on for tenants created
+  from now on** (`TenantSettings::for_new_tenant`). Tenants created before keep
+  what they had, so nobody is made to set an authenticator up by an upgrade.
+- The audit row of a settings change now also carries `mfaMode`, `requireMfa`,
+  `suggestMfaSetup` and `requireConsoleMfa`.

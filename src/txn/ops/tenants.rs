@@ -272,6 +272,10 @@ impl Transaction for SaveTenantSettings {
                 "refreshTokenLifetimeSecs": s.refresh_token_lifetime_secs,
                 "allowKeepSignedIn": s.allow_keep_signed_in,
                 "allowRememberMfa": s.allow_remember_mfa,
+                "mfaMode": s.mfa_mode.as_str(),
+                "requireMfa": s.require_mfa,
+                "suggestMfaSetup": s.suggest_mfa_setup,
+                "requireConsoleMfa": s.require_console_mfa,
                 "auditRetentionDays": s.audit_retention_days,
             }),
         )

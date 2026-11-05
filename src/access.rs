@@ -588,7 +588,13 @@ pub(crate) async fn explain_in(
                 format!(
                     "{} requires it of everyone: {}",
                     home.name,
-                    if home.settings.require_mfa { "yes" } else { "no" }
+                    if home.settings.enforces_mfa() {
+                        "yes, enforced"
+                    } else if home.settings.require_mfa {
+                        "yes, by default"
+                    } else {
+                        "no"
+                    }
                 ),
             ),
             line(

@@ -18,7 +18,7 @@ use crate::admin::context::{AdminContext, On};
 use crate::admin::routes::{At, Settled, TenantTab, checked, chrome, field, parse_form, settle};
 use crate::admin::view::{self, e};
 use crate::admin::{TENANT_READ, TENANT_WRITE};
-use crate::tenant::{Tenant, TenantSettings};
+use crate::tenant::{MfaMode, Tenant, TenantSettings};
 use crate::txn::{self, ops::tenants::SaveTenantSettings};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -28,6 +28,8 @@ use axum::response::Response;
 /// Form field names, spelled once. They match the struct's field names, which is
 /// what makes the form and the type obviously the same three values.
 const REQUIRE_MFA: &str = "require_mfa";
+const MFA_MODE: &str = "mfa_mode";
+const SUGGEST_MFA_SETUP: &str = "suggest_mfa_setup";
 const PASSWORD_HISTORY: &str = "password_history";
 const ALLOW_CROSS_TENANT: &str = "allow_cross_tenant_sign_in";
 const REQUIRE_CONSOLE_MFA: &str = "require_console_mfa";
@@ -97,20 +99,37 @@ remembered, so the user cannot choose it again.</p>
 <p class="muted">Only to applications that accept other tenants and have assigned the account, directly or
 through one of this tenant's groups. A user's own setting, on their page, can make an exception either way.</p>
 <h2>Multi-factor authentication</h2>
-<label><input type="checkbox" name="{REQUIRE_MFA}"{mfa}{disabled}> Require MFA of everyone signing in to this tenant's applications</label>
+<fieldset class="ticks mfa-mode"><legend>Mode</legend>
+<label><input type="radio" name="{MFA_MODE}" value="{permissive}"{is_permissive}{disabled}> <strong>Permissive</strong>: the user's own setting and each application's switch decide</label>
+<label><input type="radio" name="{MFA_MODE}" value="{enforced}"{is_enforced}{disabled}> <strong>Enforced</strong>: every sign-in needs MFA, for everyone</label>
+</fieldset>
+<p class="muted">Enforced covers sign-in to this tenant's applications (by its own accounts and by other tenants'),
+this tenant's accounts signing in anywhere, My Account, the console and the Auth API. Nobody is exempt, each
+user's and application's own MFA setting no longer matters, and a code is asked at every new sign-in:
+"Don't ask again on this device" is not offered, and browsers already remembered are forgotten. Whoever has not
+set up an authenticator does so at their next sign-in. Either way, an account with an authenticator is always
+asked for a code.</p>
+<div class="when-permissive">
+<label><input type="checkbox" name="{REQUIRE_MFA}"{mfa}{disabled}> Permissive: require MFA of everyone by default</label>
 <p class="muted">A user's own setting, on their page, can make an exception either way. Whoever has not set
 up an authenticator does so at their next sign-in, and then signs in again with it.</p>
+<label><input type="checkbox" name="{SUGGEST_MFA_SETUP}"{suggest}{disabled}> Permissive: offer to set up an authenticator at sign-in</label>
+<p class="muted">Someone without an authenticator is asked, after their password, whether to set one up now.
+"Not now" carries on with the sign-in and asks again after {snooze_days} days.</p>
+</div>
 <label><input type="checkbox" name="{REQUIRE_CONSOLE_MFA}"{console_mfa}{disabled}> Require MFA of this tenant's administrators signing in to the console</label>
-<p class="muted">Applies whatever their own setting says.{root_note}</p>
+<p class="muted">Applies whatever their own setting says, and in either mode.{root_note}</p>
 <h2>Staying signed in</h2>
 <label><input type="checkbox" name="{ALLOW_KEEP_SIGNED_IN}"{keep}{disabled}> Offer "Keep me signed in" on the sign-in page</label>
 <p class="muted">A session the user keeps lasts {keep_days} days on that browser instead of the session lifetime above.
 Applications that need a fresh sign-in can still ask for one (<code>prompt=login</code>, <code>max_age</code>).</p>
+<div class="when-permissive">
 <label><input type="checkbox" name="{ALLOW_REMEMBER_MFA}"{remember}{disabled}> Offer "Don't ask again on this device" when a code is entered</label>
 <p class="muted">For this tenant's accounts: a browser they remember skips the code for {remember_days} days, but
 never the password. A fresh sign-in an application asks for always asks for the code too. Signing out
 everywhere, a new password or a new authenticator forgets every remembered browser. Not in the console,
-which always asks administrators for their code.</p>
+which always asks administrators for their code. Not offered or trusted while MFA is enforced.</p>
+</div>
 <h2>Audit log</h2>
 <label for="{AUDIT_RETENTION}">Keep audit entries for (days)</label><input id="{AUDIT_RETENTION}" name="{AUDIT_RETENTION}" type="text" value="{retention}"{disabled}>
 <p class="muted">Between {min_retention} and {max_retention} days. Older entries for this tenant are deleted every hour.</p>
@@ -123,6 +142,20 @@ either "Staying signed in" option off takes effect at once, for what was already
         url = e(&settings_url(st.public_url.base(), tenant)),
         csrf = view::csrf_input(&ctx.csrf),
         mfa = if settings.require_mfa { " checked" } else { "" },
+        suggest = if settings.suggest_mfa_setup { " checked" } else { "" },
+        snooze_days = TenantSettings::MFA_SETUP_SNOOZE_SECS / SECS_PER_DAY,
+        permissive = MfaMode::Permissive.as_str(),
+        enforced = MfaMode::Enforced.as_str(),
+        is_permissive = if settings.mfa_mode == MfaMode::Permissive {
+            " checked"
+        } else {
+            ""
+        },
+        is_enforced = if settings.mfa_mode == MfaMode::Enforced {
+            " checked"
+        } else {
+            ""
+        },
         history = settings.password_history,
         retention = settings.audit_retention_days,
         min_retention = TenantSettings::MIN_AUDIT_RETENTION_DAYS,
@@ -243,6 +276,9 @@ pub async fn post(ctx: AdminContext, State(st): State<AppState>, Path(key): Path
             allow_cross_tenant_sign_in: checked(&form, ALLOW_CROSS_TENANT),
             require_mfa: checked(&form, REQUIRE_MFA),
             require_console_mfa: checked(&form, REQUIRE_CONSOLE_MFA),
+            // Left out of the form, or not one of the modes, it keeps what the tenant has.
+            mfa_mode: MfaMode::parse(field(&form, MFA_MODE)).unwrap_or(tenant.settings.mfa_mode),
+            suggest_mfa_setup: checked(&form, SUGGEST_MFA_SETUP),
             allow_keep_signed_in: checked(&form, ALLOW_KEEP_SIGNED_IN),
             allow_remember_mfa: checked(&form, ALLOW_REMEMBER_MFA),
             // Left out of the form, it keeps what the tenant has.

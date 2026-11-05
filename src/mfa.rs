@@ -208,6 +208,10 @@ pub(crate) async fn enrolled_at_in(conn: &mut crate::db::Conn, user_id: &str) ->
 }
 
 /// Whether MFA is required of this user here. `tenant` is the user's own.
+///
+/// Enforced, in the account's own tenant or in the tenant of the application
+/// signed in to, requires it whatever else says; otherwise the account's own
+/// setting (or the tenant's default) and the place's own switch decide.
 pub async fn required<'c>(db: impl Handle<'c>, tenant: &Tenant, user_id: &str, at: At<'_>) -> anyhow::Result<bool> {
     let mut conn = db.acquire().await?;
     required_in(&mut conn, tenant, user_id, at).await
@@ -219,6 +223,15 @@ pub(crate) async fn required_in(
     user_id: &str,
     at: At<'_>,
 ) -> anyhow::Result<bool> {
+    if tenant.settings.enforces_mfa() {
+        return Ok(true);
+    }
+    if let At::App(sp) = &at
+        && sp.tenant_id != tenant.id
+        && crate::tenant::enforces_mfa_in(&mut *conn, &sp.tenant_id).await?
+    {
+        return Ok(true);
+    }
     let base = match policy_in(&mut *conn, user_id).await? {
         MfaPolicy::Required => true,
         MfaPolicy::NotRequired => false,
@@ -837,7 +850,7 @@ pub async fn remember_device<'c>(
     user_id: &str,
     home: &Tenant,
 ) -> anyhow::Result<Option<String>> {
-    if !home.settings.allow_remember_mfa {
+    if !home.settings.remembers_mfa() {
         return Ok(None);
     }
     let mut conn = db.acquire().await?;
@@ -906,7 +919,7 @@ pub async fn remembered<'c>(
     let Some(device) = device else {
         return Ok(Remembered::No);
     };
-    if !home.settings.allow_remember_mfa || freshness.forced {
+    if !home.settings.remembers_mfa() || freshness.forced {
         return Ok(Remembered::No);
     }
     let mut conn = db.acquire().await?;

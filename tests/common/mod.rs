@@ -53,7 +53,11 @@ impl TestServer {
     }
 
     pub async fn tenant(&self, name: &str, domain: &str) -> Tenant {
-        tenant::create(&self.pool, name, domain, false).await.unwrap()
+        password_console(
+            &self.pool,
+            tenant::create(&self.pool, name, domain, false).await.unwrap(),
+        )
+        .await
     }
 
     pub async fn app(&self, tenant: &Tenant, name: &str) -> TestApp {
@@ -276,7 +280,17 @@ pub async fn user_fixture(s: &TestServer) -> UserFixture {
 /// hold a role that reaches beyond their own tenant.
 pub async fn root_user_fixture(s: &TestServer) -> UserFixture {
     let tenant = tenant::create(&s.pool, "Contoso", "contoso.com", true).await.unwrap();
+    let tenant = password_console(&s.pool, tenant).await;
     user_fixture_in(s, tenant, "alice@contoso.com").await
+}
+
+/// A new tenant requires MFA of its administrators in the console. Most tests
+/// sign in to the console with a password alone, so the fixtures turn that off;
+/// the tests of console MFA turn it back on.
+pub async fn password_console(pool: &db::DbPool, mut tenant: Tenant) -> Tenant {
+    tenant.settings.require_console_mfa = false;
+    tenant::save_settings(pool, &tenant.id, &tenant.settings).await.unwrap();
+    tenant
 }
 
 pub async fn user_fixture_in(s: &TestServer, tenant: Tenant, upn: &str) -> UserFixture {

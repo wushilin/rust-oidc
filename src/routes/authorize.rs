@@ -941,7 +941,7 @@ async fn start_mfa(
             let home = access::home_of(&st.pool, user).await.ok().flatten();
             let issuer = home.as_ref().map_or(v.tenant.name.as_str(), |t| t.name.as_str());
             let enroll = secret.as_deref().map(|s| (s, issuer));
-            let offer = home.as_ref().is_some_and(|h| h.settings.allow_remember_mfa);
+            let offer = home.as_ref().is_some_and(|h| may_remember(h, &v.tenant));
             mfa_page(st, v, request, &user.upn, purpose, &ticket, enroll, offer, None)
         }
         Err(e) => html::error(Some(&v.tenant.name), &AadError::from(e).description()),
@@ -1174,7 +1174,7 @@ async fn second_step(
                         Purpose::Verify,
                         &ticket,
                         None,
-                        home.settings.allow_remember_mfa,
+                        may_remember(&home, &v.tenant),
                         Some(MFA_WRONG),
                     ),
                     _ => login_page(st, v, request, "", Some(MFA_EXPIRED)),
@@ -1279,15 +1279,26 @@ pub(crate) fn with_device_cookie(st: &AppState, mut resp: Response, device: Opti
     resp
 }
 
-/// Whether this browser may skip `user`'s code this time. A failure to look is
-/// treated as "no": the user is asked for the code.
+/// Whether "Don't ask again on this device" is offered and trusted for a sign-in
+/// of an account of `home` to `resource`: the account's own tenant allows it, and
+/// neither tenant enforces MFA, which asks for a code at every sign-in.
+pub(crate) fn may_remember(home: &Tenant, resource: &Tenant) -> bool {
+    home.settings.remembers_mfa() && !resource.settings.enforces_mfa()
+}
+
+/// Whether this browser may skip `user`'s code this time, signing in to
+/// `resource`. A failure to look is treated as "no": the user is asked for the code.
 pub(crate) async fn device_remembered(
     st: &AppState,
     headers: &HeaderMap,
     user: &User,
     home: &Tenant,
+    resource: &Tenant,
     freshness: mfa::Freshness,
 ) -> bool {
+    if !may_remember(home, resource) {
+        return false;
+    }
     let device = session::cookie(headers, MFA_DEVICE_COOKIE);
     matches!(
         mfa::remembered(&st.pool, device.as_deref(), &user.id, home, freshness).await,
@@ -1409,7 +1420,7 @@ pub async fn login(
                     // A code is skipped on a browser remembered for it; setting an
                     // authenticator up never is.
                     if step == mfa::Step::Verify
-                        && device_remembered(&st, &headers, &user, &decision.home, freshness(&params)).await
+                        && device_remembered(&st, &headers, &user, &decision.home, &v.tenant, freshness(&params)).await
                     {
                         audit_remembered(&st, &v.tenant.id, &user, Channel::Authorize).await;
                         return finish_sign_in(&st, &tenant_key, &headers, &params, &request, &v, &user, true, keep)

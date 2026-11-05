@@ -1013,7 +1013,8 @@ async fn overview(here: &Here<'_>) -> String {
             Some(at) => format!("Authenticator set up {}", view::ts(at)),
             None => "No authenticator".into(),
         },
-        (enrolled.is_none() && policy == crate::mfa::MfaPolicy::Required).then_some("MFA required, not set up"),
+        (enrolled.is_none() && (policy == crate::mfa::MfaPolicy::Required || tenant.settings.enforces_mfa()))
+            .then_some("MFA required, not set up"),
     ));
     let cards: String = cards
         .iter()
@@ -1154,12 +1155,23 @@ async fn authentication(here: &Here<'_>) -> String {
         ),
         None => "No authenticator set up.".to_string(),
     };
-    let tenant_rule = if tenant.settings.require_mfa {
-        "This tenant requires MFA of everyone."
+    let enforced = tenant.settings.enforces_mfa();
+    let tenant_rule = if enforced {
+        "This tenant enforces MFA: every sign-in uses it, whatever this account's own setting."
+    } else if tenant.settings.require_mfa {
+        "This tenant requires MFA of everyone by default."
     } else {
-        "This tenant does not require MFA of everyone."
+        "This tenant does not require MFA of everyone by default."
     };
-    let setting = if here.may_write() {
+    let setting = if enforced {
+        // Shown as required and greyed: the account's own setting is kept as it
+        // is, and applies again if the tenant goes back to Permissive.
+        format!(
+            r#"<label for="mfa_policy">Requirement</label><select id="mfa_policy" disabled><option selected>Required (enforced by the tenant)</option></select>
+<p class="muted">{tenant_rule} Its own setting, {own}, applies again if the tenant goes back to Permissive.</p>"#,
+            own = e(&policy.label().to_lowercase()),
+        )
+    } else if here.may_write() {
         let options: String = crate::mfa::MfaPolicy::ALL
             .iter()
             .map(|p| {

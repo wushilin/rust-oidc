@@ -42,7 +42,15 @@ pub enum BindingWriter<'a> {
     Operator,
 }
 
-impl BindingWriter<'_> {
+impl<'a> BindingWriter<'a> {
+    /// The writer a transaction's actor is.
+    pub fn of(actor: &'a crate::txn::Actor) -> Self {
+        match actor {
+            crate::txn::Actor::Cli => Self::Operator,
+            other => Self::Admin(other.bindings()),
+        }
+    }
+
     /// Whether this writer may create or delete a binding whose scope is `target`.
     pub fn may_write(&self, target: &Scope) -> bool {
         match self {
@@ -50,6 +58,41 @@ impl BindingWriter<'_> {
             Self::Operator => true,
         }
     }
+
+    /// Whether this writer may change who holds these bindings: true when it
+    /// could grant every one of them. The no-widening rule applied to the
+    /// other ways of taking a role's reach, besides writing its binding.
+    fn may_change_holder<'b>(&self, held: impl IntoIterator<Item = &'b Scope>) -> bool {
+        held.into_iter().all(|scope| self.may_write(scope))
+    }
+}
+
+/// Whether `writer` may change an account that holds console roles: reset its
+/// password or authenticator, disable or delete it. Resetting the credentials
+/// of a Global Administrator hands that role to whoever chose the new password,
+/// so it is a binding write in all but name, and is checked as one against every
+/// role the account holds, directly or through a group. An account holding no
+/// role may be changed by anyone the action itself allows.
+pub(crate) async fn may_change_account_in(
+    conn: &mut crate::db::Conn,
+    writer: BindingWriter<'_>,
+    user_id: &str,
+) -> anyhow::Result<bool> {
+    let held = crate::admin::bindings::effective_for_user_in(conn, user_id).await?;
+    Ok(writer.may_change_holder(held.iter().map(|b| &b.scope)))
+}
+
+/// Whether `writer` may change who is in a group that holds console roles.
+/// Membership of such a group *is* the role, so joining it, or putting someone
+/// in it, is a binding write and is checked as one against every role the group
+/// holds. A group holding no role is an ordinary group.
+pub(crate) async fn may_change_members_in(
+    conn: &mut crate::db::Conn,
+    writer: BindingWriter<'_>,
+    group_id: &str,
+) -> anyhow::Result<bool> {
+    let held = crate::admin::bindings::of_principal_in(conn, crate::directory::PrincipalType::Group, group_id).await?;
+    Ok(writer.may_change_holder(held.iter().map(|b| &b.scope)))
 }
 
 /// Why a binding delete was refused.

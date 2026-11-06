@@ -318,6 +318,22 @@ pub async fn settle_attempt<'c>(db: impl Handle<'c>, user_id: &str, attempt: Att
     }
 }
 
+/// Whether the account is locked out right now. For a step that checks a code
+/// without a password (a signed-in user confirming with one): a locked account
+/// is refused there as it is at sign-in, so a lockout the wrong codes caused
+/// stops the guessing.
+pub async fn is_locked<'c>(db: impl Handle<'c>, user_id: &str) -> anyhow::Result<bool> {
+    let mut conn = db.acquire().await?;
+    let row: Option<(Option<i64>,)> = sqlx::query_as(crate::db::qc(
+        &conn,
+        "SELECT locked_until FROM users WHERE id = ? AND deleted_at IS NULL",
+    ))
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.is_some_and(|(until,)| until.is_some_and(|until| until > now())))
+}
+
 /// One more wrong attempt, locking the account at the threshold. True when this
 /// one locked it.
 async fn count_failure_in(conn: &mut crate::db::Conn, user_id: &str, failed: i64, ts: i64) -> anyhow::Result<bool> {

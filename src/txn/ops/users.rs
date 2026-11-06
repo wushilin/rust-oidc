@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use super::{Account, NO_SUCH_ACCOUNT, tenant, user};
+use super::{Account, NO_SUCH_ACCOUNT, may_change_account, tenant, user};
 use crate::access::CrossTenantPolicy;
 use crate::admin::{GROUP_WRITE, USER_RESET, USER_WRITE};
 use crate::db::Event;
@@ -158,6 +158,7 @@ impl Transaction for DisableUser {
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
         not_self(cx, &self.user_id)?;
+        may_change_account(cx, &self.user_id).await?;
         let done = users::set_enabled_in(cx.conn(), &self.tenant_id, &self.user_id, false).await;
         let found = cx.check(done)?;
         cx.ensure(found, not_found)
@@ -198,6 +199,9 @@ impl Transaction for ResetPassword {
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<String> {
         let target = user(cx, &self.tenant_id, &self.account).await?;
+        // A new password for an account holding roles hands them to whoever
+        // chose it: only someone who could grant those roles may set one.
+        may_change_account(cx, &target.id).await?;
         let stored = users::store_password_in(cx.conn(), &self.tenant_id, &target.id, &self.password).await;
         let found = cx.check(stored)?;
         cx.ensure(found, not_found)?;
@@ -241,6 +245,7 @@ impl Transaction for DeleteUser {
     async fn run(&self, cx: &mut Cx<'_>) -> Step<String> {
         not_self(cx, &self.user_id)?;
         let target = user(cx, &self.tenant_id, &Account::Id(self.user_id.clone())).await?;
+        may_change_account(cx, &self.user_id).await?;
         let done = users::soft_delete_in(cx.conn(), &self.tenant_id, &self.user_id).await;
         let found = cx.check(done)?;
         cx.ensure(found, not_found)?;
@@ -465,6 +470,9 @@ impl Transaction for ResetUserMfa {
     }
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
+        // Taking the second factor off an account holding roles is half of
+        // taking the account: the same rule as for its password.
+        may_change_account(cx, &self.user_id).await?;
         let done = crate::mfa::reset_in(cx.conn(), &self.tenant_id, &self.user_id).await;
         let removed = cx.check(done)?;
         cx.ensure(removed, || {
@@ -505,6 +513,17 @@ impl Transaction for SetUserGroups {
     }
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<MembershipChange> {
+        // Every group joined or left that holds a console role is that role's
+        // reach changing: checked as a binding write, group by group.
+        let all = crate::groups::list_in(cx.conn(), &self.tenant_id).await;
+        let all = cx.check(all)?;
+        let held = crate::groups::for_user_in(cx.conn(), &self.user_id).await;
+        let held: Vec<String> = cx.check(held)?.into_iter().map(|g| g.id).collect();
+        for group in &all {
+            if self.group_ids.contains(&group.id) != held.contains(&group.id) {
+                super::may_change_members(cx, &group.id).await?;
+            }
+        }
         let done = crate::groups::set_for_user_in(cx.conn(), &self.tenant_id, &self.user_id, &self.group_ids).await;
         cx.check(done)
     }

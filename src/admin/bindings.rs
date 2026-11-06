@@ -250,6 +250,25 @@ pub async fn list_all<'c>(db: impl Handle<'c>) -> anyhow::Result<Vec<StoredBindi
     list_all_in(&mut conn).await
 }
 
+/// The bindings granted to one principal directly (for a user: not those held
+/// through a group, which [`effective_for_user`] adds).
+pub(crate) async fn of_principal_in(
+    conn: &mut crate::db::Conn,
+    principal_type: PrincipalType,
+    principal_id: &str,
+) -> anyhow::Result<Vec<StoredBinding>> {
+    let rows = sqlx::query(crate::db::qc(
+        conn,
+        "SELECT id, principal_type, principal_id, role_id, scope_kind FROM role_bindings
+         WHERE principal_type = ? AND principal_id = ? ORDER BY created_at",
+    ))
+    .bind(principal_type.as_str())
+    .bind(principal_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    hydrate_in(&mut *conn, rows).await
+}
+
 pub(crate) async fn list_all_in(conn: &mut crate::db::Conn) -> anyhow::Result<Vec<StoredBinding>> {
     // Through `db::q` like every other statement, although this one carries no
     // placeholder today: `tests/sql_routing.rs` only flags calls containing `?`,

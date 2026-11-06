@@ -687,7 +687,9 @@ async fn console_second_step(st: &AppState, form: &Params, op: crate::html::Logi
         Ok(Some(t)) => t,
         _ => return sign_in_page(st, "", Some(MFA_EXPIRED)),
     };
-    let Ok(Some(waiting)) = crate::mfa::pending(&st.pool, ticket, &home.id).await else {
+    // This page shows the code page after a wrong password too (decision 55),
+    // so it reads such a ticket; the check below comes before anything else.
+    let Ok(Some(waiting)) = crate::mfa::pending_either(&st.pool, ticket, &home.id).await else {
         return sign_in_page(st, "", Some(MFA_EXPIRED));
     };
     // A code page after a wrong password: never a sign-in, whatever is posted.

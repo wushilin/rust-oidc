@@ -1124,7 +1124,9 @@ async fn second_step(
 ) -> Response {
     let ticket = form.get(html::MFA_TICKET).cloned().unwrap_or_default();
     let typed = form.get(html::MFA_CODE).cloned().unwrap_or_default();
-    let pending = match mfa::pending(&st.pool, &ticket, &v.tenant.id).await {
+    // This page shows the code page after a wrong password too (decision 55),
+    // so it reads such a ticket; the check below comes before anything else.
+    let pending = match mfa::pending_either(&st.pool, &ticket, &v.tenant.id).await {
         Ok(Some(p)) => p,
         Ok(None) => return login_page(st, v, request, "", Some(MFA_EXPIRED)),
         Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
@@ -1222,26 +1224,10 @@ async fn second_step(
                 with_device_cookie(st, resp, device)
             }
             Ok(None) => {
-                wrong_code(st, &v.tenant.id, &user.id, Channel::Authorize).await;
-                // A right password with a wrong code: what lockout is for.
-                match users::settle_attempt(&st.pool, &user.id, Attempt::Failed).await {
-                    Ok(true) => {
-                        let details = serde_json::json!({
-                            "via": Channel::Authorize.as_str(),
-                            "clientId": v.client.app_id,
-                        });
-                        audit::record(
-                            st,
-                            &v.tenant.id,
-                            Actor::Id(&user.id),
-                            Event::Lockout,
-                            Some(&user.id),
-                            details,
-                        )
-                        .await;
-                    }
-                    Ok(false) => {}
-                    Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+                if let Err(e) =
+                    wrong_code_counted(st, &v.tenant.id, &user.id, Channel::Authorize, Some(&v.client.app_id)).await
+                {
+                    return html::error(Some(&v.tenant.name), &AadError::from(e).description());
                 }
                 match mfa::failed_attempt(&st.pool, &ticket).await {
                     Ok(true) => mfa_page(
@@ -1316,6 +1302,37 @@ pub(crate) async fn wrong_code(st: &AppState, tenant_id: &str, user_id: &str, vi
         serde_json::json!({ "via": via.as_str() }),
     )
     .await;
+}
+
+/// A wrong code from someone holding the password (or a session): what lockout
+/// is for (decision 55). Records the code, counts the attempt and, when this
+/// one locked the account, the lockout. Every page that checks a code after a
+/// right password counts it this way, so no page is the one where guessing is
+/// free.
+pub(crate) async fn wrong_code_counted(
+    st: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    via: Channel,
+    client_id: Option<&str>,
+) -> anyhow::Result<()> {
+    wrong_code(st, tenant_id, user_id, via).await;
+    if users::settle_attempt(&st.pool, user_id, Attempt::Failed).await? {
+        let mut details = serde_json::json!({ "via": via.as_str() });
+        if let Some(id) = client_id {
+            details["clientId"] = id.into();
+        }
+        audit::record(
+            st,
+            tenant_id,
+            Actor::Id(user_id),
+            Event::Lockout,
+            Some(user_id),
+            details,
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Remember this browser for the account's second factor, if the box was ticked

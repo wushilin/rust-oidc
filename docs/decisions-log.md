@@ -1752,4 +1752,57 @@ is right. Decided without asking:
   the password that the password was right. The authorize request is checked again in
   full once the code is right, so a refusal still comes, then.
 - **Device-code sign-in and My Account are unchanged** for now: a wrong password
-  there counts at once in both modes.
+  there counts at once in both modes. (Their codes were brought under the same
+  rule the next day: decision 56.)
+
+## Security review of 2026-11-06
+
+**56. The second factor at My Account and at the device-code sign-in follows
+decision 55** (2026-11-06; a security review found both pages outside it, fixed
+without asking). Two holes, one cause: the rule lived in the two pages that had it,
+not where the data is.
+- **A code page after a wrong password signs nobody in, anywhere.** The ticket
+  `mfa::begin_unverified` writes is scoped by hash and tenant only, so My Account and
+  the device sign-in, which never looked at `password_right`, accepted it and made a
+  session on a right code alone. Now the storage layer refuses it: `mfa::pending`
+  returns only a step whose password was right, and the two pages that show the
+  unverified code page read it through `mfa::pending_either`, which is the only way
+  to get one. A new consumer of tickets cannot get this wrong.
+- **A wrong code after a right password counts toward lockout at My Account and at
+  the device sign-in**, and a right password clears nothing until the code is right
+  (`authenticate_deferred`, `wrong_code_counted`), exactly as at application and
+  console sign-in. Before, each right password reset the count and minted a fresh
+  ticket of five tries: unlimited guessing at web speed, on the two pages decision 55
+  left aside.
+- **A wrong password still counts at once on those two pages**, in both modes: the
+  hiding of decision 55 stays with application and console sign-in under Enforced.
+- **A signed-in user confirming with a code** (new phone, new recovery codes) gets
+  no free guesses either: a wrong code counts toward lockout, and a locked account is
+  refused there (`users::is_locked`), so a stolen session cannot replace the second
+  factor by trying codes.
+- `tests/mfa_surfaces.rs`; each test fails with its guard removed.
+
+**57. Changing who holds a role is a binding write** (2026-11-06; a security review
+found two ways round the no-widening rule, fixed without asking). The rule of
+`authz::may_write_binding` guarded only `role_bindings`; two other transactions
+changed who effectively holds a binding without it.
+- **An account that holds console roles** can have its password or authenticator
+  reset, or be disabled or deleted, only by someone who could grant every role it
+  holds (directly or through a group). A new password for the Global Administrator
+  hands the role to whoever chose it, so a root-tenant User Administrator could have
+  taken the platform. Stricter than Entra's list of roles a User Administrator may
+  still reset: here any role at all puts the account out of reach of someone who
+  could not grant it, which is one rule instead of a table. An account holding no
+  role is as before. The operator (CLI) is exempt, as for bindings.
+- **A group that holds console roles** has its membership changed (someone added,
+  oneself included, or removed, or an account's groups set) only by someone who could
+  grant every binding the group holds: Entra's role-assignable groups, without the
+  flag. A Groups Administrator or Tenant Administrator of the root tenant could have
+  joined a group bound to Global Administrator. A group holding no role is an
+  ordinary group.
+- Checked inside the transactions (`ops::may_change_account`,
+  `ops::may_change_members`, over `authz::may_change_account_in` and
+  `authz::may_change_members_in`), where `GrantRole` checks its own; the refusal is
+  `NotPermitted`, as for a binding write. Console pages that run a transaction per
+  row list it; the user page answers 403.
+- `tests/rbac_role_holders.rs`; each test fails with its guard removed.

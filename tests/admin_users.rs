@@ -771,3 +771,43 @@ async fn both_password_forms_offer_the_generator() {
         );
     }
 }
+
+/// An empty password box is a request for a generated one, whichever button
+/// sent the form: an empty password is never set.
+#[tokio::test]
+async fn an_empty_password_box_generates_one() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let t = rust_oidc::tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+
+    let page = b
+        .post(
+            &s.url(&format!("/admin/tenants/{}/users/new", f.tenant.id)),
+            &[("upn", "mo@contoso.com"), ("password", "")],
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let password = shown_once(&page.body).expect("a password is generated and shown");
+    let ok = users::authenticate(&s.pool, &t, "mo@contoso.com", &password)
+        .await
+        .unwrap();
+    assert!(matches!(ok, AuthResult::Ok(_)));
+
+    let target = users::list(&s.pool, &f.tenant.id, Some("mo"), 10, 0).await.unwrap()[0]
+        .id
+        .clone();
+    let page = b
+        .post(
+            &s.url(&format!("/admin/tenants/{}/users/{target}", f.tenant.id)),
+            &[("op", "reset"), ("password", "")],
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let reset = shown_once(&page.body).expect("a password is generated and shown");
+    assert_ne!(reset, password);
+    let ok = users::authenticate(&s.pool, &t, "mo@contoso.com", &reset)
+        .await
+        .unwrap();
+    assert!(matches!(ok, AuthResult::Ok(_)));
+}

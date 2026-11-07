@@ -121,18 +121,19 @@ impl PasswordSource {
         }
     }
 
-    /// The button pressed. Anything but the generator's is a typed password, so
-    /// a form posted by Enter in the box sets what is in the box.
+    /// The generator when its button was pressed or the box was left empty
+    /// (an empty password is never one to set); otherwise what was typed, so a
+    /// form posted by Enter in the box sets what is in the box.
     fn of(form: &Params) -> Self {
-        if field(form, Self::FIELD) == Self::Generated.as_str() {
+        if field(form, Self::FIELD) == Self::Generated.as_str() || field(form, PASSWORD).is_empty() {
             Self::Generated
         } else {
             Self::Typed
         }
     }
 
-    /// The generator's button. `formnovalidate`, because the password box it
-    /// stands in for may be empty and marked required.
+    /// The generator's button. `formnovalidate`, so nothing the browser checks
+    /// about the rest of the form stops it.
     fn button(label: &str) -> String {
         format!(
             r#"<button class="secondary" type="submit" name="{field}" value="{value}" formnovalidate>{label}</button>"#,
@@ -559,8 +560,8 @@ async fn new_user_page(
 <span class="suffix">@ {suffix}</span></div>
 <p class="muted">What the person signs in with. Type the part before the @; the tenant's domain is added.</p>
 <label for="password">Initial password</label><input id="password" name="password" type="password" autocomplete="new-password">
-<p class="muted">At least {min} characters, or leave it empty and use <strong>{generate}</strong>: a random
-{generated}-character password, shown once on the page that follows.</p>
+<p class="muted">At least {min} characters. Left empty (or with <strong>{generate}</strong>), a random
+{generated}-character password is set, and shown once on the page that follows.</p>
 <label><input type="checkbox" name="{REQUIRE_CHANGE}" checked> Require them to choose their own password at first sign-in</label>
 <label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}">
 <div class="fields">
@@ -1226,10 +1227,10 @@ fn password(here: &Here<'_>) -> String {
         here.op_form(
             UserOp::Reset,
             &format!(
-                r#"<label for="password">New password</label><input id="password" name="password" type="password" autocomplete="new-password" required>
+                r#"<label for="password">New password</label><input id="password" name="password" type="password" autocomplete="new-password">
 <label><input type="checkbox" name="{REQUIRE_CHANGE}" checked> Require them to choose a new password at their next sign-in</label>
 <div class="actions"><button type="submit">Reset password</button>{generate_button}</div>
-<p class="muted">At least {min} characters, or a random {generated}-character one, shown once on the page that follows. A reset signs the user out everywhere, revokes their refresh tokens and
+<p class="muted">At least {min} characters. Left empty, a random {generated}-character one is set, and shown once on the page that follows. A reset signs the user out everywhere, revokes their refresh tokens and
 ends a lockout. It is not checked against the account's recent passwords, which would tell you what they were,
 but it is remembered, so the user cannot choose it again themselves.</p>"#,
                 min = users::MIN_PASSWORD_CHARS,

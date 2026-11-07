@@ -1826,4 +1826,7 @@ changed who effectively holds a binding without it.
   secret is; it is stored only as a hash and never rendered again. The notice's
   text selects as a whole on one click, for copying. A refused change shows no
   password, and the generator does nothing on any form but these two.
+- **An empty password box generates one too**, whichever button sent the form: an
+  empty password is never one to set, and the New user page shows the box as
+  optional. The reset box is no longer `required` for the same reason.
 - `tests/admin_users.rs` (the generated-password tests).

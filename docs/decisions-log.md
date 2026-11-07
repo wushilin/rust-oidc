@@ -1806,3 +1806,24 @@ changed who effectively holds a binding without it.
   `NotPermitted`, as for a binding write. Console pages that run a transaction per
   row list it; the user page answers 403.
 - `tests/rbac_role_holders.rs`; each test fails with its guard removed.
+
+## Generated passwords in the console
+
+- **New user and Reset password each offer a generator button** ("Create with a
+  generated password", "Reset to a generated password"): a second submit button in
+  the same form, so the console stays script-free. It is `formnovalidate`, so an
+  empty, required password box does not block it, and it comes after the main
+  button, so Enter in the box still sets what was typed. The button's value,
+  `PasswordSource`, is an enum; anything but `generated` is a typed password.
+- **Ten characters** (`GENERATED_PASSWORD_CHARS`), at least one each of upper case,
+  lower case, digit and symbol, shuffled; characters misread by hand (`0 O o 1 l I`)
+  and ones forms or shells mangle (quotes, backslash, space) are left out. About
+  60 bits; it passes the same length rule and goes through the same transactions
+  (`CreateUser`, `ResetPassword`) and audit rows as a typed one, which never hold
+  the password.
+- **Shown once**: the answer to the post is the user's Password section itself
+  (`200`, `no-store`) with the value in the shown-once notice, as a new client
+  secret is; it is stored only as a hash and never rendered again. The notice's
+  text selects as a whole on one click, for copying. A refused change shows no
+  password, and the generator does nothing on any form but these two.
+- `tests/admin_users.rs` (the generated-password tests).

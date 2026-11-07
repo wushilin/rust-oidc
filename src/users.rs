@@ -501,6 +501,53 @@ impl NewPassword {
     }
 }
 
+/// How long a password the console generates is.
+pub const GENERATED_PASSWORD_CHARS: usize = 10;
+
+/// The character classes a generated password draws on, one character of each
+/// at least. Characters easily misread when copied by hand (`0 O o`, `1 l I`)
+/// are left out, and so are quotes, backslashes and spaces, which some terminals
+/// and forms mangle.
+const GENERATED_PASSWORD_CLASSES: &[&[u8]] = &[
+    b"ABCDEFGHJKLMNPQRSTUVWXYZ",
+    b"abcdefghijkmnpqrstuvwxyz",
+    b"23456789",
+    b"!#$%&*+-=?@^_",
+];
+
+/// A random password for an administrator to hand to someone: ten characters
+/// with at least one upper-case letter, lower-case letter, digit and symbol, in
+/// random order (about 60 bits). It is shown once, on the page that sets it.
+pub fn generate_password() -> String {
+    use crate::util::random_string;
+    let all: Vec<u8> = GENERATED_PASSWORD_CLASSES.concat();
+    let mut chars: Vec<char> = GENERATED_PASSWORD_CLASSES
+        .iter()
+        .map(|class| random_string(class, 1))
+        .chain(std::iter::once(random_string(
+            &all,
+            GENERATED_PASSWORD_CHARS - GENERATED_PASSWORD_CLASSES.len(),
+        )))
+        .flat_map(|s| s.chars().collect::<Vec<_>>())
+        .collect();
+    // Fisher-Yates, so the guaranteed characters are not always at the front.
+    for i in (1..chars.len()).rev() {
+        chars.swap(i, random_below(i + 1));
+    }
+    chars.into_iter().collect()
+}
+
+/// A uniform random number in `0..n` (`n` at most 256), by rejection.
+fn random_below(n: usize) -> usize {
+    let limit = 256 - (256 % n);
+    loop {
+        let b = crate::util::random_bytes(1)[0] as usize;
+        if b < limit {
+            return b % n;
+        }
+    }
+}
+
 fn check_length(password: &str) -> anyhow::Result<()> {
     if password.chars().count() < MIN_PASSWORD_CHARS {
         bail!("password must be at least {MIN_PASSWORD_CHARS} characters");

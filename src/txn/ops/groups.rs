@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use super::{Account, tenant, user};
+use super::{Account, may_change_members, tenant, user};
 use crate::admin::GROUP_WRITE;
 use crate::db::Event;
 use crate::routes::audit::clip;
@@ -140,6 +140,9 @@ impl Transaction for AddGroupMember {
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<AddedMember> {
         group(cx, &self.tenant_id, &self.group_id).await?;
+        // Membership of a group that holds a console role is the role: putting
+        // someone in it (oneself included) is a binding write, checked as one.
+        may_change_members(cx, &self.group_id).await?;
         let member = user(cx, &self.tenant_id, &self.account).await?;
         let done = crate::groups::add_member_id_in(cx.conn(), &self.tenant_id, &self.group_id, &member.id).await;
         cx.check(done)?;
@@ -183,6 +186,7 @@ impl Transaction for RemoveGroupMember {
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
         group(cx, &self.tenant_id, &self.group_id).await?;
+        may_change_members(cx, &self.group_id).await?;
         let done = crate::groups::remove_member_in(cx.conn(), &self.tenant_id, &self.group_id, &self.user_id).await;
         let removed = cx.check(done)?;
         cx.ensure(removed, || {

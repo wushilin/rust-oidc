@@ -33,7 +33,7 @@ use crate::txn::{
     self,
     ops::self_service::{ReplaceRecoveryCodes, SignOutEverywhere},
 };
-use crate::users::{self, AuthResult, User};
+use crate::users::{self, Attempt, AuthResult, User};
 use crate::util::ct_eq;
 
 type Params = HashMap<String, String>;
@@ -43,6 +43,7 @@ type Params = HashMap<String, String>;
 const VOLUNTARY: &str = "voluntary";
 const EXPIRED: &str = "That sign-in has expired or had too many wrong codes. Please sign in again.";
 const WRONG_CODE: &str = "That code didn't work. Check the time on your phone, wait for a new code and try again.";
+const LOCKED: &str = "Your account is temporarily locked. Try again later. (AADSTS50053)";
 
 fn url(st: &AppState, tenant: &Tenant) -> String {
     st.public_url.tenant_url(&tenant.id, "myaccount")
@@ -343,12 +344,25 @@ pub async fn post(
 }
 
 /// The sign-in form: the password, then whatever comes after it.
+///
+/// A right password that will be asked for a code settles nothing yet: the code
+/// does, as at an application's sign-in (decision 55). A wrong password counts
+/// at once.
 async fn password(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form: &Params) -> Response {
     let upn = get(form, "upn").trim();
-    let (outcome, trace) = match users::authenticate_traced(&st.pool, tenant, upn, get(form, "password")).await {
+    let (outcome, mut trace) = match users::authenticate_deferred(&st.pool, tenant, upn, get(form, "password")).await {
         Ok(o) => o,
         Err(e) => return fail(tenant, e),
     };
+    // No code to wait for on a wrong password: it counts now.
+    if matches!(outcome, AuthResult::InvalidCredentials)
+        && let Some(id) = trace.user_id.as_deref()
+    {
+        trace.lockout_triggered = match users::settle_attempt(&st.pool, id, Attempt::Failed).await {
+            Ok(locked) => locked,
+            Err(e) => return fail(tenant, e),
+        };
+    }
     audit::sign_in_failure(st, &tenant.id, upn, &outcome, &trace, Channel::MyAccount, "").await;
     let user = match outcome {
         AuthResult::Ok(user) => user,
@@ -377,21 +391,29 @@ async fn password(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form: &Pa
         }
     };
     let keep = KeepSignedIn::chosen(tenant, html::ticked(form, html::KEEP_SIGNED_IN));
-    match mfa::step(&st.pool, tenant, &user.id, mfa::At::MyAccount).await {
-        // A code is skipped on a browser remembered for it; setting an
-        // authenticator up never is. My Account carries no prompt or max_age.
-        Ok(mfa::Step::Verify)
-            if super::authorize::device_remembered(st, headers, &user, tenant, tenant, mfa::Freshness::default())
-                .await =>
-        {
-            super::authorize::audit_remembered(st, &tenant.id, &user, Channel::MyAccount).await;
-            finish(st, tenant, headers, &user, true, keep).await
-        }
-        Ok(step) => match step_purpose(step) {
-            Some(purpose) => start(st, tenant, &user, purpose, false, keep).await,
-            None => finish(st, tenant, headers, &user, false, keep).await,
-        },
-        Err(e) => fail(tenant, e),
+    let step = match mfa::step(&st.pool, tenant, &user.id, mfa::At::MyAccount).await {
+        Ok(step) => step,
+        Err(e) => return fail(tenant, e),
+    };
+    // A code is skipped on a browser remembered for it; setting an
+    // authenticator up never is. My Account carries no prompt or max_age.
+    let remembered = step == mfa::Step::Verify
+        && super::authorize::device_remembered(st, headers, &user, tenant, tenant, mfa::Freshness::default()).await;
+    // A code comes next: the counter waits for it.
+    if step == mfa::Step::Verify && !remembered {
+        return start(st, tenant, &user, Purpose::Verify, false, keep).await;
+    }
+    // The password is all this sign-in asks: it settles the count now.
+    if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
+        return fail(tenant, e);
+    }
+    if remembered {
+        super::authorize::audit_remembered(st, &tenant.id, &user, Channel::MyAccount).await;
+        return finish(st, tenant, headers, &user, true, keep).await;
+    }
+    match step_purpose(step) {
+        Some(purpose) => start(st, tenant, &user, purpose, false, keep).await,
+        None => finish(st, tenant, headers, &user, false, keep).await,
     }
 }
 
@@ -429,6 +451,10 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
         Purpose::Verify => match mfa::check(&st.pool, &user.id, typed).await {
             Ok(Some(factor)) => {
                 let _ = mfa::finish(&st.pool, ticket).await;
+                // Both factors right: the count the password left alone is cleared.
+                if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
+                    return fail(tenant, e);
+                }
                 let device = if voluntary {
                     None
                 } else {
@@ -451,7 +477,12 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
                 super::authorize::with_device_cookie(st, resp, device)
             }
             Ok(None) => {
-                super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::MyAccount).await;
+                // A right password with a wrong code: what lockout is for.
+                if let Err(e) =
+                    super::authorize::wrong_code_counted(st, &tenant.id, &user.id, Channel::MyAccount, None).await
+                {
+                    return fail(tenant, e);
+                }
                 match mfa::failed_attempt(&st.pool, ticket).await {
                     Ok(true) => step_page(
                         st,
@@ -612,15 +643,34 @@ async fn action(
             }
             start(st, tenant, user, Purpose::Enroll, true, keep).await
         }
-        AccountOp::MfaReplace => match mfa::check(&st.pool, &user.id, typed).await {
-            Ok(Some(_)) => start(st, tenant, user, Purpose::Enroll, true, keep).await,
-            Ok(None) => {
-                super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::MyAccount).await;
-                refuse("That code didn't work.").await
+        // Confirmed with a code by someone holding a session: a wrong one counts
+        // toward lockout as at sign-in, and a locked account is refused, so the
+        // page is no place to guess at a second factor.
+        AccountOp::MfaReplace => {
+            match users::is_locked(&st.pool, &user.id).await {
+                Ok(false) => {}
+                Ok(true) => return refuse(LOCKED).await,
+                Err(e) => return fail(tenant, e),
             }
-            Err(e) => fail(tenant, e),
-        },
+            match mfa::check(&st.pool, &user.id, typed).await {
+                Ok(Some(_)) => start(st, tenant, user, Purpose::Enroll, true, keep).await,
+                Ok(None) => {
+                    if let Err(e) =
+                        super::authorize::wrong_code_counted(st, &tenant.id, &user.id, Channel::MyAccount, None).await
+                    {
+                        return fail(tenant, e);
+                    }
+                    refuse("That code didn't work.").await
+                }
+                Err(e) => fail(tenant, e),
+            }
+        }
         AccountOp::RecoveryCodes => {
+            match users::is_locked(&st.pool, &user.id).await {
+                Ok(false) => {}
+                Ok(true) => return refuse(LOCKED).await,
+                Err(e) => return fail(tenant, e),
+            }
             // An authenticator code, not a recovery code: new codes are for whoever
             // still has the authenticator.
             let digits = typed.trim().replace(' ', "");
@@ -631,7 +681,11 @@ async fn action(
                     Ok(Some(mfa::Factor::Authenticator))
                 );
             if !confirmed {
-                super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::MyAccount).await;
+                if let Err(e) =
+                    super::authorize::wrong_code_counted(st, &tenant.id, &user.id, Channel::MyAccount, None).await
+                {
+                    return fail(tenant, e);
+                }
                 return refuse("That code didn't work. Use the six-digit code from your authenticator.").await;
             }
             let replace = ReplaceRecoveryCodes {

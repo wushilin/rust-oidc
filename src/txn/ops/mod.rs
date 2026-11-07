@@ -15,6 +15,7 @@ pub mod tenants;
 pub mod users;
 
 use super::{Cx, Refusal, Step};
+use crate::admin::authz::{self, BindingWriter};
 use crate::tenant::Tenant;
 use crate::users::User;
 
@@ -36,6 +37,24 @@ pub(crate) async fn tenant(cx: &mut Cx<'_>, tenant_id: &str) -> Step<Tenant> {
         Some(t) if t.id == tenant_id => Ok(t),
         _ => Err(cx.fail(Refusal::NotFound("There is no such tenant.".into()))),
     }
+}
+
+/// Abort unless the actor may change this account, which holds console roles
+/// the actor would have to be able to grant ([`authz::may_change_account_in`]).
+pub(crate) async fn may_change_account(cx: &mut Cx<'_>, user_id: &str) -> Step<()> {
+    let actor = cx.actor().clone();
+    let permitted = authz::may_change_account_in(cx.conn(), BindingWriter::of(&actor), user_id).await;
+    let permitted = cx.check(permitted)?;
+    cx.ensure(permitted, || Refusal::NotPermitted)
+}
+
+/// Abort unless the actor may change who is in this group, which holds console
+/// roles the actor would have to be able to grant ([`authz::may_change_members_in`]).
+pub(crate) async fn may_change_members(cx: &mut Cx<'_>, group_id: &str) -> Step<()> {
+    let actor = cx.actor().clone();
+    let permitted = authz::may_change_members_in(cx.conn(), BindingWriter::of(&actor), group_id).await;
+    let permitted = cx.check(permitted)?;
+    cx.ensure(permitted, || Refusal::NotPermitted)
 }
 
 /// A live account of the tenant, or abort.

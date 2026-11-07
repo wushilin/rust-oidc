@@ -25,7 +25,7 @@ use crate::mfa::{self, Purpose};
 use crate::ratelimit::{Hit, Limit};
 use crate::session::{self, CSRF_COOKIE};
 use crate::tenant::{self, Tenant};
-use crate::users::AuthResult;
+use crate::users::{Attempt, AuthResult};
 use crate::util::{b64url, now, random_bytes, sha256_hex};
 use crate::{html, scopes, users};
 
@@ -599,6 +599,10 @@ async fn second_step(
         Purpose::Verify => match mfa::check(&st.pool, &user.id, &typed).await {
             Ok(Some(factor)) => {
                 let _ = mfa::finish(&st.pool, &ticket).await;
+                // Both factors right: the count the password left alone is cleared.
+                if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
+                    return html::error(Some(&tenant.name), &AadError::from(e).description());
+                }
                 let device = super::authorize::remember_if_asked(st, headers, form, &user, &home).await;
                 audit::record(
                     st,
@@ -619,7 +623,18 @@ async fn second_step(
                 super::authorize::with_device_cookie(st, resp, device)
             }
             Ok(None) => {
-                super::authorize::wrong_code(st, &tenant.id, &user.id, Channel::Device).await;
+                // A right password with a wrong code: what lockout is for.
+                if let Err(e) = super::authorize::wrong_code_counted(
+                    st,
+                    &tenant.id,
+                    &user.id,
+                    Channel::Device,
+                    Some(&pending.client.app_id),
+                )
+                .await
+                {
+                    return html::error(Some(&tenant.name), &AadError::from(e).description());
+                }
                 match mfa::failed_attempt(&st.pool, &ticket).await {
                     Ok(true) => mfa_page(
                         st,
@@ -745,10 +760,21 @@ async fn sign_in(
         .await
         .ok()
         .flatten();
-    let (outcome, trace) = match access::authenticate(&st.pool, tenant, sp.as_ref(), upn, password).await {
+    // A right password that will be asked for a code settles nothing yet: the
+    // code does, as at an application's sign-in (decision 55). A wrong password
+    // counts at once.
+    let (outcome, mut trace) = match access::authenticate_deferred(&st.pool, tenant, sp.as_ref(), upn, password).await {
         Ok(o) => o,
         Err(e) => return Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
     };
+    if matches!(outcome, AuthResult::InvalidCredentials)
+        && let Some(id) = trace.user_id.as_deref()
+    {
+        trace.lockout_triggered = match users::settle_attempt(&st.pool, id, Attempt::Failed).await {
+            Ok(locked) => locked,
+            Err(e) => return Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
+        };
+    }
     audit::sign_in_failure(
         st,
         &tenant.id,
@@ -802,17 +828,32 @@ async fn sign_in(
 
     gate(st, tenant, &pending, &user.id).await?;
     let keep = session::KeepSignedIn::chosen(tenant, html::ticked(form, html::KEEP_SIGNED_IN));
+    let fail = |e: anyhow::Error| html::error(Some(&tenant.name), &AadError::from(e).description());
     // A second step, where one is needed, before there is any session.
-    if let Some(step) = second_step_needed(st, tenant, &pending, &user.id, &[]).await {
-        // A code is skipped on a browser remembered for it; setting an
-        // authenticator up never is. A device code carries no prompt or max_age.
-        if step == mfa::Step::Verify
-            && let Ok(Some(home)) = access::home_of(&st.pool, &user).await
-            && super::authorize::device_remembered(st, headers, &user, &home, tenant, mfa::Freshness::default()).await
-        {
-            super::authorize::audit_remembered(st, &tenant.id, &user, Channel::Device).await;
-            return finish_sign_in(st, tenant, headers, &pending, &user, true, keep).await;
-        }
+    let step = second_step_needed(st, tenant, &pending, &user.id, &[]).await;
+    // A code is skipped on a browser remembered for it; setting an
+    // authenticator up never is. A device code carries no prompt or max_age.
+    let remembered = step == Some(mfa::Step::Verify)
+        && match access::home_of(&st.pool, &user).await {
+            Ok(Some(home)) => {
+                super::authorize::device_remembered(st, headers, &user, &home, tenant, mfa::Freshness::default()).await
+            }
+            Ok(None) => false,
+            Err(e) => return Err(fail(e)),
+        };
+    // A code comes next: the counter waits for it.
+    if step == Some(mfa::Step::Verify) && !remembered {
+        return Ok(start_mfa(st, tenant, &pending, &user.id, mfa::Step::Verify, keep).await);
+    }
+    // The password is all this sign-in asks: it settles the count now.
+    users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded)
+        .await
+        .map_err(fail)?;
+    if remembered {
+        super::authorize::audit_remembered(st, &tenant.id, &user, Channel::Device).await;
+        return finish_sign_in(st, tenant, headers, &pending, &user, true, keep).await;
+    }
+    if let Some(step) = step {
         return Ok(start_mfa(st, tenant, &pending, &user.id, step, keep).await);
     }
     finish_sign_in(st, tenant, headers, &pending, &user, false, keep).await

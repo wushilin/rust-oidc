@@ -48,10 +48,7 @@ pub enum Principal {
 /// The binding writer the actor is: an administrator is held to no-widening, the
 /// command line is not.
 fn writer(actor: &Actor) -> BindingWriter<'_> {
-    match actor {
-        Actor::Cli => BindingWriter::Operator,
-        other => BindingWriter::Admin(other.bindings()),
-    }
+    BindingWriter::of(actor)
 }
 
 /// The tenant a change to the Global roles belongs to in the audit log: the

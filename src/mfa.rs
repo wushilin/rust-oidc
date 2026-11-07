@@ -833,7 +833,21 @@ pub async fn begin_unverified<'c>(
     Ok(ticket)
 }
 
-/// The live second step a ticket names, in this tenant.
+/// Which tickets a lookup returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tickets {
+    /// Only a step whose password was right: the only kind that may end in a
+    /// sign-in.
+    Verified,
+    /// That, or a code page shown after a wrong password.
+    Either,
+}
+
+/// The live second step a ticket names, in this tenant, whose password was
+/// right. A code page shown after a wrong password ([`begin_unverified`]) is
+/// never returned here, so no page that reads a ticket this way can turn one
+/// into a sign-in; the two sign-in pages that show such a page, and answer its
+/// code without signing anyone in, read it with [`pending_either`].
 pub async fn pending<'c>(db: impl Handle<'c>, ticket: &str, tenant_id: &str) -> anyhow::Result<Option<Pending>> {
     let mut conn = db.acquire().await?;
     pending_in(&mut conn, ticket, tenant_id).await
@@ -844,19 +858,45 @@ pub(crate) async fn pending_in(
     ticket: &str,
     tenant_id: &str,
 ) -> anyhow::Result<Option<Pending>> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(String, String, String, Option<String>, crate::db::Flag, crate::db::Flag)> =
-        sqlx::query_as(crate::db::qc(
-            conn,
+    load_pending_in(conn, ticket, tenant_id, Tickets::Verified).await
+}
+
+/// [`pending`], or the code page shown after a wrong password. Only for a page
+/// that checks [`Pending::password_right`] before anything else and never signs
+/// in on a step whose password was wrong.
+pub async fn pending_either<'c>(db: impl Handle<'c>, ticket: &str, tenant_id: &str) -> anyhow::Result<Option<Pending>> {
+    let mut conn = db.acquire().await?;
+    load_pending_in(&mut conn, ticket, tenant_id, Tickets::Either).await
+}
+
+async fn load_pending_in(
+    conn: &mut crate::db::Conn,
+    ticket: &str,
+    tenant_id: &str,
+    which: Tickets,
+) -> anyhow::Result<Option<Pending>> {
+    let sql = match which {
+        Tickets::Verified => {
             "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right FROM mfa_pending
-         WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ?",
-        ))
+             WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ? AND password_right = ?"
+        }
+        Tickets::Either => {
+            "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right FROM mfa_pending
+             WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ? AND (password_right = ? OR password_right = ?)"
+        }
+    };
+    let mut query = sqlx::query_as(crate::db::qc(conn, sql))
         .bind(sha256_hex(ticket.as_bytes()))
         .bind(tenant_id)
         .bind(now())
         .bind(MAX_ATTEMPTS)
-        .fetch_optional(&mut *conn)
-        .await?;
+        .bind(true);
+    if which == Tickets::Either {
+        query = query.bind(false);
+    }
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, String, String, Option<String>, crate::db::Flag, crate::db::Flag)> =
+        query.fetch_optional(&mut *conn).await?;
     Ok(
         row.and_then(|(user_id, tenant_id, purpose, enroll_secret, kept, right)| {
             Some(Pending {

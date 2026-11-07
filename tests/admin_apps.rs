@@ -647,3 +647,109 @@ async fn the_application_page_is_split_into_sections() {
     let vurl = s2.url(&format!("/admin/tenants/{}/apps/{}", v.tenant.id, v.web.app_id));
     assert_eq!(vb.get(&format!("{vurl}/users")).await.status, 200);
 }
+
+// ---- rename ----
+
+/// Renaming from the Overview changes what sign-in errors call the
+/// application, and nothing a client depends on.
+#[tokio::test]
+async fn an_application_is_renamed_from_its_overview() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let url = s.url(&format!("/admin/tenants/{}/apps/{}", f.tenant.id, f.web.app_id));
+
+    let overview = b.get(&url).await;
+    assert!(overview.body.contains(r#"value="rename""#), "{}", overview.body);
+
+    let page = b.post(&url, &[("op", "rename"), ("name", "Payroll portal")]).await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    assert!(
+        page.location.as_deref().is_some_and(|l| l.ends_with(&f.web.app_id)),
+        "{:?}",
+        page.location
+    );
+    let app = apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap();
+    assert_eq!(app.display_name, "Payroll portal");
+    let overview = b.get(&url).await;
+    assert!(overview.body.contains("Payroll portal"), "{}", overview.body);
+
+    let refused = b.post(&url, &[("op", "rename"), ("name", "  ")]).await;
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(refused.body.contains("needs a display name"), "{}", refused.body);
+
+    // The same client id and secret still work, and the error a user sees
+    // names the application by its new name.
+    apps::set_password_grant_allowed(&s.pool, &app, true).await.unwrap();
+    let sp = apps::service_principal(&s.pool, &f.tenant.id, &app.app_id)
+        .await
+        .unwrap()
+        .unwrap();
+    apps::set_assignment_required(&s.pool, &sp.id, true).await.unwrap();
+    let (status, body) = s
+        .token(
+            &f.tenant.id,
+            &[
+                ("grant_type", "password"),
+                ("client_id", &f.web.app_id),
+                ("client_secret", &f.web.secret),
+                ("username", &f.upn),
+                ("password", &f.password),
+                ("scope", "openid"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let description = body["error_description"].as_str().unwrap_or_default();
+    assert!(description.contains("AADSTS50105"), "{description}");
+    assert!(description.contains("Payroll portal"), "{description}");
+}
+
+#[tokio::test]
+async fn a_viewer_cannot_rename_an_application() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    bind_in_own_tenant(&s, &f, RoleId::ApplicationViewer).await;
+    let b = signed_in_admin(&s, &f).await;
+    let url = s.url(&format!("/admin/tenants/{}/apps/{}", f.tenant.id, f.web.app_id));
+    let before = apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap().display_name;
+    let overview = b.get(&url).await;
+    assert_eq!(overview.status, 200);
+    assert!(
+        !overview.body.contains(r#"value="rename""#),
+        "a viewer is not offered the form"
+    );
+    let page = b.post(&url, &[("op", "rename"), ("name", "mole")]).await;
+    assert_eq!(page.status, 403, "{}", page.body);
+    assert_eq!(
+        apps::find(&s.pool, &f.web.app_id).await.unwrap().unwrap().display_name,
+        before
+    );
+}
+
+#[tokio::test]
+async fn another_tenants_admin_cannot_rename_an_application() {
+    let s = TestServer::start().await;
+    let t = tenant_admin_fixture(&s).await;
+    let other = s.tenant("Fabrikam", "fabrikam.test").await;
+    let victim = s.app(&other, "fabrikam-api").await;
+    let b = signed_in_admin(&s, &t).await;
+    for path in [
+        format!("/admin/tenants/{}/apps/{}", other.id, victim.app_id),
+        format!("/admin/tenants/fabrikam.test/apps/{}", victim.app_id),
+        // Their application named under one's own tenant.
+        format!("/admin/tenants/{}/apps/{}", t.tenant.id, victim.app_id),
+    ] {
+        let page = b.post(&s.url(&path), &[("op", "rename"), ("name", "mole")]).await;
+        assert!(
+            page.status == 403 || page.status == 404,
+            "POST {path}: {} {}",
+            page.status,
+            page.body
+        );
+    }
+    assert_eq!(
+        apps::find(&s.pool, &victim.app_id).await.unwrap().unwrap().display_name,
+        "fabrikam-api"
+    );
+}

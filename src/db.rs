@@ -558,6 +558,7 @@ pub enum Event {
     AdminRoleRevoke,
     // -- the console's remaining sections --
     AdminAppCreate,
+    AdminAppRename,
     AdminAppFlags,
     AdminAppIdentifierUriAdd,
     AdminAppIdentifierUriRemove,
@@ -681,6 +682,7 @@ impl Event {
         Self::AdminRoleGrant,
         Self::AdminRoleRevoke,
         Self::AdminAppCreate,
+        Self::AdminAppRename,
         Self::AdminAppFlags,
         Self::AdminAppIdentifierUriAdd,
         Self::AdminAppIdentifierUriRemove,
@@ -791,6 +793,7 @@ impl Event {
             Self::AdminRoleGrant => "admin.role.grant",
             Self::AdminRoleRevoke => "admin.role.revoke",
             Self::AdminAppCreate => "admin.app.create",
+            Self::AdminAppRename => "admin.app.rename",
             Self::AdminAppFlags => "admin.app.flags",
             Self::AdminAppIdentifierUriAdd => "admin.app.identifier_uri.add",
             Self::AdminAppIdentifierUriRemove => "admin.app.identifier_uri.remove",

@@ -405,6 +405,7 @@ transactions! {
     RevokeAppRole(ops::apps::RevokeAppRole),
     SetAssignmentRequired(ops::apps::SetAssignmentRequired),
     SetGroupMembershipClaims(ops::apps::SetGroupMembershipClaims),
+    RenameApp(ops::apps::RenameApp),
     GrantAuthApiPermission(ops::apps::GrantAuthApiPermission),
     RevokeAuthApiPermission(ops::apps::RevokeAuthApiPermission),
     GrantRole(ops::roles::GrantRole),

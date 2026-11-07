@@ -96,9 +96,9 @@ impl Transaction for CreateApp {
     async fn run(&self, cx: &mut Cx<'_>) -> Step<Application> {
         let tenant = tenant(cx, &self.tenant_id).await?;
         let name = self.display_name.trim();
-        cx.ensure(!name.is_empty(), || {
-            Refusal::Invalid("An application needs a display name.".into())
-        })?;
+        if let Some(problem) = apps::app_name_problem(name) {
+            return Err(cx.fail(Refusal::Invalid(problem)));
+        }
         let created = apps::create_in(cx.conn(), &tenant, name).await;
         Ok(cx.check(created)?.application)
     }
@@ -108,6 +108,56 @@ impl Transaction for CreateApp {
             &self.tenant_id,
             &app.app_id,
             json!({ "displayName": clip(&app.display_name) }),
+        )
+    }
+}
+
+/// Rename an application (Entra's *Branding & properties*): its display name,
+/// which sign-in pages and error messages show. Its client id, object id,
+/// credentials, roles and assignments are untouched, and no token carries the
+/// name, so no client notices.
+pub struct RenameApp {
+    pub tenant_id: String,
+    pub app_id: String,
+    pub display_name: String,
+}
+
+/// The names before and after, for the audit row.
+#[derive(Debug)]
+pub struct Renamed {
+    pub from: String,
+    pub to: String,
+}
+
+impl Transaction for RenameApp {
+    type Output = Renamed;
+    const INFO: KindInfo = KindInfo {
+        name: "Rename application",
+        need: Need::Action(APP_WRITE),
+        event: Event::AdminAppRename,
+    };
+
+    on_application!();
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<Renamed> {
+        let (_, app) = application(cx, &self.tenant_id, &self.app_id).await?;
+        let name = self.display_name.trim();
+        if let Some(problem) = apps::app_name_problem(name) {
+            return Err(cx.fail(Refusal::Invalid(problem)));
+        }
+        let done = apps::rename_in(cx.conn(), &app, name).await;
+        cx.check(done)?;
+        Ok(Renamed {
+            from: app.display_name,
+            to: name.to_string(),
+        })
+    }
+
+    fn audit(&self, renamed: &Renamed) -> Audit {
+        on_app(
+            &self.tenant_id,
+            &self.app_id,
+            json!({ "from": clip(&renamed.from), "displayName": clip(&renamed.to) }),
         )
     }
 }

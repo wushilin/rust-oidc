@@ -27,7 +27,8 @@ use crate::tenant::Tenant;
 use crate::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
     GrantAppRole, GrantAuthApiPermission, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri,
-    RemoveRedirectUri, RevokeAppRole, RevokeAuthApiPermission, SaveAppFlags, SetGroupMembershipClaims, UnassignApp,
+    RemoveRedirectUri, RenameApp, RevokeAppRole, RevokeAuthApiPermission, SaveAppFlags, SetGroupMembershipClaims,
+    UnassignApp,
 };
 use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
 use crate::util::now;
@@ -134,6 +135,8 @@ impl AppSection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppOp {
+    /// Its display name, on the Overview.
+    Rename,
     /// `allow_password_grant` and the two implicit toggles, saved together.
     Flags,
     /// Which groups its tokens carry.
@@ -164,6 +167,7 @@ impl AppOp {
     /// page goes back to after it.
     fn section(self) -> AppSection {
         match self {
+            Self::Rename => AppSection::Overview,
             Self::Flags | Self::RedirectUriAdd | Self::RedirectUriRemove => AppSection::Authentication,
             Self::GroupClaims => AppSection::TokenConfiguration,
             Self::SecretAdd | Self::SecretRemove | Self::CertificateAdd | Self::CertificateRemove => {
@@ -178,6 +182,7 @@ impl AppOp {
     }
 
     pub const ALL: &'static [AppOp] = &[
+        Self::Rename,
         Self::Flags,
         Self::GroupClaims,
         Self::SecretAdd,
@@ -203,6 +208,7 @@ impl AppOp {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Rename => "rename",
             Self::Flags => "flags",
             Self::GroupClaims => "group_claims",
             Self::SecretAdd => "secret_add",
@@ -241,7 +247,8 @@ impl AppOp {
             | Self::RoleUnassign
             | Self::AuthApiGrant
             | Self::AuthApiRevoke => ASSIGNMENT_WRITE,
-            Self::Flags
+            Self::Rename
+            | Self::Flags
             | Self::GroupClaims
             | Self::RedirectUriAdd
             | Self::RedirectUriRemove
@@ -258,6 +265,7 @@ impl AppOp {
     fn kind(self) -> crate::txn::TxnKind {
         use crate::txn::TxnKind;
         match self {
+            Self::Rename => TxnKind::RenameApp,
             Self::Flags => TxnKind::SaveAppFlags,
             Self::GroupClaims => TxnKind::SetGroupMembershipClaims,
             Self::SecretAdd => TxnKind::AddAppSecret,
@@ -528,7 +536,7 @@ async fn detail(
     let may_assign = ctx.can_in(ASSIGNMENT_WRITE, tenant);
 
     let content = match section {
-        AppSection::Overview => overview(st, ctx, tenant, app).await,
+        AppSection::Overview => overview(st, ctx, tenant, app, &url, &csrf).await,
         AppSection::Authentication => {
             let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
             let sp = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
@@ -661,8 +669,32 @@ other applications may hold. Add one under App roles, with the Application membe
 
 /// The overview: what the application is, and a card per section saying what is
 /// in it and whether anything needs attention.
-async fn overview(st: &AppState, ctx: &AdminContext, tenant: &Tenant, app: &Application) -> String {
+async fn overview(
+    st: &AppState,
+    ctx: &AdminContext,
+    tenant: &Tenant,
+    app: &Application,
+    url: &str,
+    csrf: &str,
+) -> String {
     let base = st.public_url.base();
+    let rename = if ctx.can_in(APP_WRITE, tenant) {
+        format!(
+            r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{op_field}" value="{op}">
+<label for="{NAME}">Display name</label>
+<input id="{NAME}" name="{NAME}" type="text" value="{name}" maxlength="{max}" required>
+<p class="muted">What sign-in pages and error messages call the application. Renaming changes nothing else: the
+client id, credentials, roles and assignments stay as they are, and no token carries the name.</p>
+<div class="actions"><button type="submit">Save</button></div></form>"#,
+            url = e(url),
+            op_field = AppOp::FIELD,
+            op = AppOp::Rename.as_str(),
+            name = e(&app.display_name),
+            max = apps::MAX_APP_NAME_CHARS,
+        )
+    } else {
+        String::new()
+    };
     let facts = format!(
         r#"<dl class="facts"><dt>Application (client) id</dt><dd>{app_id}</dd>
 <dt>Object id</dt><dd>{id}</dd><dt>Tenant</dt><dd>{tenant_name}</dd></dl>"#,
@@ -774,7 +806,7 @@ flow needs before it runs anything.</p>"#,
     } else {
         String::new()
     };
-    format!(r#"{facts}<div class="tiles">{cards}</div>{flow}"#)
+    format!(r#"{facts}{rename}<div class="tiles">{cards}</div>{flow}"#)
 }
 
 /// The service principal's own switches, shown with the application's flags.
@@ -1692,6 +1724,14 @@ async fn apply(
                 allow_password_grant: checked(form, ALLOW_PASSWORD_GRANT),
                 allow_id_token_implicit: checked(form, ALLOW_ID_TOKEN),
                 allow_access_token_implicit: checked(form, ALLOW_ACCESS_TOKEN),
+            };
+            redirect(st, &actor, &t).await
+        }
+        AppOp::Rename => {
+            let t = RenameApp {
+                tenant_id,
+                app_id,
+                display_name: field(form, NAME).to_string(),
             };
             redirect(st, &actor, &t).await
         }

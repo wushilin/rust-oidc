@@ -9,8 +9,8 @@ use rust_oidc::apps::{self, MemberType, PreparedSecret, Principal, RedirectPlatf
 use rust_oidc::db::Event;
 use rust_oidc::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
-    GrantAppRole, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri, RemoveRedirectUri, RevokeAppRole,
-    SaveAppFlags, SetAssignmentRequired, UnassignApp,
+    GrantAppRole, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri, RemoveRedirectUri, RenameApp,
+    RevokeAppRole, SaveAppFlags, SetAssignmentRequired, UnassignApp,
 };
 use rust_oidc::txn::{self, Actor, Outcome, Refusal};
 use serde_json::Value;
@@ -643,4 +643,84 @@ async fn assignment_required_is_set_with_its_audit_row_and_refused_for_an_unknow
     assert!(matches!(outcome, Outcome::Refused(Refusal::NotFound(_))), "{outcome:?}");
     assert!(w.sp().await.app_role_assignment_required, "nothing changed");
     assert_eq!(rows(&w.s, Event::AdminAppAssignmentRequired).await.len(), 1);
+}
+
+// ---- rename ----
+
+#[tokio::test]
+async fn an_application_is_renamed_with_its_audit_row() {
+    let w = world().await;
+    let before = w.app().await;
+    let rename = RenameApp {
+        tenant_id: w.tid(),
+        app_id: w.web(),
+        display_name: "  Payroll portal  ".into(),
+    };
+    txn::run(&w.s.pool, &w.actor, &rename).await.into_result().unwrap();
+    let after = w.app().await;
+    assert_eq!(after.display_name, "Payroll portal", "trimmed");
+    async fn after_app(w: &World) -> apps::Application {
+        w.app().await
+    }
+    // Only the name: the identity and the credentials are untouched.
+    assert_eq!((after.id, after.app_id), (before.id, before.app_id.clone()));
+    assert!(matches!(
+        apps::verify_secret(&w.s.pool, &after_app(&w).await, &w.f.web.secret)
+            .await
+            .unwrap(),
+        SecretCheck::Valid
+    ));
+
+    let audit = rows(&w.s, Event::AdminAppRename).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].0.as_deref(), Some(w.web().as_str()));
+    assert_eq!(audit[0].1["from"], before.display_name.as_str());
+    assert_eq!(audit[0].1["displayName"], "Payroll portal");
+}
+
+#[tokio::test]
+async fn a_rename_to_nothing_or_too_long_is_refused_with_nothing_changed() {
+    let w = world().await;
+    let before = w.app().await.display_name;
+    let too_long = "x".repeat(apps::MAX_APP_NAME_CHARS + 1);
+    for name in ["", "   ", too_long.as_str()] {
+        let rename = RenameApp {
+            tenant_id: w.tid(),
+            app_id: w.web(),
+            display_name: name.into(),
+        };
+        let outcome = txn::run(&w.s.pool, &w.actor, &rename).await;
+        assert!(refused(&outcome), "{name:?}: {outcome:?}");
+    }
+    let longest = "y".repeat(apps::MAX_APP_NAME_CHARS);
+    let rename = RenameApp {
+        tenant_id: w.tid(),
+        app_id: w.web(),
+        display_name: longest.clone(),
+    };
+    txn::run(&w.s.pool, &w.actor, &rename).await.into_result().unwrap();
+    assert_eq!(w.app().await.display_name, longest, "the limit itself is allowed");
+    assert_ne!(before, longest);
+    assert_eq!(
+        rows(&w.s, Event::AdminAppRename).await.len(),
+        1,
+        "refusals record nothing"
+    );
+}
+
+#[tokio::test]
+async fn another_tenants_application_cannot_be_renamed() {
+    let w = world().await;
+    let other = w.s.tenant("Fabrikam", "fabrikam.test").await;
+    let theirs = w.s.app(&other, "fabrikam-api").await;
+    // Named under this tenant: not found here.
+    let rename = RenameApp {
+        tenant_id: w.tid(),
+        app_id: theirs.app_id.clone(),
+        display_name: "mole".into(),
+    };
+    let outcome = txn::run(&w.s.pool, &w.actor, &rename).await;
+    assert!(matches!(outcome, Outcome::Refused(Refusal::NotFound(_))), "{outcome:?}");
+    let app = apps::find(&w.s.pool, &theirs.app_id).await.unwrap().unwrap();
+    assert_eq!(app.display_name, "fabrikam-api");
 }

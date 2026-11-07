@@ -115,11 +115,52 @@ pub async fn create<'c>(db: impl Handle<'c>, tenant: &Tenant, display_name: &str
     create_in(&mut conn, tenant, display_name).await
 }
 
+/// The longest display name an application may have, in characters: Microsoft
+/// Graph's limit for `application.displayName`.
+pub const MAX_APP_NAME_CHARS: usize = 256;
+
+/// Why a display name cannot be an application's, or `None` when it can. The
+/// name is taken as given; callers trim it first.
+pub fn app_name_problem(display_name: &str) -> Option<String> {
+    if display_name.trim().is_empty() {
+        Some("An application needs a display name.".into())
+    } else if display_name.chars().count() > MAX_APP_NAME_CHARS {
+        Some(format!("A display name has at most {MAX_APP_NAME_CHARS} characters."))
+    } else {
+        None
+    }
+}
+
+/// Rename an application: its display name only. The client id, object id and
+/// everything attached to them stay as they are.
+pub async fn rename<'c>(db: impl Handle<'c>, app: &Application, display_name: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire().await?;
+    rename_in(&mut conn, app, display_name).await
+}
+
+pub(crate) async fn rename_in(conn: &mut crate::db::Conn, app: &Application, display_name: &str) -> anyhow::Result<()> {
+    if let Some(problem) = app_name_problem(display_name) {
+        bail!(problem);
+    }
+    sqlx::query(crate::db::qc(
+        conn,
+        "UPDATE applications SET display_name = ? WHERE id = ? AND deleted_at IS NULL",
+    ))
+    .bind(display_name)
+    .bind(&app.id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn create_in(
     conn: &mut crate::db::Conn,
     tenant: &Tenant,
     display_name: &str,
 ) -> anyhow::Result<CreatedApp> {
+    if let Some(problem) = app_name_problem(display_name) {
+        bail!(problem);
+    }
     let application = Application {
         id: new_guid(),
         app_id: new_guid(),

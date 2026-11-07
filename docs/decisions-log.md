@@ -1830,3 +1830,24 @@ changed who effectively holds a binding without it.
   empty password is never one to set, and the New user page shows the box as
   optional. The reset box is no longer `required` for the same reason.
 - `tests/admin_users.rs` (the generated-password tests).
+
+## Renaming an application
+
+- **An application can be renamed**, as in Entra (*Branding & properties*): a
+  Display name form at the top of its Overview, for whoever holds `App:Write` in
+  its tenant. Only the name changes. The client id, the object id and everything
+  attached to them (credentials, URIs, roles, assignments, grants) stay as they
+  are, and no token carries the name (there is no `app_displayname` claim), so no
+  client notices. The new name shows at once wherever the name is read: sign-in
+  and consent pages, AADSTS messages (50105, 7000112), the console and the
+  sign-in check.
+- **A new transaction, `RenameApp`, with its own event `admin.app.rename`**
+  (house rule 6: a new kind of change). Its audit row records the name before
+  (`from`) and after (`displayName`), both clipped.
+- **The name rule lives in storage** (`apps::app_name_problem`, applied by
+  `create_in` and `rename_in`): not empty after trimming, at most
+  `MAX_APP_NAME_CHARS` (256, Microsoft Graph's limit for `displayName`). The
+  transactions check it first so the actor gets a refusal that says what is
+  wrong. Creating an application now has the same length limit. Names need not
+  be unique, as in Entra. No migration.
+- `tests/txn_apps.rs` and `tests/admin_apps.rs` (the rename tests).

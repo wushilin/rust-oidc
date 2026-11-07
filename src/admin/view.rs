@@ -228,7 +228,7 @@ details.add > .fold { border:1px solid var(--line); border-radius:0 6px 6px 6px;
 .banner, .notice { background:var(--surface); border:1px solid var(--accent); border-left-width:4px; border-radius:4px; padding:12px 16px; margin:0 0 20px; }
 .banner { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; }
 .banner.bad { border-color:var(--err); }
-.once { display:block; margin:8px 0 0; padding:8px 10px; font:13px/1.45 var(--mono); word-break:break-all; border:1px dashed var(--line); border-radius:4px; }
+.once { display:block; margin:8px 0 0; padding:8px 10px; font:13px/1.45 var(--mono); word-break:break-all; user-select:all; -webkit-user-select:all; border:1px dashed var(--line); border-radius:4px; }
 dl.facts { display:grid; grid-template-columns:max-content 1fr; gap:4px 18px; margin:0 0 10px; }
 dl.facts dt { color:var(--muted); }
 dl.facts dd { margin:0; word-break:break-all; font-family:var(--mono); font-size:13px; }

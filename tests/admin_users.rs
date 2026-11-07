@@ -594,3 +594,180 @@ async fn an_admin_reset_is_not_told_about_recent_passwords() {
         .unwrap_err();
     assert!(err.downcast_ref::<users::PasswordReused>().is_some(), "{err}");
 }
+
+// ---- generated passwords ----
+
+/// The value in the page's shown-once notice, unescaped.
+fn shown_once(body: &str) -> Option<String> {
+    const OPEN: &str = r#"<code class="once">"#;
+    let start = body.find(OPEN)? + OPEN.len();
+    let end = start + body[start..].find("</code>")?;
+    Some(
+        body[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Every row's details, to check a password is written nowhere.
+async fn all_audit_details(s: &TestServer) -> String {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(rust_oidc::db::q(&s.pool, "SELECT details FROM audit_log"))
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+    rows.into_iter().filter_map(|(d,)| d).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn a_generated_password_is_ten_characters_of_every_class() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..500 {
+        let p = users::generate_password();
+        assert_eq!(p.chars().count(), users::GENERATED_PASSWORD_CHARS, "{p}");
+        assert!(p.chars().any(|c| c.is_ascii_uppercase()), "{p}");
+        assert!(p.chars().any(|c| c.is_ascii_lowercase()), "{p}");
+        assert!(p.chars().any(|c| c.is_ascii_digit()), "{p}");
+        assert!(p.chars().any(|c| !c.is_ascii_alphanumeric()), "{p}");
+        assert!(!p.chars().any(|c| "0Oo1lI\"'\\ ".contains(c)), "{p}");
+        seen.insert(p);
+    }
+    assert_eq!(seen.len(), 500, "no repeats");
+}
+
+#[tokio::test]
+async fn a_user_created_with_a_generated_password_sees_it_once() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let page = b
+        .post(
+            &s.url(&format!("/admin/tenants/{}/users/new", f.tenant.id)),
+            &[
+                ("upn", "gen@contoso.com"),
+                // Whatever the box holds, the generator's button sets a generated one.
+                ("password", "Typed-In-Box-1"),
+                ("password_source", "generated"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        page.status, 200,
+        "the answer is the page itself, not a redirect: {}",
+        page.body
+    );
+    assert_eq!(
+        page.headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let password = shown_once(&page.body).expect("the password is shown");
+    assert_eq!(password.chars().count(), users::GENERATED_PASSWORD_CHARS);
+
+    let t = rust_oidc::tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    let ok = users::authenticate(&s.pool, &t, "gen@contoso.com", &password)
+        .await
+        .unwrap();
+    assert!(matches!(ok, AuthResult::Ok(_)), "the shown password is the one set");
+    let typed = users::authenticate(&s.pool, &t, "gen@contoso.com", "Typed-In-Box-1")
+        .await
+        .unwrap();
+    assert!(!matches!(typed, AuthResult::Ok(_)), "the box's password was not set");
+
+    // Never rendered again, and never recorded.
+    let found = users::list(&s.pool, &f.tenant.id, Some("gen"), 10, 0).await.unwrap();
+    let user_url = s.url(&format!("/admin/tenants/{}/users/{}", f.tenant.id, found[0].id));
+    for section in ["", "/password"] {
+        let again = b.get(&format!("{user_url}{section}")).await;
+        assert_eq!(again.status, 200);
+        assert!(!again.body.contains(&password), "shown again on {section:?}");
+    }
+    assert!(!all_audit_details(&s).await.contains(&password));
+    assert_eq!(audit_rows(&s, Event::AdminUserCreate.as_str()).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_reset_to_a_generated_password_shows_it_once() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let target = make_user(&s, &f.tenant, "jo@contoso.com").await;
+    let url = s.url(&format!("/admin/tenants/{}/users/{target}", f.tenant.id));
+
+    let page = b
+        .post(
+            &url,
+            &[("op", "reset"), ("password", ""), ("password_source", "generated")],
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(
+        page.headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let password = shown_once(&page.body).expect("the password is shown");
+
+    let t = rust_oidc::tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    let ok = users::authenticate(&s.pool, &t, "jo@contoso.com", &password)
+        .await
+        .unwrap();
+    assert!(matches!(ok, AuthResult::Ok(_)));
+    let old = users::authenticate(&s.pool, &t, "jo@contoso.com", "Correct-Horse-9")
+        .await
+        .unwrap();
+    assert!(!matches!(old, AuthResult::Ok(_)));
+
+    let again = b.get(&format!("{url}/password")).await;
+    assert!(!again.body.contains(&password), "never rendered again");
+    assert!(!all_audit_details(&s).await.contains(&password));
+    assert_eq!(audit_rows(&s, Event::AdminUserReset.as_str()).await.len(), 1);
+}
+
+/// The generator only answers a reset: on any other form it changes no password.
+#[tokio::test]
+async fn the_generator_sets_no_password_on_other_operations() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let target = make_user(&s, &f.tenant, "kim@contoso.com").await;
+    let url = s.url(&format!("/admin/tenants/{}/users/{target}", f.tenant.id));
+    let page = b
+        .post(
+            &url,
+            &[
+                ("op", "attributes"),
+                ("display_name", "Kim"),
+                ("password_source", "generated"),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let t = rust_oidc::tenant::find_for_admin(&s.pool, &f.tenant.id).await.unwrap();
+    let ok = users::authenticate(&s.pool, &t, "kim@contoso.com", "Correct-Horse-9")
+        .await
+        .unwrap();
+    assert!(matches!(ok, AuthResult::Ok(_)), "the password is unchanged");
+    assert!(audit_rows(&s, Event::AdminUserReset.as_str()).await.is_empty());
+}
+
+#[tokio::test]
+async fn both_password_forms_offer_the_generator() {
+    let s = TestServer::start().await;
+    let f = admin_fixture(&s).await;
+    let b = signed_in_admin(&s, &f).await;
+    let target = make_user(&s, &f.tenant, "lee@contoso.com").await;
+    for url in [
+        format!("/admin/tenants/{}/users/new", f.tenant.id),
+        format!("/admin/tenants/{}/users/{target}/password", f.tenant.id),
+    ] {
+        let page = b.get(&s.url(&url)).await;
+        assert_eq!(page.status, 200, "{url}");
+        assert!(
+            page.body
+                .contains(r#"name="password_source" value="generated" formnovalidate"#),
+            "{url}: {}",
+            page.body
+        );
+    }
+}

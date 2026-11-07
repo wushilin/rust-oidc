@@ -102,6 +102,74 @@ impl UserOp {
 /// Whether a password an administrator sets must be replaced at next sign-in.
 const REQUIRE_CHANGE: &str = "require_change";
 
+/// Where the password an administrator sets comes from: what they typed, or
+/// the generator. It is the value of the submit button that sent the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordSource {
+    Typed,
+    /// [`users::generate_password`], shown once on the page that answers.
+    Generated,
+}
+
+impl PasswordSource {
+    const FIELD: &'static str = "password_source";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Typed => "typed",
+            Self::Generated => "generated",
+        }
+    }
+
+    /// The button pressed. Anything but the generator's is a typed password, so
+    /// a form posted by Enter in the box sets what is in the box.
+    fn of(form: &Params) -> Self {
+        if field(form, Self::FIELD) == Self::Generated.as_str() {
+            Self::Generated
+        } else {
+            Self::Typed
+        }
+    }
+
+    /// The generator's button. `formnovalidate`, because the password box it
+    /// stands in for may be empty and marked required.
+    fn button(label: &str) -> String {
+        format!(
+            r#"<button class="secondary" type="submit" name="{field}" value="{value}" formnovalidate>{label}</button>"#,
+            field = Self::FIELD,
+            value = Self::Generated.as_str(),
+            label = e(label),
+        )
+    }
+
+    /// When the generator was asked for, put a fresh password in the form's
+    /// password field in place of whatever the box held, and return it so the
+    /// page that answers can show it.
+    fn take(form: &mut Params) -> Option<String> {
+        match Self::of(form) {
+            Self::Typed => None,
+            Self::Generated => {
+                let generated = users::generate_password();
+                form.insert(PASSWORD.to_string(), generated.clone());
+                Some(generated)
+            }
+        }
+    }
+}
+
+/// The notice holding a generated password, on the one page that shows it.
+fn reveal_password(password: &str) -> String {
+    view::shown_once(
+        "This is the only time this password is shown.",
+        password,
+        "Only a hash of it is stored, so it cannot be shown again. Copy it now and give it to the user; \
+         if it is lost, reset the password again.",
+    )
+}
+
+/// The password box on the new-user and reset forms.
+const PASSWORD: &str = "password";
+
 /// The user's setting for other tenants' applications.
 const CROSS_TENANT: &str = "cross_tenant";
 
@@ -441,6 +509,12 @@ fn submitted_upn(form: &Params) -> String {
     }
 }
 
+/// The new-user form's generator button.
+const CREATE_GENERATED: &str = "Create with a generated password";
+
+/// The reset form's generator button.
+const RESET_GENERATED: &str = "Reset to a generated password";
+
 async fn new_user_page(
     st: &AppState,
     ctx: &AdminContext,
@@ -485,6 +559,8 @@ async fn new_user_page(
 <span class="suffix">@ {suffix}</span></div>
 <p class="muted">What the person signs in with. Type the part before the @; the tenant's domain is added.</p>
 <label for="password">Initial password</label><input id="password" name="password" type="password" autocomplete="new-password">
+<p class="muted">At least {min} characters, or leave it empty and use <strong>{generate}</strong>: a random
+{generated}-character password, shown once on the page that follows.</p>
 <label><input type="checkbox" name="{REQUIRE_CHANGE}" checked> Require them to choose their own password at first sign-in</label>
 <label for="display_name">Display name</label><input id="display_name" name="display_name" type="text" value="{display}">
 <div class="fields">
@@ -494,8 +570,12 @@ async fn new_user_page(
 <label for="email">Email address</label><input id="email" name="email" type="text" value="{email}">
 <p class="muted">A contact address, <strong>not the sign-in name</strong>: it can be anything, and changing it
 later does not change how the person signs in. Left empty, it is set to the user name.</p>
-{error}<div class="actions"><button type="submit">Create user</button><a href="{url}">Cancel</a></div></form>"#,
+{error}<div class="actions"><button type="submit">Create user</button>{generate_button}<a href="{url}">Cancel</a></div></form>"#,
         url = e(&users_url(st.public_url.base(), tenant)),
+        min = users::MIN_PASSWORD_CHARS,
+        generated = users::GENERATED_PASSWORD_CHARS,
+        generate = CREATE_GENERATED,
+        generate_button = PasswordSource::button(CREATE_GENERATED),
         csrf = view::csrf_input(&ctx.csrf),
         upn = e(field(form, "upn")),
         display = e(field(form, "display_name")),
@@ -527,6 +607,8 @@ pub async fn create_user(
     let Some(tenant) = ctx.tenant(&key) else {
         return view::not_found();
     };
+    let mut form = form;
+    let generated = PasswordSource::take(&mut form);
     let upn = submitted_upn(&form);
     // An email address is a contact detail and is not required. Left empty it
     // starts out as the user name, which is the usual case and can be changed.
@@ -537,7 +619,7 @@ pub async fn create_user(
         users::PasswordSetBy::Admin
     };
     // Checked and hashed before the transaction: hashing is slow.
-    let outcome = match NewPassword::for_new_account_as(field(&form, "password"), by) {
+    let outcome = match NewPassword::for_new_account_as(field(&form, PASSWORD), by) {
         Ok(password) => {
             let create = CreateUser {
                 tenant_id: tenant.id.clone(),
@@ -555,9 +637,18 @@ pub async fn create_user(
     // The storage layer validates the UPN against the tenant's verified domains;
     // its message names the problem.
     match settle(outcome) {
-        Settled::Done(created) => {
-            view::see_other(&format!("{}/{}", users_url(st.public_url.base(), tenant), created.id))
-        }
+        Settled::Done(created) => match generated {
+            // The one exception to "303 after a post": the password lives in
+            // this response and nowhere else.
+            Some(password) => match users::find(&st.pool, &tenant.id, &created.id).await {
+                Ok(Some(user)) => {
+                    let notice = Notice::Reveal(&password);
+                    detail(&st, &ctx, tenant, &user, UserSection::Password, notice, StatusCode::OK).await
+                }
+                _ => view::server_error(),
+            },
+            None => view::see_other(&format!("{}/{}", users_url(st.public_url.base(), tenant), created.id)),
+        },
         Settled::Refused(message) => {
             new_user_page(&st, &ctx, tenant, &form, Some(&message), StatusCode::BAD_REQUEST).await
         }
@@ -736,7 +827,7 @@ async fn show(st: &AppState, ctx: &AdminContext, key: &str, user_id: &str, secti
         return view::not_found();
     };
     match users::find(&st.pool, &tenant.id, user_id).await {
-        Ok(Some(user)) => detail(st, ctx, tenant, &user, section, None, StatusCode::OK).await,
+        Ok(Some(user)) => detail(st, ctx, tenant, &user, section, Notice::None, StatusCode::OK).await,
         Ok(None) => view::not_found(),
         Err(err) => {
             tracing::error!("user lookup failed: {err}");
@@ -797,13 +888,23 @@ impl Here<'_> {
     }
 }
 
+/// What a user's page shows above its section, besides the section itself.
+#[derive(Clone, Copy)]
+enum Notice<'a> {
+    None,
+    /// Why the change just asked for was refused.
+    Error(&'a str),
+    /// A generated password, shown on this response only.
+    Reveal(&'a str),
+}
+
 async fn detail(
     st: &AppState,
     ctx: &AdminContext,
     tenant: &Tenant,
     user: &User,
     section: UserSection,
-    error: Option<&str>,
+    notice: Notice<'_>,
     status: StatusCode,
 ) -> Response {
     let base = st.public_url.base();
@@ -881,7 +982,11 @@ async fn detail(
         tenant_name = e(&tenant.name),
         pills = pills(&here),
         banner = banner(&here),
-        error = view::error_block(error),
+        error = match notice {
+            Notice::None => String::new(),
+            Notice::Error(message) => view::error_block(Some(message)),
+            Notice::Reveal(password) => reveal_password(password),
+        },
     );
     view::page(
         &chrome(st, ctx, At::Tenant(tenant, TenantTab::Users)),
@@ -1123,11 +1228,13 @@ fn password(here: &Here<'_>) -> String {
             &format!(
                 r#"<label for="password">New password</label><input id="password" name="password" type="password" autocomplete="new-password" required>
 <label><input type="checkbox" name="{REQUIRE_CHANGE}" checked> Require them to choose a new password at their next sign-in</label>
-<div class="actions"><button type="submit">Reset password</button></div>
-<p class="muted">At least {min} characters. A reset signs the user out everywhere, revokes their refresh tokens and
+<div class="actions"><button type="submit">Reset password</button>{generate_button}</div>
+<p class="muted">At least {min} characters, or a random {generated}-character one, shown once on the page that follows. A reset signs the user out everywhere, revokes their refresh tokens and
 ends a lockout. It is not checked against the account's recent passwords, which would tell you what they were,
 but it is remembered, so the user cannot choose it again themselves.</p>"#,
                 min = users::MIN_PASSWORD_CHARS,
+                generated = users::GENERATED_PASSWORD_CHARS,
+                generate_button = PasswordSource::button(RESET_GENERATED),
             ),
         )
     } else {
@@ -1365,8 +1472,19 @@ pub async fn detail_post(
         .filter(|(k, _)| k == GROUP)
         .map(|(_, v)| v.into_owned())
         .collect();
+    // Only a reset sets a password; a generator button on any other form is
+    // ignored rather than minting a password nothing uses.
+    let mut form = form;
+    let generated = match op {
+        UserOp::Reset => PasswordSource::take(&mut form),
+        _ => None,
+    };
     let outcome = run_op(&st, &ctx, tenant, &user, op, &form, &ticked).await;
     match settle(outcome) {
+        Settled::Done(()) if generated.is_some() => {
+            let notice = Notice::Reveal(generated.as_deref().unwrap_or_default());
+            detail(&st, &ctx, tenant, &user, op.section(), notice, StatusCode::OK).await
+        }
         Settled::Done(()) => {
             let base = st.public_url.base();
             // A deleted user has no page to go back to.
@@ -1383,7 +1501,7 @@ pub async fn detail_post(
                 tenant,
                 &user,
                 op.section(),
-                Some(&message),
+                Notice::Error(&message),
                 StatusCode::BAD_REQUEST,
             )
             .await
@@ -1434,8 +1552,7 @@ async fn run_op(
                 users::PasswordSetBy::Admin
             };
             // Checked against the history and hashed before the transaction.
-            let password = match users::prepare_password(&st.pool, tenant, &user.id, field(form, "password"), by).await
-            {
+            let password = match users::prepare_password(&st.pool, tenant, &user.id, field(form, PASSWORD), by).await {
                 Ok(p) => p,
                 Err(err) => return Outcome::from_error(&err),
             };

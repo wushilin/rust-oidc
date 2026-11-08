@@ -656,6 +656,8 @@ fn console_mfa_page(
             secret,
             issuer: &home.name,
             error,
+            // The answer stays on this server.
+            redirect_uri: None,
         }),
         _ => crate::html::mfa_verify(&crate::html::MfaVerify {
             tenant_name: &home.name,
@@ -667,6 +669,8 @@ fn console_mfa_page(
             ticket,
             error,
             offer_remember_device: false,
+            // The answer stays on this server.
+            redirect_uri: None,
         }),
     };
     resp.headers_mut().append(
@@ -862,6 +866,8 @@ fn console_change_page(st: &AppState, home: &Tenant, upn: &str, ticket: &str, er
         op: crate::html::LoginOp::ChangePassword.as_str(),
         ticket,
         error,
+        // The answer stays on this server.
+        redirect_uri: None,
     });
     resp.headers_mut().append(
         header::SET_COOKIE,

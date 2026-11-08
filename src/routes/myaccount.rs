@@ -84,6 +84,8 @@ fn login_page(st: &AppState, tenant: &Tenant, upn: &str, error: Option<&str>) ->
         upn,
         error,
         offer_keep_signed_in: tenant.settings.allow_keep_signed_in,
+        // The answer stays on this server.
+        redirect_uri: None,
     });
     with_csrf(resp, st, &csrf)
 }
@@ -161,6 +163,8 @@ fn step_page(
             secret,
             issuer: &tenant.name,
             error,
+            // The answer stays on this server.
+            redirect_uri: None,
         }),
         (Purpose::ChangePassword | Purpose::ChangePasswordAfterMfa, _) => {
             html::change_password(&html::ChangePassword {
@@ -172,6 +176,8 @@ fn step_page(
                 op: LoginOp::ChangePassword.as_str(),
                 ticket,
                 error,
+                // The answer stays on this server.
+                redirect_uri: None,
             })
         }
         _ => html::mfa_verify(&html::MfaVerify {
@@ -185,6 +191,8 @@ fn step_page(
             error,
             // At sign-in only: a code asked for on the page itself is not a sign-in.
             offer_remember_device: !voluntary && tenant.settings.remembers_mfa(),
+            // The answer stays on this server.
+            redirect_uri: None,
         }),
     };
     with_csrf(resp, st, &csrf)

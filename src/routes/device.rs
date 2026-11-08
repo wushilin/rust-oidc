@@ -508,6 +508,8 @@ fn mfa_page(
             secret,
             issuer,
             error,
+            // The answer stays on this server.
+            redirect_uri: None,
         }),
         _ => html::mfa_verify(&html::MfaVerify {
             tenant_name: &tenant.name,
@@ -519,6 +521,8 @@ fn mfa_page(
             ticket,
             error,
             offer_remember_device,
+            // The answer stays on this server.
+            redirect_uri: None,
         }),
     };
     resp.headers_mut().append(
@@ -701,6 +705,8 @@ fn login_page(st: &AppState, tenant: &Tenant, pending: &Pending, upn: &str, erro
         upn,
         error,
         offer_keep_signed_in: tenant.settings.allow_keep_signed_in,
+        // The answer stays on this server.
+        redirect_uri: None,
     });
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -915,6 +921,8 @@ fn change_page(
         op: html::LoginOp::ChangePassword.as_str(),
         ticket,
         error,
+        // The answer stays on this server.
+        redirect_uri: None,
     });
     resp.headers_mut().append(
         header::SET_COOKIE,

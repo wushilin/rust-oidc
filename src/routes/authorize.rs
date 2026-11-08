@@ -796,6 +796,7 @@ fn login_page(st: &AppState, v: &Validated, request: &str, upn: &str, error: Opt
         upn,
         error,
         offer_keep_signed_in: v.tenant.settings.allow_keep_signed_in,
+        redirect_uri: Some(&v.redirect_uri),
     });
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -814,6 +815,7 @@ fn account_picker(st: &AppState, v: &Validated, request: &str, user: &User) -> R
         request,
         upn: &user.upn,
         display_name: user.display_name.as_deref().unwrap_or(&user.upn),
+        redirect_uri: Some(&v.redirect_uri),
     });
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -869,6 +871,7 @@ async fn consent_page(
         request,
         upn: &user.upn,
         items: &items,
+        redirect_uri: Some(&v.redirect_uri),
     });
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -971,6 +974,7 @@ async fn suggest_mfa(st: &AppState, v: &Validated, request: &str, user: &User, k
         op_field: "op",
         ticket: &ticket,
         snooze_days: TenantSettings::MFA_SETUP_SNOOZE_SECS / SECS_PER_DAY,
+        redirect_uri: Some(&v.redirect_uri),
     });
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -1040,6 +1044,7 @@ fn change_page(st: &AppState, v: &Validated, request: &str, upn: &str, ticket: &
         op: html::LoginOp::ChangePassword.as_str(),
         ticket,
         error,
+        redirect_uri: Some(&v.redirect_uri),
     });
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -1086,6 +1091,7 @@ fn mfa_page(
                 secret,
                 issuer,
                 error,
+                redirect_uri: Some(&v.redirect_uri),
             })
         }
         _ => html::mfa_verify(&html::MfaVerify {
@@ -1098,6 +1104,7 @@ fn mfa_page(
             ticket,
             error,
             offer_remember_device,
+            redirect_uri: Some(&v.redirect_uri),
         }),
     };
     resp.headers_mut().append(

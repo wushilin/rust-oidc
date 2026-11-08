@@ -1851,3 +1851,39 @@ changed who effectively holds a binding without it.
   wrong. Creating an application now has the same length limit. Names need not
   be unique, as in Entra. No migration.
 - `tests/txn_apps.rs` and `tests/admin_apps.rs` (the rename tests).
+
+## `form-action` names the client's origin on the sign-in pages
+
+- **Chrome applies `form-action` to the redirect that follows a form
+  submission**; Firefox and Safari check only the form's own target. Every
+  sign-in page sent `form-action 'self'`, so when the login, second-step,
+  change-password, consent or account-picker form was posted and the answer
+  was the 302 to the client's redirect URI, Chrome dropped the navigation
+  without a word. The response's cookies still applied (session set, CSRF
+  cookie cleared), so posting again hit the CSRF branch ("Your session
+  expired") and reloading the authorize URL succeeded on the session that had
+  been set, which made it look like flakiness. The `form_post` page already
+  listed the client's origin for the same reason; the ordinary pages now do too.
+- **Only the validated redirect URI**: the origin comes from the URL that
+  `validate_client` matched against the application's registered URIs, held in
+  `Validated`, never from the raw `redirect_uri` parameter. A request with an
+  unregistered URI gets the error page, whose policy names no origin.
+- **The origin, not the URI**: a CSP source is an origin (`scheme://host[:port]`),
+  derived with `Url::origin().ascii_serialization()` as `form_post` does. A
+  native redirect URI with a custom scheme has an opaque origin, which no
+  source expression spells; the scheme alone (`msauth.example:`) matches it,
+  so that is what is sent for one.
+- **Pages whose answer stays on this server keep `form-action 'self'`**: the
+  device flow (which ends on a page of its own), My Account, the front door,
+  and the console's sign-in, second-step and change-password pages.
+  `src/admin/view.rs` is untouched.
+- **The CSRF token remains the real protection** against a cross-site post.
+  `form-action` never guarded the login endpoint: a form on another site could
+  always post to it. Listing one more origin widens nothing a CSRF cookie and
+  field do not already cover; it only lets Chrome follow the redirect that the
+  server, having checked the request, decided to send.
+- `tests/form_action.rs` and the unit tests in `src/html.rs`. The integration
+  test walks a sign-in with an authenticator for a client whose redirect URI is
+  `https://venus.example/.tlsproxy/oidc/callback` and reads the header on each
+  page; another asserts the console's pages still send exactly
+  `form-action 'self'`.

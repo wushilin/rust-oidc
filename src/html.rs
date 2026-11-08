@@ -93,6 +93,34 @@ fn respond(status: StatusCode, html: String, csp: &str) -> Response {
 const CSP_DEFAULT: &str =
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
+/// The policy for a sign-in page whose form the server may answer with a
+/// redirect to the client. Chrome holds a redirect that follows a form
+/// submission to `form-action` too (Firefox and Safari do not), so with
+/// `form-action 'self'` alone Chrome silently drops the 302 to the client's
+/// redirect URI and the user sees nothing happen. Such a page lists the
+/// client's origin beside `'self'`; the rest is [`CSP_DEFAULT`]. Only a
+/// redirect URI that the authorize endpoint validated against the application's
+/// registered ones is passed here, never the raw request parameter.
+fn csp_for_form(redirect_uri: Option<&url::Url>) -> std::borrow::Cow<'static, str> {
+    match redirect_uri {
+        None => std::borrow::Cow::Borrowed(CSP_DEFAULT),
+        Some(uri) => std::borrow::Cow::Owned(format!(
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {}; frame-ancestors 'none'; base-uri 'none'",
+            csp_source(uri)
+        )),
+    }
+}
+
+/// The CSP source expression that matches `uri`: its origin, or for a URI whose
+/// origin is opaque (a native app's custom scheme) the scheme alone, which is
+/// the only source expression that can match it.
+fn csp_source(uri: &url::Url) -> String {
+    match uri.origin() {
+        url::Origin::Tuple(..) => uri.origin().ascii_serialization(),
+        url::Origin::Opaque(_) => format!("{}:", uri.scheme()),
+    }
+}
+
 /// The sign-in form's "Keep me signed in" box.
 pub const KEEP_SIGNED_IN: &str = "keep_signed_in";
 /// The second step's "Don't ask again on this device" box.
@@ -137,6 +165,10 @@ pub struct LoginForm<'a> {
     pub error: Option<&'a str>,
     /// Show "Keep me signed in": the tenant offers it.
     pub offer_keep_signed_in: bool,
+    /// The validated redirect URI of the request this page belongs to, where the
+    /// form's answer may send the browser; its origin joins `form-action`.
+    /// None where the answer stays on this server.
+    pub redirect_uri: Option<&'a url::Url>,
 }
 
 pub fn login(f: &LoginForm) -> Response {
@@ -170,7 +202,11 @@ pub fn login(f: &LoginForm) -> Response {
     } else {
         StatusCode::OK
     };
-    respond(status, page("Sign in", f.tenant_name, &body), CSP_DEFAULT)
+    respond(
+        status,
+        page("Sign in", f.tenant_name, &body),
+        &csp_for_form(f.redirect_uri),
+    )
 }
 
 /// What a sign-in page's form asks the login endpoint to do, carried in `op`.
@@ -243,6 +279,10 @@ pub struct Consent<'a> {
     pub request: &'a str,
     pub upn: &'a str,
     pub items: &'a [ConsentItem],
+    /// The validated redirect URI of the request this page belongs to, where the
+    /// form's answer may send the browser; its origin joins `form-action`.
+    /// None where the answer stays on this server.
+    pub redirect_uri: Option<&'a url::Url>,
 }
 
 /// "This application wants these permissions. Allow?"
@@ -281,7 +321,7 @@ refuse and nothing is shared.</p>
     respond(
         StatusCode::OK,
         page("Permissions requested", Some(p.tenant_name), &body),
-        CSP_DEFAULT,
+        &csp_for_form(p.redirect_uri),
     )
 }
 
@@ -293,6 +333,10 @@ pub struct AccountPicker<'a> {
     pub request: &'a str,
     pub upn: &'a str,
     pub display_name: &'a str,
+    /// The validated redirect URI of the request this page belongs to, where the
+    /// form's answer may send the browser; its origin joins `form-action`.
+    /// None where the answer stays on this server.
+    pub redirect_uri: Option<&'a url::Url>,
 }
 
 pub fn account_picker(p: &AccountPicker) -> Response {
@@ -317,7 +361,7 @@ pub fn account_picker(p: &AccountPicker) -> Response {
     respond(
         StatusCode::OK,
         page("Pick an account", Some(p.tenant_name), &body),
-        CSP_DEFAULT,
+        &csp_for_form(p.redirect_uri),
     )
 }
 
@@ -341,6 +385,10 @@ pub struct MfaVerify<'a> {
     pub error: Option<&'a str>,
     /// Show "Don't ask again on this device": the account's tenant offers it.
     pub offer_remember_device: bool,
+    /// The validated redirect URI of the request this page belongs to, where the
+    /// form's answer may send the browser; its origin joins `form-action`.
+    /// None where the answer stays on this server.
+    pub redirect_uri: Option<&'a url::Url>,
 }
 
 pub fn mfa_verify(p: &MfaVerify) -> Response {
@@ -371,7 +419,11 @@ pub fn mfa_verify(p: &MfaVerify) -> Response {
     } else {
         StatusCode::OK
     };
-    respond(status, page("Enter code", Some(p.tenant_name), &body), CSP_DEFAULT)
+    respond(
+        status,
+        page("Enter code", Some(p.tenant_name), &body),
+        &csp_for_form(p.redirect_uri),
+    )
 }
 
 /// "Set up an authenticator?", after a password, where nothing requires one.
@@ -384,6 +436,10 @@ pub struct MfaSuggest<'a> {
     pub ticket: &'a str,
     /// How many days "Not now" puts it off.
     pub snooze_days: i64,
+    /// The validated redirect URI of the request this page belongs to, where the
+    /// form's answer may send the browser; its origin joins `form-action`.
+    /// None where the answer stays on this server.
+    pub redirect_uri: Option<&'a url::Url>,
 }
 
 pub fn mfa_suggest(p: &MfaSuggest) -> Response {
@@ -408,7 +464,7 @@ password still cannot sign in as you.</p>
     respond(
         StatusCode::OK,
         page("Protect your account", Some(p.tenant_name), &body),
-        CSP_DEFAULT,
+        &csp_for_form(p.redirect_uri),
     )
 }
 
@@ -428,6 +484,10 @@ pub struct MfaEnroll<'a> {
     /// The tenant the account belongs to: what the app lists it under.
     pub issuer: &'a str,
     pub error: Option<&'a str>,
+    /// The validated redirect URI of the request this page belongs to, where the
+    /// form's answer may send the browser; its origin joins `form-action`.
+    /// None where the answer stays on this server.
+    pub redirect_uri: Option<&'a url::Url>,
 }
 
 pub fn mfa_enroll(p: &MfaEnroll) -> Response {
@@ -468,7 +528,7 @@ pub fn mfa_enroll(p: &MfaEnroll) -> Response {
     respond(
         status,
         page("Set up your authenticator", Some(p.tenant_name), &body),
-        CSP_DEFAULT,
+        &csp_for_form(p.redirect_uri),
     )
 }
 
@@ -507,6 +567,10 @@ pub struct ChangePassword<'a> {
     pub op: &'a str,
     pub ticket: &'a str,
     pub error: Option<&'a str>,
+    /// The validated redirect URI of the request this page belongs to, where the
+    /// form's answer may send the browser; its origin joins `form-action`.
+    /// None where the answer stays on this server.
+    pub redirect_uri: Option<&'a url::Url>,
 }
 
 pub fn change_password(p: &ChangePassword) -> Response {
@@ -535,7 +599,7 @@ pub fn change_password(p: &ChangePassword) -> Response {
     respond(
         status,
         page("Update your password", Some(p.tenant_name), &body),
-        CSP_DEFAULT,
+        &csp_for_form(p.redirect_uri),
     )
 }
 
@@ -728,7 +792,7 @@ pub fn form_post(action: &url::Url, params: &[(&str, String)]) -> Response {
         r#"<!doctype html><html><head><meta charset="utf-8"><title>Working...</title></head><body><form method="POST" name="hiddenform" action="{action}">{inputs}<noscript><p>Script is disabled. Click Submit to continue.</p><input type="submit" value="Submit"></noscript></form><script nonce="{nonce}">document.forms[0].submit()</script></body></html>"#,
         action = escape(action.as_str()),
     );
-    let origin = action.origin().ascii_serialization();
+    let origin = csp_source(action);
     let csp = format!(
         "default-src 'none'; script-src 'nonce-{nonce}'; form-action {origin}; frame-ancestors 'none'; base-uri 'none'"
     );
@@ -812,4 +876,32 @@ pub fn device_approval(p: &DeviceApproval) -> Response {
 pub fn device_result(tenant_name: Option<&str>, heading: &str, message: &str) -> Response {
     let body = format!(r#"<h1>{}</h1><p class="sub">{}</p>"#, escape(heading), escape(message));
     respond(StatusCode::OK, page(heading, tenant_name, &body), CSP_DEFAULT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_that_may_redirect_to_the_client_lists_its_origin_in_form_action() {
+        let uri = url::Url::parse("https://venus.example/.tlsproxy/oidc/callback").unwrap();
+        let csp = csp_for_form(Some(&uri));
+        assert!(csp.contains("form-action 'self' https://venus.example;"), "{csp}");
+        // Only form-action differs from the default policy.
+        assert_eq!(csp.replace(" https://venus.example;", ";"), CSP_DEFAULT);
+    }
+
+    #[test]
+    fn a_page_that_stays_on_this_server_keeps_the_default_policy() {
+        assert_eq!(csp_for_form(None), CSP_DEFAULT);
+        assert!(CSP_DEFAULT.contains("form-action 'self';"));
+    }
+
+    #[test]
+    fn a_native_redirect_uri_is_matched_by_its_scheme() {
+        let uri = url::Url::parse("msauth.com.example.app://auth").unwrap();
+        assert_eq!(csp_source(&uri), "msauth.com.example.app:");
+        let uri = url::Url::parse("http://localhost:8400/cb").unwrap();
+        assert_eq!(csp_source(&uri), "http://localhost:8400");
+    }
 }

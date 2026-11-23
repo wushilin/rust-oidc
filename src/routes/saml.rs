@@ -335,7 +335,15 @@ pub(super) fn from_aad(err: &AadError) -> SamlError {
 
 /// The class the assertion states, and whether the request's can be met: a
 /// requested class this sign-in satisfies is echoed, else the strongest used.
-fn authn_context(requested: &[String], amr: &[String]) -> Result<&'static str, SamlError> {
+fn authn_context(requested: &[String], declaration: bool, amr: &[String]) -> Result<&'static str, SamlError> {
+    let unmet = || SamlError {
+        status: protocol::STATUS_RESPONDER,
+        sub_status: Some(protocol::STATUS_NO_AUTHN_CONTEXT),
+        message: "The requested authentication context cannot be satisfied.".into(),
+    };
+    if declaration {
+        return Err(unmet());
+    }
     let mfa = amr.iter().any(|m| m == Amr::Mfa.as_str());
     let strongest = if mfa { protocol::AC_MFA } else { protocol::AC_PASSWORD };
     if requested.is_empty() {
@@ -350,11 +358,7 @@ fn authn_context(requested: &[String], amr: &[String]) -> Result<&'static str, S
             _ => {}
         }
     }
-    Err(SamlError {
-        status: protocol::STATUS_REQUESTER,
-        sub_status: Some(protocol::STATUS_NO_AUTHN_CONTEXT),
-        message: "The requested authentication context cannot be satisfied.".into(),
-    })
+    Err(unmet())
 }
 
 fn single(name: &str, value: Option<String>) -> Option<AssertionAttribute> {
@@ -467,7 +471,8 @@ async fn build(st: &AppState, i: &Issue<'_>) -> anyhow::Result<String> {
     let config = &i.call.config;
     let request = i.call.request.as_ref();
     let requested_contexts: &[String] = request.map_or(&[], |r| r.authn_contexts.as_slice());
-    let context = authn_context(requested_contexts, &i.session.amr)?;
+    let declaration = request.is_some_and(|r| r.requests_declaration);
+    let context = authn_context(requested_contexts, declaration, &i.session.amr)?;
     let key = saml::active_key(&st.pool, i.app)
         .await?
         .ok_or_else(|| anyhow::anyhow!("the application has no active signing certificate"))?;

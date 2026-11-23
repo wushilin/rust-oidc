@@ -435,6 +435,9 @@ pub struct AuthnRequest {
     pub sp_name_qualifier: Option<String>,
     /// The authentication context classes asked for, with `exact` comparison.
     pub authn_contexts: Vec<String>,
+    /// The request names an authentication context declaration. None is
+    /// supported, so such a request can never be satisfied.
+    pub requests_declaration: bool,
 }
 
 impl AuthnRequest {
@@ -497,14 +500,19 @@ impl AuthnRequest {
             None => (None, None),
         };
         let mut authn_contexts = Vec::new();
+        let mut requests_declaration = false;
         if let Some(context) = root.child(NS_PROTOCOL, "RequestedAuthnContext") {
             if !matches!(context.attr("Comparison"), None | Some("exact")) {
                 return Err(SamlError {
-                    status: STATUS_REQUESTER,
+                    status: STATUS_RESPONDER,
                     sub_status: Some(STATUS_NO_AUTHN_CONTEXT),
                     message: "RequestedAuthnContext Comparison must be 'exact'.".into(),
                 });
             }
+            requests_declaration = context
+                .children
+                .iter()
+                .any(|c| c.is(NS_ASSERTION, "AuthnContextDeclRef"));
             authn_contexts = context
                 .children
                 .iter()
@@ -524,6 +532,7 @@ impl AuthnRequest {
             name_id_format,
             sp_name_qualifier,
             authn_contexts,
+            requests_declaration,
         })
     }
 }

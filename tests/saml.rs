@@ -1024,6 +1024,30 @@ async fn a_logout_answer_only_counts_in_the_browser_carrying_the_logout() {
 }
 
 #[tokio::test]
+async fn an_authentication_context_that_cannot_be_met_is_refused() {
+    let w = world().await;
+    for reference in [
+        "<saml:AuthnContextDeclRef>urn:example:declaration</saml:AuthnContextDeclRef>",
+        "<saml:AuthnContextClassRef>urn:example:unavailable</saml:AuthnContextClassRef>",
+    ] {
+        let body =
+            format!(r#"<samlp:RequestedAuthnContext Comparison="exact">{reference}</samlp:RequestedAuthnContext>"#);
+        let b = Browser::new();
+        let page = b
+            .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", &body), None))
+            .await;
+        let page = b.login(&page, &w.f.upn, &w.f.password).await;
+        let response = response_of(&page);
+        assert_eq!(
+            status_codes(&response),
+            vec![protocol::STATUS_RESPONDER, protocol::STATUS_NO_AUTHN_CONTEXT],
+            "{reference}"
+        );
+        assert!(response.child(NS_ASSERTION, "Assertion").is_none(), "{reference}");
+    }
+}
+
+#[tokio::test]
 async fn a_reply_url_is_used_exactly_as_registered() {
     let w = world().await;
     let registered = "https://sp.example:443/acs";

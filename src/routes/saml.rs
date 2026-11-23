@@ -104,6 +104,8 @@ pub(super) struct SamlCall {
     pub request: Option<AuthnRequest>,
     /// The gallery launch this sign-in is, if it is one.
     pub launch: Option<String>,
+    /// The request's signature was verified.
+    pub signed: bool,
     pub config: SamlConfig,
     pub idp_entity: String,
     pub relay_state: Option<String>,
@@ -157,15 +159,27 @@ fn signed_message_ok(
     Ok(())
 }
 
-/// Check the message's signature where the application requires one.
+/// Check the message's signature, and say whether one was verified.
+///
+/// An application requiring signatures must send one. Otherwise a signature is
+/// checked when the application has a certificate to check it with: a message
+/// that claims to be signed and is not must not pass. Without a certificate it
+/// cannot be checked, and is treated as unsigned.
 async fn check_signature(
     st: &AppState,
     app: &Application,
     config: &SamlConfig,
     query: &SamlQuery,
-) -> Result<(), SamlError> {
-    if !config.require_signed_requests {
-        return Ok(());
+) -> Result<bool, SamlError> {
+    let xml = protocol::decode_message(&query.message)?;
+    let detached = query.is_signed();
+    let enveloped = !detached && crate::saml_dsig::carries_signature(&xml);
+    if !detached && !enveloped {
+        return if config.require_signed_requests {
+            Err(SamlError::requester("The request is not signed."))
+        } else {
+            Ok(false)
+        };
     }
     let certificates: Vec<Vec<u8>> = saml::verification_certificates(&st.pool, app)
         .await
@@ -174,10 +188,16 @@ async fn check_signature(
         .filter(|c| c.not_after > now())
         .map(|c| c.cert_der)
         .collect();
-    query.verify(
-        &certificates,
-        config.signing_algorithm == protocol::SigningAlgorithm::Sha1,
-    )
+    if certificates.is_empty() && !config.require_signed_requests {
+        return Ok(false);
+    }
+    let allow_sha1 = config.signing_algorithm == protocol::SigningAlgorithm::Sha1;
+    if detached {
+        query.verify(&certificates, allow_sha1)?;
+    } else {
+        crate::saml_dsig::verify(&xml, &certificates, allow_sha1)?;
+    }
+    Ok(true)
 }
 
 fn refused(message: &str) -> SamlError {
@@ -265,11 +285,12 @@ pub(super) async fn resolve(
             "This application requires signed requests, so it must be opened from its own sign-in page.",
         ));
     }
+    let mut signed = false;
     if let (Some(request), Some(query)) = (&request, &query) {
-        check_signature(st, &app, &config, query)
+        signed = check_signature(st, &app, &config, query)
             .await
             .map_err(|e| page(t, &e.message))?;
-        if config.require_signed_requests {
+        if signed {
             signed_message_ok(
                 st,
                 tenant_key,
@@ -294,6 +315,7 @@ pub(super) async fn resolve(
         SamlCall {
             request,
             launch,
+            signed,
             config,
             idp_entity,
             relay_state,
@@ -490,7 +512,7 @@ async fn build(st: &AppState, i: &Issue<'_>) -> anyhow::Result<String> {
         }
         .into());
     }
-    if config.require_signed_requests
+    if i.call.signed
         && let Some(r) = request
         && !saml::consume_message(&st.pool, &i.app.id, &r.id).await?
     {
@@ -577,7 +599,7 @@ pub async fn endpoint(
         Ok(query) => query,
         Err(e) => return page(None, &e.message),
     };
-    // A signature is verified on the Redirect binding only, so a POST has none.
+    // A POST's signature is inside the message; query parameters do not count.
     let raw = if method == Method::POST {
         query.without_signature()
     } else {
@@ -881,10 +903,11 @@ async fn logout_requested(
     let Some(logout_url) = config.logout_url.clone() else {
         return page(t, "No Logout URL is configured for this application.");
     };
-    if let Err(e) = check_signature(st, &app, &config, query).await {
-        return page(t, &e.message);
-    }
-    if config.require_signed_requests
+    let signed = match check_signature(st, &app, &config, query).await {
+        Ok(signed) => signed,
+        Err(e) => return page(t, &e.message),
+    };
+    if signed
         && let Err(m) = signed_message_ok(
             st,
             tenant_key,
@@ -936,7 +959,7 @@ async fn logout_requested(
     };
     // Used up only by a request that really ends this session, so that someone
     // holding a copy of the URL cannot burn it from another browser.
-    if config.require_signed_requests {
+    if signed {
         match saml::consume_message(&st.pool, &app.id, &request.id).await {
             Ok(true) => {}
             Ok(false) => return page(t, "This signed request has already been used."),

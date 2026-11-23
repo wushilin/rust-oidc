@@ -211,7 +211,7 @@ async fn start(
     voluntary: bool,
     keep: KeepSignedIn,
 ) -> Response {
-    match mfa::begin(&st.pool, &tenant.id, &user.id, purpose, keep).await {
+    match mfa::begin(&st.pool, &tenant.id, &user.id, purpose, keep, None).await {
         Ok(ticket) => {
             let secret = match purpose {
                 Purpose::Enroll => mfa::pending(&st.pool, &ticket, &tenant.id)

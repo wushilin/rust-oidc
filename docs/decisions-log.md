@@ -1967,3 +1967,19 @@ assigned, and the account's own tenant (or its own setting) allows it.
   they are not this tenant's to read, as with unassigned accounts of other tenants.
 - **An expired active certificate is reported as stopping sign-in.** The server would
   still sign, but applications validating the certificate's dates reject the result.
+
+### Sign-out requests stay compatible (owner's decision, 2026-11-23)
+
+- **An unsigned logout request may end a session**, at the OIDC logout endpoint
+  without an `id_token_hint`, and at SAML for an application the browser's session
+  used when no `SessionIndex` is sent. A forged request can therefore sign a user
+  out. The owner accepted this: it does not grant access, and requiring proof would
+  break existing applications. *To reverse*: ask for confirmation in
+  `routes::logout::logout`, and require `SessionIndex` in `logout_requested`.
+
+### A second step belongs to its request (2026-11-23)
+
+- **The browser sign-in's ticket stores a hash of the authorization request**, and
+  only that request can continue it. Otherwise a password entered for one request
+  could finish another that asked for a fresh sign-in. Device-code, My Account and
+  console steps have their own flows and are not tied to a request.

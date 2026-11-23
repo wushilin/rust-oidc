@@ -141,17 +141,19 @@ fn internal(tenant: Option<&Tenant>, e: anyhow::Error) -> Response {
     page(tenant, &AadError::from(e).description())
 }
 
-/// What a signed message must also satisfy: addressed to this tenant's endpoint
-/// (the bindings require `Destination` on a signed message), and recent.
-fn signed_message_ok(
-    st: &AppState,
-    tenant_key: &str,
-    tenant: &Tenant,
-    destination: Option<&str>,
-    issue_instant: Option<i64>,
-) -> Result<(), &'static str> {
-    if !destination.is_some_and(|d| d == sso_url(st, &tenant.id) || d == sso_url(st, tenant_key)) {
-        return Err("The signed request's Destination is not this endpoint.");
+/// A `Destination`, when a request has one, must be where it was received. SAML
+/// Core 3.2.1 requires discarding the request otherwise, signed or not.
+fn addressed_here(st: &AppState, tenant_key: &str, tenant: &Tenant, destination: Option<&str>) -> bool {
+    destination.is_none_or(|d| d == sso_url(st, &tenant.id) || d == sso_url(st, tenant_key))
+}
+
+const WRONG_DESTINATION: &str = "The request's Destination is not this endpoint.";
+
+/// What a signed message must also satisfy: it names a `Destination` (the
+/// bindings require one on a signed message), and is recent.
+fn signed_message_ok(destination: Option<&str>, issue_instant: Option<i64>) -> Result<(), &'static str> {
+    if destination.is_none() {
+        return Err("The signed request has no Destination.");
     }
     if !protocol::is_fresh(issue_instant, now()) {
         return Err("The signed request has expired.");
@@ -287,18 +289,14 @@ pub(super) async fn resolve(
     }
     let mut signed = false;
     if let (Some(request), Some(query)) = (&request, &query) {
+        if !addressed_here(st, tenant_key, &tenant, request.destination.as_deref()) {
+            return Err(page(t, WRONG_DESTINATION));
+        }
         signed = check_signature(st, &app, &config, query)
             .await
             .map_err(|e| page(t, &e.message))?;
         if signed {
-            signed_message_ok(
-                st,
-                tenant_key,
-                &tenant,
-                request.destination.as_deref(),
-                request.issue_instant,
-            )
-            .map_err(|m| page(t, m))?;
+            signed_message_ok(request.destination.as_deref(), request.issue_instant).map_err(|m| page(t, m))?;
         }
     }
 
@@ -903,19 +901,14 @@ async fn logout_requested(
     let Some(logout_url) = config.logout_url.clone() else {
         return page(t, "No Logout URL is configured for this application.");
     };
+    if !addressed_here(st, tenant_key, &tenant, request.destination.as_deref()) {
+        return page(t, WRONG_DESTINATION);
+    }
     let signed = match check_signature(st, &app, &config, query).await {
         Ok(signed) => signed,
         Err(e) => return page(t, &e.message),
     };
-    if signed
-        && let Err(m) = signed_message_ok(
-            st,
-            tenant_key,
-            &tenant,
-            request.destination.as_deref(),
-            request.issue_instant,
-        )
-    {
+    if signed && let Err(m) = signed_message_ok(request.destination.as_deref(), request.issue_instant) {
         return page(t, m);
     }
     let signed_in = match session::find(&st.pool, headers, &tenant.id).await {

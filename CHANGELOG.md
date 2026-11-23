@@ -23,6 +23,8 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - A SAML request for an authentication context declaration, which is not
   supported, is now refused with `NoAuthnContext` instead of signing in. An
   unmet authentication context is reported with the top-level status `Responder`.
+- A SAML sign-in or logout request whose `Destination` names another endpoint is
+  now discarded even when unsigned, as SAML Core 3.2.1 requires.
 
 ### Security
 

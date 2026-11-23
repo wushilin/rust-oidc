@@ -1986,3 +1986,11 @@ assigned, and the account's own tenant (or its own setting) allows it.
   only that request can continue it. Otherwise a password entered for one request
   could finish another that asked for a fresh sign-in. Device-code, My Account and
   console steps have their own flows and are not tied to a request.
+
+### An unsigned SAML request's Destination is checked (2026-11-24)
+
+- **A `Destination` that is present must be this tenant's endpoint**, on signed and
+  unsigned sign-in and logout requests, because SAML Core 3.2.1 says to discard the
+  request otherwise. The owner set full conformance as the release bar. An application
+  sending a stale `Destination` after a host change now fails until it is corrected.
+  An unsigned request with no `Destination` is still accepted, as the standard allows.

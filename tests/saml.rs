@@ -878,6 +878,30 @@ async fn still_signed_in(w: &World, b: &Browser) -> bool {
 }
 
 #[tokio::test]
+async fn an_unsigned_request_addressed_elsewhere_is_discarded() {
+    let w = world().await;
+    let here = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let (b, _) = signed_in(&w).await;
+
+    // Control: the right Destination is accepted.
+    let right = authn_request(&format!(r#"Destination="{here}""#), "");
+    let page = b.get(&redirect_url(&w.s, &w.f.tenant.id, &right, None)).await;
+    assert_eq!(status_codes(&response_of(&page)), vec![protocol::STATUS_SUCCESS]);
+
+    let wrong = r#"Destination="https://other.example/saml2""#;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request(wrong, ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+
+    // A misaddressed logout request ends nothing.
+    let logout = logout_request(ENTITY).replace(r#"ID="_out1""#, &format!(r#"{wrong} ID="_out1""#));
+    let page = b.get(&logout_url(&w, &logout)).await;
+    assert_ne!(page.status, 302, "{}", page.body);
+    assert!(still_signed_in(&w, &b).await);
+}
+
+#[tokio::test]
 async fn an_application_the_session_never_reached_cannot_end_it() {
     let w = world().await;
     let other = "https://other.example/";

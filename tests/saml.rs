@@ -878,6 +878,70 @@ async fn still_signed_in(w: &World, b: &Browser) -> bool {
 }
 
 #[tokio::test]
+async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_url() {
+    let w = world().await;
+    let subject = "<saml:Subject><saml:NameID>nobody@example.test</saml:NameID></saml:Subject>";
+    let format = r#"<samlp:NameIDPolicy Format="urn:example:unknown"/>"#;
+    let comparison = r#"<samlp:RequestedAuthnContext Comparison="minimum"><saml:AuthnContextClassRef>urn:example</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>"#;
+    let artifact = r#"ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact""#;
+    for (attrs, body, top, sub) in [
+        (
+            "",
+            subject,
+            protocol::STATUS_REQUESTER,
+            protocol::STATUS_REQUEST_UNSUPPORTED,
+        ),
+        (
+            artifact,
+            "",
+            protocol::STATUS_REQUESTER,
+            protocol::STATUS_REQUEST_UNSUPPORTED,
+        ),
+        (
+            "",
+            format,
+            protocol::STATUS_REQUESTER,
+            protocol::STATUS_INVALID_NAMEID_POLICY,
+        ),
+        (
+            "",
+            comparison,
+            protocol::STATUS_RESPONDER,
+            protocol::STATUS_NO_AUTHN_CONTEXT,
+        ),
+    ] {
+        let page = Browser::new()
+            .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request(attrs, body), None))
+            .await;
+        let response = response_of(&page);
+        assert_eq!(status_codes(&response), vec![top, sub], "{attrs}{body}");
+        assert_eq!(response.attr("Destination"), Some(ACS));
+        assert_eq!(response.attr("InResponseTo"), Some("_req1"));
+        assert!(response.child(NS_ASSERTION, "Assertion").is_none());
+    }
+
+    // Never to a URL the application did not register.
+    let elsewhere = r#"AssertionConsumerServiceURL="https://evil.example/acs""#;
+    let page = Browser::new()
+        .get(&redirect_url(
+            &w.s,
+            &w.f.tenant.id,
+            &authn_request(elsewhere, subject),
+            None,
+        ))
+        .await;
+    assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+
+    // And not for a request failing the application's signature requirement.
+    let (_, _, cert_pem) = sp_key();
+    require_signed(&w, &cert_pem).await;
+    let page = Browser::new()
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", subject), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+}
+
+#[tokio::test]
 async fn an_unsigned_request_addressed_elsewhere_is_discarded() {
     let w = world().await;
     let here = w.s.url(&format!("/{}/saml2", w.f.tenant.id));

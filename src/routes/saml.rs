@@ -305,21 +305,21 @@ pub(super) async fn resolve(
         .and_then(|q| q.relay_state.clone())
         .or_else(|| config.relay_state.clone());
     let idp_entity = idp_entity_id(st, &tenant.id);
-    Ok((
-        tenant,
-        app,
-        sp,
-        reply,
-        SamlCall {
-            request,
-            launch,
-            signed,
-            config,
-            idp_entity,
-            relay_state,
-            reply_url,
-        },
-    ))
+    let call = SamlCall {
+        request,
+        launch,
+        signed,
+        config,
+        idp_entity,
+        relay_state,
+        reply_url,
+    };
+    // Only now is the requester known and the Reply URL registered, so a request
+    // that cannot be honored can be told so with a SAML status.
+    if let Some(refusal) = call.request.as_ref().and_then(|r| r.refusal.as_ref()) {
+        return Err(error_answer(&call, &reply, refusal));
+    }
+    Ok((tenant, app, sp, reply, call))
 }
 
 fn post_back(reply: &url::Url, response: String, relay_state: Option<&str>) -> Response {

@@ -1994,3 +1994,11 @@ assigned, and the account's own tenant (or its own setting) allows it.
   request otherwise. The owner set full conformance as the release bar. An application
   sending a stale `Destination` after a host change now fails until it is corrected.
   An unsigned request with no `Destination` is still accepted, as the standard allows.
+
+### Unsupported SAML requests are answered in SAML (2026-11-24)
+
+- **A well-formed request we cannot honor gets an error `Response`** at the registered
+  Reply URL, after the application, Reply URL, `Destination` and signature checks.
+  This keeps Entra's refusal of `Subject` while meeting the SAML requirement for an
+  error status. A malformed request, or one failing those checks, still gets a local
+  page, since nothing establishes where an answer may safely go.

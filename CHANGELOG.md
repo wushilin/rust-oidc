@@ -28,6 +28,8 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - A well-formed SAML request that cannot be honored (a `Subject`, an unsupported
   response binding, NameID format or context comparison) now gets a SAML error
   at the registered Reply URL instead of a local error page.
+- An encrypted SAML assertion now always comes in a signed `Response`, whatever
+  the signing option, and its encrypted key names the application as `Recipient`.
 
 ### Security
 

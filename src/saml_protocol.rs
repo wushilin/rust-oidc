@@ -974,8 +974,9 @@ fn assertion(a: &AssertionInput<'_>, signer: Option<&Signer<'_>>) -> anyhow::Res
 }
 
 /// Encrypt an assertion for the application: AES-256-CBC, its key wrapped with
-/// RSA-OAEP to the application's certificate. The assertion is signed first.
-fn encrypt_assertion(assertion: &str, cert_der: &[u8]) -> anyhow::Result<String> {
+/// RSA-OAEP to the application's certificate, naming it as the key's recipient.
+/// The assertion is signed first.
+fn encrypt_assertion(assertion: &str, cert_der: &[u8], recipient: &str) -> anyhow::Result<String> {
     let (spki, _) = public_key_of(cert_der)?;
     let public = PublicEncryptingKey::from_der(&spki).map_err(|_| anyhow::anyhow!("the encryption key is not RSA"))?;
     let oaep = OaepPublicEncryptingKey::new(public).map_err(|_| anyhow::anyhow!("the encryption key is unusable"))?;
@@ -1000,7 +1001,8 @@ fn encrypt_assertion(assertion: &str, cert_der: &[u8]) -> anyhow::Result<String>
         .len();
     wrapped.truncate(wrapped_len);
     Ok(format!(
-        r#"<saml:EncryptedAssertion xmlns:saml="{NS_ASSERTION}"><xenc:EncryptedData xmlns:xenc="{NS_XENC}" Type="{TYPE_ELEMENT}"><xenc:EncryptionMethod Algorithm="{ENC_AES256_CBC}"></xenc:EncryptionMethod><ds:KeyInfo xmlns:ds="{NS_DS}"><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm="{ENC_RSA_OAEP}"><ds:DigestMethod Algorithm="{DIGEST_SHA1}"></ds:DigestMethod></xenc:EncryptionMethod><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{key}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{value}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>"#,
+        r#"<saml:EncryptedAssertion xmlns:saml="{NS_ASSERTION}"><xenc:EncryptedData xmlns:xenc="{NS_XENC}" Type="{TYPE_ELEMENT}"><xenc:EncryptionMethod Algorithm="{ENC_AES256_CBC}"></xenc:EncryptionMethod><ds:KeyInfo xmlns:ds="{NS_DS}"><xenc:EncryptedKey Recipient="{recipient}"><xenc:EncryptionMethod Algorithm="{ENC_RSA_OAEP}"><ds:DigestMethod Algorithm="{DIGEST_SHA1}"></ds:DigestMethod></xenc:EncryptionMethod><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{key}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{value}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>"#,
+        recipient = attr(recipient)?,
         cert = b64(cert_der),
         key = b64(&wrapped),
         value = b64(&sealed),
@@ -1032,10 +1034,12 @@ pub fn success_response(
     encrypt_to: Option<&[u8]>,
 ) -> anyhow::Result<String> {
     let sign_assertion = matches!(option, SigningOption::Assertion | SigningOption::Both);
-    let sign_response = matches!(option, SigningOption::Response | SigningOption::Both);
+    // CBC ciphertext has no integrity of its own, so the SAML profile asks for
+    // a signature over the Response whenever an assertion is encrypted this way.
+    let sign_response = encrypt_to.is_some() || matches!(option, SigningOption::Response | SigningOption::Both);
     let inner = assertion(a, sign_assertion.then_some(signer))?;
     let inner = match encrypt_to {
-        Some(cert) => encrypt_assertion(&inner, cert)?,
+        Some(cert) => encrypt_assertion(&inner, cert, a.audience)?,
         None => inner,
     };
     let id = new_id();
@@ -1179,6 +1183,45 @@ mod tests {
         assert_eq!(r.issuer, "https://sp.example/");
         assert!(r.force_authn);
         assert_eq!(r.acs_url.as_deref(), Some("https://sp.example/acs"));
+    }
+
+    #[test]
+    fn an_encrypted_assertion_comes_in_a_signed_response_naming_its_recipient() {
+        use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256, RsaKeySize};
+        let key = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048).unwrap();
+        let cert = CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (pem, der) = (key.serialize_pem(), cert.der().to_vec());
+        let signer = Signer {
+            private_key_pem: &pem,
+            cert_der: &der,
+            algorithm: SigningAlgorithm::Sha256,
+        };
+        let input = AssertionInput {
+            idp_entity_id: "https://idp.example/",
+            audience: "https://sp.example/",
+            recipient: "https://sp.example/acs",
+            in_response_to: None,
+            name_id: "someone",
+            name_id_format: NameIdFormat::Persistent,
+            sp_name_qualifier: None,
+            session_index: "_session",
+            authn_instant: 1_800_000_000,
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            attributes: &[],
+            now: 1_800_000_000,
+        };
+        let decode = |encoded: String| String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+
+        let sealed = decode(success_response(&input, &signer, SigningOption::Assertion, Some(&der)).unwrap());
+        assert!(sealed.contains(r#"<xenc:EncryptedKey Recipient="https://sp.example/">"#));
+        crate::saml_dsig::verify(&sealed, std::slice::from_ref(&der), false).unwrap();
+
+        // Control: without encryption the configured option still decides.
+        let plain = decode(success_response(&input, &signer, SigningOption::Assertion, None).unwrap());
+        assert!(parse_xml(&plain).unwrap().child(NS_DS, "Signature").is_none());
     }
 
     #[test]

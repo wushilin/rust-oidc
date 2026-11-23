@@ -3,6 +3,18 @@
 Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 [GitHub release pages](https://github.com/wushilin/rust-oidc/releases).
 
+## Unreleased
+
+### Added
+
+- SAML 2.0 single sign-on for applications, following Entra's setup: create an
+  application by name, choose SAML under Single sign-on, then set Basic SAML
+  Configuration, Attributes & Claims and SAML Certificates. Includes SP- and
+  IdP-initiated sign-in, signed request verification (HTTP-Redirect), assertion
+  encryption, certificate rollover, federation metadata and Single Logout.
+- **My apps** on My Account: the applications a user is assigned to, directly or
+  through a group, ready to open.
+
 ## 0.6.0
 
 ### Fixed

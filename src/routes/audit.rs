@@ -42,6 +42,8 @@ pub enum Channel {
     MyAccount,
     /// The Auth API's credential check, called by an application for a user.
     AuthApi,
+    /// SAML Single Logout, asked for by an application.
+    SamlLogout,
 }
 
 impl Channel {
@@ -54,6 +56,7 @@ impl Channel {
             Self::Console => "console",
             Self::MyAccount => "my_account",
             Self::AuthApi => "auth_api",
+            Self::SamlLogout => "saml_logout",
         }
     }
 }

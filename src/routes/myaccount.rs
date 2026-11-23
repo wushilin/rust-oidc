@@ -112,6 +112,9 @@ async fn dashboard(st: &AppState, tenant: &Tenant, user: &User, shown: Shown<'_>
     let required = mfa::required(&st.pool, tenant, &user.id, mfa::At::MyAccount)
         .await
         .unwrap_or(false);
+    let apps = crate::saml::gallery(&st.pool, &tenant.id, &user.id)
+        .await
+        .unwrap_or_default();
     let resp = html::my_account(&html::MyAccount {
         tenant_name: &tenant.name,
         action: &url(st, tenant),
@@ -127,6 +130,7 @@ async fn dashboard(st: &AppState, tenant: &Tenant, user: &User, shown: Shown<'_>
         notice: shown.notice,
         error: shown.error,
         new_codes: shown.new_codes,
+        apps: &apps,
     });
     with_csrf(resp, st, &csrf)
 }
@@ -618,6 +622,24 @@ async fn action(
     };
     let typed = get(form, html::MFA_CODE);
     match op {
+        // Only an application in this user's own gallery, without a Sign on URL.
+        AccountOp::LaunchApp => {
+            let chosen = get(form, html::LAUNCH_APP);
+            let listed = crate::saml::gallery(&st.pool, &tenant.id, &user.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| a.app_id == chosen && a.is_saml && a.sign_on_url.is_none());
+            let app = crate::apps::find(&st.pool, chosen).await.ok().flatten();
+            let app_tenant = match &listed {
+                Some(a) => tenant::resolve(&st.pool, &a.tenant_id).await.ok().flatten(),
+                None => None,
+            };
+            let (Some(app), Some(app_tenant)) = (app, app_tenant) else {
+                return refuse("That application is not available to you.").await;
+            };
+            super::authorize::launch_saml(st, &app_tenant, headers, &app, user).await
+        }
         AccountOp::Password => {
             let current_ok = matches!(
                 users::authenticate(&st.pool, tenant, &user.upn, get(form, html::CURRENT_PASSWORD)).await,

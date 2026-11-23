@@ -109,6 +109,10 @@ pub fn router() -> Router<AppState> {
             get(app_pages::section_page),
         )
         .route(
+            "/admin/tenants/{tenant}/apps/{app}/sso/certificate/{id}",
+            get(crate::admin::saml::certificate_download),
+        )
+        .route(
             "/admin/tenants/{tenant}/roles",
             get(crate::admin::roles::page).post(crate::admin::roles::post),
         )

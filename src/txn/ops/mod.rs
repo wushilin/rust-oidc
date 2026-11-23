@@ -10,6 +10,7 @@ pub mod flow;
 pub mod groups;
 pub mod keys;
 pub mod roles;
+pub mod saml;
 pub mod self_service;
 pub mod tenants;
 pub mod users;

@@ -39,6 +39,14 @@ pub async fn logout(
         return html::signed_out(None);
     };
     let signed_in = session::find(&st.pool, &headers, &tenant.id).await.ok().flatten();
+    let participants = match session::cookie(&headers, SESSION_COOKIE) {
+        Some(cookie) => {
+            crate::saml::take_participants(&st.pool, &crate::util::sha256_hex(cookie.as_bytes()), &tenant.id)
+                .await
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
     if let Err(e) = session::end(&st.pool, &headers, &tenant.id).await {
         tracing::error!(error = ?e, "ending session failed");
     }
@@ -94,15 +102,24 @@ pub async fn logout(
         )
         .await;
     }
-    let mut resp = match target {
-        Some(url) => {
+    let chain = super::saml::logout_participants(
+        &st,
+        &tenant,
+        &headers,
+        participants,
+        target.as_ref().map(url::Url::to_string),
+    )
+    .await;
+    let mut resp = match (chain, target) {
+        (Some(chain), _) => chain,
+        (None, Some(url)) => {
             let mut r = StatusCode::FOUND.into_response();
             if let Ok(v) = HeaderValue::from_str(url.as_str()) {
                 r.headers_mut().insert(header::LOCATION, v);
             }
             r
         }
-        None => html::signed_out(Some(&tenant.name)),
+        (None, None) => html::signed_out(Some(&tenant.name)),
     };
     // Other tenants' sessions share the cookie, so only drop it when none remain.
     if session::cookie(&headers, SESSION_COOKIE).is_some()

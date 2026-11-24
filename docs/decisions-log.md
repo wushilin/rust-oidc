@@ -2025,6 +2025,12 @@ assigned, and the account's own tenant (or its own setting) allows it.
   since such a request is schema-invalid (SAML Core 3.2.1). This holds for a signed
   request too: the freshness check needs a valid time, and replaying an error answer
   gains nothing. A signed request with a valid but stale time still gets a local page.
+- **Error `Response`s are signed** with the application's active certificate and
+  algorithm, like successful ones with Response signing. SAMLscope accepts an error
+  status only from a signed Response (IIP-SSO01-ep), and signing lets the application
+  tell our refusal from a forged one. They are sent only after the request passed the
+  application, Reply URL, `Destination` and signature checks, so this does not let
+  anyone obtain a signed message for a request we would not answer.
 - **SAMLscope contradicts itself on Version 1.1**: IIP-SSO01-ep requires top-level
   `VersionMismatch` and IIP-SSO01-an requires `Requester` for the same request. We
   follow the version-specific rule (`VersionMismatch`), so IIP-SSO01-an reports a

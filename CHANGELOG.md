@@ -35,6 +35,8 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   `IssueInstant` is missing or not a valid time now gets `Requester` there too,
   signed or not; an invalid one used to be ignored, or reported as expired when
   signed.
+- SAML error responses are now signed with the application's signing
+  certificate, so the application can trust the status they carry.
 - An encrypted SAML assertion now always comes in a signed `Response`, whatever
   the signing option, and its encrypted key names the application as `Recipient`.
 

@@ -112,6 +112,8 @@ pub(super) struct SamlCall {
     /// The Reply URL exactly as registered: `Recipient` and `Destination` must
     /// match it to the byte, and parsing a URL can normalize it.
     pub reply_url: String,
+    /// The application's active signing key, which also signs error answers.
+    pub signing_key: Option<saml::ActiveKey>,
 }
 
 /// Where a sign-in restarts after a step that signs the user out.
@@ -308,6 +310,7 @@ pub(super) async fn resolve(
         .and_then(|q| q.relay_state.clone())
         .or_else(|| config.relay_state.clone());
     let idp_entity = idp_entity_id(st, &tenant.id);
+    let signing_key = saml::active_key(&st.pool, &app).await.map_err(|e| internal(t, e))?;
     let call = SamlCall {
         request,
         launch,
@@ -316,6 +319,7 @@ pub(super) async fn resolve(
         idp_entity,
         relay_state,
         reply_url,
+        signing_key,
     };
     // Only now is the requester known and the Reply URL registered, so a request
     // that cannot be honored can be told so with a SAML status.
@@ -336,7 +340,19 @@ fn post_back(reply: &url::Url, response: String, relay_state: Option<&str>) -> R
 /// A protocol failure, posted to the application's registered Reply URL.
 pub(super) fn error_answer(call: &SamlCall, reply: &url::Url, error: &SamlError) -> Response {
     let in_response_to = call.request.as_ref().map(|r| r.id.as_str());
-    match protocol::error_response(&call.idp_entity, &call.reply_url, in_response_to, error, now()) {
+    let signer = call.signing_key.as_ref().map(|key| Signer {
+        private_key_pem: &key.private_key_pem,
+        cert_der: &key.cert_der,
+        algorithm: call.config.signing_algorithm,
+    });
+    match protocol::error_response(
+        &call.idp_entity,
+        &call.reply_url,
+        in_response_to,
+        error,
+        now(),
+        signer.as_ref(),
+    ) {
         Ok(response) => post_back(reply, response, call.relay_state.as_deref()),
         Err(e) => internal(None, e),
     }

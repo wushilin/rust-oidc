@@ -88,6 +88,18 @@ fn response_of(page: &Page) -> Node {
     protocol::parse_xml(&xml).unwrap()
 }
 
+/// The raw XML of the `<samlp:Response>` a page posts to the application.
+fn response_xml(page: &Page) -> String {
+    let encoded = page.field("SAMLResponse").unwrap();
+    String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap()
+}
+
+/// The certificate the application's responses are signed with.
+async fn idp_signing_cert(w: &World) -> Vec<u8> {
+    let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
+    saml::active_key(&w.s.pool, &app).await.unwrap().unwrap().cert_der
+}
+
 fn status_codes(response: &Node) -> Vec<String> {
     let mut out = Vec::new();
     let mut code = response
@@ -402,8 +414,13 @@ async fn a_signed_request_must_be_addressed_here_and_recent() {
     }
 
     // With no valid IssueInstant to judge, the request is schema-invalid: Requester.
-    let issued = protocol::instant(rust_oidc::util::now()).unwrap();
+    let issued = protocol::parse_xml(&current)
+        .unwrap()
+        .attr("IssueInstant")
+        .unwrap()
+        .to_string();
     let bad_time = current.replace(&issued, "not-a-saml-timestamp");
+    assert_ne!(bad_time, current);
     let query = sp_signer(&pem, &der)
         .sign_redirect("SAMLRequest", &protocol::encode_redirect(&bad_time).unwrap(), None)
         .unwrap();
@@ -942,12 +959,15 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
     ] {
         cases.push((authn_request(attrs, body), top, sub));
     }
+    let certs = [idp_signing_cert(&w).await];
     for (xml, top, sub) in cases {
         let page = Browser::new()
             .get(&redirect_url(&w.s, &w.f.tenant.id, &xml, None))
             .await;
         let response = response_of(&page);
         assert_eq!(status_codes(&response), vec![top, sub], "{xml}");
+        // Signed, so the application can trust the status.
+        rust_oidc::saml_dsig::verify(&response_xml(&page), &certs, false).unwrap();
         assert_eq!(response.attr("Destination"), Some(ACS));
         assert_eq!(response.attr("InResponseTo"), Some("_req1"));
         assert!(response.child(NS_ASSERTION, "Assertion").is_none());

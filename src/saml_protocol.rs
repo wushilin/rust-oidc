@@ -1105,26 +1105,38 @@ pub fn success_response(
     Ok(b64(xml.as_bytes()))
 }
 
-/// A failed `<samlp:Response>`, base64-encoded for the POST binding.
+/// A failed `<samlp:Response>`, base64-encoded for the POST binding, signed when
+/// a signer is given so the application can trust the status it carries.
 pub fn error_response(
     idp_entity_id: &str,
     destination: &str,
     in_response_to: Option<&str>,
     error: &SamlError,
     now: i64,
+    signer: Option<&Signer<'_>>,
 ) -> anyhow::Result<String> {
     let in_response_to = match in_response_to {
         Some(r) => format!(r#" InResponseTo="{}""#, attr(r)?),
         None => String::new(),
     };
-    let xml = format!(
-        r#"<samlp:Response xmlns:samlp="{NS_PROTOCOL}" Destination="{destination}" ID="{id}"{in_response_to} IssueInstant="{issued}" Version="2.0">{issuer}{status}</samlp:Response>"#,
+    let id = new_id();
+    let head = format!(
+        r#"<samlp:Response xmlns:samlp="{NS_PROTOCOL}" Destination="{destination}" ID="{id}"{in_response_to} IssueInstant="{issued}" Version="2.0">{issuer}"#,
         destination = attr(destination)?,
-        id = new_id(),
         issued = instant(now)?,
         issuer = issuer_element(idp_entity_id)?,
-        status = status_element(error.status, error.sub_status, Some(&error.message))?,
     );
+    let tail = format!(
+        "{}</samlp:Response>",
+        status_element(error.status, error.sub_status, Some(&error.message))?
+    );
+    let xml = match signer {
+        Some(signer) => {
+            let signature = signer.enveloped(&id, &format!("{head}{tail}"))?;
+            format!("{head}{signature}{tail}")
+        }
+        None => format!("{head}{tail}"),
+    };
     Ok(b64(xml.as_bytes()))
 }
 

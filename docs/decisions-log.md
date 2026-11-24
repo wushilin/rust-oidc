@@ -2012,3 +2012,12 @@ assigned, and the account's own tenant (or its own setting) allows it.
   SHOULD (IIP-SSO01.ak). Answering would let anyone make this server post a signed
   message, with an `InResponseTo` and `RelayState` they chose, to the application.
   *To reverse*: answer at the default Reply URL from `check_signature`'s error path.
+
+### Version and ForceAuthn with IsPassive are answered in SAML (2026-11-24)
+
+- **A request of another version gets `VersionMismatch`**, as SAML Core 3.2.2.2
+  requires, with the second-level code saying whether it was too low or too high.
+  It is answered at the registered Reply URL after the usual checks, like the other
+  unsupported requests. Logout requests of another version still get a local page.
+- **`ForceAuthn` and `IsPassive` together get `NoPassive`.** Fresh authentication
+  here always needs the user, so it cannot be done without a sign-in page.

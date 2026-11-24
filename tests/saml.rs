@@ -884,6 +884,24 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
     let format = r#"<samlp:NameIDPolicy Format="urn:example:unknown"/>"#;
     let comparison = r#"<samlp:RequestedAuthnContext Comparison="minimum"><saml:AuthnContextClassRef>urn:example</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>"#;
     let artifact = r#"ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact""#;
+    let version = |v: &str| authn_request("", "").replace(r#"Version="2.0""#, &format!(r#"Version="{v}""#));
+    let mut cases: Vec<(String, &str, &str)> = vec![
+        (
+            version("1.1"),
+            protocol::STATUS_VERSION_MISMATCH,
+            protocol::STATUS_VERSION_TOO_LOW,
+        ),
+        (
+            version("3.0"),
+            protocol::STATUS_VERSION_MISMATCH,
+            protocol::STATUS_VERSION_TOO_HIGH,
+        ),
+        (
+            authn_request(r#"ForceAuthn="true" IsPassive="true""#, ""),
+            protocol::STATUS_RESPONDER,
+            protocol::STATUS_NO_PASSIVE,
+        ),
+    ];
     for (attrs, body, top, sub) in [
         (
             "",
@@ -910,11 +928,14 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
             protocol::STATUS_NO_AUTHN_CONTEXT,
         ),
     ] {
+        cases.push((authn_request(attrs, body), top, sub));
+    }
+    for (xml, top, sub) in cases {
         let page = Browser::new()
-            .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request(attrs, body), None))
+            .get(&redirect_url(&w.s, &w.f.tenant.id, &xml, None))
             .await;
         let response = response_of(&page);
-        assert_eq!(status_codes(&response), vec![top, sub], "{attrs}{body}");
+        assert_eq!(status_codes(&response), vec![top, sub], "{xml}");
         assert_eq!(response.attr("Destination"), Some(ACS));
         assert_eq!(response.attr("InResponseTo"), Some("_req1"));
         assert!(response.child(NS_ASSERTION, "Assertion").is_none());

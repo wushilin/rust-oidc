@@ -61,6 +61,9 @@ const CM_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 pub const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
 pub const STATUS_REQUESTER: &str = "urn:oasis:names:tc:SAML:2.0:status:Requester";
 pub const STATUS_RESPONDER: &str = "urn:oasis:names:tc:SAML:2.0:status:Responder";
+pub const STATUS_VERSION_MISMATCH: &str = "urn:oasis:names:tc:SAML:2.0:status:VersionMismatch";
+pub const STATUS_VERSION_TOO_LOW: &str = "urn:oasis:names:tc:SAML:2.0:status:RequestVersionTooLow";
+pub const STATUS_VERSION_TOO_HIGH: &str = "urn:oasis:names:tc:SAML:2.0:status:RequestVersionTooHigh";
 pub const STATUS_NO_PASSIVE: &str = "urn:oasis:names:tc:SAML:2.0:status:NoPassive";
 pub const STATUS_AUTHN_FAILED: &str = "urn:oasis:names:tc:SAML:2.0:status:AuthnFailed";
 pub const STATUS_NO_AUTHN_CONTEXT: &str = "urn:oasis:names:tc:SAML:2.0:status:NoAuthnContext";
@@ -391,18 +394,42 @@ fn check_id(id: Option<&str>) -> Result<String, SamlError> {
     Ok(id.to_string())
 }
 
+/// The only protocol version spoken here.
+const SAML_VERSION: (u32, u32) = (2, 0);
+
+/// Why a message's version cannot be processed: the top-level `VersionMismatch`
+/// status of SAML core 3.2.2.2, with whether it is too low or too high.
+fn version_mismatch(root: &Node) -> Option<SamlError> {
+    let raw = root.attr("Version").unwrap_or_default();
+    let version = raw
+        .split_once('.')
+        .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)));
+    if version == Some(SAML_VERSION) {
+        return None;
+    }
+    Some(SamlError {
+        status: STATUS_VERSION_MISMATCH,
+        sub_status: match version {
+            Some(v) if v < SAML_VERSION => Some(STATUS_VERSION_TOO_LOW),
+            Some(_) => Some(STATUS_VERSION_TOO_HIGH),
+            None => None,
+        },
+        message: "The SAML message must have Version 2.0.".into(),
+    })
+}
+
+fn check_issue_instant(root: &Node) -> Result<(), SamlError> {
+    match root.attr("IssueInstant") {
+        Some(_) => Ok(()),
+        None => Err(SamlError::requester("The SAML message has no IssueInstant.")),
+    }
+}
+
 fn check_version(root: &Node) -> Result<(), SamlError> {
-    if root.attr("Version") != Some("2.0") {
-        return Err(SamlError {
-            status: STATUS_REQUESTER,
-            sub_status: Some("urn:oasis:names:tc:SAML:2.0:status:RequestVersionDeprecated"),
-            message: "The SAML message must have Version 2.0.".into(),
-        });
+    match version_mismatch(root) {
+        Some(mismatch) => Err(mismatch),
+        None => check_issue_instant(root),
     }
-    if root.attr("IssueInstant").is_none() {
-        return Err(SamlError::requester("The SAML message has no IssueInstant."));
-    }
-    Ok(())
 }
 
 fn issuer_of(root: &Node) -> Result<String, SamlError> {
@@ -449,11 +476,14 @@ impl AuthnRequest {
             return Err(SamlError::requester("The message is not a SAML AuthnRequest."));
         }
         let id = check_id(root.attr("ID"))?;
-        check_version(&root)?;
+        check_issue_instant(&root)?;
         let issuer = issuer_of(&root)?;
-        let mut refusal = root
-            .child(NS_ASSERTION, "Subject")
-            .map(|_| SamlError::unsupported("An AuthnRequest must not contain a Subject."));
+        // A request of another version is still answered, at the registered
+        // Reply URL, as SAML core 3.2.2.2 requires.
+        let mut refusal = version_mismatch(&root);
+        if root.child(NS_ASSERTION, "Subject").is_some() {
+            refusal.get_or_insert_with(|| SamlError::unsupported("An AuthnRequest must not contain a Subject."));
+        }
         if let Some(binding) = root.attr("ProtocolBinding")
             && binding != BINDING_POST
         {
@@ -479,8 +509,13 @@ impl AuthnRequest {
         }
         let force_authn = xs_bool(root.attr("ForceAuthn"));
         let is_passive = xs_bool(root.attr("IsPassive"));
+        // Fresh authentication always needs the user here, so it cannot be passive.
         if force_authn && is_passive {
-            return Err(SamlError::requester("ForceAuthn and IsPassive cannot both be true."));
+            refusal.get_or_insert_with(|| SamlError {
+                status: STATUS_RESPONDER,
+                sub_status: Some(STATUS_NO_PASSIVE),
+                message: "ForceAuthn and IsPassive cannot both be honored.".into(),
+            });
         }
         let (name_id_format, sp_name_qualifier) = match root.child(NS_PROTOCOL, "NameIDPolicy") {
             Some(policy) => {
@@ -1235,6 +1270,32 @@ mod tests {
         let xml = request("", "<saml:Subject></saml:Subject>");
         let refusal = AuthnRequest::parse(&xml).unwrap().refusal.unwrap();
         assert_eq!(refusal.sub_status, Some(STATUS_REQUEST_UNSUPPORTED));
+    }
+
+    #[test]
+    fn another_version_is_answered_with_version_mismatch() {
+        for (version, sub) in [
+            ("1.1", Some(STATUS_VERSION_TOO_LOW)),
+            ("2.1", Some(STATUS_VERSION_TOO_HIGH)),
+            ("two", None),
+        ] {
+            let xml = request("", "").replace(r#"Version="2.0""#, &format!(r#"Version="{version}""#));
+            let refusal = AuthnRequest::parse(&xml).unwrap().refusal.unwrap();
+            assert_eq!(
+                (refusal.status, refusal.sub_status),
+                (STATUS_VERSION_MISMATCH, sub),
+                "{version}"
+            );
+        }
+        assert!(AuthnRequest::parse(&request("", "")).unwrap().refusal.is_none());
+    }
+
+    #[test]
+    fn forced_and_passive_together_is_answered_with_no_passive() {
+        let r = AuthnRequest::parse(&request(r#"ForceAuthn="true" IsPassive="true""#, "")).unwrap();
+        assert_eq!(r.refusal.unwrap().sub_status, Some(STATUS_NO_PASSIVE));
+        let r = AuthnRequest::parse(&request(r#"ForceAuthn="true""#, "")).unwrap();
+        assert!(r.refusal.is_none());
     }
 
     #[test]

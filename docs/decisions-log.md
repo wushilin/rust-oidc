@@ -2120,3 +2120,19 @@ assigned, and the account's own tenant (or its own setting) allows it.
 - **Not taken up**: decrypting an `EncryptedID` in logout requests (would need an IdP
   encryption key in metadata), and answering a badly signed request in SAML (kept as a
   local page, as recorded above).
+
+### Metadata file checks (2026-11-24)
+
+- **A file grouping several service providers is accepted** when exactly one of them
+  carries an Identifier the application already has; otherwise the administrator is
+  asked for the application's own file. Federation aggregates are such files.
+- **Refused**: metadata whose `validUntil` (on the entity or any group holding it) has
+  passed, a file listing one entityID twice, and a SAML-namespace element directly
+  inside `Extensions`, which the schema reserves for other namespaces.
+- **Not required**, though SAMLscope's metadata-trust checks expect it: a signature on
+  the file, and a `validUntil` at all or one within a set horizon (IIP-MD03.a, MD04.a,
+  MD04.c). An administrator uploading a file reviews it; requiring either would refuse
+  most ordinary SP metadata. These checks report failures by design under "file only".
+- **Size**: an uploaded file may be up to 2 MB and 50,000 elements, against 64 KB and
+  256 elements for a SAML message from the network; only a signed-in administrator can
+  upload one.

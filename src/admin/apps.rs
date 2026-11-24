@@ -25,7 +25,7 @@ use crate::admin::{APP_READ, APP_ROTATE, APP_WRITE, ASSIGNMENT_READ, ASSIGNMENT_
 use crate::apps::{self, Application, GroupMembershipClaims, MemberType, Principal, RedirectPlatform, ScopeConsent};
 use crate::directory::PrincipalType;
 use crate::rbac::Action;
-use crate::saml_metadata::{SpMetadata, parse_sp_metadata};
+use crate::saml_metadata::{SpMetadata, read_sp_metadata};
 use crate::tenant::Tenant;
 use crate::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
@@ -1799,7 +1799,13 @@ pub async fn detail_post(
             .get(super::saml::METADATA_FILE)
             .map(String::as_str)
             .unwrap_or_default();
-        return match parse_sp_metadata(file) {
+        let known = crate::saml::config(&st.pool, &app)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.identifiers)
+            .unwrap_or_default();
+        return match read_sp_metadata(file, &known, now()) {
             Ok(draft) => {
                 let page = Page {
                     draft: Some(&draft),

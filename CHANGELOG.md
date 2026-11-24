@@ -28,6 +28,10 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   application's entity ID, its HTTP-POST Reply URLs with their indexes and
   default, and its Logout URL fill in the form for review. Nothing is saved
   until the administrator saves it.
+- The metadata file upload takes this application's entry from a file grouping
+  several (by its Identifier), accepts files up to 2 MB, and refuses metadata
+  that has expired, lists one entity twice, or puts a SAML element inside
+  `Extensions`.
 - Reply URLs keep an explicit index and default. A line in the Reply URL box
   may end with `index=N` and `default`; plain lines work as before.
 

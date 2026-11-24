@@ -6,7 +6,18 @@
 //! administrator saves them like any other Basic SAML Configuration.
 
 use crate::saml::ReplyUrl;
-use crate::saml_protocol::{BINDING_POST, BINDING_REDIRECT, NS_METADATA, Node, parse_xml};
+use crate::saml_protocol::{
+    BINDING_POST, BINDING_REDIRECT, NS_ASSERTION, NS_METADATA, NS_PROTOCOL, Node, XmlLimits, parse_instant,
+    parse_xml_within,
+};
+
+/// An uploaded metadata file, from a signed-in administrator: room for a group
+/// of entities, still bounded.
+const METADATA_LIMITS: XmlLimits = XmlLimits {
+    bytes: 2 * 1024 * 1024,
+    elements: 50_000,
+    depth: 32,
+};
 
 /// What a metadata file says about one service provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,37 +45,85 @@ fn xs_bool(raw: &str) -> Option<bool> {
     }
 }
 
-/// Every `EntityDescriptor` with an `SPSSODescriptor`, however deeply grouped.
-fn service_providers<'a>(node: &'a Node, out: &mut Vec<&'a Node>) {
+/// Every `EntityDescriptor`, however deeply grouped, with whether it or a group
+/// holding it has a `validUntil` already past.
+fn entities<'a>(node: &'a Node, now: i64, expired: bool, out: &mut Vec<(&'a Node, bool)>) {
+    let expired = expired
+        || node
+            .attr("validUntil")
+            .and_then(parse_instant)
+            .is_some_and(|t| t <= now);
     if is(node, "EntityDescriptor") {
-        if children(node, "SPSSODescriptor").next().is_some() {
-            out.push(node);
-        }
+        out.push((node, expired));
     } else if is(node, "EntitiesDescriptor") {
         for child in &node.children {
-            service_providers(child, out);
+            entities(child, now, expired, out);
         }
     }
 }
 
+/// A SAML-defined element directly inside an `Extensions`, which the schema
+/// reserves for other namespaces.
+fn saml_element_in_extensions(node: &Node) -> bool {
+    let reserved = |n: &Node| [NS_METADATA, NS_ASSERTION, NS_PROTOCOL].contains(&n.ns.as_str());
+    (is(node, "Extensions") && node.children.iter().any(reserved))
+        || node.children.iter().any(saml_element_in_extensions)
+}
+
 /// Read a metadata file describing exactly one service provider.
 pub fn parse_sp_metadata(xml: &str) -> Result<SpMetadata, String> {
-    let root = parse_xml(xml).map_err(|_| "The file is not a readable SAML metadata document.".to_string())?;
+    read_sp_metadata(xml, &[], crate::util::now())
+}
+
+/// Read a metadata file for an application already known by these
+/// identifiers. A file grouping several service providers is accepted when
+/// exactly one of them is this application.
+pub fn read_sp_metadata(xml: &str, known: &[String], now: i64) -> Result<SpMetadata, String> {
+    if xml.len() > METADATA_LIMITS.bytes {
+        return Err("The file is larger than 2 MB.".into());
+    }
+    let root = parse_xml_within(xml, METADATA_LIMITS)
+        .map_err(|_| "The file is not a readable SAML metadata document.".to_string())?;
     if !is(&root, "EntityDescriptor") && !is(&root, "EntitiesDescriptor") {
         return Err("The file is not SAML metadata: it has no EntityDescriptor.".into());
     }
-    let mut found = Vec::new();
-    service_providers(&root, &mut found);
-    let entity = match found.as_slice() {
-        [one] => *one,
-        [] => return Err("The file describes no service provider (SPSSODescriptor).".into()),
-        many => {
+    if saml_element_in_extensions(&root) {
+        return Err("The file is not valid SAML metadata: an Extensions element holds a SAML element.".into());
+    }
+    let mut all = Vec::new();
+    entities(&root, now, false, &mut all);
+    let mut ids = std::collections::BTreeSet::new();
+    for (entity, _) in &all {
+        if let Some(id) = entity.attr("entityID")
+            && !ids.insert(id)
+        {
+            return Err(format!("The file lists the entity '{id}' twice."));
+        }
+    }
+    let providers: Vec<(&Node, bool)> = all
+        .into_iter()
+        .filter(|(e, _)| children(e, "SPSSODescriptor").next().is_some())
+        .collect();
+    let chosen: Vec<&(&Node, bool)> = match providers.len() {
+        0 => return Err("The file describes no service provider (SPSSODescriptor).".into()),
+        1 => providers.iter().collect(),
+        _ => providers
+            .iter()
+            .filter(|(e, _)| e.attr("entityID").is_some_and(|id| known.iter().any(|k| k == id)))
+            .collect(),
+    };
+    let (entity, expired) = match chosen.as_slice() {
+        [one] => **one,
+        _ => {
             return Err(format!(
-                "The file describes {} service providers; upload one application's metadata.",
-                many.len()
+                "The file describes {} service providers and none is clearly this application; upload its own metadata.",
+                providers.len()
             ));
         }
     };
+    if expired {
+        return Err("The metadata has expired: its validUntil has passed.".into());
+    }
     let entity_id = entity
         .attr("entityID")
         .map(str::trim)
@@ -212,6 +271,78 @@ mod tests {
         assert!(parse_sp_metadata(&group(1)).is_ok());
         assert!(parse_sp_metadata(&group(2)).is_err());
         assert!(parse_sp_metadata(&group(0)).is_err());
+    }
+
+    #[test]
+    fn picks_this_application_from_a_group() {
+        let other = sp(&acs(0, None, BINDING_POST)).replace("https://sp.example/", "https://other.example/");
+        let group = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="{NS_METADATA}">{}{other}</md:EntitiesDescriptor>"#,
+            sp(&acs(0, None, BINDING_POST))
+        );
+        let known = ["https://sp.example/".to_string()];
+        assert_eq!(
+            read_sp_metadata(&group, &known, 0).unwrap().entity_id,
+            "https://sp.example/"
+        );
+        assert!(read_sp_metadata(&group, &[], 0).is_err());
+        // The same entity twice is refused, whatever is known.
+        let twice = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="{NS_METADATA}">{0}{0}</md:EntitiesDescriptor>"#,
+            sp(&acs(0, None, BINDING_POST))
+        );
+        assert!(read_sp_metadata(&twice, &known, 0).unwrap_err().contains("twice"));
+    }
+
+    #[test]
+    fn reads_a_large_group() {
+        let many: String = (0..100)
+            .map(|i| sp(&acs(0, None, BINDING_POST)).replace("https://sp.example/", &format!("https://sp{i}.example/")))
+            .collect();
+        let group = format!(r#"<md:EntitiesDescriptor xmlns:md="{NS_METADATA}">{many}</md:EntitiesDescriptor>"#);
+        // Beyond what a SAML message may hold.
+        assert!(crate::saml_protocol::parse_xml(&group).is_err());
+        let known = ["https://sp42.example/".to_string()];
+        assert_eq!(
+            read_sp_metadata(&group, &known, 0).unwrap().entity_id,
+            "https://sp42.example/"
+        );
+    }
+
+    #[test]
+    fn refuses_expired_metadata_at_any_level() {
+        let now = 1_900_000_000;
+        let entity = sp(&acs(0, None, BINDING_POST));
+        let dated = |when: &str| {
+            entity.replace(
+                "<md:EntityDescriptor ",
+                &format!(r#"<md:EntityDescriptor validUntil="{when}" "#),
+            )
+        };
+        assert!(
+            read_sp_metadata(&dated("2020-01-01T00:00:00Z"), &[], now)
+                .unwrap_err()
+                .contains("expired")
+        );
+        assert!(read_sp_metadata(&dated("2040-01-01T00:00:00Z"), &[], now).is_ok());
+        let group = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="{NS_METADATA}" validUntil="2020-01-01T00:00:00Z">{entity}</md:EntitiesDescriptor>"#
+        );
+        assert!(read_sp_metadata(&group, &[], now).is_err());
+    }
+
+    #[test]
+    fn refuses_a_saml_element_in_extensions() {
+        let bad = sp(&format!(
+            r#"<md:Extensions><md:Organization/></md:Extensions>{}"#,
+            acs(0, None, BINDING_POST)
+        ));
+        assert!(read_sp_metadata(&bad, &[], 0).is_err());
+        let fine = sp(&format!(
+            r#"<md:Extensions><x:Thing xmlns:x="urn:example:ext"/></md:Extensions>{}"#,
+            acs(0, None, BINDING_POST)
+        ));
+        assert!(read_sp_metadata(&fine, &[], 0).is_ok());
     }
 
     #[test]

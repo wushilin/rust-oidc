@@ -87,6 +87,21 @@ pub const AC_MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_DEPTH: usize = 16;
 pub(crate) const MAX_ELEMENTS: usize = 256;
+
+/// How much XML a parse accepts before refusing it.
+#[derive(Debug, Clone, Copy)]
+pub struct XmlLimits {
+    pub bytes: usize,
+    pub elements: usize,
+    pub depth: usize,
+}
+
+/// A SAML message from the network.
+pub const MESSAGE_LIMITS: XmlLimits = XmlLimits {
+    bytes: MAX_MESSAGE_BYTES,
+    elements: MAX_ELEMENTS,
+    depth: MAX_DEPTH,
+};
 const MAX_ID_CHARS: usize = 256;
 
 /// How long a bearer assertion may be delivered. Entra's `Conditions` window is
@@ -361,8 +376,13 @@ fn predefined_entity(name: &str) -> Option<char> {
 
 /// Parse a message into a tree, refusing anything a SAML message has no use for.
 pub fn parse_xml(xml: &str) -> Result<Node, SamlError> {
+    parse_xml_within(xml, MESSAGE_LIMITS)
+}
+
+/// Parse XML within these limits, refusing a DOCTYPE and anything larger.
+pub fn parse_xml_within(xml: &str, limits: XmlLimits) -> Result<Node, SamlError> {
     let bad = || SamlError::requester("The SAML message is not well-formed XML.");
-    if xml.len() > MAX_MESSAGE_BYTES {
+    if xml.len() > limits.bytes {
         return Err(SamlError::requester("The SAML message is too large."));
     }
     let mut reader = NsReader::from_str(xml);
@@ -377,14 +397,14 @@ pub fn parse_xml(xml: &str) -> Result<Node, SamlError> {
             Event::Start(_) | Event::Empty(_) if root.is_some() => return Err(bad()),
             Event::Start(e) => {
                 elements += 1;
-                if elements > MAX_ELEMENTS || stack.len() >= MAX_DEPTH {
+                if elements > limits.elements || stack.len() >= limits.depth {
                     return Err(SamlError::requester("The SAML message is too complex."));
                 }
                 stack.push(node_from(ns, &e)?);
             }
             Event::Empty(e) => {
                 elements += 1;
-                if elements > MAX_ELEMENTS || stack.len() >= MAX_DEPTH {
+                if elements > limits.elements || stack.len() >= limits.depth {
                     return Err(SamlError::requester("The SAML message is too complex."));
                 }
                 let node = node_from(ns, &e)?;

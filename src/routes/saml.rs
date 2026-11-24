@@ -155,7 +155,10 @@ fn signed_message_ok(destination: Option<&str>, issue_instant: Option<i64>) -> R
     if destination.is_none() {
         return Err("The signed request has no Destination.");
     }
-    if !protocol::is_fresh(issue_instant, now()) {
+    // Without a valid IssueInstant there is nothing to judge freshness by; such a
+    // request is refused with Requester anyway, and an error answer carries no
+    // assertion, so replaying it gains nothing.
+    if issue_instant.is_some() && !protocol::is_fresh(issue_instant, now()) {
         return Err("The signed request has expired.");
     }
     Ok(())

@@ -32,8 +32,9 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   status `VersionMismatch` (`RequestVersionTooLow` or `RequestVersionTooHigh`),
   and one with both `ForceAuthn` and `IsPassive` with `NoPassive`, both at the
   registered Reply URL. Both used to get a local error page. A request whose
-  `IssueInstant` is missing or not a valid time now gets `Requester` there too;
-  an invalid one used to be ignored.
+  `IssueInstant` is missing or not a valid time now gets `Requester` there too,
+  signed or not; an invalid one used to be ignored, or reported as expired when
+  signed.
 - An encrypted SAML assertion now always comes in a signed `Response`, whatever
   the signing option, and its encrypted key names the application as `Recipient`.
 

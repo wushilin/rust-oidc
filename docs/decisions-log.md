@@ -2022,7 +2022,9 @@ assigned, and the account's own tenant (or its own setting) allows it.
 - **`ForceAuthn` and `IsPassive` together get `NoPassive`.** Fresh authentication
   here always needs the user, so it cannot be done without a sign-in page.
 - **A missing or invalid `IssueInstant` gets `Requester`**, also at the Reply URL,
-  since such a request is schema-invalid (SAML Core 3.2.1).
+  since such a request is schema-invalid (SAML Core 3.2.1). This holds for a signed
+  request too: the freshness check needs a valid time, and replaying an error answer
+  gains nothing. A signed request with a valid but stale time still gets a local page.
 - **SAMLscope contradicts itself on Version 1.1**: IIP-SSO01-ep requires top-level
   `VersionMismatch` and IIP-SSO01-an requires `Requester` for the same request. We
   follow the version-specific rule (`VersionMismatch`), so IIP-SSO01-an reports a

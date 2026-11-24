@@ -398,7 +398,19 @@ async fn a_signed_request_must_be_addressed_here_and_recent() {
             .unwrap();
         let page = b.get(&format!("{endpoint}?{query}")).await;
         assert!(page.field("csrf").is_none(), "{xml}: {}", page.body);
+        assert!(page.field("SAMLResponse").is_none(), "{xml}: {}", page.body);
     }
+
+    // With no valid IssueInstant to judge, the request is schema-invalid: Requester.
+    let issued = protocol::instant(rust_oidc::util::now()).unwrap();
+    let bad_time = current.replace(&issued, "not-a-saml-timestamp");
+    let query = sp_signer(&pem, &der)
+        .sign_redirect("SAMLRequest", &protocol::encode_redirect(&bad_time).unwrap(), None)
+        .unwrap();
+    let page = b.get(&format!("{endpoint}?{query}")).await;
+    let response = response_of(&page);
+    assert_eq!(status_codes(&response), vec![protocol::STATUS_REQUESTER]);
+    assert!(response.child(NS_ASSERTION, "Assertion").is_none());
 }
 
 #[tokio::test]

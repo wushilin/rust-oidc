@@ -669,6 +669,27 @@ async fn federation_metadata_describes_the_endpoint_and_certificate() {
     assert_eq!(root.local, "EntityDescriptor");
     assert!(page.body.contains("X509Certificate"));
     assert!(!page.body.contains("PRIVATE"));
+    // The algorithms it signs and digests with are declared, from its settings.
+    let alg = "urn:oasis:names:tc:SAML:metadata:algsupport";
+    let declared = |root: &Node, local: &str| -> Vec<String> {
+        root.child(protocol::NS_METADATA, "Extensions")
+            .map(|e| {
+                e.children
+                    .iter()
+                    .filter(|c| c.ns == alg && c.local == local)
+                    .map(|c| c.attr("Algorithm").unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        declared(&root, "SigningMethod"),
+        vec!["http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"]
+    );
+    assert_eq!(
+        declared(&root, "DigestMethod"),
+        vec!["http://www.w3.org/2001/04/xmlenc#sha256"]
+    );
 }
 
 async fn my_account(w: &World, b: &Browser) -> Page {
@@ -2208,4 +2229,86 @@ async fn an_asynchronous_logout_is_not_answered() {
     assert!(again.location.is_none(), "{:?}", again.location);
     assert!(again.field("SAMLResponse").is_none(), "{}", again.body);
     assert!(again.body.contains("could not be signed out"), "{}", again.body);
+}
+
+async fn set_name_id(w: &World, format: protocol::NameIdFormat, source: saml::NameIdSource) {
+    let save = rust_oidc::txn::ops::saml::SaveSamlClaims {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        name_id_format: format,
+        name_id_source: source,
+        claims: saml::DEFAULT_CLAIMS
+            .iter()
+            .map(|(name, source)| saml::Claim {
+                name: name.to_string(),
+                source: *source,
+            })
+            .collect(),
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &save).await.into_result().unwrap();
+}
+
+fn name_id_of(page: &Page) -> String {
+    response_of(page)
+        .child(NS_ASSERTION, "Assertion")
+        .and_then(|a| a.child(NS_ASSERTION, "Subject"))
+        .and_then(|s| s.child(NS_ASSERTION, "NameID"))
+        .unwrap()
+        .text
+        .clone()
+}
+
+#[tokio::test]
+async fn a_persistent_name_id_is_always_the_pairwise_identifier() {
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    let plain = redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None);
+    let sign_in = || b.get(&plain);
+
+    // Configured persistent with a user name source: still not the user name.
+    set_name_id(
+        &w,
+        protocol::NameIdFormat::Persistent,
+        saml::NameIdSource::UserPrincipalName,
+    )
+    .await;
+    let persistent = name_id_of(&sign_in().await);
+    assert_ne!(persistent, w.f.upn);
+    assert!(!persistent.contains('@'), "{persistent}");
+    // And the same as a request asking for persistent gets.
+    let asked = authn_request(
+        "",
+        r#"<samlp:NameIDPolicy Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"/>"#,
+    );
+    let page = b.get(&redirect_url(&w.s, &w.f.tenant.id, &asked, None)).await;
+    assert_eq!(name_id_of(&page), persistent);
+
+    // The lowercase form is the same identifier, in hex.
+    set_name_id(
+        &w,
+        protocol::NameIdFormat::Persistent,
+        saml::NameIdSource::PairwiseIdLowercase,
+    )
+    .await;
+    let lowercase = name_id_of(&sign_in().await);
+    assert_eq!(lowercase.len(), 64, "{lowercase}");
+    assert!(
+        lowercase
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{lowercase}"
+    );
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&persistent)
+        .unwrap();
+    assert_eq!(lowercase, hex::encode(decoded));
+
+    // Control: the email format still sends the configured user name.
+    set_name_id(
+        &w,
+        protocol::NameIdFormat::EmailAddress,
+        saml::NameIdSource::UserPrincipalName,
+    )
+    .await;
+    assert_eq!(name_id_of(&sign_in().await), w.f.upn);
 }

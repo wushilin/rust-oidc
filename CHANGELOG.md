@@ -39,6 +39,12 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   no longer has to be pasted again to change the method, and "Stop encrypting"
   is its own button.
 
+- A persistent SAML Name ID is always the application's own pairwise
+  identifier, whatever the Name ID source; a new source, *user.pairwiseid
+  (lowercase hex)*, gives it in lowercase for an application that ignores case.
+- SAML federation metadata declares the signing and digest algorithms each
+  application uses (SAML Metadata Profile for Algorithm Support).
+
 ### Fixed
 
 - A SAML request for an authentication context declaration, which is not

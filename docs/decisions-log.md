@@ -2102,3 +2102,21 @@ assigned, and the account's own tenant (or its own setting) allows it.
   is shown a failure page instead, and the session is untouched. Requests with a wrong
   `Destination` or a bad signature are refused before this, as before. The extension is
   honored signed or not; not answering an unsigned request gives nothing away.
+
+### Persistent Name ID, its lowercase form, and algorithm metadata (2026-11-24)
+
+- **The owner approved three small changes** the SAMLscope self-declarations pointed to.
+- **A persistent Name ID is always the pairwise identifier**, departing from Entra,
+  which sends whatever source is configured. A persistent identifier must not be a
+  business identifier such as a UPN or email (IIP-SSO05.a8), and must differ per
+  application. SAML is unreleased, so no deployed application sees its Name IDs change.
+- **`user.pairwiseid (lowercase hex)`** gives the same identifier as 64 lowercase hex
+  digits, for an application that compares Name IDs without regard to case (IIP-IDP21.a).
+  It is a Name ID source rather than a separate setting, so the stored column and the
+  claims transaction stay as they are.
+- **Metadata declares `alg:DigestMethod` and `alg:SigningMethod`** from the
+  application's signing algorithm, preferred first, with SHA-256 always listed since it
+  is always accepted (IIP-MD09.a, .b). Entra's metadata has none; it only adds.
+- **Not taken up**: decrypting an `EncryptedID` in logout requests (would need an IdP
+  encryption key in metadata), and answering a badly signed request in SAML (kept as a
+  local page, as recorded above).

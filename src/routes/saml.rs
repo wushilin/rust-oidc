@@ -695,6 +695,7 @@ async fn metadata_xml(st: &AppState, tenant_key: &str, app_id: Option<&str>) -> 
         &sso_url(st, &tenant.id),
         &der,
         config.require_signed_requests,
+        config.signing_algorithm,
     )?))
 }
 

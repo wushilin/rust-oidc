@@ -371,6 +371,7 @@ fn claims_form(url: &str, csrf: &str, c: &SamlConfig, may_write: bool) -> String
 <select id="{NAME_ID_FORMAT}" name="{NAME_ID_FORMAT}"{disabled}>{formats}</select>
 <label for="{NAME_ID_SOURCE}">Name ID source attribute</label>
 <select id="{NAME_ID_SOURCE}" name="{NAME_ID_SOURCE}"{disabled}>{sources}</select>
+<p class="muted">A persistent Name ID is always this application's own pairwise identifier, whatever the source; choose the lowercase hex form for an application that ignores case.</p>
 <table><tr><th>Claim name</th><th>Source attribute</th></tr>{rows}</table>{button}</form>"#,
         open = form_open(url, csrf, AppOp::SamlClaims),
         formats = options(NameIdFormat::ALL, c.name_id_format, NameIdFormat::as_str, format_label),

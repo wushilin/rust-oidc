@@ -32,6 +32,8 @@ pub const NS_ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 const NS_DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const NS_XENC: &str = "http://www.w3.org/2001/04/xmlenc#";
 pub const NS_METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
+/// The SAML V2.0 Metadata Profile for Algorithm Support.
+const NS_ALG: &str = "urn:oasis:names:tc:SAML:metadata:algsupport";
 
 /// The HTTP parameters of the SAML bindings, spelled once.
 pub const PARAM_REQUEST: &str = "SAMLRequest";
@@ -1350,7 +1352,23 @@ pub fn idp_metadata(
     sso_url: &str,
     certificates: &[Vec<u8>],
     want_signed_requests: bool,
+    signing_algorithm: SigningAlgorithm,
 ) -> anyhow::Result<String> {
+    // The algorithms this application's messages use, preferred first (SAML V2.0
+    // Metadata Profile for Algorithm Support). SHA-256 is always accepted too.
+    let mut algorithms = vec![signing_algorithm];
+    if signing_algorithm != SigningAlgorithm::Sha256 {
+        algorithms.push(SigningAlgorithm::Sha256);
+    }
+    let digests: String = algorithms
+        .iter()
+        .map(|a| format!(r#"<alg:DigestMethod Algorithm="{}"/>"#, a.digest_uri()))
+        .collect();
+    let signing: String = algorithms
+        .iter()
+        .map(|a| format!(r#"<alg:SigningMethod Algorithm="{}"/>"#, a.signature_uri()))
+        .collect();
+    let extensions = format!(r#"<Extensions xmlns:alg="{NS_ALG}">{digests}{signing}</Extensions>"#);
     let keys: String = certificates
         .iter()
         .map(|c| {
@@ -1367,7 +1385,7 @@ pub fn idp_metadata(
         .collect();
     let url = attr(sso_url)?;
     Ok(format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><EntityDescriptor xmlns="{NS_METADATA}" entityID="{entity}"><IDPSSODescriptor WantAuthnRequestsSigned="{want_signed_requests}" protocolSupportEnumeration="{NS_PROTOCOL}">{keys}<SingleLogoutService Binding="{BINDING_REDIRECT}" Location="{url}"/><SingleLogoutService Binding="{BINDING_POST}" Location="{url}"/>{formats}<SingleSignOnService Binding="{BINDING_REDIRECT}" Location="{url}"/><SingleSignOnService Binding="{BINDING_POST}" Location="{url}"/></IDPSSODescriptor></EntityDescriptor>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><EntityDescriptor xmlns="{NS_METADATA}" entityID="{entity}">{extensions}<IDPSSODescriptor WantAuthnRequestsSigned="{want_signed_requests}" protocolSupportEnumeration="{NS_PROTOCOL}">{keys}<SingleLogoutService Binding="{BINDING_REDIRECT}" Location="{url}"/><SingleLogoutService Binding="{BINDING_POST}" Location="{url}"/>{formats}<SingleSignOnService Binding="{BINDING_REDIRECT}" Location="{url}"/><SingleSignOnService Binding="{BINDING_POST}" Location="{url}"/></IDPSSODescriptor></EntityDescriptor>"#,
         entity = attr(idp_entity_id)?,
     ))
 }

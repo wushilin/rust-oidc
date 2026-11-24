@@ -68,6 +68,7 @@ closed_set!(
         Mail => "mail", "user.mail",
         ObjectId => "objectId", "user.objectid",
         PairwiseId => "pairwiseId", "user.pairwiseid",
+        PairwiseIdLowercase => "pairwiseIdLowercase", "user.pairwiseid (lowercase hex)",
     }
 );
 
@@ -1718,11 +1719,22 @@ pub async fn gallery<'c>(db: impl Handle<'c>, home_tenant_id: &str, user_id: &st
     Ok(out)
 }
 
-/// What the assertion says the user's Name ID is. The value always comes from
-/// the configured source: a request may choose a compatible format, but never
-/// which user property identifies the user. As in Entra, `persistent` is the
-/// pairwise identifier and `transient` is generated; an empty source falls back
-/// to the user principal name.
+/// The pairwise identifier as lowercase hex, for an application that compares
+/// Name IDs without regard to case.
+fn lowercase_pairwise(pairwise: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(pairwise)
+        .map(hex::encode)
+        .unwrap_or_else(|_| pairwise.to_ascii_lowercase())
+}
+
+/// What the assertion says the user's Name ID is. The value comes from the
+/// configured source: a request may choose a compatible format, but never which
+/// user property identifies the user. `persistent` is always this application's
+/// own pairwise identifier (lowercase hex if that is the chosen source), so it is
+/// never a name such as a UPN that other applications also see; `transient` is
+/// generated; an empty source falls back to the user principal name.
 pub fn name_id_for(
     config: &SamlConfig,
     requested: Option<NameIdFormat>,
@@ -1731,17 +1743,24 @@ pub fn name_id_for(
 ) -> Result<(String, NameIdFormat), protocol::SamlError> {
     let app_tenant_id = config.tenant_id.as_str();
     let format = requested.unwrap_or(config.name_id_format);
+    let own_pairwise = match config.name_id_source {
+        NameIdSource::PairwiseIdLowercase => lowercase_pairwise(pairwise),
+        _ => pairwise.to_string(),
+    };
     let configured = match config.name_id_source {
         NameIdSource::UserPrincipalName => user.upn.clone(),
         NameIdSource::Mail => trusted_email(user, app_tenant_id).unwrap_or_else(|| user.upn.clone()),
         NameIdSource::ObjectId => user.id.clone(),
-        NameIdSource::PairwiseId => pairwise.to_string(),
+        NameIdSource::PairwiseId | NameIdSource::PairwiseIdLowercase => own_pairwise.clone(),
     };
     let value = match (format, requested.is_some()) {
         (NameIdFormat::Transient, _) => protocol::new_id(),
-        (NameIdFormat::Persistent, true) => pairwise.to_string(),
+        (NameIdFormat::Persistent, _) => own_pairwise,
         (NameIdFormat::EmailAddress, true)
-            if matches!(config.name_id_source, NameIdSource::ObjectId | NameIdSource::PairwiseId) =>
+            if matches!(
+                config.name_id_source,
+                NameIdSource::ObjectId | NameIdSource::PairwiseId | NameIdSource::PairwiseIdLowercase
+            ) =>
         {
             return Err(protocol::SamlError {
                 status: protocol::STATUS_REQUESTER,

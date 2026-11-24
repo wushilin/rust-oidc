@@ -2083,3 +2083,22 @@ assigned, and the account's own tenant (or its own setting) allows it.
 - **The encrypted assertion still always comes in a signed Response**, GCM or not.
 - **The form keeps the certificate unless a new one is pasted**; stopping is a separate
   button, so changing only the method cannot drop encryption by accident.
+
+### A posted logout request is answered over POST (2026-11-24)
+
+- **Supersedes "the answer stays on HTTP-Redirect" above.** A browser refuses a
+  redirect that follows a form post when the posting page's `form-action` policy does
+  not list the redirect's target. SAMLscope's pages do exactly that, and so may an
+  application's; the logout then never reaches the application. Answering with our own
+  auto-posting page, as sign-in does, avoids it: our page's policy names the target.
+- **The LogoutResponse sent over POST is signed inside**, as the binding requires.
+  A request that came by Redirect is still answered by Redirect.
+
+### Asynchronous Single Logout (2026-11-24)
+
+- **A LogoutRequest carrying `aslo:Asynchronous` gets no LogoutResponse**, as the
+  extension requires: the session ends as for any logout, other applications are told,
+  and the browser is shown our signed-out page. With no matching session, the browser
+  is shown a failure page instead, and the session is untouched. Requests with a wrong
+  `Destination` or a bad signature are refused before this, as before. The extension is
+  honored signed or not; not answering an unsigned request gives nothing away.

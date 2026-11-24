@@ -679,7 +679,13 @@ pub struct LogoutRequest {
     pub not_on_or_after: Option<i64>,
     pub destination: Option<String>,
     pub session_indexes: Vec<String>,
+    /// The application asked for no answer (the Asynchronous Single Logout
+    /// extension): the browser is shown the outcome instead.
+    pub asynchronous: bool,
 }
+
+/// The Asynchronous Single Logout protocol extension.
+pub const NS_ASYNC_SLO: &str = "urn:oasis:names:tc:SAML:2.0:protocol:ext:async-slo";
 
 impl LogoutRequest {
     pub fn parse(xml: &str) -> Result<Self, SamlError> {
@@ -709,6 +715,9 @@ impl LogoutRequest {
             not_on_or_after,
             destination: root.attr("Destination").map(str::to_string),
             session_indexes,
+            asynchronous: root
+                .child(NS_PROTOCOL, "Extensions")
+                .is_some_and(|e| e.child(NS_ASYNC_SLO, "Asynchronous").is_some()),
         })
     }
 }
@@ -1281,6 +1290,8 @@ pub fn error_response(
 }
 
 /// A `<samlp:LogoutResponse>`, as XML for the Redirect binding.
+/// A `<samlp:LogoutResponse>`, as XML: signed inside when a signer is given,
+/// for the POST binding; the Redirect binding signs the query instead.
 pub fn logout_response(
     idp_entity_id: &str,
     destination: &str,
@@ -1288,16 +1299,24 @@ pub fn logout_response(
     status: &str,
     sub_status: Option<&str>,
     now: i64,
+    signer: Option<&Signer<'_>>,
 ) -> anyhow::Result<String> {
-    Ok(format!(
-        r#"<samlp:LogoutResponse xmlns:samlp="{NS_PROTOCOL}" Destination="{destination}" ID="{id}" InResponseTo="{reply}" IssueInstant="{issued}" Version="2.0">{issuer}{status}</samlp:LogoutResponse>"#,
+    let id = new_id();
+    let head = format!(
+        r#"<samlp:LogoutResponse xmlns:samlp="{NS_PROTOCOL}" Destination="{destination}" ID="{id}" InResponseTo="{reply}" IssueInstant="{issued}" Version="2.0">{issuer}"#,
         destination = attr(destination)?,
-        id = new_id(),
         reply = attr(in_response_to)?,
         issued = instant(now)?,
         issuer = issuer_element(idp_entity_id)?,
-        status = status_element(status, sub_status, None)?,
-    ))
+    );
+    let tail = format!("{}</samlp:LogoutResponse>", status_element(status, sub_status, None)?);
+    Ok(match signer {
+        Some(signer) => {
+            let signature = signer.enveloped(&id, &format!("{head}{tail}"))?;
+            format!("{head}{signature}{tail}")
+        }
+        None => format!("{head}{tail}"),
+    })
 }
 
 /// A `<samlp:LogoutRequest>` to one session participant, as XML, and its id.

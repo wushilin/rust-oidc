@@ -19,8 +19,10 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   verification certificate, even if it does not require signatures.
 
 - SAML logout requests are accepted on the HTTP-POST binding as well as
-  HTTP-Redirect, and the federation metadata lists both. The answer still goes
-  to the registered Logout URL over HTTP-Redirect.
+  HTTP-Redirect, and the federation metadata lists both. The answer goes to the
+  registered Logout URL over the binding the request used, signed inside when
+  posted. A logout request marked asynchronous (the SAML Asynchronous Single
+  Logout extension) gets no answer; the browser is shown the outcome.
 
 - **Upload metadata file** under Basic SAML Configuration, as in Entra: the
   application's entity ID, its HTTP-POST Reply URLs with their indexes and

@@ -37,6 +37,9 @@ use crate::util::{now, sha256_hex};
 pub(super) const SAML_REQUEST: &str = protocol::PARAM_REQUEST;
 const SAML_RESPONSE: &str = protocol::PARAM_RESPONSE;
 const RELAY_STATE: &str = protocol::PARAM_RELAY_STATE;
+/// What an asynchronous logout tells the browser when there was nothing to end.
+const NOTHING_TO_SIGN_OUT: &str = "You could not be signed out of this application: there is no matching session here.";
+
 /// Marks a sign-in started from the app gallery; its value is the launch ticket.
 pub(super) const IDP_INITIATED: &str = "saml_launch";
 /// The request string as received, kept beside the parsed parameters because a
@@ -638,7 +641,8 @@ pub async fn endpoint(
     };
     let is_logout = protocol::parse_xml(&xml).is_ok_and(|root| root.local == "LogoutRequest");
     if is_logout {
-        return logout_requested(&st, &tenant_key, &headers, &xml, &query).await;
+        let posted = method == Method::POST;
+        return logout_requested(&st, &tenant_key, &headers, &xml, &query, posted).await;
     }
     let mut params = Params::new();
     for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
@@ -757,6 +761,9 @@ pub struct LogoutFinish {
     /// A participant could not be told, or said it failed.
     #[serde(default)]
     pub partial: bool,
+    /// The initiator asked over HTTP-POST, so it is answered the same way.
+    #[serde(default)]
+    pub answer_by_post: bool,
 }
 
 /// Tell the next participant, or finish. `browser` is the cookie value that ties
@@ -823,28 +830,58 @@ fn logout_browser(headers: &HeaderMap) -> String {
     session::cookie(headers, LOGOUT_COOKIE).unwrap_or_else(session::new_token)
 }
 
+/// What the application that asked to log out is told.
+struct LogoutAnswer<'a> {
+    in_response_to: &'a str,
+    relay_state: Option<&'a str>,
+    status: &'a str,
+    sub_status: Option<&'a str>,
+    /// Answer over HTTP-POST, as the request came: a redirect after a form post
+    /// can be refused by the application page's own `form-action` policy.
+    by_post: bool,
+}
+
 /// Answer a logout request at the application's registered Logout URL.
-#[allow(clippy::too_many_arguments)]
 async fn answer_logout(
     st: &AppState,
     tenant: &Tenant,
     app: &Application,
     config: &SamlConfig,
     logout_url: &str,
-    in_response_to: &str,
-    relay_state: Option<&str>,
-    status: &str,
-    sub_status: Option<&str>,
+    answer: LogoutAnswer<'_>,
 ) -> anyhow::Result<Response> {
+    let entity = idp_entity_id(st, &tenant.id);
+    if !answer.by_post {
+        let xml = protocol::logout_response(
+            &entity,
+            logout_url,
+            answer.in_response_to,
+            answer.status,
+            answer.sub_status,
+            now(),
+            None,
+        )?;
+        return signed_redirect(st, app, config, logout_url, SAML_RESPONSE, &xml, answer.relay_state).await;
+    }
+    let key = saml::active_key(&st.pool, app)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the application has no active signing certificate"))?;
+    let signer = Signer {
+        private_key_pem: &key.private_key_pem,
+        cert_der: &key.cert_der,
+        algorithm: config.signing_algorithm,
+    };
     let xml = protocol::logout_response(
-        &idp_entity_id(st, &tenant.id),
+        &entity,
         logout_url,
-        in_response_to,
-        status,
-        sub_status,
+        answer.in_response_to,
+        answer.status,
+        answer.sub_status,
         now(),
+        Some(&signer),
     )?;
-    signed_redirect(st, app, config, logout_url, SAML_RESPONSE, &xml, relay_state).await
+    let url = url::Url::parse(logout_url)?;
+    Ok(post_back(&url, crate::util::b64(xml.as_bytes()), answer.relay_state))
 }
 
 async fn finished(st: &AppState, tenant: &Tenant, finish: LogoutFinish) -> anyhow::Result<Response> {
@@ -858,18 +895,14 @@ async fn finished(st: &AppState, tenant: &Tenant, finish: LogoutFinish) -> anyho
         } else {
             (protocol::STATUS_SUCCESS, None)
         };
-        return answer_logout(
-            st,
-            tenant,
-            &app,
-            &config,
-            &logout_url,
+        let answer = LogoutAnswer {
             in_response_to,
-            finish.relay_state.as_deref(),
+            relay_state: finish.relay_state.as_deref(),
             status,
             sub_status,
-        )
-        .await;
+            by_post: finish.answer_by_post,
+        };
+        return answer_logout(st, tenant, &app, &config, &logout_url, answer).await;
     }
     // With nobody to send a status to, the user is told directly.
     if finish.partial {
@@ -890,9 +923,10 @@ async fn logout_requested(
     headers: &HeaderMap,
     xml: &str,
     query: &SamlQuery,
+    posted: bool,
 ) -> Response {
-    // Either binding: a POST's signature is checked inside the message. The
-    // answer always goes back over HTTP-Redirect to the registered Logout URL.
+    // Either binding: a POST's signature is checked inside the message, and the
+    // answer goes to the registered Logout URL over the binding the request used.
     let tenant = match tenant::resolve(&st.pool, tenant_key).await {
         Ok(Some(t)) => t,
         Ok(None) => return page(None, &AadError::tenant_not_found(tenant_key).description()),
@@ -951,20 +985,19 @@ async fn logout_requested(
         .filter(|i| request.session_indexes.is_empty() || request.session_indexes.contains(i))
         .collect();
     let (Some(session), Some(hash), false) = (&signed_in, &hash, matched.is_empty()) else {
+        // An application that asked for no answer gets none; the user is told.
+        if request.asynchronous {
+            return page(t, NOTHING_TO_SIGN_OUT);
+        }
         // Nothing of this application's here to end: say so, and end nothing.
-        return match answer_logout(
-            st,
-            &tenant,
-            &app,
-            &config,
-            &logout_url,
-            &request.id,
-            query.relay_state.as_deref(),
-            protocol::STATUS_RESPONDER,
-            Some(protocol::STATUS_UNKNOWN_PRINCIPAL),
-        )
-        .await
-        {
+        let answer = LogoutAnswer {
+            in_response_to: &request.id,
+            relay_state: query.relay_state.as_deref(),
+            status: protocol::STATUS_RESPONDER,
+            sub_status: Some(protocol::STATUS_UNKNOWN_PRINCIPAL),
+            by_post: posted,
+        };
+        return match answer_logout(st, &tenant, &app, &config, &logout_url, answer).await {
             Ok(resp) => resp,
             Err(e) => internal(t, e),
         };
@@ -996,12 +1029,19 @@ async fn logout_requested(
     .await;
     // The application that asked is answered last, not asked again.
     participants.retain(|p| !matched.contains(&p.session_index));
+    // Asynchronous: nobody is answered, so the logout ends on our own page.
+    let (initiator, in_response_to) = if request.asynchronous {
+        (None, None)
+    } else {
+        (Some(app.id.clone()), Some(request.id))
+    };
     let finish = LogoutFinish {
-        initiator: Some(app.id.clone()),
-        in_response_to: Some(request.id),
+        initiator,
+        in_response_to,
         relay_state: query.relay_state.clone(),
         final_url: None,
         partial: false,
+        answer_by_post: posted,
     };
     match advance(st, &tenant, participants, finish, &logout_browser(headers)).await {
         Ok(mut resp) => {
@@ -1082,6 +1122,7 @@ pub(super) async fn logout_participants(
         relay_state: None,
         final_url,
         partial: false,
+        answer_by_post: false,
     };
     match advance(st, tenant, participants, finish, &logout_browser(headers)).await {
         Ok(resp) => Some(resp),

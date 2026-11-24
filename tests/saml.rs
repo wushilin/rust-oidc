@@ -1072,12 +1072,18 @@ async fn single_logout_accepts_the_post_binding() {
     let answer = b
         .post_form(&endpoint, &[("SAMLRequest", encoded.as_str()), ("RelayState", "after")])
         .await;
-    assert_eq!(answer.status, 302, "{}", answer.body);
-    assert!(answer.location.as_deref().unwrap().starts_with(LOGOUT));
-    let response = decoded_location(&answer, "SAMLResponse");
+    // Answered over POST too: a redirect after the application's form post can be
+    // refused by that page's own form-action policy.
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.form_action(), LOGOUT);
+    assert_eq!(answer.field("RelayState").as_deref(), Some("after"));
+    let xml = response_xml(&answer);
+    let response = protocol::parse_xml(&xml).unwrap();
+    assert_eq!(response.local, "LogoutResponse");
     assert_eq!(response.attr("InResponseTo"), Some("_out1"));
     assert_eq!(status_codes(&response), vec![protocol::STATUS_SUCCESS]);
-    assert_eq!(answer.redirect_params()["RelayState"], "after");
+    // Signed inside, as the POST binding requires.
+    rust_oidc::saml_dsig::verify(&xml, &[idp_signing_cert(&w).await], false).unwrap();
 
     // The session really ended.
     let again = b
@@ -2172,4 +2178,34 @@ async fn the_encryption_method_can_change_without_the_certificate() {
         .await;
     assert_eq!(stopped.status, 303);
     assert!(saved_config(&w).await.encryption_cert.is_none());
+}
+
+fn async_logout_request(issuer: &str) -> String {
+    logout_request(issuer).replace(
+        "<saml:NameID>",
+        r#"<samlp:Extensions><aslo:Asynchronous xmlns:aslo="urn:oasis:names:tc:SAML:2.0:protocol:ext:async-slo"/></samlp:Extensions><saml:NameID>"#,
+    )
+}
+
+#[tokio::test]
+async fn an_asynchronous_logout_is_not_answered() {
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
+
+    // Signed out, shown our page, and the application gets no LogoutResponse.
+    let done = b.get(&logout_url(&w, &async_logout_request(ENTITY))).await;
+    assert_ne!(done.status, 302, "{}", done.body);
+    assert!(done.field("SAMLResponse").is_none(), "{}", done.body);
+    assert!(done.body.contains("signed out"), "{}", done.body);
+    assert!(!still_signed_in(&w, &b).await);
+
+    // With nothing left to end, the user is told it failed, and still no answer.
+    let again = b.get(&logout_url(&w, &async_logout_request(ENTITY))).await;
+    assert!(again.location.is_none(), "{:?}", again.location);
+    assert!(again.field("SAMLResponse").is_none(), "{}", again.body);
+    assert!(again.body.contains("could not be signed out"), "{}", again.body);
 }

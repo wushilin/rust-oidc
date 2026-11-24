@@ -22,6 +22,13 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   HTTP-Redirect, and the federation metadata lists both. The answer still goes
   to the registered Logout URL over HTTP-Redirect.
 
+- **Upload metadata file** under Basic SAML Configuration, as in Entra: the
+  application's entity ID, its HTTP-POST Reply URLs with their indexes and
+  default, and its Logout URL fill in the form for review. Nothing is saved
+  until the administrator saves it.
+- Reply URLs keep an explicit index and default. A line in the Reply URL box
+  may end with `index=N` and `default`; plain lines work as before.
+
 ### Fixed
 
 - A SAML request for an authentication context declaration, which is not

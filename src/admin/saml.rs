@@ -19,7 +19,8 @@ use crate::access::{Flow, FlowVerdict, Mark, Report, Section, line};
 use crate::apps::{self, Application, ServicePrincipal};
 use crate::claims::Amr;
 use crate::routes::saml as endpoints;
-use crate::saml::{self, BasicConfig, Claim, ClaimSource, NameIdSource, NewCertificate, SamlConfig};
+use crate::saml::{self, BasicConfig, Claim, ClaimSource, NameIdSource, NewCertificate, ReplyUrl, SamlConfig};
+use crate::saml_metadata::SpMetadata;
 use crate::saml_protocol::{NameIdFormat, SigningAlgorithm, SigningOption};
 use crate::tenant::Tenant;
 use crate::txn::ops::saml::{
@@ -120,7 +121,18 @@ pub(super) struct May {
     pub rotate: bool,
 }
 
-/// The Single sign-on section.
+/// What the SAML page shows beyond the saved configuration.
+struct Shown<'a> {
+    may: &'a May,
+    /// Values read from a metadata file, not yet saved.
+    draft: Option<&'a SpMetadata>,
+}
+
+/// The uploaded SAML metadata file's field.
+pub(super) const METADATA_FILE: &str = "metadata_file";
+
+/// The Single sign-on section; with a draft, Basic SAML Configuration shows the
+/// values read from a metadata file, for the administrator to review and save.
 pub(super) async fn section(
     st: &AppState,
     tenant: &Tenant,
@@ -128,6 +140,7 @@ pub(super) async fn section(
     url: &str,
     csrf: &str,
     may: May,
+    draft: Option<&SpMetadata>,
 ) -> String {
     let config = saml::config(&st.pool, app).await.ok().flatten();
     let sp = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
@@ -141,7 +154,7 @@ pub(super) async fn section(
     let properties = visibility_form(url, csrf, visible, may.write);
     match config.filter(|c| c.enabled) {
         Some(config) => {
-            let body = saml_page(st, tenant, app, url, csrf, &config, &may).await;
+            let body = saml_page(st, tenant, app, url, csrf, &config, Shown { may: &may, draft }).await;
             format!("{body}{properties}")
         }
         None => {
@@ -209,8 +222,9 @@ async fn saml_page(
     url: &str,
     csrf: &str,
     config: &SamlConfig,
-    may: &May,
+    shown: Shown<'_>,
 ) -> String {
+    let Shown { may, draft } = shown;
     let certificates = saml::certificates(&st.pool, app).await.unwrap_or_default();
     let verification = saml::verification_certificates(&st.pool, app).await.unwrap_or_default();
     let metadata_url = format!(
@@ -234,7 +248,7 @@ async fn saml_page(
 <h3>Attributes &amp; Claims</h3>{claims}
 <h3>SAML Certificates</h3>{certs}{signing}{verify}{encrypt}
 <h3>Set up {name}</h3>{login}{identifier}{logout}{metadata}"#,
-        basic = basic_form(url, csrf, config, may.write),
+        basic = basic_section(url, csrf, config, may.write, draft),
         claims = claims_form(url, csrf, config, may.write),
         certs = certificates_table(url, csrf, app, tenant, st.public_url.base(), &certificates, may.rotate),
         signing = signing_form(url, csrf, config, may.rotate),
@@ -260,6 +274,44 @@ async fn saml_page(
     out
 }
 
+/// The saved configuration with a metadata file's values in place: its entity ID
+/// first among the Identifiers, its Reply URLs, and its Logout URL if it has one.
+fn with_draft(c: &SamlConfig, draft: &SpMetadata) -> SamlConfig {
+    let mut merged = c.clone();
+    merged.identifiers = std::iter::once(draft.entity_id.clone())
+        .chain(c.identifiers.iter().filter(|i| **i != draft.entity_id).cloned())
+        .collect();
+    merged.reply_urls = draft.reply_urls.clone();
+    if draft.logout_url.is_some() {
+        merged.logout_url = draft.logout_url.clone();
+    }
+    merged
+}
+
+/// Basic SAML Configuration, with the metadata file upload beside it.
+fn basic_section(url: &str, csrf: &str, c: &SamlConfig, may_write: bool, draft: Option<&SpMetadata>) -> String {
+    let (notice, shown) = match draft {
+        Some(draft) => (
+            r#"<p class="notice" role="status">Read from the metadata file. Review the values, then Save; nothing has changed yet.</p>"#,
+            with_draft(c, draft),
+        ),
+        None => ("", c.clone()),
+    };
+    let upload = if may_write {
+        format!(
+            r#"<form method="post" action="{action}" enctype="multipart/form-data">{csrf}<input type="hidden" name="{field}" value="{op}">
+<label for="{METADATA_FILE}">Upload metadata file</label><input id="{METADATA_FILE}" name="{METADATA_FILE}" type="file" accept=".xml,application/xml,text/xml,application/samlmetadata+xml" required>
+<div class="actions"><button type="submit" class="secondary">Read file</button></div></form>"#,
+            action = e(url),
+            field = AppOp::FIELD,
+            op = AppOp::SamlMetadataImport.as_str(),
+        )
+    } else {
+        String::new()
+    };
+    format!("{upload}{notice}{}", basic_form(url, csrf, &shown, may_write))
+}
+
 fn basic_form(url: &str, csrf: &str, c: &SamlConfig, may_write: bool) -> String {
     let readonly = if may_write { "" } else { " readonly" };
     let button = if may_write {
@@ -270,14 +322,14 @@ fn basic_form(url: &str, csrf: &str, c: &SamlConfig, may_write: bool) -> String 
     format!(
         r#"{open}<label for="{IDENTIFIERS}">Identifier (Entity ID), one per line; the first is the default</label>
 <textarea id="{IDENTIFIERS}" name="{IDENTIFIERS}" rows="3"{readonly}>{identifiers}</textarea>
-<label for="{REPLY_URLS}">Reply URL (Assertion Consumer Service URL), one per line; the first is the default</label>
+<label for="{REPLY_URLS}">Reply URL (Assertion Consumer Service URL), one per line; the first is the default. To set them yourself, add <code>index=N</code> and mark one <code>default</code>.</label>
 <textarea id="{REPLY_URLS}" name="{REPLY_URLS}" rows="3"{readonly}>{replies}</textarea>
 <label for="{SIGN_ON_URL}">Sign on URL (optional)</label><input id="{SIGN_ON_URL}" name="{SIGN_ON_URL}" type="text" inputmode="url" value="{sign_on}"{readonly}>
 <label for="{RELAY_STATE}">Relay State (optional)</label><input id="{RELAY_STATE}" name="{RELAY_STATE}" type="text" value="{relay}"{readonly}>
 <label for="{LOGOUT_URL}">Logout URL (optional)</label><input id="{LOGOUT_URL}" name="{LOGOUT_URL}" type="text" inputmode="url" value="{logout}"{readonly}>{button}</form>"#,
         open = form_open(url, csrf, AppOp::SamlBasic),
         identifiers = e(&c.identifiers.join("\n")),
-        replies = e(&c.reply_urls.join("\n")),
+        replies = e(&reply_lines(&c.reply_urls)),
         sign_on = e(c.sign_on_url.as_deref().unwrap_or_default()),
         relay = e(c.relay_state.as_deref().unwrap_or_default()),
         logout = e(c.logout_url.as_deref().unwrap_or_default()),
@@ -535,7 +587,15 @@ pub(super) async fn extend_check(
     );
     require(
         !config.reply_urls.is_empty(),
-        format!("Reply URL: {}", config.reply_urls.join(", ")),
+        format!(
+            "Reply URL: {}",
+            config
+                .reply_urls
+                .iter()
+                .map(|r| r.url.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         "no Reply URL is set",
         &mut setup,
     );
@@ -725,6 +785,80 @@ fn invalid(message: &str) -> Outcome<()> {
     Outcome::Refused(Refusal::Invalid(message.to_string()))
 }
 
+/// Marks a Reply URL line's index.
+const INDEX_PREFIX: &str = "index=";
+/// Marks the default Reply URL's line.
+const DEFAULT_MARK: &str = "default";
+
+/// Reply URLs as the form shows them: plain lines when each is indexed by its
+/// position and the first is the default, else every line with its index.
+fn reply_lines(replies: &[ReplyUrl]) -> String {
+    if ReplyUrl::is_plain_list(replies) {
+        return replies.iter().map(|r| r.url.as_str()).collect::<Vec<_>>().join("\n");
+    }
+    replies
+        .iter()
+        .map(|r| {
+            let mark = if r.default {
+                format!(" {DEFAULT_MARK}")
+            } else {
+                String::new()
+            };
+            format!("{} {INDEX_PREFIX}{}{mark}", r.url, r.index)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reply URL lines: `URL`, optionally followed by `index=N` and `default`. A
+/// line without an index takes the lowest one not yet used; with no line
+/// marked default, the first is.
+fn parse_reply_lines(lines: &[String]) -> Result<Vec<ReplyUrl>, String> {
+    let mut parsed = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut words = line.split_whitespace();
+        let Some(url) = words.next() else { continue };
+        let (mut index, mut default) = (None, false);
+        for word in words {
+            if word == DEFAULT_MARK {
+                default = true;
+            } else if let Some(n) = word.strip_prefix(INDEX_PREFIX) {
+                index = Some(
+                    n.parse::<u16>()
+                        .map_err(|_| format!("'{word}' is not an index from 0 to 65535."))?,
+                );
+            } else {
+                return Err(format!(
+                    "'{word}' is not understood after a Reply URL; use {INDEX_PREFIX}N or {DEFAULT_MARK}."
+                ));
+            }
+        }
+        parsed.push((url.to_string(), index, default));
+    }
+    let mut used: std::collections::BTreeSet<u16> = parsed.iter().filter_map(|(_, i, _)| *i).collect();
+    let any_default = parsed.iter().any(|(_, _, d)| *d);
+    let mut replies = Vec::with_capacity(parsed.len());
+    for (position, (url, index, default)) in parsed.into_iter().enumerate() {
+        let index = match index {
+            Some(i) => i,
+            None => {
+                let free = (0..=u16::MAX)
+                    .find(|i| !used.contains(i))
+                    .ok_or("There are too many Reply URLs.")?;
+                used.insert(free);
+                free
+            }
+        };
+        replies.push(ReplyUrl {
+            url,
+            index,
+            default: default || (!any_default && position == 0),
+        });
+    }
+    replies.sort_by_key(|r| r.index);
+    Ok(replies)
+}
+
 fn lines(form: &Params, name: &str) -> Vec<String> {
     field(form, name)
         .lines()
@@ -771,9 +905,13 @@ pub(super) async fn apply(
         }
         AppOp::SamlDisable => run(st, actor, &DisableSamlSso { tenant_id, app_id }).await,
         AppOp::SamlBasic => {
+            let reply_urls = match parse_reply_lines(&lines(form, REPLY_URLS)) {
+                Ok(replies) => replies,
+                Err(problem) => return invalid(&problem),
+            };
             let basic = BasicConfig {
                 identifiers: lines(form, IDENTIFIERS),
-                reply_urls: lines(form, REPLY_URLS),
+                reply_urls,
                 sign_on_url: maybe(SIGN_ON_URL),
                 relay_state: maybe(RELAY_STATE),
                 logout_url: maybe(LOGOUT_URL),

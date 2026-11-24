@@ -676,6 +676,33 @@ impl AdminBrowser {
         self.b.post_form(url, &fields).await
     }
 
+    /// Post a console form as `multipart/form-data` with one file, the session's
+    /// CSRF token added, as a browser sends a file upload.
+    pub async fn post_file(&self, url: &str, form: &[(&str, &str)], file: (&str, &str, &str)) -> Page {
+        const BOUNDARY: &str = "----rust-oidc-test-boundary";
+        let mut body = String::new();
+        let csrf = [(admin_session::CSRF_FIELD, self.csrf.as_str())];
+        for (name, value) in form.iter().chain(csrf.iter()) {
+            body.push_str(&format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        let (name, file_name, content) = file;
+        body.push_str(&format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{file_name}\"\r\nContent-Type: application/xml\r\n\r\n{content}\r\n--{BOUNDARY}--\r\n"
+        ));
+        let response = self
+            .b
+            .http
+            .post(url)
+            .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        Browser::page(response).await
+    }
+
     /// Post without the token, for the tests that are about the token.
     pub async fn post_raw(&self, url: &str, form: &[(&str, &str)]) -> Page {
         self.b.post_form(url, form).await

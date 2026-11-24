@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD;
 use common::*;
 use rust_oidc::apps::{self, MemberType, Principal};
 use rust_oidc::db::Event;
-use rust_oidc::saml::{self, BasicConfig, NewCertificate};
+use rust_oidc::saml::{self, BasicConfig, NewCertificate, ReplyUrl};
 use rust_oidc::saml_protocol::{self as protocol, NS_ASSERTION, NS_PROTOCOL, Node, Signer, SigningAlgorithm};
 use rust_oidc::txn::ops::apps::SetAssignmentRequired;
 use rust_oidc::txn::ops::saml::{
@@ -31,7 +31,7 @@ struct World {
 fn basic(entity: &str) -> BasicConfig {
     BasicConfig {
         identifiers: vec![entity.to_string()],
-        reply_urls: vec![ACS.to_string(), SECOND_ACS.to_string()],
+        reply_urls: ReplyUrl::listed([ACS.to_string(), SECOND_ACS.to_string()]),
         sign_on_url: None,
         relay_state: None,
         logout_url: Some(LOGOUT.to_string()),
@@ -1456,7 +1456,7 @@ async fn a_reply_url_is_used_exactly_as_registered() {
         tenant_id: w.f.tenant.id.clone(),
         app_id: w.app_id.clone(),
         basic: BasicConfig {
-            reply_urls: vec![registered.to_string()],
+            reply_urls: ReplyUrl::listed([registered.to_string()]),
             ..basic(ENTITY)
         },
     };
@@ -1962,4 +1962,138 @@ async fn check_sign_in_is_unchanged_for_an_oidc_application() {
     assert!(page.body.contains("Password grant"), "{}", page.body);
     assert!(page.body.contains("In the token"), "{}", page.body);
     assert!(!page.body.contains("SAML setup"), "{}", page.body);
+}
+
+/// An SP metadata file: two POST endpoints, the second marked default, and an
+/// Artifact one that cannot be used.
+fn sp_metadata(entity: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{entity}"><md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://imported.example/slo"/><md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact" Location="https://imported.example/art" index="0"/><md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://imported.example/acs-1" index="1"/><md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://imported.example/acs-2" index="2" isDefault="true"/></md:SPSSODescriptor></md:EntityDescriptor>"#
+    )
+}
+
+async fn saved_config(w: &World) -> saml::SamlConfig {
+    let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
+    saml::config(&w.s.pool, &app).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn a_metadata_file_fills_in_basic_saml_configuration_for_review() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    let before = saved_config(&w).await;
+
+    let entity = "https://imported.example/";
+    let page = a
+        .post_file(
+            &url,
+            &[("op", "saml_metadata_import")],
+            ("metadata_file", "sp.xml", &sp_metadata(entity)),
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Review the values"), "{}", page.body);
+    assert!(
+        page.body.contains("https://imported.example/acs-1 index=1"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("https://imported.example/acs-2 index=2 default"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("https://imported.example/slo"), "{}", page.body);
+    assert!(!page.body.contains("https://imported.example/art"), "{}", page.body);
+    // Reading the file changes nothing.
+    assert_eq!(saved_config(&w).await, before);
+
+    // Saving the reviewed form keeps the indexes and the default.
+    let saved = a
+        .post(
+            &url,
+            &[
+                ("op", "saml_basic"),
+                ("identifiers", &format!("{entity}\n{ENTITY}")),
+                (
+                    "reply_urls",
+                    "https://imported.example/acs-1 index=1\nhttps://imported.example/acs-2 index=2 default",
+                ),
+                ("logout_url", "https://imported.example/slo"),
+            ],
+        )
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    let config = saved_config(&w).await;
+    assert_eq!(config.default_reply_url(), Some("https://imported.example/acs-2"));
+    assert_eq!(
+        config.reply_url_for(None, Some(1)),
+        Some("https://imported.example/acs-1")
+    );
+    assert_eq!(config.reply_url_for(None, Some(0)), None);
+    assert_eq!(config.logout_url.as_deref(), Some("https://imported.example/slo"));
+
+    // A file that is not one application's metadata is refused with the reason.
+    let two = format!(
+        r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">{}{}</md:EntitiesDescriptor>"#,
+        sp_metadata("https://one.example/").replace(r#"<?xml version="1.0"?>"#, ""),
+        sp_metadata("https://two.example/").replace(r#"<?xml version="1.0"?>"#, "")
+    );
+    let page = a
+        .post_file(
+            &url,
+            &[("op", "saml_metadata_import")],
+            ("metadata_file", "sp.xml", &two),
+        )
+        .await;
+    assert_eq!(page.status, 400);
+    assert!(page.body.contains("2 service providers"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn reply_urls_keep_their_index_and_default_through_the_form() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    let save = |replies: &'static str| {
+        let a = &a;
+        let url = url.clone();
+        async move {
+            a.post(
+                &url,
+                &[("op", "saml_basic"), ("identifiers", ENTITY), ("reply_urls", replies)],
+            )
+            .await
+        }
+    };
+    // Plain lines: indexed in order, the first the default.
+    assert_eq!(save("https://a.example/acs\nhttps://b.example/acs").await.status, 303);
+    let c = saved_config(&w).await;
+    assert_eq!(c.default_reply_url(), Some("https://a.example/acs"));
+    assert_eq!(c.reply_url_for(None, Some(1)), Some("https://b.example/acs"));
+    // A line without an index takes the lowest unused one.
+    assert_eq!(
+        save("https://a.example/acs index=0\nhttps://b.example/acs default")
+            .await
+            .status,
+        303
+    );
+    let c = saved_config(&w).await;
+    assert_eq!(c.default_reply_url(), Some("https://b.example/acs"));
+    assert_eq!(c.reply_url_for(None, Some(1)), Some("https://b.example/acs"));
+    // Refused: two defaults, a repeated index, an unknown word.
+    for bad in [
+        "https://a.example/acs default\nhttps://b.example/acs default",
+        "https://a.example/acs index=3\nhttps://b.example/acs index=3",
+        "https://a.example/acs primary",
+    ] {
+        assert_eq!(save(bad).await.status, 400, "{bad}");
+    }
+    assert_eq!(
+        saved_config(&w).await.default_reply_url(),
+        Some("https://b.example/acs")
+    );
 }

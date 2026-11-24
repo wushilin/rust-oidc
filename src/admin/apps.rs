@@ -17,12 +17,15 @@
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, Settled, TenantTab, checked, chrome, field, optional, parse_form, settle};
+use crate::admin::routes::{
+    At, Params, Settled, TenantTab, checked, chrome, field, optional, parse_form, parse_multipart, settle,
+};
 use crate::admin::view::{self, e};
 use crate::admin::{APP_READ, APP_ROTATE, APP_WRITE, ASSIGNMENT_READ, ASSIGNMENT_WRITE};
 use crate::apps::{self, Application, GroupMembershipClaims, MemberType, Principal, RedirectPlatform, ScopeConsent};
 use crate::directory::PrincipalType;
 use crate::rbac::Action;
+use crate::saml_metadata::{SpMetadata, parse_sp_metadata};
 use crate::tenant::Tenant;
 use crate::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
@@ -34,7 +37,7 @@ use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
 use crate::util::now;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 
 /// What a post to an application's page asks for.
@@ -171,6 +174,7 @@ pub enum AppOp {
     SamlEnable,
     SamlDisable,
     SamlBasic,
+    SamlMetadataImport,
     SamlClaims,
     SamlSigning,
     SamlCertificateAdd,
@@ -203,6 +207,7 @@ impl AppOp {
             Self::SamlEnable
             | Self::SamlDisable
             | Self::SamlBasic
+            | Self::SamlMetadataImport
             | Self::SamlClaims
             | Self::SamlSigning
             | Self::SamlCertificateAdd
@@ -240,6 +245,7 @@ impl AppOp {
         Self::SamlEnable,
         Self::SamlDisable,
         Self::SamlBasic,
+        Self::SamlMetadataImport,
         Self::SamlClaims,
         Self::SamlSigning,
         Self::SamlCertificateAdd,
@@ -280,6 +286,7 @@ impl AppOp {
             Self::SamlEnable => "saml_enable",
             Self::SamlDisable => "saml_disable",
             Self::SamlBasic => "saml_basic",
+            Self::SamlMetadataImport => "saml_metadata_import",
             Self::SamlClaims => "saml_claims",
             Self::SamlSigning => "saml_signing",
             Self::SamlCertificateAdd => "saml_certificate_add",
@@ -332,6 +339,7 @@ impl AppOp {
             | Self::RoleAdd
             | Self::SamlDisable
             | Self::SamlBasic
+            | Self::SamlMetadataImport
             | Self::SamlClaims
             | Self::SignOnUrl
             | Self::Visibility => APP_WRITE,
@@ -339,11 +347,11 @@ impl AppOp {
     }
 
     /// The transaction it runs, for the test that the page asks for the same
-    /// action the transaction needs.
+    /// action the transaction needs; `None` for one that only shows a page.
     #[cfg(test)]
-    fn kind(self) -> crate::txn::TxnKind {
+    fn kind(self) -> Option<crate::txn::TxnKind> {
         use crate::txn::TxnKind;
-        match self {
+        Some(match self {
             Self::Rename => TxnKind::RenameApp,
             Self::Flags => TxnKind::SaveAppFlags,
             Self::GroupClaims => TxnKind::SetGroupMembershipClaims,
@@ -366,6 +374,8 @@ impl AppOp {
             Self::SamlEnable => TxnKind::EnableSamlSso,
             Self::SamlDisable => TxnKind::DisableSamlSso,
             Self::SamlBasic => TxnKind::SaveSamlBasic,
+            // Reading a metadata file only fills in the form; saving it is SamlBasic.
+            Self::SamlMetadataImport => return None,
             Self::SamlClaims => TxnKind::SaveSamlClaims,
             Self::SamlSigning => TxnKind::SaveSamlSigning,
             Self::SamlCertificateAdd => TxnKind::AddSamlCertificate,
@@ -377,7 +387,7 @@ impl AppOp {
             Self::SamlEncryption => TxnKind::SetSamlEncryption,
             Self::SignOnUrl => TxnKind::SetAppSignOnUrl,
             Self::Visibility => TxnKind::SetAppVisibility,
-        }
+        })
     }
 }
 
@@ -631,6 +641,8 @@ struct Page<'a> {
     reveal: Option<&'a str>,
     /// The user name the Check sign-in section was asked about.
     check: Option<&'a str>,
+    /// Values read from an uploaded SAML metadata file, to review before saving.
+    draft: Option<&'a SpMetadata>,
 }
 
 async fn detail(
@@ -656,7 +668,7 @@ async fn detail(
                 write: may_write,
                 rotate: may_rotate,
             };
-            super::saml::section(st, tenant, app, &url, &csrf, may).await
+            super::saml::section(st, tenant, app, &url, &csrf, may, page.draft).await
         }
         AppSection::Authentication => {
             let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
@@ -1754,9 +1766,15 @@ pub async fn detail_post(
     ctx: AdminContext,
     State(st): State<AppState>,
     Path((key, app_key)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let form = parse_form(&body);
+    // A metadata file comes as multipart; every other form is URL-encoded.
+    let form = match parse_multipart(&headers, body.clone()).await {
+        Ok(Some(fields)) => fields,
+        Ok(None) => parse_form(&body),
+        Err(_) => return view::bad_request("The upload could not be read."),
+    };
     let Some(op) = AppOp::parse(field(&form, AppOp::FIELD)) else {
         return view::bad_request("That is not an operation this page offers.");
     };
@@ -1774,6 +1792,30 @@ pub async fn detail_post(
     let Ok(app) = apps::find_in_tenant(&st.pool, tenant, &app_key).await else {
         return view::not_found();
     };
+    // As in Entra, an uploaded metadata file only fills in Basic SAML
+    // Configuration; nothing changes until the administrator saves it.
+    if op == AppOp::SamlMetadataImport {
+        let file = form
+            .get(super::saml::METADATA_FILE)
+            .map(String::as_str)
+            .unwrap_or_default();
+        return match parse_sp_metadata(file) {
+            Ok(draft) => {
+                let page = Page {
+                    draft: Some(&draft),
+                    ..Page::default()
+                };
+                detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::OK).await
+            }
+            Err(problem) => {
+                let page = Page {
+                    error: Some(&problem),
+                    ..Page::default()
+                };
+                detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::BAD_REQUEST).await
+            }
+        };
+    }
 
     // The role tick boxes repeat one field name, which the form map keeps only
     // one value of, so they are read from the body.
@@ -1850,6 +1892,7 @@ async fn apply(
         AppOp::SamlEnable
         | AppOp::SamlDisable
         | AppOp::SamlBasic
+        | AppOp::SamlMetadataImport
         | AppOp::SamlClaims
         | AppOp::SamlSigning
         | AppOp::SamlCertificateAdd
@@ -2151,8 +2194,9 @@ mod tests {
     fn every_operation_runs_its_own_transaction_with_the_same_action() {
         let mut seen = std::collections::HashSet::new();
         for op in AppOp::ALL {
-            assert!(seen.insert(op.kind().info().event.as_str()), "{op:?} shares an event");
-            assert_eq!(op.kind().info().need, Need::Action(op.action()), "{op:?}");
+            let Some(kind) = op.kind() else { continue };
+            assert!(seen.insert(kind.info().event.as_str()), "{op:?} shares an event");
+            assert_eq!(kind.info().need, Need::Action(op.action()), "{op:?}");
         }
     }
 

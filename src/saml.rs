@@ -168,13 +168,44 @@ pub fn thumbprint(der: &[u8]) -> String {
     hex::encode_upper(Sha1::digest(der))
 }
 
+/// One Reply URL (Assertion Consumer Service URL), with the index a request
+/// may name it by and whether it is the one used when a request names none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyUrl {
+    pub url: String,
+    pub index: u16,
+    pub default: bool,
+}
+
+impl ReplyUrl {
+    /// URLs in order: each indexed by its position, the first the default.
+    pub fn listed(urls: impl IntoIterator<Item = String>) -> Vec<ReplyUrl> {
+        urls.into_iter()
+            .enumerate()
+            .map(|(i, url)| ReplyUrl {
+                url,
+                index: u16::try_from(i).unwrap_or(u16::MAX),
+                default: i == 0,
+            })
+            .collect()
+    }
+
+    /// Whether these are exactly what `listed` would make of their URLs.
+    pub fn is_plain_list(replies: &[ReplyUrl]) -> bool {
+        replies
+            .iter()
+            .enumerate()
+            .all(|(i, r)| usize::from(r.index) == i && r.default == (i == 0))
+    }
+}
+
 /// Basic SAML Configuration, as read from a form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasicConfig {
     /// The first is the default.
     pub identifiers: Vec<String>,
-    /// The first is the default; the position is the index.
-    pub reply_urls: Vec<String>,
+    /// Exactly one is the default; indexes are distinct.
+    pub reply_urls: Vec<ReplyUrl>,
     pub sign_on_url: Option<String>,
     pub relay_state: Option<String>,
     pub logout_url: Option<String>,
@@ -227,11 +258,19 @@ impl BasicConfig {
             }
         }
         let distinct = |v: &[String]| v.iter().collect::<std::collections::BTreeSet<_>>().len() == v.len();
-        if !distinct(&self.identifiers) || !distinct(&self.reply_urls) {
+        let urls: Vec<String> = self.reply_urls.iter().map(|r| r.url.clone()).collect();
+        if !distinct(&self.identifiers) || !distinct(&urls) {
             return Some("The same value is listed twice.".into());
         }
+        let indexes: std::collections::BTreeSet<u16> = self.reply_urls.iter().map(|r| r.index).collect();
+        if indexes.len() != self.reply_urls.len() {
+            return Some("Two Reply URLs have the same index.".into());
+        }
+        if self.reply_urls.iter().filter(|r| r.default).count() != 1 {
+            return Some("Exactly one Reply URL must be the default.".into());
+        }
         for reply in &self.reply_urls {
-            if let Some(problem) = url_problem("Reply URL", reply) {
+            if let Some(problem) = url_problem("Reply URL", &reply.url) {
                 return Some(problem);
             }
         }
@@ -298,7 +337,8 @@ pub struct SamlConfig {
     /// `Some` while SAML is the application's single sign-on method.
     pub enabled: bool,
     pub identifiers: Vec<String>,
-    pub reply_urls: Vec<String>,
+    /// In index order.
+    pub reply_urls: Vec<ReplyUrl>,
     pub sign_on_url: Option<String>,
     pub relay_state: Option<String>,
     pub logout_url: Option<String>,
@@ -317,7 +357,11 @@ impl SamlConfig {
     }
 
     pub fn default_reply_url(&self) -> Option<&str> {
-        self.reply_urls.first().map(String::as_str)
+        self.reply_urls
+            .iter()
+            .find(|r| r.default)
+            .or_else(|| self.reply_urls.first())
+            .map(|r| r.url.as_str())
     }
 
     /// Basic SAML Configuration is complete enough to sign anyone in.
@@ -329,11 +373,12 @@ impl SamlConfig {
     /// default. A URL that is not registered is never used.
     pub fn reply_url_for(&self, requested: Option<&str>, index: Option<i64>) -> Option<&str> {
         match (requested, index) {
-            (Some(url), _) => self.reply_urls.iter().find(|r| *r == url).map(String::as_str),
-            (None, Some(i)) => usize::try_from(i)
-                .ok()
-                .and_then(|i| self.reply_urls.get(i))
-                .map(String::as_str),
+            (Some(url), _) => self.reply_urls.iter().find(|r| r.url == url).map(|r| r.url.as_str()),
+            (None, Some(i)) => self
+                .reply_urls
+                .iter()
+                .find(|r| i64::from(r.index) == i)
+                .map(|r| r.url.as_str()),
             (None, None) => self.default_reply_url(),
         }
     }
@@ -419,9 +464,9 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
     .bind(&app.id)
     .fetch_all(&mut *conn)
     .await?;
-    let replies: Vec<(String,)> = sqlx::query_as(crate::db::qc(
+    let replies: Vec<(String, i64, crate::db::Flag)> = sqlx::query_as(crate::db::qc(
         conn,
-        "SELECT url FROM app_saml_reply_urls WHERE application_id = ? ORDER BY url_index",
+        "SELECT url, url_index, is_default FROM app_saml_reply_urls WHERE application_id = ? ORDER BY url_index",
     ))
     .bind(&app.id)
     .fetch_all(&mut *conn)
@@ -443,7 +488,16 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
         tenant_id,
         enabled: mode.as_deref() == Some(SSO_MODE_SAML),
         identifiers: identifiers.into_iter().map(|(v,)| v).collect(),
-        reply_urls: replies.into_iter().map(|(v,)| v).collect(),
+        reply_urls: replies
+            .into_iter()
+            .map(|(url, index, default)| {
+                Ok(ReplyUrl {
+                    url,
+                    index: u16::try_from(index).map_err(|_| anyhow!("Reply URL index {index} is out of range"))?,
+                    default: default.into(),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?,
         sign_on_url,
         relay_state,
         logout_url,
@@ -739,15 +793,15 @@ pub(crate) async fn save_basic_in(
     .bind(&app.id)
     .execute(&mut *conn)
     .await?;
-    for (i, url) in basic.reply_urls.iter().enumerate() {
+    for reply in &basic.reply_urls {
         sqlx::query(crate::db::qc(
             conn,
             "INSERT INTO app_saml_reply_urls (application_id, url, url_index, is_default) VALUES (?, ?, ?, ?)",
         ))
         .bind(&app.id)
-        .bind(url)
-        .bind(i as i64)
-        .bind(i == 0)
+        .bind(&reply.url)
+        .bind(i64::from(reply.index))
+        .bind(reply.default)
         .execute(&mut *conn)
         .await?;
     }

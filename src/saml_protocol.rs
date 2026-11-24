@@ -31,7 +31,7 @@ pub const NS_PROTOCOL: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 pub const NS_ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 const NS_DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const NS_XENC: &str = "http://www.w3.org/2001/04/xmlenc#";
-const NS_METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
+pub const NS_METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
 
 /// The HTTP parameters of the SAML bindings, spelled once.
 pub const PARAM_REQUEST: &str = "SAMLRequest";

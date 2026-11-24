@@ -2045,3 +2045,22 @@ assigned, and the account's own tenant (or its own setting) allows it.
   the application's metadata we do not know whether it accepts a posted answer.
 - A cross-site POST carries our session cookie only because it is `SameSite=None`
   over HTTPS; over plain HTTP that works only when the application is on the same site.
+
+### SP metadata import is file only (2026-11-24)
+
+- **The owner chose file import only**, as Entra's "Upload metadata file": no URL is
+  fetched, nothing is refreshed, and the file's signature and `validUntil` are not
+  relied on. The file only fills in Basic SAML Configuration, and the administrator
+  reviews and saves it, so it goes through the same checks and the same
+  `SaveSamlBasic` transaction and audit row as typed values.
+- **What is read**: the entity ID (first Identifier, others kept), the
+  `AssertionConsumerService` endpoints on HTTP-POST with their `index`, the default
+  chosen by SAML metadata 2.2.3 (first `isDefault="true"`, else first unmarked, else
+  first), and a Logout URL (HTTP-Redirect first, else HTTP-POST). Certificates in the
+  file are not taken, as in Entra. A file describing more or fewer than one service
+  provider is refused.
+- **Reply URLs now keep an explicit index and default**, which the existing columns
+  already held. Exactly one must be the default and indexes must be distinct, checked
+  where they are saved. The text box stays one URL per line; `index=N` and `default`
+  are written only when the plain order would not say the same.
+- **axum's `multipart` feature** is turned on for the upload (adds `multer`).

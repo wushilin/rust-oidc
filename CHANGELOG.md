@@ -18,6 +18,10 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   HTTP-Redirect. An invalid signature is refused whenever the application has a
   verification certificate, even if it does not require signatures.
 
+- SAML logout requests are accepted on the HTTP-POST binding as well as
+  HTTP-Redirect, and the federation metadata lists both. The answer still goes
+  to the registered Logout URL over HTTP-Redirect.
+
 ### Fixed
 
 - A SAML request for an authentication context declaration, which is not

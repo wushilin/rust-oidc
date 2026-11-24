@@ -2035,3 +2035,13 @@ assigned, and the account's own tenant (or its own setting) allows it.
   `VersionMismatch` and IIP-SSO01-an requires `Requester` for the same request. We
   follow the version-specific rule (`VersionMismatch`), so IIP-SSO01-an reports a
   failure. Answering with a local page would avoid the failure but meets neither rule.
+
+### Logout over HTTP-POST (2026-11-24)
+
+- **The owner chose to accept `LogoutRequest` on HTTP-POST**, departing from Entra,
+  whose Single Logout is Redirect only. SAMLscope sends its logout probes over POST,
+  and some applications only post. The metadata lists a POST `SingleLogoutService`.
+- **The answer stays on HTTP-Redirect** to the registered Logout URL, because without
+  the application's metadata we do not know whether it accepts a posted answer.
+- A cross-site POST carries our session cookie only because it is `SameSite=None`
+  over HTTPS; over plain HTTP that works only when the application is on the same site.

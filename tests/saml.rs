@@ -1059,6 +1059,34 @@ async fn a_wrong_session_index_ends_nothing() {
 }
 
 #[tokio::test]
+async fn single_logout_accepts_the_post_binding() {
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
+
+    let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let encoded = STANDARD.encode(logout_request(ENTITY));
+    let answer = b
+        .post_form(&endpoint, &[("SAMLRequest", encoded.as_str()), ("RelayState", "after")])
+        .await;
+    assert_eq!(answer.status, 302, "{}", answer.body);
+    assert!(answer.location.as_deref().unwrap().starts_with(LOGOUT));
+    let response = decoded_location(&answer, "SAMLResponse");
+    assert_eq!(response.attr("InResponseTo"), Some("_out1"));
+    assert_eq!(status_codes(&response), vec![protocol::STATUS_SUCCESS]);
+    assert_eq!(answer.redirect_params()["RelayState"], "after");
+
+    // The session really ended.
+    let again = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(again.field("SAMLResponse").is_none(), "{}", again.body);
+}
+
+#[tokio::test]
 async fn an_expired_logout_request_is_refused() {
     let w = world().await;
     let (b, _) = signed_in(&w).await;

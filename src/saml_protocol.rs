@@ -1208,7 +1208,7 @@ pub fn idp_metadata(
         .collect();
     let url = attr(sso_url)?;
     Ok(format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><EntityDescriptor xmlns="{NS_METADATA}" entityID="{entity}"><IDPSSODescriptor WantAuthnRequestsSigned="{want_signed_requests}" protocolSupportEnumeration="{NS_PROTOCOL}">{keys}<SingleLogoutService Binding="{BINDING_REDIRECT}" Location="{url}"/>{formats}<SingleSignOnService Binding="{BINDING_REDIRECT}" Location="{url}"/><SingleSignOnService Binding="{BINDING_POST}" Location="{url}"/></IDPSSODescriptor></EntityDescriptor>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><EntityDescriptor xmlns="{NS_METADATA}" entityID="{entity}"><IDPSSODescriptor WantAuthnRequestsSigned="{want_signed_requests}" protocolSupportEnumeration="{NS_PROTOCOL}">{keys}<SingleLogoutService Binding="{BINDING_REDIRECT}" Location="{url}"/><SingleLogoutService Binding="{BINDING_POST}" Location="{url}"/>{formats}<SingleSignOnService Binding="{BINDING_REDIRECT}" Location="{url}"/><SingleSignOnService Binding="{BINDING_POST}" Location="{url}"/></IDPSSODescriptor></EntityDescriptor>"#,
         entity = attr(idp_entity_id)?,
     ))
 }

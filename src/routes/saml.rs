@@ -635,7 +635,7 @@ pub async fn endpoint(
     };
     let is_logout = protocol::parse_xml(&xml).is_ok_and(|root| root.local == "LogoutRequest");
     if is_logout {
-        return logout_requested(&st, &tenant_key, &headers, &xml, &query, method).await;
+        return logout_requested(&st, &tenant_key, &headers, &xml, &query).await;
     }
     let mut params = Params::new();
     for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
@@ -887,12 +887,9 @@ async fn logout_requested(
     headers: &HeaderMap,
     xml: &str,
     query: &SamlQuery,
-    method: Method,
 ) -> Response {
-    // Entra's Single Logout is the Redirect binding only.
-    if method != Method::GET {
-        return page(None, "SAML logout requests use the HTTP-Redirect binding.");
-    }
+    // Either binding: a POST's signature is checked inside the message. The
+    // answer always goes back over HTTP-Redirect to the registered Logout URL.
     let tenant = match tenant::resolve(&st.pool, tenant_key).await {
         Ok(Some(t)) => t,
         Ok(None) => return page(None, &AadError::tenant_not_found(tenant_key).description()),

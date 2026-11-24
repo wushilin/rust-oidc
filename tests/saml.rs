@@ -941,6 +941,15 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
         assert!(response.child(NS_ASSERTION, "Assertion").is_none());
     }
 
+    // A schema-invalid IssueInstant is the requester's fault, with no second-level code.
+    let bad_time = authn_request("", "").replace("2026-11-23T00:00:00Z", "not-a-saml-timestamp");
+    let page = Browser::new()
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &bad_time, None))
+        .await;
+    let response = response_of(&page);
+    assert_eq!(status_codes(&response), vec![protocol::STATUS_REQUESTER]);
+    assert!(response.child(NS_ASSERTION, "Assertion").is_none());
+
     // Never to a URL the application did not register.
     let elsewhere = r#"AssertionConsumerServiceURL="https://evil.example/acs""#;
     let page = Browser::new()

@@ -418,9 +418,13 @@ fn version_mismatch(root: &Node) -> Option<SamlError> {
     })
 }
 
+/// `IssueInstant` is required and must be an `xs:dateTime`.
 fn check_issue_instant(root: &Node) -> Result<(), SamlError> {
     match root.attr("IssueInstant") {
-        Some(_) => Ok(()),
+        Some(raw) if parse_instant(raw).is_some() => Ok(()),
+        Some(_) => Err(SamlError::requester(
+            "The IssueInstant of the SAML message is not a valid time.",
+        )),
         None => Err(SamlError::requester("The SAML message has no IssueInstant.")),
     }
 }
@@ -476,11 +480,11 @@ impl AuthnRequest {
             return Err(SamlError::requester("The message is not a SAML AuthnRequest."));
         }
         let id = check_id(root.attr("ID"))?;
-        check_issue_instant(&root)?;
         let issuer = issuer_of(&root)?;
         // A request of another version is still answered, at the registered
-        // Reply URL, as SAML core 3.2.2.2 requires.
-        let mut refusal = version_mismatch(&root);
+        // Reply URL, as SAML core 3.2.2.2 requires; so is one without a valid
+        // IssueInstant, with Requester (SAML core 3.2.1).
+        let mut refusal = version_mismatch(&root).or_else(|| check_issue_instant(&root).err());
         if root.child(NS_ASSERTION, "Subject").is_some() {
             refusal.get_or_insert_with(|| SamlError::unsupported("An AuthnRequest must not contain a Subject."));
         }
@@ -1288,6 +1292,15 @@ mod tests {
             );
         }
         assert!(AuthnRequest::parse(&request("", "")).unwrap().refusal.is_none());
+    }
+
+    #[test]
+    fn an_invalid_issue_instant_is_answered_with_requester() {
+        for bad in [r#"IssueInstant="not-a-saml-timestamp""#, ""] {
+            let xml = request("", "").replace(r#"IssueInstant="2026-11-23T00:00:00Z""#, bad);
+            let refusal = AuthnRequest::parse(&xml).unwrap().refusal.unwrap();
+            assert_eq!((refusal.status, refusal.sub_status), (STATUS_REQUESTER, None), "{bad}");
+        }
     }
 
     #[test]

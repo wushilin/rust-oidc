@@ -2021,3 +2021,9 @@ assigned, and the account's own tenant (or its own setting) allows it.
   unsupported requests. Logout requests of another version still get a local page.
 - **`ForceAuthn` and `IsPassive` together get `NoPassive`.** Fresh authentication
   here always needs the user, so it cannot be done without a sign-in page.
+- **A missing or invalid `IssueInstant` gets `Requester`**, also at the Reply URL,
+  since such a request is schema-invalid (SAML Core 3.2.1).
+- **SAMLscope contradicts itself on Version 1.1**: IIP-SSO01-ep requires top-level
+  `VersionMismatch` and IIP-SSO01-an requires `Requester` for the same request. We
+  follow the version-specific rule (`VersionMismatch`), so IIP-SSO01-an reports a
+  failure. Answering with a local page would avoid the failure but meets neither rule.

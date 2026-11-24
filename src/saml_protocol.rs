@@ -15,7 +15,7 @@
 use aws_lc_rs::cipher::{AES_256, PaddedBlockEncryptingKey, UnboundCipherKey};
 use aws_lc_rs::digest;
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::rsa::{OAEP_SHA1_MGF1SHA1, OaepPublicEncryptingKey, PublicEncryptingKey};
+use aws_lc_rs::rsa::PublicEncryptingKey;
 use aws_lc_rs::signature::{self, RsaKeyPair, UnparsedPublicKey};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -52,8 +52,11 @@ pub const BINDING_REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Re
 
 const C14N_EXCLUSIVE: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const TRANSFORM_ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
-const ENC_AES256_CBC: &str = "http://www.w3.org/2001/04/xmlenc#aes256-cbc";
-const ENC_RSA_OAEP: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
+const NS_XENC11: &str = "http://www.w3.org/2009/xmlenc11#";
+const MGF1_SHA256: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha256";
+const DIGEST_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+/// AES-GCM's nonce, as XML Encryption 1.1 sends it ahead of the ciphertext.
+const GCM_NONCE_BYTES: usize = 12;
 const DIGEST_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
 const TYPE_ELEMENT: &str = "http://www.w3.org/2001/04/xmlenc#Element";
 const CM_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
@@ -133,6 +136,92 @@ closed_set!(
 );
 
 closed_set!(
+    /// How an encrypted assertion's content is encrypted. Entra uses AES-256-CBC;
+    /// the GCM modes also protect the content's integrity.
+    ContentEncryption {
+        Aes256Gcm => "aes256-gcm",
+        Aes128Gcm => "aes128-gcm",
+        Aes256Cbc => "aes256-cbc",
+    }
+);
+
+impl ContentEncryption {
+    pub fn uri(self) -> &'static str {
+        match self {
+            Self::Aes256Gcm => "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+            Self::Aes128Gcm => "http://www.w3.org/2009/xmlenc11#aes128-gcm",
+            Self::Aes256Cbc => "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+        }
+    }
+}
+
+closed_set!(
+    /// How the content key is wrapped to the application's certificate: RSA-OAEP
+    /// as XML Encryption 1.1 names it, or the 1.0 name with a SHA-1 mask.
+    KeyTransport {
+        RsaOaepMgf1p => "rsa-oaep-mgf1p",
+        RsaOaep => "rsa-oaep",
+    }
+);
+
+impl KeyTransport {
+    pub fn uri(self) -> &'static str {
+        match self {
+            Self::RsaOaepMgf1p => "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+            Self::RsaOaep => "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+        }
+    }
+}
+
+closed_set!(
+    /// The digest RSA-OAEP hashes with.
+    KeyTransportDigest {
+        Sha1 => "sha1",
+        Sha256 => "sha256",
+    }
+);
+
+impl KeyTransportDigest {
+    pub fn uri(self) -> &'static str {
+        match self {
+            Self::Sha1 => DIGEST_SHA1,
+            Self::Sha256 => DIGEST_SHA256,
+        }
+    }
+}
+
+/// How an application's assertions are encrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionAlgorithms {
+    pub content: ContentEncryption,
+    pub transport: KeyTransport,
+    pub digest: KeyTransportDigest,
+}
+
+impl EncryptionAlgorithms {
+    /// What Entra sends, and what an application set up before the choice existed
+    /// keeps: AES-256-CBC, its key wrapped with RSA-OAEP over SHA-1.
+    pub const ENTRA: Self = Self {
+        content: ContentEncryption::Aes256Cbc,
+        transport: KeyTransport::RsaOaepMgf1p,
+        digest: KeyTransportDigest::Sha1,
+    };
+    /// What a newly set up application starts with.
+    pub const RECOMMENDED: Self = Self {
+        content: ContentEncryption::Aes256Gcm,
+        transport: KeyTransport::RsaOaep,
+        digest: KeyTransportDigest::Sha256,
+    };
+}
+
+/// Encrypt the assertion to this certificate, this way.
+#[derive(Debug, Clone, Copy)]
+pub struct Encryption<'a> {
+    pub cert_der: &'a [u8],
+    pub algorithms: EncryptionAlgorithms,
+}
+
+closed_set!(
     /// Entra's *Signing Algorithm*: SHA-256 by default, SHA-1 only when chosen.
     SigningAlgorithm {
         Sha256 => "sha256",
@@ -150,7 +239,7 @@ impl SigningAlgorithm {
 
     fn digest_uri(self) -> &'static str {
         match self {
-            Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
+            Self::Sha256 => DIGEST_SHA256,
             Self::Sha1 => DIGEST_SHA1,
         }
     }
@@ -1015,34 +1104,85 @@ fn assertion(a: &AssertionInput<'_>, signer: Option<&Signer<'_>>) -> anyhow::Res
 /// Encrypt an assertion for the application: AES-256-CBC, its key wrapped with
 /// RSA-OAEP to the application's certificate, naming it as the key's recipient.
 /// The assertion is signed first.
-fn encrypt_assertion(assertion: &str, cert_der: &[u8], recipient: &str) -> anyhow::Result<String> {
+/// The content key wrapped to the certificate's RSA key with OAEP. With
+/// `rsa-oaep` and SHA-256 the mask is MGF1-SHA256, stated in the message;
+/// otherwise it is the MGF1-SHA1 both names default to.
+fn wrap_key(cert_der: &[u8], key: &[u8], algorithms: EncryptionAlgorithms) -> anyhow::Result<Vec<u8>> {
+    use rsa::pkcs8::DecodePublicKey;
     let (spki, _) = public_key_of(cert_der)?;
-    let public = PublicEncryptingKey::from_der(&spki).map_err(|_| anyhow::anyhow!("the encryption key is not RSA"))?;
-    let oaep = OaepPublicEncryptingKey::new(public).map_err(|_| anyhow::anyhow!("the encryption key is unusable"))?;
-    let key = random_bytes(32);
-    let cipher = PaddedBlockEncryptingKey::cbc_pkcs7(
-        UnboundCipherKey::new(&AES_256, &key).map_err(|_| anyhow::anyhow!("cipher key"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("cipher"))?;
-    let mut data = assertion.as_bytes().to_vec();
-    let context = cipher
-        .encrypt(&mut data)
-        .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-    let iv: &[u8] = (&context)
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("cipher returned no IV"))?;
-    let mut sealed = iv.to_vec();
-    sealed.extend_from_slice(&data);
-    let mut wrapped = vec![0u8; oaep.ciphertext_size()];
-    let wrapped_len = oaep
-        .encrypt(&OAEP_SHA1_MGF1SHA1, &key, &mut wrapped, None)
-        .map_err(|_| anyhow::anyhow!("key wrapping failed"))?
-        .len();
-    wrapped.truncate(wrapped_len);
+    let public =
+        rsa::RsaPublicKey::from_public_key_der(&spki).map_err(|_| anyhow::anyhow!("the encryption key is not RSA"))?;
+    let padding = match (algorithms.transport, algorithms.digest) {
+        (_, KeyTransportDigest::Sha1) => rsa::Oaep::new::<sha1_rsa::Sha1>(),
+        (KeyTransport::RsaOaepMgf1p, KeyTransportDigest::Sha256) => {
+            rsa::Oaep::new_with_mgf_hash::<rsa::sha2::Sha256, sha1_rsa::Sha1>()
+        }
+        (KeyTransport::RsaOaep, KeyTransportDigest::Sha256) => rsa::Oaep::new::<rsa::sha2::Sha256>(),
+    };
+    public
+        .encrypt(&mut rsa::rand_core::OsRng, padding, key)
+        .map_err(|_| anyhow::anyhow!("key wrapping failed"))
+}
+
+/// The content encrypted with a fresh key: the IV or nonce, then the ciphertext
+/// (and, for GCM, its tag), as XML Encryption lays out a `CipherValue`.
+fn seal_content(content: ContentEncryption, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    use aws_lc_rs::aead::{AES_128_GCM, AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    match content {
+        ContentEncryption::Aes256Cbc => {
+            let key = random_bytes(32);
+            let cipher = PaddedBlockEncryptingKey::cbc_pkcs7(
+                UnboundCipherKey::new(&AES_256, &key).map_err(|_| anyhow::anyhow!("cipher key"))?,
+            )
+            .map_err(|_| anyhow::anyhow!("cipher"))?;
+            let mut data = plaintext.to_vec();
+            let context = cipher
+                .encrypt(&mut data)
+                .map_err(|_| anyhow::anyhow!("encryption failed"))?;
+            let iv: &[u8] = (&context)
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("cipher returned no IV"))?;
+            let mut sealed = iv.to_vec();
+            sealed.extend_from_slice(&data);
+            Ok((key, sealed))
+        }
+        ContentEncryption::Aes128Gcm | ContentEncryption::Aes256Gcm => {
+            let (algorithm, key_len) = match content {
+                ContentEncryption::Aes128Gcm => (&AES_128_GCM, 16),
+                _ => (&AES_256_GCM, 32),
+            };
+            let key = random_bytes(key_len);
+            let cipher = LessSafeKey::new(UnboundKey::new(algorithm, &key).map_err(|_| anyhow::anyhow!("cipher key"))?);
+            let nonce_bytes = random_bytes(GCM_NONCE_BYTES);
+            let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| anyhow::anyhow!("nonce"))?;
+            let mut data = plaintext.to_vec();
+            cipher
+                .seal_in_place_append_tag(nonce, Aad::empty(), &mut data)
+                .map_err(|_| anyhow::anyhow!("encryption failed"))?;
+            let mut sealed = nonce_bytes;
+            sealed.extend_from_slice(&data);
+            Ok((key, sealed))
+        }
+    }
+}
+
+fn encrypt_assertion(assertion: &str, to: Encryption<'_>, recipient: &str) -> anyhow::Result<String> {
+    let algorithms = to.algorithms;
+    let (key, sealed) = seal_content(algorithms.content, assertion.as_bytes())?;
+    let wrapped = wrap_key(to.cert_der, &key, algorithms)?;
+    let mgf = match (algorithms.transport, algorithms.digest) {
+        (KeyTransport::RsaOaep, KeyTransportDigest::Sha256) => {
+            format!(r#"<xenc11:MGF xmlns:xenc11="{NS_XENC11}" Algorithm="{MGF1_SHA256}"></xenc11:MGF>"#)
+        }
+        _ => String::new(),
+    };
     Ok(format!(
-        r#"<saml:EncryptedAssertion xmlns:saml="{NS_ASSERTION}"><xenc:EncryptedData xmlns:xenc="{NS_XENC}" Type="{TYPE_ELEMENT}"><xenc:EncryptionMethod Algorithm="{ENC_AES256_CBC}"></xenc:EncryptionMethod><ds:KeyInfo xmlns:ds="{NS_DS}"><xenc:EncryptedKey Recipient="{recipient}"><xenc:EncryptionMethod Algorithm="{ENC_RSA_OAEP}"><ds:DigestMethod Algorithm="{DIGEST_SHA1}"></ds:DigestMethod></xenc:EncryptionMethod><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{key}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{value}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>"#,
+        r#"<saml:EncryptedAssertion xmlns:saml="{NS_ASSERTION}"><xenc:EncryptedData xmlns:xenc="{NS_XENC}" Type="{TYPE_ELEMENT}"><xenc:EncryptionMethod Algorithm="{content}"></xenc:EncryptionMethod><ds:KeyInfo xmlns:ds="{NS_DS}"><xenc:EncryptedKey Recipient="{recipient}"><xenc:EncryptionMethod Algorithm="{transport}"><ds:DigestMethod Algorithm="{digest}"></ds:DigestMethod>{mgf}</xenc:EncryptionMethod><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{key}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{value}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>"#,
+        content = algorithms.content.uri(),
+        transport = algorithms.transport.uri(),
+        digest = algorithms.digest.uri(),
         recipient = attr(recipient)?,
-        cert = b64(cert_der),
+        cert = b64(to.cert_der),
         key = b64(&wrapped),
         value = b64(&sealed),
     ))
@@ -1070,7 +1210,7 @@ pub fn success_response(
     a: &AssertionInput<'_>,
     signer: &Signer<'_>,
     option: SigningOption,
-    encrypt_to: Option<&[u8]>,
+    encrypt_to: Option<Encryption<'_>>,
 ) -> anyhow::Result<String> {
     let sign_assertion = matches!(option, SigningOption::Assertion | SigningOption::Both);
     // CBC ciphertext has no integrity of its own, so the SAML profile asks for
@@ -1078,7 +1218,7 @@ pub fn success_response(
     let sign_response = encrypt_to.is_some() || matches!(option, SigningOption::Response | SigningOption::Both);
     let inner = assertion(a, sign_assertion.then_some(signer))?;
     let inner = match encrypt_to {
-        Some(cert) => encrypt_assertion(&inner, cert, a.audience)?,
+        Some(to) => encrypt_assertion(&inner, to, a.audience)?,
         None => inner,
     };
     let id = new_id();
@@ -1266,13 +1406,114 @@ mod tests {
         };
         let decode = |encoded: String| String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
 
-        let sealed = decode(success_response(&input, &signer, SigningOption::Assertion, Some(&der)).unwrap());
+        let to = Encryption {
+            cert_der: &der,
+            algorithms: EncryptionAlgorithms::ENTRA,
+        };
+        let sealed = decode(success_response(&input, &signer, SigningOption::Assertion, Some(to)).unwrap());
         assert!(sealed.contains(r#"<xenc:EncryptedKey Recipient="https://sp.example/">"#));
         crate::saml_dsig::verify(&sealed, std::slice::from_ref(&der), false).unwrap();
 
         // Control: without encryption the configured option still decides.
         let plain = decode(success_response(&input, &signer, SigningOption::Assertion, None).unwrap());
         assert!(parse_xml(&plain).unwrap().child(NS_DS, "Signature").is_none());
+    }
+
+    /// Undo `encrypt_assertion` as an application would, from the message alone.
+    fn decrypt_assertion(sealed: &str, private_pem: &str) -> String {
+        use aws_lc_rs::aead::{AES_128_GCM, AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+        use aws_lc_rs::cipher::{DecryptionContext, PaddedBlockDecryptingKey};
+        use rsa::pkcs8::DecodePrivateKey;
+        let root = parse_xml(sealed).unwrap();
+        let data = root.child(NS_XENC, "EncryptedData").unwrap();
+        let content = data
+            .child(NS_XENC, "EncryptionMethod")
+            .unwrap()
+            .attr("Algorithm")
+            .unwrap();
+        let encrypted_key = data
+            .child(NS_DS, "KeyInfo")
+            .and_then(|k| k.child(NS_XENC, "EncryptedKey"))
+            .unwrap();
+        let method = encrypted_key.child(NS_XENC, "EncryptionMethod").unwrap();
+        let transport = method.attr("Algorithm").unwrap();
+        let digest = method.child(NS_DS, "DigestMethod").unwrap().attr("Algorithm").unwrap();
+        let mgf = method.child(NS_XENC11, "MGF").and_then(|m| m.attr("Algorithm"));
+        let value = |n: &Node| {
+            let v = n
+                .child(NS_XENC, "CipherData")
+                .and_then(|c| c.child(NS_XENC, "CipherValue"))
+                .unwrap();
+            STANDARD.decode(v.text.trim()).unwrap()
+        };
+        // The digest and mask exactly as the message states them; an omitted
+        // mask is MGF1-SHA1 for both key transport names.
+        let padding = match (digest == DIGEST_SHA256, mgf == Some(MGF1_SHA256)) {
+            (false, false) => rsa::Oaep::new::<sha1_rsa::Sha1>(),
+            (true, false) => rsa::Oaep::new_with_mgf_hash::<rsa::sha2::Sha256, sha1_rsa::Sha1>(),
+            (true, true) => rsa::Oaep::new::<rsa::sha2::Sha256>(),
+            (false, true) => panic!("SHA-1 digest with a SHA-256 mask is never sent"),
+        };
+        assert!(
+            transport == KeyTransport::RsaOaep.uri() || mgf.is_none(),
+            "1.0 name with a mask"
+        );
+        let private = rsa::RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
+        let key = private.decrypt(padding, &value(encrypted_key)).unwrap();
+        let mut body = value(data);
+        let plain = if content == ContentEncryption::Aes256Cbc.uri() {
+            let (iv, rest) = body.split_at_mut(16);
+            let cipher = PaddedBlockDecryptingKey::cbc_pkcs7(UnboundCipherKey::new(&AES_256, &key).unwrap()).unwrap();
+            let iv: [u8; 16] = iv.try_into().unwrap();
+            cipher
+                .decrypt(rest, DecryptionContext::Iv128(iv.into()))
+                .unwrap()
+                .to_vec()
+        } else {
+            let algorithm = if content == ContentEncryption::Aes128Gcm.uri() {
+                &AES_128_GCM
+            } else {
+                &AES_256_GCM
+            };
+            let (nonce, rest) = body.split_at_mut(GCM_NONCE_BYTES);
+            let cipher = LessSafeKey::new(UnboundKey::new(algorithm, &key).unwrap());
+            let nonce = Nonce::try_assume_unique_for_key(nonce).unwrap();
+            cipher.open_in_place(nonce, Aad::empty(), rest).unwrap().to_vec()
+        };
+        String::from_utf8(plain).unwrap()
+    }
+
+    #[test]
+    fn every_encryption_choice_decrypts_as_its_message_says() {
+        use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256, RsaKeySize};
+        let key = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048).unwrap();
+        let cert = CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (pem, der) = (key.serialize_pem(), cert.der().to_vec());
+        let assertion =
+            r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a"></saml:Assertion>"#;
+        for &content in ContentEncryption::ALL {
+            for &transport in KeyTransport::ALL {
+                for &digest in KeyTransportDigest::ALL {
+                    let algorithms = EncryptionAlgorithms {
+                        content,
+                        transport,
+                        digest,
+                    };
+                    let to = Encryption {
+                        cert_der: &der,
+                        algorithms,
+                    };
+                    let sealed = encrypt_assertion(assertion, to, "https://sp.example/").unwrap();
+                    assert!(sealed.contains(content.uri()), "{algorithms:?}");
+                    assert!(sealed.contains(transport.uri()), "{algorithms:?}");
+                    assert!(sealed.contains(digest.uri()), "{algorithms:?}");
+                    assert_eq!(decrypt_assertion(&sealed, &pem), assertion, "{algorithms:?}");
+                }
+            }
+        }
     }
 
     #[test]

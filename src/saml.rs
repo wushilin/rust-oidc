@@ -19,7 +19,10 @@ use sha1::{Digest, Sha1};
 
 use crate::apps::{Application, ServicePrincipal};
 use crate::db::{Conn, Flag, Handle};
-use crate::saml_protocol::{self as protocol, NameIdFormat, SigningAlgorithm, SigningOption};
+use crate::saml_protocol::{
+    self as protocol, ContentEncryption, EncryptionAlgorithms, KeyTransport, KeyTransportDigest, NameIdFormat,
+    SigningAlgorithm, SigningOption,
+};
 use crate::tenant::Tenant;
 use crate::users::User;
 use crate::util::{b64, new_guid, now};
@@ -348,6 +351,8 @@ pub struct SamlConfig {
     pub signing_algorithm: SigningAlgorithm,
     pub require_signed_requests: bool,
     pub encryption_cert: Option<Vec<u8>>,
+    /// How assertions are encrypted when there is a certificate.
+    pub encryption_algorithms: EncryptionAlgorithms,
     pub claims: Vec<Claim>,
 }
 
@@ -426,6 +431,9 @@ type SettingsRow = (
     String,
     Flag,
     Option<String>,
+    String,
+    String,
+    String,
 );
 
 /// The application's SAML configuration, or `None` if SAML was never chosen.
@@ -438,14 +446,34 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
     let row: Option<SettingsRow> = sqlx::query_as(crate::db::qc(
         conn,
         "SELECT tenant_id, relay_state, logout_url, name_id_format, name_id_source, signing_option,
-                signing_algorithm, require_signed_requests, encryption_cert_b64
+                signing_algorithm, require_signed_requests, encryption_cert_b64,
+                encryption_method, key_transport, key_transport_digest
          FROM app_saml_settings WHERE application_id = ?",
     ))
     .bind(&app.id)
     .fetch_optional(&mut *conn)
     .await?;
-    let Some((tenant_id, relay_state, logout_url, format, source, option, algorithm, require, encryption)) = row else {
+    let Some((
+        tenant_id,
+        relay_state,
+        logout_url,
+        format,
+        source,
+        option,
+        algorithm,
+        require,
+        encryption,
+        content,
+        transport,
+        digest,
+    )) = row
+    else {
         return Ok(None);
+    };
+    let encryption_algorithms = EncryptionAlgorithms {
+        content: ContentEncryption::parse(&content).ok_or_else(|| anyhow!("unknown encryption method '{content}'"))?,
+        transport: KeyTransport::parse(&transport).ok_or_else(|| anyhow!("unknown key transport '{transport}'"))?,
+        digest: KeyTransportDigest::parse(&digest).ok_or_else(|| anyhow!("unknown key transport digest '{digest}'"))?,
     };
     let (mode, sign_on_url): (Option<String>, Option<String>) = sqlx::query_as(crate::db::qc(
         conn,
@@ -507,6 +535,7 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
         signing_algorithm: SigningAlgorithm::parse(&algorithm).ok_or_else(|| anyhow!("unknown signing algorithm"))?,
         require_signed_requests: require.into(),
         encryption_cert: encryption.as_deref().map(unb64).transpose()?,
+        encryption_algorithms,
         claims,
     }))
 }
@@ -657,8 +686,9 @@ pub(crate) async fn enable_in(
         sqlx::query(crate::db::qc(
             conn,
             "INSERT INTO app_saml_settings (application_id, tenant_id, name_id_format, name_id_source,
-                                            signing_option, signing_algorithm, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                            signing_option, signing_algorithm, encryption_method,
+                                            key_transport, key_transport_digest, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ))
         .bind(&app.id)
         .bind(&tenant.id)
@@ -666,6 +696,9 @@ pub(crate) async fn enable_in(
         .bind(NameIdSource::UserPrincipalName.as_str())
         .bind(SigningOption::Assertion.as_str())
         .bind(SigningAlgorithm::Sha256.as_str())
+        .bind(EncryptionAlgorithms::RECOMMENDED.content.as_str())
+        .bind(EncryptionAlgorithms::RECOMMENDED.transport.as_str())
+        .bind(EncryptionAlgorithms::RECOMMENDED.digest.as_str())
         .bind(ts)
         .execute(&mut *conn)
         .await?;
@@ -1033,22 +1066,50 @@ pub(crate) async fn remove_verification_certificate_in(
     Ok(certificate.thumbprint.clone())
 }
 
-/// Encrypt assertions to this certificate, or stop (`None`).
+/// What a change to token encryption does to the certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionCertificate<'a> {
+    /// Keep the one in use (or none), changing only how it is used.
+    Keep,
+    /// Encrypt to this certificate's key from now on.
+    Use(&'a [u8]),
+    /// Stop encrypting.
+    Stop,
+}
+
+/// Set how assertions are encrypted, and to which certificate.
 pub(crate) async fn set_encryption_in(
     conn: &mut Conn,
     app: &Application,
-    cert_der: Option<&[u8]>,
+    certificate: EncryptionCertificate<'_>,
+    algorithms: EncryptionAlgorithms,
 ) -> anyhow::Result<()> {
-    if let Some(der) = cert_der
+    if let EncryptionCertificate::Use(der) = certificate
         && !protocol::usable_rsa_certificate(der)
     {
         bail!("The certificate must hold an RSA public key.");
     }
     sqlx::query(crate::db::qc(
         conn,
+        "UPDATE app_saml_settings SET encryption_method = ?, key_transport = ?, key_transport_digest = ?
+         WHERE application_id = ?",
+    ))
+    .bind(algorithms.content.as_str())
+    .bind(algorithms.transport.as_str())
+    .bind(algorithms.digest.as_str())
+    .bind(&app.id)
+    .execute(&mut *conn)
+    .await?;
+    let cert = match certificate {
+        EncryptionCertificate::Keep => return Ok(()),
+        EncryptionCertificate::Use(der) => Some(b64(der)),
+        EncryptionCertificate::Stop => None,
+    };
+    sqlx::query(crate::db::qc(
+        conn,
         "UPDATE app_saml_settings SET encryption_cert_b64 = ? WHERE application_id = ?",
     ))
-    .bind(cert_der.map(b64))
+    .bind(cert)
     .bind(&app.id)
     .execute(&mut *conn)
     .await?;

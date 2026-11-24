@@ -29,6 +29,14 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - Reply URLs keep an explicit index and default. A line in the Reply URL box
   may end with `index=N` and `default`; plain lines work as before.
 
+- **Choose how SAML assertions are encrypted**: AES-256-GCM, AES-128-GCM or
+  AES-256-CBC, with the key wrapped by RSA-OAEP (XML Encryption 1.1) or
+  RSA-OAEP-MGF1P over SHA-256 or SHA-1. Applications already set up keep
+  AES-256-CBC with RSA-OAEP-MGF1P over SHA-1, as Entra sends; newly set up ones
+  start with AES-256-GCM and RSA-OAEP over SHA-256. The encryption certificate
+  no longer has to be pasted again to change the method, and "Stop encrypting"
+  is its own button.
+
 ### Fixed
 
 - A SAML request for an authentication context declaration, which is not

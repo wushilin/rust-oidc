@@ -2097,3 +2097,79 @@ async fn reply_urls_keep_their_index_and_default_through_the_form() {
         Some("https://b.example/acs")
     );
 }
+
+#[tokio::test]
+async fn the_encryption_method_can_change_without_the_certificate() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    // A newly set up application starts with the recommended choice.
+    assert_eq!(
+        saved_config(&w).await.encryption_algorithms,
+        protocol::EncryptionAlgorithms::RECOMMENDED
+    );
+    let (_, _, cert_pem) = sp_key();
+    let choose = |content: &'static str, cert: String| {
+        let a = &a;
+        let url = url.clone();
+        async move {
+            a.post(
+                &url,
+                &[
+                    ("op", "saml_encryption"),
+                    ("encryption_method", content),
+                    ("key_transport", "rsa-oaep-mgf1p"),
+                    ("key_transport_digest", "sha256"),
+                    ("certificate", &cert),
+                ],
+            )
+            .await
+        }
+    };
+    assert_eq!(choose("aes256-cbc", cert_pem.clone()).await.status, 303);
+    let with_cert = saved_config(&w).await.encryption_cert.clone();
+    assert!(with_cert.is_some());
+
+    // Only the method changes; the certificate stays.
+    assert_eq!(choose("aes128-gcm", String::new()).await.status, 303);
+    let config = saved_config(&w).await;
+    assert_eq!(config.encryption_cert, with_cert);
+    assert_eq!(
+        config.encryption_algorithms.content,
+        protocol::ContentEncryption::Aes128Gcm
+    );
+    assert_eq!(
+        config.encryption_algorithms.digest,
+        protocol::KeyTransportDigest::Sha256
+    );
+
+    // A sign-in encrypts that way.
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    let xml = response_xml(&page);
+    assert!(xml.contains("http://www.w3.org/2009/xmlenc11#aes128-gcm"), "{xml}");
+    assert!(xml.contains("http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"), "{xml}");
+
+    // An unknown method is refused and nothing changes.
+    assert_eq!(choose("aes512-xyz", String::new()).await.status, 400);
+    assert_eq!(saved_config(&w).await, config);
+
+    // Stop encrypting.
+    let stopped = a
+        .post(
+            &url,
+            &[
+                ("op", "saml_encryption"),
+                ("encryption_method", "aes256-gcm"),
+                ("key_transport", "rsa-oaep"),
+                ("key_transport_digest", "sha256"),
+                ("encryption_action", "stop"),
+            ],
+        )
+        .await;
+    assert_eq!(stopped.status, 303);
+    assert!(saved_config(&w).await.encryption_cert.is_none());
+}

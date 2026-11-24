@@ -12,7 +12,7 @@ use crate::admin::{APP_ROTATE, APP_WRITE};
 use crate::apps::{self, Application, ServicePrincipal};
 use crate::db::Event;
 use crate::saml::{self, BasicConfig, Claim, NameIdSource, NewCertificate};
-use crate::saml_protocol::{NameIdFormat, SigningAlgorithm, SigningOption};
+use crate::saml_protocol::{EncryptionAlgorithms, NameIdFormat, SigningAlgorithm, SigningOption};
 use crate::tenant::Tenant;
 use crate::txn::{Audit, Cx, KindInfo, LockTarget, Need, Refusal, Scope, Step, Transaction};
 
@@ -422,7 +422,19 @@ impl Transaction for RemoveSamlVerificationCertificate {
 pub struct SetSamlEncryption {
     pub tenant_id: String,
     pub app_id: String,
-    pub certificate_pem: Option<String>,
+    pub certificate: EncryptionKey,
+    pub algorithms: EncryptionAlgorithms,
+}
+
+/// What to encrypt to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptionKey {
+    /// The certificate already in use, or none.
+    Keep,
+    /// This certificate (PEM, public only).
+    Use(String),
+    /// Nothing: stop encrypting.
+    Stop,
 }
 
 impl Transaction for SetSamlEncryption {
@@ -437,28 +449,46 @@ impl Transaction for SetSamlEncryption {
     on_application!();
 
     async fn run(&self, cx: &mut Cx<'_>) -> Step<Option<String>> {
-        let pasted_key = self
-            .certificate_pem
-            .as_deref()
-            .is_some_and(|p| p.contains("PRIVATE KEY"));
+        let pasted_key = matches!(&self.certificate, EncryptionKey::Use(pem) if pem.contains("PRIVATE KEY"));
         cx.ensure(!pasted_key, || {
             Refusal::Invalid("that is a private key; paste only the certificate".into())
         })?;
         let (_, app, _) = configured(cx, &self.tenant_id, &self.app_id).await?;
-        let der = match &self.certificate_pem {
-            Some(pem) => {
+        let current = saml::config_in(cx.conn(), &app).await;
+        let current = cx.check(current)?.and_then(|c| c.encryption_cert);
+        let der = match &self.certificate {
+            EncryptionKey::Use(pem) => {
                 let parsed = apps::parse_certificate(pem);
                 Some(cx.check(parsed)?.cert_der)
             }
-            None => None,
+            EncryptionKey::Keep | EncryptionKey::Stop => None,
         };
-        let done = saml::set_encryption_in(cx.conn(), &app, der.as_deref()).await;
+        let change = match (&self.certificate, der.as_deref()) {
+            (EncryptionKey::Use(_), Some(der)) => saml::EncryptionCertificate::Use(der),
+            (EncryptionKey::Stop, _) => saml::EncryptionCertificate::Stop,
+            _ => saml::EncryptionCertificate::Keep,
+        };
+        let done = saml::set_encryption_in(cx.conn(), &app, change, self.algorithms).await;
         cx.check(done)?;
-        Ok(der.as_deref().map(saml::thumbprint))
+        let in_use = match &self.certificate {
+            EncryptionKey::Use(_) => der,
+            EncryptionKey::Stop => None,
+            EncryptionKey::Keep => current,
+        };
+        Ok(in_use.as_deref().map(saml::thumbprint))
     }
 
     fn audit(&self, thumbprint: &Option<String>) -> Audit {
-        on_app(&self.tenant_id, &self.app_id, json!({ "thumbprint": thumbprint }))
+        on_app(
+            &self.tenant_id,
+            &self.app_id,
+            json!({
+                "thumbprint": thumbprint,
+                "encryptionMethod": self.algorithms.content.as_str(),
+                "keyTransport": self.algorithms.transport.as_str(),
+                "keyTransportDigest": self.algorithms.digest.as_str(),
+            }),
+        )
     }
 }
 

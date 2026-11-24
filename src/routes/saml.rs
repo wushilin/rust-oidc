@@ -588,7 +588,10 @@ async fn build(st: &AppState, i: &Issue<'_>) -> anyhow::Result<String> {
         &input,
         &signer,
         config.signing_option,
-        config.encryption_cert.as_deref(),
+        config.encryption_cert.as_deref().map(|cert_der| protocol::Encryption {
+            cert_der,
+            algorithms: config.encryption_algorithms,
+        }),
     )?;
     Ok(response)
 }

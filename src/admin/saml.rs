@@ -21,12 +21,15 @@ use crate::claims::Amr;
 use crate::routes::saml as endpoints;
 use crate::saml::{self, BasicConfig, Claim, ClaimSource, NameIdSource, NewCertificate, ReplyUrl, SamlConfig};
 use crate::saml_metadata::SpMetadata;
-use crate::saml_protocol::{NameIdFormat, SigningAlgorithm, SigningOption};
+use crate::saml_protocol::{
+    ContentEncryption, EncryptionAlgorithms, KeyTransport, KeyTransportDigest, NameIdFormat, SigningAlgorithm,
+    SigningOption,
+};
 use crate::tenant::Tenant;
 use crate::txn::ops::saml::{
     ActivateSamlCertificate, AddSamlCertificate, AddSamlVerificationCertificate, DisableSamlSso, EnableSamlSso,
-    RemoveSamlCertificate, RemoveSamlVerificationCertificate, SaveSamlBasic, SaveSamlClaims, SaveSamlSigning,
-    SetAppSignOnUrl, SetAppVisibility, SetSamlEncryption, SetSamlRequireSigned,
+    EncryptionKey, RemoveSamlCertificate, RemoveSamlVerificationCertificate, SaveSamlBasic, SaveSamlClaims,
+    SaveSamlSigning, SetAppSignOnUrl, SetAppVisibility, SetSamlEncryption, SetSamlRequireSigned,
 };
 use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
 use crate::util::{b64, now};
@@ -43,6 +46,12 @@ const CLAIM_SOURCE: &str = "claim_source";
 const SIGNING_OPTION: &str = "signing_option";
 const SIGNING_ALGORITHM: &str = "signing_algorithm";
 const CERTIFICATE: &str = "certificate";
+const ENCRYPTION_METHOD: &str = "encryption_method";
+const KEY_TRANSPORT: &str = "key_transport";
+const KEY_TRANSPORT_DIGEST: &str = "key_transport_digest";
+/// The encryption form's button: Save, or this one to stop encrypting.
+const ENCRYPTION_ACTION: &str = "encryption_action";
+const STOP_ENCRYPTING: &str = "stop";
 const CERTIFICATE_ID: &str = "certificate_id";
 const DAYS: &str = "days";
 const REQUIRED: &str = "required";
@@ -522,21 +531,105 @@ fn verification_form(
     format!(r#"<h4>Verification certificates</h4>{table}{controls}"#)
 }
 
+fn content_label(content: ContentEncryption) -> &'static str {
+    match content {
+        ContentEncryption::Aes256Gcm => "AES-256-GCM",
+        ContentEncryption::Aes128Gcm => "AES-128-GCM",
+        ContentEncryption::Aes256Cbc => "AES-256-CBC (as Entra)",
+    }
+}
+
+fn transport_label(transport: KeyTransport) -> &'static str {
+    match transport {
+        KeyTransport::RsaOaep => "RSA-OAEP (XML Encryption 1.1)",
+        KeyTransport::RsaOaepMgf1p => "RSA-OAEP-MGF1P (as Entra)",
+    }
+}
+
+fn digest_label(digest: KeyTransportDigest) -> &'static str {
+    match digest {
+        KeyTransportDigest::Sha256 => "SHA-256",
+        KeyTransportDigest::Sha1 => "SHA-1 (as Entra)",
+    }
+}
+
+fn select<T: Copy + PartialEq>(
+    id: &str,
+    label: &str,
+    all: &[T],
+    current: T,
+    wire: impl Fn(T) -> &'static str,
+    shown: impl Fn(T) -> &'static str,
+    disabled: &str,
+) -> String {
+    let options: String = all
+        .iter()
+        .map(|v| {
+            let selected = if *v == current { " selected" } else { "" };
+            format!(r#"<option value="{}"{selected}>{}</option>"#, wire(*v), e(shown(*v)))
+        })
+        .collect();
+    format!(r#"<label for="{id}">{label}</label><select id="{id}" name="{id}"{disabled}>{options}</select>"#)
+}
+
 fn encryption_form(url: &str, csrf: &str, c: &SamlConfig, may_rotate: bool) -> String {
+    let a = c.encryption_algorithms;
     let state = match &c.encryption_cert {
         Some(der) => format!(
-            r#"<p>Assertions are encrypted (AES-256) to the certificate <code>{}</code>.</p>"#,
+            r#"<p>Assertions are encrypted ({}, key wrapped with {} over {}) to the certificate <code>{}</code>.</p>"#,
+            e(content_label(a.content)),
+            e(transport_label(a.transport)),
+            e(digest_label(a.digest)),
             e(&saml::thumbprint(der))
         ),
         None => r#"<p class="empty">Assertions are not encrypted.</p>"#.to_string(),
     };
+    let disabled = if may_rotate { "" } else { " disabled" };
+    let choices = format!(
+        "{}{}{}",
+        select(
+            ENCRYPTION_METHOD,
+            "Encryption method",
+            ContentEncryption::ALL,
+            a.content,
+            ContentEncryption::as_str,
+            content_label,
+            disabled
+        ),
+        select(
+            KEY_TRANSPORT,
+            "Key transport",
+            KeyTransport::ALL,
+            a.transport,
+            KeyTransport::as_str,
+            transport_label,
+            disabled
+        ),
+        select(
+            KEY_TRANSPORT_DIGEST,
+            "Key transport digest",
+            KeyTransportDigest::ALL,
+            a.digest,
+            KeyTransportDigest::as_str,
+            digest_label,
+            disabled
+        ),
+    );
     if !may_rotate {
-        return format!("<h4>Token encryption</h4>{state}");
+        return format!("<h4>Token encryption</h4>{state}{choices}");
     }
+    let stop = if c.encryption_cert.is_some() {
+        format!(
+            r#"<button type="submit" class="secondary" name="{ENCRYPTION_ACTION}" value="{STOP_ENCRYPTING}" formnovalidate>Stop encrypting</button>"#
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<h4>Token encryption</h4>{state}{open}<label for="encrypt_cert">Certificate (PEM, public key only); leave empty to stop encrypting</label>
+        r#"<h4>Token encryption</h4>{state}{open}{choices}<label for="encrypt_cert">Certificate (PEM, public key only); leave empty to keep the current one</label>
 <textarea id="encrypt_cert" name="{CERTIFICATE}" rows="6"></textarea>
-<div class="actions"><button type="submit">Save</button></div></form>"#,
+<p class="muted">Pick what the application can decrypt. AES-GCM also protects the assertion's integrity; an encrypted assertion always comes in a signed response.</p>
+<div class="actions"><button type="submit">Save</button>{stop}</div></form>"#,
         open = form_open(url, csrf, AppOp::SamlEncryption),
     )
 }
@@ -1061,14 +1154,33 @@ pub(super) async fn apply(
             .await
         }
         AppOp::SamlEncryption => {
-            let certificate_pem = maybe(CERTIFICATE);
+            let (Some(content), Some(transport), Some(digest)) = (
+                ContentEncryption::parse(field(form, ENCRYPTION_METHOD)),
+                KeyTransport::parse(field(form, KEY_TRANSPORT)),
+                KeyTransportDigest::parse(field(form, KEY_TRANSPORT_DIGEST)),
+            ) else {
+                return invalid("Choose how assertions are encrypted.");
+            };
+            let certificate = if field(form, ENCRYPTION_ACTION) == STOP_ENCRYPTING {
+                EncryptionKey::Stop
+            } else {
+                match maybe(CERTIFICATE) {
+                    Some(pem) => EncryptionKey::Use(pem),
+                    None => EncryptionKey::Keep,
+                }
+            };
             run(
                 st,
                 actor,
                 &SetSamlEncryption {
                     tenant_id,
                     app_id,
-                    certificate_pem,
+                    certificate,
+                    algorithms: EncryptionAlgorithms {
+                        content,
+                        transport,
+                        digest,
+                    },
                 },
             )
             .await

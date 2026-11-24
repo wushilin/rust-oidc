@@ -2064,3 +2064,22 @@ assigned, and the account's own tenant (or its own setting) allows it.
   where they are saved. The text box stays one URL per line; `index=N` and `default`
   are written only when the plain order would not say the same.
 - **axum's `multipart` feature** is turned on for the upload (adds `multer`).
+
+### Selectable assertion encryption (2026-11-24)
+
+- **The owner chose to offer AES-GCM and XML Encryption 1.1 RSA-OAEP**, departing
+  from Entra, which sends only AES-256-CBC with RSA-OAEP-MGF1P over SHA-1. The SAML
+  interoperability profile asks an IdP to support AES-GCM and both OAEP forms.
+- **Existing applications keep Entra's algorithms** (migration defaults), so no
+  service provider that works today stops decrypting. **New applications start with
+  AES-256-GCM and RSA-OAEP over SHA-256**, as recommended to the owner; an
+  administrator picks AES-256-CBC for one that cannot read GCM.
+- **The mask**: RSA-OAEP over SHA-256 states an MGF1-SHA256 mask in the message, the
+  usual modern pairing; every other choice uses the MGF1-SHA1 both names default to.
+  RSA-OAEP-MGF1P over SHA-256 is that mixed form, which aws-lc-rs does not offer, so
+  key wrapping uses the `rsa` crate (already a dependency) for every form. This is
+  encryption to a public key only; nothing is decrypted with it. A renamed `sha1`
+  0.10 dependency supplies the SHA-1 that crate takes.
+- **The encrypted assertion still always comes in a signed Response**, GCM or not.
+- **The form keeps the certificate unless a new one is pasted**; stopping is a separate
+  button, so changing only the method cannot drop encryption by accident.

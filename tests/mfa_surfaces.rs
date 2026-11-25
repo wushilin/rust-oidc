@@ -275,7 +275,8 @@ async fn guessing_at_a_new_phone_from_a_session_is_locked_out() {
     let dashboard = send_code(&b, &page, &fresh_code(&secret, 1)).await;
     assert!(dashboard.body.contains("<h1>My account</h1>"), "{}", dashboard.body);
     // Every response carries a fresh CSRF token: each post takes the latest.
-    let mut page = dashboard;
+    // The forms are on the Security tab.
+    let mut page = b.get(&format!("{}/security", my_account(&s, &f))).await;
     for n in 1..=10 {
         let op = if n % 2 == 0 {
             "account_recovery_codes"

@@ -39,6 +39,9 @@ async fn signed_in(s: &TestServer, f: &UserFixture) -> (Browser, Page) {
     );
     let page = b.login(&login, &f.upn, &f.password).await;
     assert!(page.body.contains("<h1>My account</h1>"), "{}", page.body);
+    // Signing in lands on My apps; the forms these tests use are on Security.
+    let page = b.get(&format!("{}/security", account(s, f))).await;
+    assert!(page.body.contains("Change password"), "{}", page.body);
     (b, page)
 }
 
@@ -63,7 +66,8 @@ fn codes_on(page: &Page) -> Vec<String> {
 async fn the_profile_is_shown_and_not_editable() {
     let s = TestServer::start().await;
     let f = user_fixture(&s).await;
-    let (_, page) = signed_in(&s, &f).await;
+    let (b, _) = signed_in(&s, &f).await;
+    let page = b.get(&format!("{}/profile", account(&s, &f))).await;
     assert!(page.body.contains(&f.upn), "{}", page.body);
     assert!(
         page.body.contains("Ask an administrator to change these."),
@@ -258,7 +262,7 @@ async fn sign_out_everywhere_ends_every_session_and_actions_need_the_token() {
     assert!(!forged.body.contains("You signed out"), "{}", forged.body);
     assert!(b.get(&account(&s, &f)).await.body.contains("<h1>My account</h1>"));
 
-    let page = b.get(&account(&s, &f)).await;
+    let page = b.get(&format!("{}/security", account(&s, &f))).await;
     let out = act(&b, &page, "account_sign_out_everywhere", &[]).await;
     assert!(out.body.contains("You signed out"), "{}", out.body);
     let next = b.get(&account(&s, &f)).await;

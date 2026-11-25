@@ -859,7 +859,8 @@ async fn an_unassigned_application_cannot_be_launched() {
     let w = world().await;
     let (b, _) = signed_in(&w).await;
     let url = w.s.url(&format!("/{}/myaccount", w.f.tenant.id));
-    let page = my_account(&w, &b).await;
+    // No application is listed, so the token comes from a tab with forms.
+    let page = b.get(&format!("{url}/security")).await;
     let csrf = page.field("csrf").unwrap();
     let launch = rust_oidc::html::AccountOp::LaunchApp.as_str();
     let answer = b

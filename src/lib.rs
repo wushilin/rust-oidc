@@ -17,6 +17,7 @@ pub mod flowtest;
 pub mod groups;
 pub mod html;
 pub mod keys;
+pub mod logos;
 pub mod mfa;
 pub mod ratelimit;
 pub mod rbac;

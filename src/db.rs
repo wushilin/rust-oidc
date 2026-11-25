@@ -559,6 +559,7 @@ pub enum Event {
     // -- the console's remaining sections --
     AdminAppCreate,
     AdminAppRename,
+    AdminAppLogo,
     AdminAppFlags,
     AdminAppIdentifierUriAdd,
     AdminAppIdentifierUriRemove,
@@ -697,6 +698,7 @@ impl Event {
         Self::AdminRoleRevoke,
         Self::AdminAppCreate,
         Self::AdminAppRename,
+        Self::AdminAppLogo,
         Self::AdminAppFlags,
         Self::AdminAppIdentifierUriAdd,
         Self::AdminAppIdentifierUriRemove,
@@ -822,6 +824,7 @@ impl Event {
             Self::AdminRoleRevoke => "admin.role.revoke",
             Self::AdminAppCreate => "admin.app.create",
             Self::AdminAppRename => "admin.app.rename",
+            Self::AdminAppLogo => "admin.app.logo",
             Self::AdminAppFlags => "admin.app.flags",
             Self::AdminAppIdentifierUriAdd => "admin.app.identifier_uri.add",
             Self::AdminAppIdentifierUriRemove => "admin.app.identifier_uri.remove",

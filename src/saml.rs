@@ -1702,10 +1702,23 @@ pub struct GalleryApp {
     pub display_name: String,
     pub sign_on_url: Option<String>,
     pub is_saml: bool,
+    /// What its tile shows; `None` for its initials.
+    pub logo: Option<crate::logos::Shown>,
 }
 
-/// app id, tenant, name, Sign on URL, single sign-on mode, accepts other tenants.
-type GalleryRow = (String, String, String, Option<String>, Option<String>, Flag);
+/// app id, tenant, name, Sign on URL, single sign-on mode, accepts other
+/// tenants; then its logo: library icon, image content type, updated at.
+type GalleryRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Flag,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
 
 /// The enabled, visible applications this user is assigned to, directly or
 /// through a group, that can be launched: a Sign on URL, or SAML configured so
@@ -1718,10 +1731,11 @@ pub async fn gallery<'c>(db: impl Handle<'c>, home_tenant_id: &str, user_id: &st
     let rows: Vec<GalleryRow> = sqlx::query_as(crate::db::qc(
         conn,
         "SELECT DISTINCT a.app_id, sp.tenant_id, a.display_name, a.sign_on_url, sp.preferred_sso_mode,
-                sp.accept_other_tenants
+                sp.accept_other_tenants, l.library_icon, l.content_type, l.updated_at
          FROM app_assignments x
          JOIN service_principals sp ON sp.id = x.resource_id
          JOIN applications a ON a.app_id = sp.app_id AND a.deleted_at IS NULL
+         LEFT JOIN app_logos l ON l.application_id = a.id
          WHERE sp.enabled = ? AND sp.visible_to_users = ?
            AND ((x.principal_type = ? AND x.principal_id = ?)
              OR (x.principal_type = ? AND x.principal_id IN
@@ -1741,7 +1755,7 @@ pub async fn gallery<'c>(db: impl Handle<'c>, home_tenant_id: &str, user_id: &st
         None => false,
     };
     let mut out = Vec::with_capacity(rows.len());
-    for (app_id, tenant_id, display_name, sign_on_url, mode, accepts_others) in rows {
+    for (app_id, tenant_id, display_name, sign_on_url, mode, accepts_others, icon, image_type, logo_at) in rows {
         if tenant_id != home_tenant_id {
             let accepts: bool = accepts_others.into();
             let live = crate::tenant::resolve_in(&mut *conn, &tenant_id).await?.is_some();
@@ -1767,6 +1781,7 @@ pub async fn gallery<'c>(db: impl Handle<'c>, home_tenant_id: &str, user_id: &st
                 display_name,
                 sign_on_url,
                 is_saml,
+                logo: logo_at.and_then(|at| crate::logos::Shown::from_row(icon.as_deref(), image_type.is_some(), at)),
             });
         }
     }

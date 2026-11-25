@@ -63,6 +63,13 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - A SAML Identifier (Entity ID) may be up to 1024 characters, as SAML allows
   (it was 512). It must be ASCII; percent-encode anything else.
 
+- **My Account has tabs**: My apps, Profile and Security, each at its own
+  address. My apps is where the page opens.
+- **Application logos**: on an application's Overview, upload a logo (PNG, JPEG
+  or BMP up to 100 KB, as in Entra) or choose one of sixteen built-in icons.
+  My apps shows each application as a tile with its logo, or its initials, and
+  the whole tile opens it.
+
 ### Fixed
 
 - A user not assigned to an application that requires assignment (OIDC, SAML

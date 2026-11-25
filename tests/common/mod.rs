@@ -703,6 +703,39 @@ impl AdminBrowser {
         Browser::page(response).await
     }
 
+    /// [`Self::post_file`] for a file that is not text: (field, file name,
+    /// content type, bytes).
+    pub async fn post_bytes(&self, url: &str, form: &[(&str, &str)], file: (&str, &str, &str, &[u8])) -> Page {
+        const BOUNDARY: &str = "----rust-oidc-test-boundary";
+        let mut body: Vec<u8> = Vec::new();
+        let csrf = [(admin_session::CSRF_FIELD, self.csrf.as_str())];
+        for (name, value) in form.iter().chain(csrf.iter()) {
+            body.extend_from_slice(
+                format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                    .as_bytes(),
+            );
+        }
+        let (name, file_name, content_type, content) = file;
+        body.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{file_name}\"\r\nContent-Type: {content_type}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        let response = self
+            .b
+            .http
+            .post(url)
+            .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        Browser::page(response).await
+    }
+
     /// Post without the token, for the tests that are about the token.
     pub async fn post_raw(&self, url: &str, form: &[(&str, &str)]) -> Page {
         self.b.post_form(url, form).await

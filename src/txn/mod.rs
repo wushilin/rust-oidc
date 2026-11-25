@@ -406,6 +406,7 @@ transactions! {
     SetAssignmentRequired(ops::apps::SetAssignmentRequired),
     SetGroupMembershipClaims(ops::apps::SetGroupMembershipClaims),
     RenameApp(ops::apps::RenameApp),
+    SetAppLogo(ops::apps::SetAppLogo),
     GrantAuthApiPermission(ops::apps::GrantAuthApiPermission),
     RevokeAuthApiPermission(ops::apps::RevokeAuthApiPermission),
     EnableSamlSso(ops::saml::EnableSamlSso),

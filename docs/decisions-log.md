@@ -2180,3 +2180,31 @@ Both depart from Entra; the owner chose them.
   MySQL. Migration 0027 makes MySQL's column `VARCHAR(1024)` in the ASCII character
   set; SQLite and Postgres hold TEXT and need nothing. A request naming a non-ASCII
   Issuer matches no application without asking the database.
+
+## My Account tabs and application logos
+
+- **My Account is three tabs, each its own address**: `/myaccount/apps` (My apps),
+  `/myaccount/profile` and `/myaccount/security`. The page is script-free, so a tab is
+  a link and the server shows one at a time. `/myaccount` shows My apps, as Entra's
+  My Apps is where a user starts. Forms still post to `/myaccount`; the answer shows
+  the tab the action belongs to (opening an application: My apps; password,
+  authenticator, recovery codes, sessions: Security). Signing in lands on My apps,
+  whichever tab asked for it.
+- **A logo is the application's, not a tenant's**: one for every tenant that uses it,
+  set by whoever may write the application (`App:Write`), on its Overview. It is a new
+  kind of change, *Set application logo* (`admin.app.logo`). The audit row records the
+  image's type, size and SHA-256, never the image.
+- **Uploads follow Entra's application logo rules**: PNG, JPEG or BMP, at most 100 KB.
+  The format is told by the file's first bytes, never its name or declared type, and
+  checked again when the logo is stored and when it is served. SVG is never accepted,
+  as an SVG document can carry script. Images are not decoded or resized.
+- **The icon library is this server's own**: Entra has none. Sixteen line icons on
+  colours, drawn in `src/logos.rs` and sent as inline SVG; only the icon's name is
+  stored. An application without a logo shows its name's initials on a colour fixed
+  by its id.
+- **An uploaded logo is served only to a signed-in user whose My apps lists that
+  application**, from `/myaccount/apps/{app}/logo`, with its checked type, `nosniff`
+  and a sandboxing policy. My Account's policy adds `img-src 'self'` for it. The admin
+  Overview shows the image inline as a `data:` URL, so the console's policy adds
+  `img-src data:`. The address carries a version that changes with each upload, so a
+  browser never keeps showing a replaced logo.

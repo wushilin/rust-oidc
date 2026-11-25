@@ -162,6 +162,52 @@ impl Transaction for RenameApp {
     }
 }
 
+/// Set the logo its tile shows in My apps: an uploaded image (checked before,
+/// and again by storage), a library icon, or none (`None`: its initials).
+pub struct SetAppLogo {
+    pub tenant_id: String,
+    pub app_id: String,
+    pub logo: Option<crate::logos::Logo>,
+}
+
+impl Transaction for SetAppLogo {
+    type Output = ();
+    const INFO: KindInfo = KindInfo {
+        name: "Set application logo",
+        need: Need::Action(APP_WRITE),
+        event: Event::AdminAppLogo,
+    };
+
+    on_application!();
+
+    async fn run(&self, cx: &mut Cx<'_>) -> Step<()> {
+        let (_, app) = application(cx, &self.tenant_id, &self.app_id).await?;
+        if let Some(crate::logos::Logo::Image(image)) = &self.logo
+            && let Err(problem) = crate::logos::Image::from_upload(image.bytes.clone())
+        {
+            return Err(cx.fail(Refusal::Invalid(problem)));
+        }
+        let done = crate::logos::set_in(cx.conn(), &app.id, self.logo.as_ref()).await;
+        cx.check(done)
+    }
+
+    /// What was set, never the image itself: its format, size and digest.
+    fn audit(&self, _: &()) -> Audit {
+        use crate::logos::Logo;
+        let details = match &self.logo {
+            None => json!({ "logo": "none" }),
+            Some(Logo::Library(icon)) => json!({ "logo": "library", "icon": icon.as_str() }),
+            Some(Logo::Image(image)) => json!({
+                "logo": "image",
+                "contentType": image.kind.content_type(),
+                "bytes": image.bytes.len(),
+                "sha256": crate::util::sha256_hex(&image.bytes),
+            }),
+        };
+        on_app(&self.tenant_id, &self.app_id, details)
+    }
+}
+
 /// The *Sign-in and grants* switches, saved together: every one or none.
 pub struct SaveAppFlags {
     pub tenant_id: String,

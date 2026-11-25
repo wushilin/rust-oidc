@@ -45,6 +45,7 @@ const STORAGE: &[(&str, &str)] = &[
     ("directory", "src/directory.rs"),
     ("auth_api", "src/auth_api.rs"),
     ("saml", "src/saml.rs"),
+    ("logos", "src/logos.rs"),
 ];
 
 /// Files that may write anything, besides the storage modules: the engine, and

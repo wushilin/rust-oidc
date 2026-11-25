@@ -33,8 +33,11 @@ pub const SSO_MODE_SAML: &str = "saml";
 /// How long a signing certificate is valid by default, and at most: three years.
 pub const CERT_VALIDITY_DAYS: i64 = 3 * 365;
 
-/// The longest Identifier or URL accepted, matching the indexed column.
+/// The longest URL or claim name accepted, matching the indexed column.
 pub const MAX_URI_CHARS: usize = 512;
+/// The longest Identifier (Entity ID) accepted: SAML Metadata 2.3.2 bounds
+/// `entityIDType` at 1024 characters, and a 1024-character one must be taken.
+pub const MAX_ENTITY_ID_CHARS: usize = 1024;
 /// The most Identifiers or Reply URLs an application may have.
 pub const MAX_URIS: usize = 32;
 /// The most custom claims an application may have.
@@ -299,8 +302,15 @@ impl BasicConfig {
             return Some(format!("An application may have at most {MAX_URIS} of each."));
         }
         for id in &self.identifiers {
-            if id.chars().count() > MAX_URI_CHARS || has_control(id) || id.trim() != id {
+            if id.chars().count() > MAX_ENTITY_ID_CHARS || has_control(id) || id.trim() != id {
                 return Some(format!("Identifier '{id}' is not valid."));
+            }
+            // A URI is ASCII (RFC 3986); this also keeps the indexed column
+            // within every engine's key length at 1024 characters.
+            if !id.is_ascii() {
+                return Some(format!(
+                    "Identifier '{id}' must be ASCII: percent-encode it and use punycode for a host."
+                ));
             }
         }
         let distinct = |v: &[String]| v.iter().collect::<std::collections::BTreeSet<_>>().len() == v.len();
@@ -590,6 +600,11 @@ pub async fn find_by_identifier<'c>(
     tenant_id: &str,
     entity_id: &str,
 ) -> anyhow::Result<Option<Application>> {
+    // Identifiers are ASCII; MySQL cannot compare its ASCII column with
+    // anything else, so a value no Identifier can equal is answered here.
+    if !entity_id.is_ascii() {
+        return Ok(None);
+    }
     let mut conn = db.acquire().await?;
     let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
         &conn,
@@ -616,6 +631,11 @@ pub async fn find_by_identifier_any_mode<'c>(
     tenant_id: &str,
     entity_id: &str,
 ) -> anyhow::Result<Option<Application>> {
+    // Identifiers are ASCII; MySQL cannot compare its ASCII column with
+    // anything else, so a value no Identifier can equal is answered here.
+    if !entity_id.is_ascii() {
+        return Ok(None);
+    }
     let mut conn = db.acquire().await?;
     let row: Option<(String,)> = sqlx::query_as(crate::db::qc(
         &conn,

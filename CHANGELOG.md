@@ -60,6 +60,8 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   Metadata Interoperability Profile requires: an expired or not-yet-valid
   certificate can be added and its key verifies until it is removed. The
   console marks an expired one.
+- A SAML Identifier (Entity ID) may be up to 1024 characters, as SAML allows
+  (it was 512). It must be ASCII; percent-encode anything else.
 
 ### Fixed
 

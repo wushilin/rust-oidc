@@ -604,6 +604,35 @@ async fn an_identifier_belongs_to_one_application_in_the_tenant() {
 }
 
 #[tokio::test]
+async fn an_identifier_may_be_as_long_as_saml_allows() {
+    let w = world().await;
+    let prefix = "urn:example:boundary:";
+    let save = |id: String| SaveSamlBasic {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        basic: basic(&id),
+    };
+    let longest = format!("{prefix}{}", "a".repeat(saml::MAX_ENTITY_ID_CHARS - prefix.len()));
+    txn::run(&w.s.pool, &Actor::Cli, &save(longest.clone()))
+        .await
+        .into_result()
+        .unwrap();
+    let found = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, &longest)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|a| a.app_id), Some(w.app_id.clone()));
+
+    for refused in [format!("{longest}a"), "urn:example:café".to_string()] {
+        let outcome = txn::run(&w.s.pool, &Actor::Cli, &save(refused)).await;
+        assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
+    }
+    let found = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, "urn:example:café")
+        .await
+        .unwrap();
+    assert!(found.is_none());
+}
+
+#[tokio::test]
 async fn certificate_rollover_follows_the_active_certificate() {
     let w = world().await;
     let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();

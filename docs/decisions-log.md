@@ -2172,3 +2172,11 @@ Both depart from Entra; the owner chose them.
   certificates rather than unexpired ones. The console marks an expired one as still
   verifying until removed. Revoking a key means removing it, as with Shibboleth's
   metadata keys.
+- **A SAML Identifier (Entity ID) may be 1024 characters, and must be ASCII.** SAML
+  Metadata 2.3.2 bounds `entityIDType` at 1024 characters, and the limit was 512, so
+  a valid metadata file could be imported but not saved (IIP-MD05.b). A URI is ASCII
+  (RFC 3986), as Reply URLs already had to be; requiring it keeps the indexed column
+  within every engine's key limit, which 1024 utf8mb4 characters would exceed on
+  MySQL. Migration 0027 makes MySQL's column `VARCHAR(1024)` in the ASCII character
+  set; SQLite and Postgres hold TEXT and need nothing. A request naming a non-ASCII
+  Issuer matches no application without asking the database.

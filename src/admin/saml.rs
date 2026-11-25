@@ -504,8 +504,14 @@ fn verification_form(
             } else {
                 String::new()
             };
+            // Only the key is used, so an expired certificate still verifies.
+            let expired = if x.not_after <= now() {
+                " (expired; its key still verifies until removed)"
+            } else {
+                ""
+            };
             format!(
-                r#"<tr><td class="muted">{}</td><td>{}</td><td>{remove}</td></tr>"#,
+                r#"<tr><td class="muted">{}</td><td>{}{expired}</td><td>{remove}</td></tr>"#,
                 e(&x.thumbprint),
                 e(&view::ts(x.not_after))
             )

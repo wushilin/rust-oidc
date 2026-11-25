@@ -373,9 +373,7 @@ impl Transaction for AddSamlVerificationCertificate {
         let (_, app, _) = configured(cx, &self.tenant_id, &self.app_id).await?;
         let parsed = saml::GivenCertificate::from_pem(&self.certificate_pem);
         let parsed = cx.check(parsed)?;
-        let done =
-            saml::add_verification_certificate_in(cx.conn(), &app, &parsed.der, parsed.not_before, parsed.not_after)
-                .await;
+        let done = saml::add_verification_certificate_in(cx.conn(), &app, &parsed.der, parsed.not_after).await;
         cx.check(done)
     }
 

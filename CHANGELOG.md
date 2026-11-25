@@ -56,6 +56,10 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - A metadata file's signing certificates are offered under Verification
   certificates, each with its own Add; none is trusted until an administrator
   adds it. Entra takes no keys from an uploaded file.
+- A SAML verification certificate is used for its key alone, as the SAML
+  Metadata Interoperability Profile requires: an expired or not-yet-valid
+  certificate can be added and its key verifies until it is removed. The
+  console marks an expired one.
 
 ### Fixed
 

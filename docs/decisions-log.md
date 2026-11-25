@@ -2162,3 +2162,13 @@ Both depart from Entra; the owner chose them.
   ignored, as are keys the server cannot use and text that is not a certificate.
 - **ALG03-a may stay unverified**: SAMLscope wants a SAML error answer for a corrupted
   ECDSA signature, and a badly signed request gets a local page (decided earlier).
+- **A verification certificate's dates no longer matter.** The SAML V2.0 Metadata
+  Interoperability Profile makes the key the only thing a metadata consumer uses: an
+  expired or not-yet-valid certificate, or one with odd extensions, key usage, subject
+  or issuer, must not stop its key from verifying (IIP-MD06.a9, MD12.b, MD12.d). Keys
+  from metadata are added as verification certificates, so the rule applies to all
+  of them: adding no longer refuses a certificate outside its dates, sign-in no longer
+  skips an expired one, and "the last one stays while signatures are required" counts
+  certificates rather than unexpired ones. The console marks an expired one as still
+  verifying until removed. Revoking a key means removing it, as with Shibboleth's
+  metadata keys.

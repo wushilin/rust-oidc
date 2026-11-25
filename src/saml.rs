@@ -1022,14 +1022,8 @@ pub(crate) async fn remove_certificate_in(conn: &mut Conn, app: &Application, id
 
 /// Require signed requests, or stop. Requiring needs a verification certificate.
 pub(crate) async fn set_require_signed_in(conn: &mut Conn, app: &Application, required: bool) -> anyhow::Result<()> {
-    let at = now();
-    if required
-        && !verification_certificates_in(conn, app)
-            .await?
-            .iter()
-            .any(|c| c.not_after > at)
-    {
-        bail!("Add a valid verification certificate before requiring signed requests.");
+    if required && verification_certificates_in(conn, app).await?.is_empty() {
+        bail!("Add a verification certificate before requiring signed requests.");
     }
     sqlx::query(crate::db::qc(
         conn,
@@ -1043,19 +1037,19 @@ pub(crate) async fn set_require_signed_in(conn: &mut Conn, app: &Application, re
 }
 
 /// Add a public certificate that verifies this application's signed requests.
+///
+/// Only its key is used. As the SAML V2.0 Metadata Interoperability Profile
+/// requires, nothing else in it (validity dates, extensions, key usage, subject
+/// or issuer) stops the key from verifying: an expired certificate's key works
+/// until an administrator removes it. Its expiry is kept to show.
 pub(crate) async fn add_verification_certificate_in(
     conn: &mut Conn,
     app: &Application,
     cert_der: &[u8],
-    not_before: i64,
     not_after: i64,
 ) -> anyhow::Result<String> {
     if !protocol::usable_verification_certificate(cert_der) {
         bail!("The certificate must hold an RSA public key, or an EC key on P-256 or P-384.");
-    }
-    let at = now();
-    if not_before > at || not_after <= at {
-        bail!("That certificate is not currently valid.");
     }
     let print = thumbprint(cert_der);
     if verification_certificates_in(conn, app)
@@ -1093,10 +1087,8 @@ pub(crate) async fn remove_verification_certificate_in(
         bail!("There is no such certificate on this application.");
     };
     let required = config_in(conn, app).await?.is_some_and(|c| c.require_signed_requests);
-    let at = now();
-    let others_valid = found.iter().any(|c| c.id != id && c.not_after > at);
-    if required && !others_valid {
-        bail!("Stop requiring signed requests before removing the last valid verification certificate.");
+    if required && !found.iter().any(|c| c.id != id) {
+        bail!("Stop requiring signed requests before removing the last verification certificate.");
     }
     sqlx::query(crate::db::qc(
         conn,

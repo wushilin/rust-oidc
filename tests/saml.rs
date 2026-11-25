@@ -1612,7 +1612,7 @@ async fn a_reply_url_is_used_exactly_as_registered() {
 }
 
 #[tokio::test]
-async fn the_last_valid_verification_certificate_is_kept_while_signatures_are_required() {
+async fn the_last_verification_certificate_is_kept_while_signatures_are_required() {
     let w = world().await;
     let (_, _, cert_pem) = sp_key();
     require_signed(&w, &cert_pem).await;
@@ -1625,22 +1625,45 @@ async fn the_last_valid_verification_certificate_is_kept_while_signatures_are_re
     txn::run(&w.s.pool, &Actor::Cli, &add).await.into_result().unwrap();
     let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
     let certs = saml::verification_certificates(&w.s.pool, &app).await.unwrap();
-    // One of the two has expired.
-    sqlx::query(rust_oidc::db::q(
-        &w.s.pool,
-        "UPDATE app_saml_verification_certs SET not_after = 1 WHERE id = ?",
-    ))
-    .bind(&certs[0].id)
-    .execute(&w.s.pool)
-    .await
-    .unwrap();
-    let remove = rust_oidc::txn::ops::saml::RemoveSamlVerificationCertificate {
+    let remove = |id: &str| rust_oidc::txn::ops::saml::RemoveSamlVerificationCertificate {
         tenant_id: w.f.tenant.id.clone(),
         app_id: w.app_id.clone(),
-        certificate_id: certs[1].id.clone(),
+        certificate_id: id.to_string(),
     };
-    let outcome = txn::run(&w.s.pool, &Actor::Cli, &remove).await;
+    txn::run(&w.s.pool, &Actor::Cli, &remove(&certs[1].id))
+        .await
+        .into_result()
+        .unwrap();
+    let outcome = txn::run(&w.s.pool, &Actor::Cli, &remove(&certs[0].id)).await;
     assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_certificates_key_verifies_whatever_its_dates() {
+    // Metadata Interoperability Profile: only the key counts, so an expired or
+    // not-yet-valid certificate is accepted and its key verifies.
+    for (from, to) in [(-30, -1), (1, 30)] {
+        let w = world().await;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let today = time::OffsetDateTime::now_utc();
+        params.not_before = today + time::Duration::days(from);
+        params.not_after = today + time::Duration::days(to);
+        let cert = params.self_signed(&key).unwrap();
+        let test_key = TestKey {
+            pkcs8: key.serialize_der(),
+            cert_pem: cert.pem(),
+            algorithm: RequestSignature::EcdsaSha256,
+        };
+        require_signed(&w, &test_key.cert_pem).await;
+        let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+        let query = test_key.redirect_query(
+            &signed_request_xml(&w, "_dated"),
+            RequestSignature::EcdsaSha256.as_str(),
+        );
+        let page = Browser::new().get(&format!("{endpoint}?{query}")).await;
+        assert!(at_sign_in(&page), "valid from {from} to {to} days: {}", page.body);
+    }
 }
 
 #[tokio::test]

@@ -195,7 +195,7 @@ async fn check_signature(
         .await
         .map_err(|_| refused("The verification certificates could not be read."))?
         .into_iter()
-        .filter(|c| c.not_after > now())
+        // Only the key counts (Metadata Interoperability Profile): not the dates.
         .map(|c| c.cert_der)
         .collect();
     if certificates.is_empty() && !config.require_signed_requests {

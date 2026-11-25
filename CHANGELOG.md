@@ -65,6 +65,13 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 
 ### Fixed
 
+- A user not assigned to an application that requires assignment (OIDC, SAML
+  or device code) is now told so plainly. The page gives Entra's full
+  AADSTS50105 text, naming the application, its ID and the signed-in account
+  and saying to ask an administrator for access. It used to be a shortened
+  line in small grey type, run together with the trace and correlation IDs.
+  Every sign-in error page now shows the reason first, in normal type, with
+  the IDs under "Troubleshooting details", as Entra's does.
 - A SAML request for an authentication context declaration, which is not
   supported, is now refused with `NoAuthnContext` instead of signing in. An
   unmet authentication context is reported with the top-level status `Responder`.

@@ -367,6 +367,13 @@ impl Aadsts {
     }
 }
 
+/// The identifiers Entra prints under an error, for whoever investigates it.
+pub struct Troubleshooting {
+    pub trace_id: String,
+    pub correlation_id: String,
+    pub timestamp: String,
+}
+
 #[derive(Debug)]
 pub struct AadError {
     pub status: StatusCode,
@@ -595,14 +602,28 @@ impl AadError {
     /// `error_description` for redirects and error pages:
     /// `AADSTS{code}: {message} Trace ID: ... Correlation ID: ... Timestamp: ...`
     pub fn description(&self) -> String {
-        let timestamp = time::OffsetDateTime::now_utc().format(TIMESTAMP).unwrap_or_default();
-        let correlation_id = self.correlation_id.clone().unwrap_or_else(new_guid);
+        let t = self.troubleshooting();
         format!(
-            "AADSTS{}: {} Trace ID: {} Correlation ID: {correlation_id} Timestamp: {timestamp}",
-            self.code.code(),
-            self.message,
-            new_guid()
+            "{} Trace ID: {} Correlation ID: {} Timestamp: {}",
+            self.headline(),
+            t.trace_id,
+            t.correlation_id,
+            t.timestamp
         )
+    }
+
+    /// `AADSTS{code}: {message}`: what an error page shows first.
+    pub fn headline(&self) -> String {
+        format!("AADSTS{}: {}", self.code.code(), self.message)
+    }
+
+    /// The identifiers that go with the error, fresh for each response.
+    pub fn troubleshooting(&self) -> Troubleshooting {
+        Troubleshooting {
+            trace_id: new_guid(),
+            correlation_id: self.correlation_id.clone().unwrap_or_else(new_guid),
+            timestamp: time::OffsetDateTime::now_utc().format(TIMESTAMP).unwrap_or_default(),
+        }
     }
 
     /// Too many requests on one of the buckets in [`crate::ratelimit`].

@@ -396,7 +396,7 @@ pub(super) async fn issue(
     // lets it in: one decision, re-made at every grant, so a refresh token stops
     // working the moment any of it changes.
     let decision = crate::access::decide(&st.pool, tenant, &sp, &user).await?;
-    if let Some(err) = decision.grant_error(&client.display_name, tenant) {
+    if let Some(err) = decision.grant_error(&client, tenant) {
         return Err(err);
     }
     // An account that must choose a new password gets nothing until it has, in

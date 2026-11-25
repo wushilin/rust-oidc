@@ -46,6 +46,9 @@ p.hint { color:var(--muted); font-size:13px; margin:4px 0 0 24px; }
 ul.consent { list-style:none; padding:0; margin:12px 0; }
 ul.consent li { border:1px solid var(--border); padding:10px 14px; margin:8px 0; }
 .code { color:var(--muted); font-size:12px; word-break:break-all; margin-top:18px; }
+p.reason { margin:16px 0 0; overflow-wrap:anywhere; }
+details.trouble { color:var(--muted); font-size:12px; margin-top:22px; }
+details.trouble summary { cursor:pointer; color:var(--accent); font-size:13px; }
 main.wide { max-width:600px; }
 main.wide h2 { font-size:16px; margin:28px 0 6px; padding-top:18px; border-top:1px solid var(--border); }
 dl.profile { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:8px 0; }
@@ -805,8 +808,28 @@ Browsers you told not to ask for a code again will ask again.</p>{everywhere}"#,
 
 pub fn error(tenant_name: Option<&str>, message: &str) -> Response {
     let body = format!(
-        r#"<h1>Sorry, but we're having trouble signing you in.</h1><p class="code">{}</p>"#,
+        r#"<h1>Sorry, but we're having trouble signing you in.</h1><p class="reason">{}</p>"#,
         escape(message)
+    );
+    respond(
+        StatusCode::BAD_REQUEST,
+        page("Sign in error", tenant_name, &body),
+        CSP_DEFAULT,
+    )
+}
+
+/// A sign-in that ends in an AADSTS error, laid out as Entra's page is: the
+/// reason in plain text first, the identifiers for whoever investigates it
+/// under "Troubleshooting details".
+pub fn sign_in_error(tenant_name: Option<&str>, err: &crate::error::AadError) -> Response {
+    let t = err.troubleshooting();
+    let body = format!(
+        r#"<h1>Sorry, but we're having trouble signing you in.</h1><p class="reason">{headline}</p><details class="trouble"><summary>Troubleshooting details</summary><dl class="profile"><dt>Error code</dt><dd>AADSTS{code}</dd><dt>Trace ID</dt><dd>{trace}</dd><dt>Correlation ID</dt><dd>{correlation}</dd><dt>Timestamp</dt><dd>{timestamp}</dd></dl></details>"#,
+        headline = escape(&err.headline()),
+        code = err.code.code(),
+        trace = escape(&t.trace_id),
+        correlation = escape(&t.correlation_id),
+        timestamp = escape(&t.timestamp),
     );
     respond(
         StatusCode::BAD_REQUEST,

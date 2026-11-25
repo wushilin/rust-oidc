@@ -256,7 +256,30 @@ async fn assignment_required_keeps_an_unassigned_user_out() {
     txn::run(&w.s.pool, &Actor::Cli, &set).await.into_result().unwrap();
     let (_, page) = signed_in(&w).await;
     assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
-    assert!(page.body.contains("AADSTS50105"), "{}", page.body);
+    // The reason is the page's first paragraph, in plain words: which account,
+    // which application, and who can fix it. The identifiers come after it.
+    let reason = page
+        .body
+        .split(r#"<p class="reason">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</p>").next())
+        .unwrap_or_else(|| panic!("no reason paragraph: {}", page.body));
+    assert!(reason.starts_with("AADSTS50105: "), "{reason}");
+    assert!(
+        reason.contains(&format!("user &#x27;{}&#x27; is blocked", w.f.upn)),
+        "{reason}"
+    );
+    assert!(reason.contains(&w.app_id), "{reason}");
+    assert!(
+        reason.contains("contact your administrator to assign access"),
+        "{reason}"
+    );
+    assert!(!reason.contains("Trace ID"), "{reason}");
+    assert!(
+        page.body.contains("<summary>Troubleshooting details</summary>"),
+        "{}",
+        page.body
+    );
 }
 
 /// The check on an existing session, which never passes through the password

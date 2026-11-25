@@ -54,7 +54,7 @@ fn get<'a>(form: &'a Params, name: &str) -> &'a str {
 }
 
 fn fail(tenant: &Tenant, e: anyhow::Error) -> Response {
-    html::error(Some(&tenant.name), &AadError::from(e).description())
+    html::sign_in_error(Some(&tenant.name), &AadError::from(e))
 }
 
 /// The signed-in user of this browser in this tenant, with the methods their

@@ -18,10 +18,11 @@
 use crate::apps::{self, ServicePrincipal};
 use crate::db::Handle;
 use crate::directory::PrincipalType;
-use crate::error::{AadError, Aadsts};
+use crate::error::{AadError, Aadsts, OAuthError};
 use crate::tenant::{self, Tenant};
 use crate::users::{self, AuthResult, AuthTrace, User};
 use crate::util::now;
+use axum::http::StatusCode;
 
 /// A user's own say over signing in to other tenants' applications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +169,10 @@ impl Refusal {
         }
     }
 
-    pub fn message(self, app_name: &str, app_tenant: &str, home_tenant: &str) -> String {
+    /// What the user is told: Entra's text where it has one (AADSTS50105 names
+    /// the application, its ID and the signed-in account, and says who can fix it).
+    pub fn message(self, app: &apps::Application, upn: &str, app_tenant: &str, home_tenant: &str) -> String {
+        let app_name = &app.display_name;
         match self {
             Self::HomeTenantUnavailable => format!("The organization {home_tenant} is disabled."),
             Self::OtherTenantsNotAccepted => format!(
@@ -176,8 +180,12 @@ impl Refusal {
                  administrator to accept accounts of other organizations."
             ),
             Self::NotAssigned => format!(
-                "Your administrator has configured the application {app_name} to block users unless they are \
-                 specifically granted ('assigned') access to the application."
+                "Your administrator has configured the application {app_name} ('{}') to block users unless they \
+                 are specifically granted ('assigned') access to the application. The signed in user '{upn}' is \
+                 blocked because they are not a direct member of a group with access, nor had access directly \
+                 assigned by an administrator. Please contact your administrator to assign access to this \
+                 application.",
+                app.app_id
             ),
             Self::HomeDisallows => format!(
                 "{home_tenant} does not allow its accounts to sign in to applications of other organizations, \
@@ -194,13 +202,33 @@ pub struct Decision {
     /// The account is of another tenant than the application.
     pub outsider: bool,
     pub refusal: Option<Refusal>,
+    /// The account decided about, named in what the user is told.
+    pub upn: String,
 }
 
 impl Decision {
-    /// The refusal as an OAuth error for the token endpoint.
-    pub fn grant_error(&self, app_name: &str, app_tenant: &Tenant) -> Option<AadError> {
+    /// What the user is told about the refusal, if any.
+    pub fn message(&self, app: &apps::Application, app_tenant: &Tenant) -> Option<String> {
         self.refusal
-            .map(|r| AadError::invalid_grant(r.aadsts(), r.message(app_name, &app_tenant.name, &self.home.name)))
+            .map(|r| r.message(app, &self.upn, &app_tenant.name, &self.home.name))
+    }
+
+    /// The refusal as an OAuth error for the token endpoint.
+    pub fn grant_error(&self, app: &apps::Application, app_tenant: &Tenant) -> Option<AadError> {
+        Some(AadError::invalid_grant(
+            self.refusal?.aadsts(),
+            self.message(app, app_tenant)?,
+        ))
+    }
+
+    /// The refusal as an error for a sign-in page.
+    pub fn page_error(&self, app: &apps::Application, app_tenant: &Tenant) -> Option<AadError> {
+        Some(AadError::new(
+            StatusCode::FORBIDDEN,
+            OAuthError::AccessDenied,
+            self.refusal?.aadsts(),
+            self.message(app, app_tenant)?,
+        ))
     }
 }
 
@@ -230,6 +258,7 @@ pub(crate) async fn decide_in(
             home: named,
             outsider,
             refusal: Some(Refusal::HomeTenantUnavailable),
+            upn: user.upn.clone(),
         });
     };
     let refusal = if outsider {
@@ -251,6 +280,7 @@ pub(crate) async fn decide_in(
         home,
         outsider,
         refusal,
+        upn: user.upn.clone(),
     })
 }
 
@@ -712,9 +742,7 @@ pub(crate) async fn explain_in(
     } else if !sp.enabled {
         Some(format!("{} is disabled", app.display_name))
     } else {
-        decision
-            .refusal
-            .map(|r| r.message(&app.display_name, &app_tenant.name, &decision.home.name))
+        decision.message(app, app_tenant)
     };
     let mut steps = Vec::new();
     match step {

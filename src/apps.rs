@@ -1652,16 +1652,6 @@ pub(crate) async fn user_is_assigned_in(
     Ok(n > 0)
 }
 
-/// The AADSTS50105 text for a user who is not assigned to an app that requires it.
-/// One function, because the rule is enforced in two places (the authorize page
-/// and token issuance) and they must say the same thing.
-pub fn not_assigned_message(app: &Application) -> String {
-    format!(
-        "Your administrator has configured the application {} ('{}') to block users unless they are specifically granted ('assigned') access to the application.",
-        app.display_name, app.app_id
-    )
-}
-
 /// Require MFA of everyone signing in to this application in its tenant.
 pub async fn set_mfa_required<'c>(db: impl Handle<'c>, sp_id: &str, required: bool) -> anyhow::Result<()> {
     let mut conn = db.acquire().await?;

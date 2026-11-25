@@ -2136,3 +2136,29 @@ assigned, and the account's own tenant (or its own setting) allows it.
 - **Size**: an uploaded file may be up to 2 MB and 50,000 elements, against 64 KB and
   256 elements for a SAML message from the network; only a signed-in administrator can
   upload one.
+
+### ECDSA request signatures and keys from metadata (2026-11-25)
+
+Both depart from Entra; the owner chose them.
+
+- **ECDSA request signatures** (IIP-ALG03.a). Accepted: ECDSA-SHA256 with a P-256
+  key and ECDSA-SHA384 with a P-384 key, each hash on its own curve only, which is
+  what aws-lc-rs offers as fixed-length verifiers. The signature is the fixed-length
+  r‖s of XML Signature 1.1, on both bindings; an ASN.1 DER signature is refused. The
+  algorithm named must match the certificate's key: an ECDSA name never verifies with
+  an RSA key, nor the reverse. Other curves and Ed25519 are refused when the
+  certificate is added. The federation metadata lists both ECDSA methods after the
+  application's own RSA method. Assertions are still signed with RSA only, and the
+  encryption certificate stays RSA.
+- **SAML verification certificates are read by a SAML parser**, not the OIDC client
+  assertion parser, which accepts RSA only. Client assertion certificates are
+  unchanged.
+- **Keys from an uploaded metadata file** are offered, not added. After an upload,
+  Verification certificates lists the file's signing certificates (a `KeyDescriptor`
+  marked `signing` or unmarked) that the server can verify with and that are not
+  already on the application, each with its own Add. Add runs the existing
+  *Add SAML verification certificate* transaction with that certificate, so there is no
+  new kind of change and the audit row is the same. Encryption keys in the file are
+  ignored, as are keys the server cannot use and text that is not a certificate.
+- **ALG03-a may stay unverified**: SAMLscope wants a SAML error answer for a corrupted
+  ECDSA signature, and a badly signed request gets a local page (decided earlier).

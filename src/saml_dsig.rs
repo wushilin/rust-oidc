@@ -20,14 +20,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use aws_lc_rs::digest;
-use aws_lc_rs::signature::{self, UnparsedPublicKey};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
-use crate::saml_protocol::{MAX_DEPTH, MAX_ELEMENTS, MAX_MESSAGE_BYTES, SamlError, SigningAlgorithm, public_key_of};
+use crate::saml_protocol::{MAX_DEPTH, MAX_ELEMENTS, MAX_MESSAGE_BYTES, RequestSignature, SamlError};
 
 const NS_DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const NS_EXC_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -448,14 +447,7 @@ pub fn verify(xml: &str, certificates: &[Vec<u8>], allow_sha1: bool) -> Result<(
         .only(NS_DS, "SignatureMethod")?
         .attr("Algorithm")
         .unwrap_or_default();
-    let algorithm: &'static dyn signature::VerificationAlgorithm = if method == SigningAlgorithm::Sha256.signature_uri()
-    {
-        &signature::RSA_PKCS1_2048_8192_SHA256
-    } else if allow_sha1 && method == SigningAlgorithm::Sha1.signature_uri() {
-        &signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY
-    } else {
-        return Err(refused());
-    };
+    let algorithm = RequestSignature::accepted(method, allow_sha1).ok_or_else(refused)?;
 
     let reference = info.only(NS_DS, "Reference")?;
     if reference.attr("URI") != Some(format!("#{id}").as_str())
@@ -497,14 +489,11 @@ pub fn verify(xml: &str, certificates: &[Vec<u8>], allow_sha1: bool) -> Result<(
     let mut signed = String::new();
     canonicalize(info, &BTreeMap::new(), &inclusive_prefixes(c14n)?, None, &mut signed);
     let value = decode(&sig.only(NS_DS, "SignatureValue")?.text())?;
-    let verified = certificates.iter().any(|cert| {
-        public_key_of(cert).is_ok_and(|(_, rsa)| {
-            UnparsedPublicKey::new(algorithm, rsa)
-                .verify(signed.as_bytes(), &value)
-                .is_ok()
-        })
-    });
-    if verified { Ok(()) } else { Err(refused()) }
+    if algorithm.verifies(certificates, signed.as_bytes(), &value) {
+        Ok(())
+    } else {
+        Err(refused())
+    }
 }
 
 #[cfg(test)]

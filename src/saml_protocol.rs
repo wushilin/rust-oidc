@@ -29,7 +29,7 @@ use crate::util::{b64, random_bytes};
 
 pub const NS_PROTOCOL: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 pub const NS_ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
-const NS_DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+pub const NS_DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const NS_XENC: &str = "http://www.w3.org/2001/04/xmlenc#";
 pub const NS_METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
 /// The SAML V2.0 Metadata Profile for Algorithm Support.
@@ -268,6 +268,102 @@ impl SigningAlgorithm {
         };
         b64(digest::digest(algorithm, data).as_ref())
     }
+}
+
+closed_set!(
+    /// What a service provider may sign a request with. Entra verifies RSA
+    /// only; ECDSA is accepted too (SAML V2.0 Algorithm Support, IIP-ALG03), on
+    /// the curve its hash belongs to. RSA-SHA1 only when the application allows it.
+    RequestSignature {
+        RsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+        RsaSha1 => "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+        EcdsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+        EcdsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+    }
+);
+
+impl RequestSignature {
+    /// The algorithm the message names, if this application accepts it.
+    pub fn accepted(uri: &str, allow_sha1: bool) -> Option<Self> {
+        Self::parse(uri).filter(|a| allow_sha1 || *a != Self::RsaSha1)
+    }
+
+    /// What verifies this signature with `key`, when the key is of its kind.
+    /// An ECDSA signature is the fixed-length r‖s of XML Signature 1.1.
+    fn verifier(self, key: &VerifyingKey) -> Option<&'static dyn signature::VerificationAlgorithm> {
+        match (self, key.kind) {
+            (Self::RsaSha256, KeyKind::Rsa) => Some(&signature::RSA_PKCS1_2048_8192_SHA256),
+            (Self::RsaSha1, KeyKind::Rsa) => Some(&signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY),
+            (Self::EcdsaSha256, KeyKind::P256) => Some(&signature::ECDSA_P256_SHA256_FIXED),
+            (Self::EcdsaSha384, KeyKind::P384) => Some(&signature::ECDSA_P384_SHA384_FIXED),
+            _ => None,
+        }
+    }
+
+    /// Whether `signature` over `data` verifies with any of `certificates`.
+    pub(crate) fn verifies(self, certificates: &[Vec<u8>], data: &[u8], signature: &[u8]) -> bool {
+        certificates.iter().any(|cert| {
+            verifying_key(cert).is_some_and(|key| {
+                self.verifier(&key)
+                    .is_some_and(|alg| UnparsedPublicKey::new(alg, &key.public).verify(data, signature).is_ok())
+            })
+        })
+    }
+}
+
+/// The public keys a request may be signed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    Rsa,
+    P256,
+    P384,
+}
+
+const OID_RSA: &str = "1.2.840.113549.1.1.1";
+const OID_EC: &str = "1.2.840.10045.2.1";
+const OID_P256: &str = "1.2.840.10045.3.1.7";
+const OID_P384: &str = "1.3.132.0.34";
+
+struct VerifyingKey {
+    kind: KeyKind,
+    public: Vec<u8>,
+}
+
+/// The certificate's key, when it is one a request may be signed with: RSA, or
+/// EC on P-256 or P-384.
+fn verifying_key(cert_der: &[u8]) -> Option<VerifyingKey> {
+    use x509_cert::der::Decode;
+    let cert = x509_cert::Certificate::from_der(cert_der).ok()?;
+    let spki = cert.tbs_certificate().subject_public_key_info();
+    let public = spki.subject_public_key.as_bytes()?.to_vec();
+    let kind = match spki.algorithm.oid.to_string().as_str() {
+        OID_RSA => KeyKind::Rsa,
+        OID_EC => {
+            let curve: x509_cert::der::asn1::ObjectIdentifier = spki.algorithm.parameters.as_ref()?.decode_as().ok()?;
+            match curve.to_string().as_str() {
+                OID_P256 => KeyKind::P256,
+                OID_P384 => KeyKind::P384,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let readable = match kind {
+        KeyKind::Rsa => PublicEncryptingKey::from_der(&spki_der(spki)?).is_ok(),
+        KeyKind::P256 => signature::ParsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, &public).is_ok(),
+        KeyKind::P384 => signature::ParsedPublicKey::new(&signature::ECDSA_P384_SHA384_FIXED, &public).is_ok(),
+    };
+    readable.then_some(VerifyingKey { kind, public })
+}
+
+fn spki_der(spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) -> Option<Vec<u8>> {
+    use x509_cert::der::Encode;
+    spki.to_der().ok()
+}
+
+/// Whether `cert_der` holds a key this server can verify signed requests with.
+pub fn usable_verification_certificate(cert_der: &[u8]) -> bool {
+    verifying_key(cert_der).is_some()
 }
 
 /// A protocol problem, reported to the service provider with this status when
@@ -796,6 +892,9 @@ pub fn usable_rsa_certificate(cert_der: &[u8]) -> bool {
         .is_some()
 }
 
+const SIGNATURE_ALGORITHM_REFUSED: &str =
+    "Signature algorithm not allowed. Supported: RSA-SHA256, ECDSA-SHA256 (P-256), ECDSA-SHA384 (P-384).";
+
 /// The SAML parameters of one request, read once from the raw query.
 ///
 /// A Redirect signature covers the parameters' encoded octets, so what is
@@ -882,16 +981,9 @@ impl SamlQuery {
             .next()
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default();
-        let algorithm: &'static dyn signature::VerificationAlgorithm =
-            if decoded_alg == SigningAlgorithm::Sha256.signature_uri() {
-                &signature::RSA_PKCS1_2048_8192_SHA256
-            } else if decoded_alg == SigningAlgorithm::Sha1.signature_uri() && allow_sha1 {
-                &signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY
-            } else {
-                return Err(refused(
-                    "Signature algorithm not allowed. Only RSA-SHA256 is supported.",
-                ));
-            };
+        let Some(algorithm) = RequestSignature::accepted(&decoded_alg, allow_sha1) else {
+            return Err(refused(SIGNATURE_ALGORITHM_REFUSED));
+        };
         let signature = STANDARD
             .decode(signature)
             .map_err(|_| refused("The request's signature could not be read."))?;
@@ -900,16 +992,7 @@ impl SamlQuery {
             signed.push_str(&format!("&{PARAM_RELAY_STATE}={relay}"));
         }
         signed.push_str(&format!("&{PARAM_SIG_ALG}={sig_alg}"));
-        let verified = certificates.iter().any(|cert| {
-            public_key_of(cert)
-                .map(|(_, rsa)| {
-                    UnparsedPublicKey::new(algorithm, rsa)
-                        .verify(signed.as_bytes(), &signature)
-                        .is_ok()
-                })
-                .unwrap_or(false)
-        });
-        if verified {
+        if algorithm.verifies(certificates, signed.as_bytes(), &signature) {
             Ok(())
         } else {
             Err(refused("The request's signature did not verify."))
@@ -1384,9 +1467,12 @@ pub fn idp_metadata(
         .iter()
         .map(|a| format!(r#"<alg:DigestMethod Algorithm="{}"/>"#, a.digest_uri()))
         .collect();
+    // Then what a request to it may also be signed with.
     let signing: String = algorithms
         .iter()
-        .map(|a| format!(r#"<alg:SigningMethod Algorithm="{}"/>"#, a.signature_uri()))
+        .map(|a| a.signature_uri())
+        .chain([RequestSignature::EcdsaSha256, RequestSignature::EcdsaSha384].map(RequestSignature::as_str))
+        .map(|uri| format!(r#"<alg:SigningMethod Algorithm="{uri}"/>"#))
         .collect();
     let extensions = format!(r#"<Extensions xmlns:alg="{NS_ALG}">{digests}{signing}</Extensions>"#);
     let keys: String = certificates

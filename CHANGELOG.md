@@ -49,6 +49,14 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - SAML federation metadata declares the signing and digest algorithms each
   application uses (SAML Metadata Profile for Algorithm Support).
 
+- Signed SAML requests may use ECDSA: ECDSA-SHA256 with a P-256 key or
+  ECDSA-SHA384 with a P-384 key, on both bindings, besides RSA-SHA256. A
+  verification certificate may hold such an EC key. The federation metadata
+  lists both among its signing methods. Entra verifies RSA only.
+- A metadata file's signing certificates are offered under Verification
+  certificates, each with its own Add; none is trusted until an administrator
+  adds it. Entra takes no keys from an uploaded file.
+
 ### Fixed
 
 - A SAML request for an authentication context declaration, which is not

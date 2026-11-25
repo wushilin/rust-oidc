@@ -3,13 +3,21 @@
 //! HTTP-POST binding (the only one we answer on) with their indexes and default,
 //! and a Single Logout URL. Nothing is fetched and nothing in the file is
 //! trusted: the values go through the same checks as typed ones, and the
-//! administrator saves them like any other Basic SAML Configuration.
+//! administrator saves them like any other Basic SAML Configuration. Its signing
+//! certificates are offered the same way: each is added only when the
+//! administrator chooses to verify requests with it.
 
-use crate::saml::ReplyUrl;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
+use crate::saml::{GivenCertificate, ReplyUrl};
 use crate::saml_protocol::{
-    BINDING_POST, BINDING_REDIRECT, NS_ASSERTION, NS_METADATA, NS_PROTOCOL, Node, XmlLimits, parse_instant,
-    parse_xml_within,
+    BINDING_POST, BINDING_REDIRECT, NS_ASSERTION, NS_DS, NS_METADATA, NS_PROTOCOL, Node, XmlLimits, parse_instant,
+    parse_xml_within, usable_verification_certificate,
 };
+
+/// `KeyDescriptor/@use` for a signing key; a descriptor without `use` serves both.
+const USE_SIGNING: &str = "signing";
 
 /// An uploaded metadata file, from a signed-in administrator: room for a group
 /// of entities, still bounded.
@@ -26,6 +34,9 @@ pub struct SpMetadata {
     /// In index order; exactly one is the default.
     pub reply_urls: Vec<ReplyUrl>,
     pub logout_url: Option<String>,
+    /// The service provider's signing certificates a request could be verified
+    /// with, in document order, each once.
+    pub signing_certificates: Vec<GivenCertificate>,
 }
 
 fn is(node: &Node, local: &str) -> bool {
@@ -189,7 +200,39 @@ pub fn read_sp_metadata(xml: &str, known: &[String], now: i64) -> Result<SpMetad
         entity_id,
         reply_urls,
         logout_url,
+        signing_certificates: signing_certificates(sp),
     })
+}
+
+fn in_ds<'a>(node: &'a Node, local: &'static str) -> impl Iterator<Item = &'a Node> + 'a {
+    node.children.iter().filter(move |c| c.ns == NS_DS && c.local == local)
+}
+
+/// The certificates in the descriptor's signing `KeyDescriptor`s. One this
+/// server cannot verify with, or cannot read, is left out: the file is only a
+/// source of candidates.
+fn signing_certificates(sp: &Node) -> Vec<GivenCertificate> {
+    let mut out: Vec<GivenCertificate> = Vec::new();
+    for key in children(sp, "KeyDescriptor").filter(|k| k.attr("use").is_none_or(|u| u.trim() == USE_SIGNING)) {
+        for info in in_ds(key, "KeyInfo") {
+            for data in in_ds(info, "X509Data") {
+                for cert in in_ds(data, "X509Certificate") {
+                    let text: String = cert.text.chars().filter(|c| !c.is_whitespace()).collect();
+                    let Some(given) = STANDARD
+                        .decode(text)
+                        .ok()
+                        .and_then(|der| GivenCertificate::from_der(&der).ok())
+                    else {
+                        continue;
+                    };
+                    if usable_verification_certificate(&given.der) && !out.iter().any(|c| c.der == given.der) {
+                        out.push(given);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -356,5 +399,64 @@ mod tests {
         assert!(parse_sp_metadata(&no_index).is_err());
         let no_entity = sp(&acs(0, None, BINDING_POST)).replace(r#" entityID="https://sp.example/""#, "");
         assert!(parse_sp_metadata(&no_entity).is_err());
+    }
+
+    fn cert(alg: &'static rcgen::SignatureAlgorithm) -> Vec<u8> {
+        let key = rcgen::KeyPair::generate_for(alg).unwrap();
+        rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
+
+    fn key_descriptor(usage: Option<&str>, der: &[u8]) -> String {
+        let usage = usage.map(|u| format!(r#" use="{u}""#)).unwrap_or_default();
+        // Wrapped, as files usually are.
+        let body: Vec<String> = STANDARD
+            .encode(der)
+            .as_bytes()
+            .chunks(64)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect();
+        format!(
+            r#"<md:KeyDescriptor{usage}><ds:KeyInfo xmlns:ds="{NS_DS}"><ds:X509Data><ds:X509Certificate>
+{}
+</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"#,
+            body.join("\n")
+        )
+    }
+
+    #[test]
+    fn offers_the_signing_certificates_it_can_verify_with() {
+        let rsa = {
+            let key = rcgen::KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA256, rcgen::RsaKeySize::_2048).unwrap();
+            rcgen::CertificateParams::new(Vec::<String>::new())
+                .unwrap()
+                .self_signed(&key)
+                .unwrap()
+                .der()
+                .to_vec()
+        };
+        let p256 = cert(&rcgen::PKCS_ECDSA_P256_SHA256);
+        let encryption = cert(&rcgen::PKCS_ECDSA_P384_SHA384);
+        let ed25519 = cert(&rcgen::PKCS_ED25519);
+        let body = [
+            key_descriptor(Some("signing"), &rsa),
+            key_descriptor(None, &p256),
+            key_descriptor(Some("encryption"), &encryption),
+            key_descriptor(Some("signing"), &ed25519),
+            key_descriptor(Some("signing"), &rsa),
+            r#"<md:KeyDescriptor use="signing"><ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>not base64!</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"#.to_string(),
+            acs(0, None, BINDING_POST),
+        ]
+        .concat();
+        let m = parse_sp_metadata(&sp(&body)).unwrap();
+        let found: Vec<&[u8]> = m.signing_certificates.iter().map(|c| c.der.as_slice()).collect();
+        // Signing and unmarked keys, once each; not the encryption key, nor a
+        // key or text this server cannot verify with.
+        assert_eq!(found, vec![rsa.as_slice(), p256.as_slice()]);
+        assert!(m.signing_certificates.iter().all(|c| c.not_after > c.not_before));
     }
 }

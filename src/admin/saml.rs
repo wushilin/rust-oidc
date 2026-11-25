@@ -261,7 +261,7 @@ async fn saml_page(
         claims = claims_form(url, csrf, config, may.write),
         certs = certificates_table(url, csrf, app, tenant, st.public_url.base(), &certificates, may.rotate),
         signing = signing_form(url, csrf, config, may.rotate),
-        verify = verification_form(url, csrf, config, &verification, may.rotate),
+        verify = verification_form(url, csrf, config, &verification, may.rotate, draft),
         encrypt = encryption_form(url, csrf, config, may.rotate),
         name = e(&app.display_name),
         login = copy_field("saml_login_url", "Login URL", &sso),
@@ -483,7 +483,15 @@ fn verification_form(
     c: &SamlConfig,
     certificates: &[saml::VerificationCertificate],
     may_rotate: bool,
+    draft: Option<&SpMetadata>,
 ) -> String {
+    let offered = if may_rotate {
+        draft
+            .map(|d| offered_certificates(url, csrf, d, certificates))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let rows: String = certificates
         .iter()
         .map(|x| {
@@ -511,7 +519,7 @@ fn verification_form(
     let controls = if may_rotate {
         format!(
             r#"{open}<label><input type="checkbox" name="{REQUIRED}"{checked}> Require verification certificates</label>
-<p class="muted">Requests may be signed on the HTTP-Redirect or HTTP-POST binding, with RSA-SHA256.</p>
+<p class="muted">Requests may be signed on the HTTP-Redirect or HTTP-POST binding, with RSA-SHA256, or with ECDSA-SHA256 (P-256) or ECDSA-SHA384 (P-384) keys.</p>
 <div class="actions"><button type="submit">Save</button></div></form>{add}"#,
             open = form_open(url, csrf, AppOp::SamlRequireSigned),
             checked = if c.require_signed_requests { " checked" } else { "" },
@@ -529,7 +537,39 @@ fn verification_form(
     } else {
         String::new()
     };
-    format!(r#"<h4>Verification certificates</h4>{table}{controls}"#)
+    format!(r#"<h4>Verification certificates</h4>{table}{offered}{controls}"#)
+}
+
+/// The metadata file's signing certificates not yet on the application, each
+/// with its own Add: nothing in the file is trusted until an administrator
+/// chooses it.
+fn offered_certificates(
+    url: &str,
+    csrf: &str,
+    draft: &SpMetadata,
+    registered: &[saml::VerificationCertificate],
+) -> String {
+    let rows: String = draft
+        .signing_certificates
+        .iter()
+        .filter(|c| !registered.iter().any(|r| r.thumbprint == saml::thumbprint(&c.der)))
+        .map(|c| {
+            format!(
+                r#"<tr><td class="muted">{thumbprint}</td><td>{expires}</td><td>{open}<textarea name="{CERTIFICATE}" hidden readonly>{pem}</textarea><button type="submit" class="secondary">Add</button></form></td></tr>"#,
+                thumbprint = e(&saml::thumbprint(&c.der)),
+                expires = e(&view::ts(c.not_after)),
+                open = form_open(url, csrf, AppOp::SamlVerificationAdd),
+                pem = e(&c.pem()),
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<p class="notice" role="status">Signing certificates in the metadata file. Add the ones this application signs its requests with; nothing has changed yet.</p>
+<table><tr><th>Thumbprint</th><th>Expires</th><th></th></tr>{rows}</table>"#
+    )
 }
 
 fn content_label(content: ContentEncryption) -> &'static str {

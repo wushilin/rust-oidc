@@ -172,6 +172,48 @@ pub fn thumbprint(der: &[u8]) -> String {
     hex::encode_upper(Sha1::digest(der))
 }
 
+/// A service provider's certificate as given to us: its DER and validity. The
+/// key may be RSA or EC; [`add_verification_certificate_in`] decides whether a
+/// request can be verified with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenCertificate {
+    pub der: Vec<u8>,
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+impl GivenCertificate {
+    pub fn from_der(der: &[u8]) -> anyhow::Result<Self> {
+        use x509_cert::der::{Decode, Encode};
+        let cert = x509_cert::Certificate::from_der(der).map_err(|_| anyhow::anyhow!("not an X.509 certificate"))?;
+        let validity = cert.tbs_certificate().validity();
+        Ok(Self {
+            der: cert.to_der()?,
+            not_before: validity.not_before.to_unix_duration().as_secs() as i64,
+            not_after: validity.not_after.to_unix_duration().as_secs() as i64,
+        })
+    }
+
+    pub fn from_pem(pem: &str) -> anyhow::Result<Self> {
+        use x509_cert::der::{DecodePem, Encode};
+        let cert = x509_cert::Certificate::from_pem(pem.as_bytes())
+            .map_err(|_| anyhow::anyhow!("not a PEM X.509 certificate"))?;
+        Self::from_der(&cert.to_der()?)
+    }
+
+    pub fn pem(&self) -> String {
+        let body: Vec<String> = b64(&self.der)
+            .as_bytes()
+            .chunks(64)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect();
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            body.join("\n")
+        )
+    }
+}
+
 /// One Reply URL (Assertion Consumer Service URL), with the index a request
 /// may name it by and whether it is the one used when a request names none.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1008,8 +1050,8 @@ pub(crate) async fn add_verification_certificate_in(
     not_before: i64,
     not_after: i64,
 ) -> anyhow::Result<String> {
-    if !protocol::usable_rsa_certificate(cert_der) {
-        bail!("The certificate must hold an RSA public key.");
+    if !protocol::usable_verification_certificate(cert_der) {
+        bail!("The certificate must hold an RSA public key, or an EC key on P-256 or P-384.");
     }
     let at = now();
     if not_before > at || not_after <= at {

@@ -9,7 +9,9 @@ use common::*;
 use rust_oidc::apps::{self, MemberType, Principal};
 use rust_oidc::db::Event;
 use rust_oidc::saml::{self, BasicConfig, NewCertificate, ReplyUrl};
-use rust_oidc::saml_protocol::{self as protocol, NS_ASSERTION, NS_PROTOCOL, Node, Signer, SigningAlgorithm};
+use rust_oidc::saml_protocol::{
+    self as protocol, NS_ASSERTION, NS_PROTOCOL, Node, RequestSignature, Signer, SigningAlgorithm,
+};
 use rust_oidc::txn::ops::apps::SetAssignmentRequired;
 use rust_oidc::txn::ops::saml::{
     ActivateSamlCertificate, AddSamlCertificate, AddSamlVerificationCertificate, EnableSamlSso, RemoveSamlCertificate,
@@ -682,9 +684,14 @@ async fn federation_metadata_describes_the_endpoint_and_certificate() {
             })
             .unwrap_or_default()
     };
+    // Then what requests to it may also be signed with.
     assert_eq!(
         declared(&root, "SigningMethod"),
-        vec!["http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"]
+        vec![
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+        ]
     );
     assert_eq!(
         declared(&root, "DigestMethod"),
@@ -1269,8 +1276,71 @@ struct Enveloped<'a> {
 }
 
 fn enveloped(e: &Enveloped<'_>, pem: &str) -> String {
-    use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let key = TestKey {
+        pkcs8: STANDARD.decode(body).unwrap(),
+        cert_pem: String::new(),
+        algorithm: RequestSignature::RsaSha256,
+    };
+    enveloped_by(e, &key)
+}
+
+/// A service provider's signing key, of any kind a request may be signed with.
+struct TestKey {
+    pkcs8: Vec<u8>,
+    cert_pem: String,
+    algorithm: RequestSignature,
+}
+
+impl TestKey {
+    fn ec(curve: &'static rcgen::SignatureAlgorithm, algorithm: RequestSignature) -> Self {
+        let key = rcgen::KeyPair::generate_for(curve).unwrap();
+        let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        Self {
+            pkcs8: key.serialize_der(),
+            cert_pem: cert.pem(),
+            algorithm,
+        }
+    }
+
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{self, EcdsaKeyPair, RsaKeyPair};
+        let ec = |alg| {
+            EcdsaKeyPair::from_pkcs8(alg, &self.pkcs8)
+                .unwrap()
+                .sign(&SystemRandom::new(), data)
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        };
+        match self.algorithm {
+            RequestSignature::EcdsaSha256 => ec(&signature::ECDSA_P256_SHA256_FIXED_SIGNING),
+            RequestSignature::EcdsaSha384 => ec(&signature::ECDSA_P384_SHA384_FIXED_SIGNING),
+            _ => {
+                let key = RsaKeyPair::from_pkcs8(&self.pkcs8).unwrap();
+                let mut value = vec![0u8; key.public_modulus_len()];
+                key.sign(&signature::RSA_PKCS1_SHA256, &SystemRandom::new(), data, &mut value)
+                    .unwrap();
+                value
+            }
+        }
+    }
+
+    /// The Redirect-binding query for `xml`, signed under the name `sig_alg`.
+    fn redirect_query(&self, xml: &str, sig_alg: &str) -> String {
+        let alg: String = url::form_urlencoded::byte_serialize(sig_alg.as_bytes()).collect();
+        let unsigned = format!("SAMLRequest={}&SigAlg={alg}", encoded_param(xml));
+        let signature = STANDARD.encode(self.sign(unsigned.as_bytes()));
+        let signature: String = url::form_urlencoded::byte_serialize(signature.as_bytes()).collect();
+        format!("{unsigned}&Signature={signature}")
+    }
+}
+
+fn enveloped_by(e: &Enveloped<'_>, key: &TestKey) -> String {
     let issued = protocol::instant(rust_oidc::util::now()).unwrap();
     let open = format!(
         r#"<samlp:AuthnRequest xmlns:samlp="{NS_PROTOCOL}" Destination="{}" ID="{}" IssueInstant="{issued}" Version="2.0"><saml:Issuer xmlns:saml="{NS_ASSERTION}">{ENTITY}</saml:Issuer>"#,
@@ -1283,21 +1353,12 @@ fn enveloped(e: &Enveloped<'_>, pem: &str) -> String {
     );
     let inner = format!(
         r##"<ds:CanonicalizationMethod Algorithm="{EXC}"></ds:CanonicalizationMethod><ds:SignatureMethod Algorithm="{}"></ds:SignatureMethod><ds:Reference URI="{}"><ds:Transforms><ds:Transform Algorithm="{DS}enveloped-signature"></ds:Transform><ds:Transform Algorithm="{EXC}"></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"></ds:DigestMethod><ds:DigestValue>{}</ds:DigestValue></ds:Reference>"##,
-        SigningAlgorithm::Sha256.signature_uri(),
+        key.algorithm.as_str(),
         e.uri.map_or_else(|| format!("#{}", e.id), str::to_string),
         STANDARD.encode(digest.as_ref()),
     );
     let signed_info = format!(r#"<ds:SignedInfo xmlns:ds="{DS}">{inner}</ds:SignedInfo>"#);
-    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
-    let key = RsaKeyPair::from_pkcs8(&STANDARD.decode(body).unwrap()).unwrap();
-    let mut value = vec![0u8; key.public_modulus_len()];
-    key.sign(
-        &RSA_PKCS1_SHA256,
-        &SystemRandom::new(),
-        signed_info.as_bytes(),
-        &mut value,
-    )
-    .unwrap();
+    let value = key.sign(signed_info.as_bytes());
     format!(
         r#"{open}<ds:Signature xmlns:ds="{DS}"><ds:SignedInfo>{inner}</ds:SignedInfo><ds:SignatureValue>{}</ds:SignatureValue>{}</ds:Signature>{}{close}"#,
         STANDARD.encode(&value),
@@ -1473,6 +1534,59 @@ async fn a_bad_signature_is_refused_when_a_certificate_is_registered() {
     let unsigned = authn_request("", "").replace("_req1", "_opt3");
     let page = post_request(&w, &Browser::new(), &unsigned).await;
     assert!(at_sign_in(&page), "{}", page.body);
+}
+
+#[tokio::test]
+async fn an_ecdsa_signed_request_is_verified_on_both_bindings() {
+    for (curve, algorithm, other) in [
+        (
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            RequestSignature::EcdsaSha256,
+            RequestSignature::EcdsaSha384,
+        ),
+        (
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+            RequestSignature::EcdsaSha384,
+            RequestSignature::EcdsaSha256,
+        ),
+    ] {
+        let w = world().await;
+        let key = TestKey::ec(curve, algorithm);
+        require_signed(&w, &key.cert_pem).await;
+        let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+        let get = |query: String| {
+            let url = format!("{endpoint}?{query}");
+            async move { Browser::new().get(&url).await }
+        };
+
+        let page = get(key.redirect_query(&signed_request_xml(&w, "_ec1"), algorithm.as_str())).await;
+        assert!(at_sign_in(&page), "{algorithm:?}: {}", page.body);
+        // The algorithm named must be the one the key signs with.
+        let page = get(key.redirect_query(&signed_request_xml(&w, "_ec2"), other.as_str())).await;
+        assert!(!at_sign_in(&page), "{algorithm:?} named as {other:?}");
+        // A corrupted signature: the last byte of s changed.
+        let query = key.redirect_query(&signed_request_xml(&w, "_ec3"), algorithm.as_str());
+        let (unsigned, signature) = query.rsplit_once("&Signature=").unwrap();
+        let mut raw = STANDARD
+            .decode(
+                url::form_urlencoded::parse(format!("s={signature}").as_bytes())
+                    .next()
+                    .unwrap()
+                    .1
+                    .as_bytes(),
+            )
+            .unwrap();
+        *raw.last_mut().unwrap() ^= 1;
+        let corrupted: String = url::form_urlencoded::byte_serialize(STANDARD.encode(raw).as_bytes()).collect();
+        let page = get(format!("{unsigned}&Signature={corrupted}")).await;
+        assert!(!at_sign_in(&page), "{algorithm:?}: a corrupted signature must not pass");
+
+        let page = post_request(&w, &Browser::new(), &enveloped_by(&plain(&w, "_ec4"), &key)).await;
+        assert!(at_sign_in(&page), "{algorithm:?}: {}", page.body);
+        let stranger = TestKey::ec(curve, algorithm);
+        let page = post_request(&w, &Browser::new(), &enveloped_by(&plain(&w, "_ec5"), &stranger)).await;
+        assert!(!at_sign_in(&page), "{algorithm:?}: another key must not pass");
+    }
 }
 
 #[tokio::test]
@@ -2002,6 +2116,74 @@ fn sp_metadata(entity: &str) -> String {
 async fn saved_config(w: &World) -> saml::SamlConfig {
     let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
     saml::config(&w.s.pool, &app).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn a_metadata_files_signing_certificate_is_offered_and_added_only_when_chosen() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
+    let registered = || async { saml::verification_certificates(&w.s.pool, &app).await.unwrap() };
+
+    let key = TestKey::ec(&rcgen::PKCS_ECDSA_P256_SHA256, RequestSignature::EcdsaSha256);
+    let given = saml::GivenCertificate::from_pem(&key.cert_pem).unwrap();
+    let descriptor = format!(
+        r#"<md:KeyDescriptor use="signing"><ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"#,
+        STANDARD.encode(&given.der)
+    );
+    let file = sp_metadata("https://imported.example/").replace(
+        r#"protocol"><md:SingleLogoutService"#,
+        &format!(r#"protocol">{descriptor}<md:SingleLogoutService"#),
+    );
+    let upload = || {
+        a.post_file(
+            &url,
+            &[("op", "saml_metadata_import")],
+            ("metadata_file", "sp.xml", &file),
+        )
+    };
+
+    let page = upload().await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let print = saml::thumbprint(&given.der);
+    assert!(page.body.contains(&print), "{}", page.body);
+    // Reading the file trusts nothing.
+    assert!(registered().await.is_empty());
+
+    let start = r#"<textarea name="certificate" hidden readonly>"#;
+    let offered = page
+        .body
+        .split_once(start)
+        .unwrap()
+        .1
+        .split_once("</textarea>")
+        .unwrap()
+        .0;
+    let added = a
+        .post(&url, &[("op", "saml_verification_add"), ("certificate", offered)])
+        .await;
+    assert_eq!(added.status, 303, "{}", added.body);
+    let now = registered().await;
+    assert_eq!(
+        now.iter().map(|c| c.thumbprint.as_str()).collect::<Vec<_>>(),
+        vec![print.as_str()]
+    );
+
+    // Once added, it is not offered again, and requests signed with it pass.
+    let page = upload().await;
+    assert!(!page.body.contains(start), "{}", page.body);
+    let set = SetSamlRequireSigned {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        required: true,
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &set).await.into_result().unwrap();
+    let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let query = key.redirect_query(&signed_request_xml(&w, "_md1"), RequestSignature::EcdsaSha256.as_str());
+    let page = Browser::new().get(&format!("{endpoint}?{query}")).await;
+    assert!(at_sign_in(&page), "{}", page.body);
 }
 
 #[tokio::test]

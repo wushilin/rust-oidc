@@ -2045,3 +2045,11 @@ assigned, and the account's own tenant (or its own setting) allows it.
   the application's metadata we do not know whether it accepts a posted answer.
 - A cross-site POST carries our session cookie only because it is `SameSite=None`
   over HTTPS; over plain HTTP that works only when the application is on the same site.
+
+- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
+  `Destination` must be the public URL, the tenant's id or one of its verified
+  domains (matched as the path segment itself is, without regard to case), then
+  `/saml2`, with nothing before, between or after. It was compared with the name the
+  request arrived under, but the sign-in form posts back under the tenant's id, so a
+  request sent to the domain form of the endpoint passed on arrival and was refused
+  after the password. Another tenant's endpoint on this server is still elsewhere.

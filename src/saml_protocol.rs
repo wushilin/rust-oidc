@@ -744,8 +744,8 @@ impl SamlQuery {
         self.raw_sig_alg.is_some() || self.raw_signature.is_some()
     }
 
-    /// The same message with no signature: what a POST carries, because a
-    /// signature is only verified on the Redirect binding.
+    /// The same message with no Redirect-binding signature: what a POST carries,
+    /// because its signature, if it has one, is inside the message.
     pub fn without_signature(&self) -> String {
         let mut out = format!("{}={}", self.param, self.raw_message);
         if let Some(relay) = &self.raw_relay_state {

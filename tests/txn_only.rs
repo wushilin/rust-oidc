@@ -44,6 +44,7 @@ const STORAGE: &[(&str, &str)] = &[
     ("scopes", "src/scopes.rs"),
     ("directory", "src/directory.rs"),
     ("auth_api", "src/auth_api.rs"),
+    ("saml", "src/saml.rs"),
 ];
 
 /// Files that may write anything, besides the storage modules: the engine, and
@@ -82,6 +83,15 @@ const ALLOWED: &[(&str, &str)] = &[
     ("flowtest", "take"),
     // Start-up: a signing key exists before the server serves.
     ("keys", "ensure"),
+    // Which applications a browser session signed in to, for Single Logout:
+    // sign-in state like a session, written where the protocol happens.
+    ("saml", "ensure_participant"),
+    ("saml", "create_launch_ticket"),
+    ("saml", "take_launch_ticket"),
+    ("saml", "consume_message"),
+    ("saml", "take_participants"),
+    ("saml", "save_logout_state"),
+    ("saml", "take_logout_state"),
 ];
 
 /// Tables that hold protocol or session state rather than the directory: written
@@ -100,6 +110,10 @@ const STATE_TABLES: &[&str] = &[
     "flow_tests",
     "audit_log",
     "server_secrets",
+    "saml_session_participants",
+    "saml_logout_state",
+    "saml_launch_tickets",
+    "saml_seen_messages",
 ];
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -6,6 +6,7 @@ pub mod discovery;
 mod front_door;
 mod logout;
 mod myaccount;
+pub mod saml;
 mod token;
 mod user_grants;
 mod userinfo;
@@ -48,6 +49,11 @@ pub fn router(state: AppState) -> Router {
             get(authorize::authorize).post(authorize::authorize),
         )
         .route("/{tenant}/login", post(authorize::login))
+        .route("/{tenant}/saml2", get(saml::endpoint).post(saml::endpoint))
+        .route(
+            "/{tenant}/federationmetadata/2007-06/federationmetadata.xml",
+            get(saml::metadata),
+        )
         .route("/{tenant}/oauth2/v2.0/devicecode", post(device::devicecode))
         .route(
             "/{tenant}/oauth2/deviceauth",

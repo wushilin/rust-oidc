@@ -1887,3 +1887,83 @@ changed who effectively holds a binding without it.
   `https://venus.example/.tlsproxy/oidc/callback` and reads the header on each
   page; another asserts the console's pages still send exactly
   `form-action 'self'`.
+
+## SAML single sign-on
+
+The owner chose **Entra parity** over literal OASIS IdP conformance (2026-11-23).
+OASIS's IdP mode also requires Artifact/SOAP, ECP, NameID Management, SOAP logout,
+IdP discovery and legacy cryptography (3DES, RSA v1.5). None of those is built, so
+this server does not claim formal OASIS conformance.
+
+- **Creating one follows Entra**: a name first, then SAML is chosen on the
+  application's Single sign-on page. *To reverse*: ask for the Identifier on create.
+- **Each application has its own signing certificates**, three years by default,
+  because SAML applications pin them. New ones start inactive. *To reverse*: sign
+  with the shared token keys, which would break pinned applications at rotation.
+- **Signed requests are verified on the HTTP-Redirect binding only.** A POSTed
+  enveloped signature is not verified, so an application requiring signatures must
+  use Redirect. This keeps XML signature wrapping out of the design. *To reverse*:
+  add a canonicalizer and strict reference checks.
+- **Everything signed is generated in canonical form** instead of being serialized
+  and canonicalized. *To reverse*: adopt a general XML security library.
+- **Token encryption is AES-256-CBC with RSA-OAEP.** Entra documents AES-256 but not
+  its mode or key transport; CBC and OAEP are the widely interoperable choice.
+- **SHA-1 signing is opt-in per application**, as in Entra, and signing it is the
+  only use of the `rsa` crate here because aws-lc-rs will not create RSA-SHA1.
+- **IdP-initiated sign-in starts only from the user's own app gallery**, by a post
+  with its CSRF token; `/saml2` refuses it, and an application requiring signed
+  requests cannot use it. A Sign on URL makes the gallery link SP-initiated instead.
+- **The assertion window is 70 minutes**, Entra's documented `Conditions` length.
+- **Single Logout is a front-channel redirect chain**, Entra's binding. A participant
+  that never answers stops the chain; its pending state expires after ten minutes.
+- **Claims** are editable by name and source; tenant, object id, display name,
+  authentication methods, roles and groups are added as Entra adds them.
+
+### SAML hardening after review (2026-11-23)
+
+Two independent reviews and working exploits led to these rules:
+
+- **SAML parameters are read once.** A repeated SAML parameter, or one whose name is
+  percent-encoded, is refused, and the signature covers exactly the values used.
+- **A signed message must name this endpoint, be under an hour old, and be used once.**
+  Entra documents ignoring `Destination` and `IssueInstant`; that stays true for
+  unsigned requests only, since the SAML bindings require the check on signed ones.
+- **A request cannot choose which user property is the Name ID.** It may choose a
+  compatible format; `persistent` is the pairwise id and `transient` is generated.
+- **A gallery launch is a single-use, ten-minute ticket** bound to the user and app.
+- **Logout departs from Entra in one place.** Entra ignores the NameID. Here it is
+  ignored too, but only an application this browser's session signed in to can end
+  the session, and any SessionIndex it sends must match. Otherwise it is answered
+  `UnknownPrincipal` and nothing ends. *To reverse*: drop the check in
+  `logout_requested`, which lets a forged unsigned request sign a user out.
+- **A participant that fails or cannot be reached makes the logout `PartialLogout`.**
+- **Tenant, object id, display name, methods, role and group claims are reserved.**
+- **A logout tells every subject an application was told about.** Participants are
+  recorded per Name ID (at most eight per user and application), survive a user
+  switch on the same browser and session revocation, and expire with the session.
+- **A logout that cannot reach everyone says so**: `PartialLogout` to an initiating
+  application, or a page saying so when the OIDC logout endpoint started it.
+
+### SAML across tenants (owner's request, 2026-11-23)
+
+Entra documents SAML SSO as single-tenant only. The owner chose to allow it, under
+the same rule as OIDC: the application accepts other tenants, the account is
+assigned, and the account's own tenant (or its own setting) allows it.
+
+- **A guest's email is released only when verified**, as a claim and as a Name ID;
+  otherwise the Name ID falls back to their UPN. Another tenant's administrators set
+  that field, and many SAML applications key accounts on it.
+- **A guest's assertion names their home issuer** in `identityprovider` and carries
+  none of their home tenant's groups, as their OIDC tokens do.
+- **My apps lists another tenant's application** only while all three conditions
+  hold. *To reverse*: restore the refusal in `saml::enable_in` and
+  `apps::set_accept_other_tenants_in`.
+
+### Check sign-in for SAML (2026-11-23)
+
+- **The report uses the real functions**: the same access decision, Name ID and
+  attribute code as a sign-in, so it cannot say something a sign-in would not do.
+- **A guest's values are shown only while that guest may sign in here.** Until then
+  they are not this tenant's to read, as with unassigned accounts of other tenants.
+- **An expired active certificate is reported as stopping sign-in.** The server would
+  still sign, but applications validating the certificate's dates reject the result.

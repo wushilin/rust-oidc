@@ -20,6 +20,7 @@ pub mod lockout;
 pub mod platform_roles;
 pub mod roles;
 pub mod routes;
+pub mod saml;
 pub mod session;
 pub mod settings;
 pub mod tenants;

@@ -1067,6 +1067,16 @@ async fn revoke_access(tx: &mut sqlx::AnyConnection, engine: crate::db::Engine, 
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    // An unused launch dies with the sessions. Which SAML applications they
+    // reached is kept until it expires: those applications are still signed in,
+    // and a later logout on this browser must still tell them.
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM saml_launch_tickets WHERE user_id = ?",
+    ))
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(crate::db::sql_stmt(
         engine,
         "DELETE FROM admin_sessions WHERE user_id = ?",

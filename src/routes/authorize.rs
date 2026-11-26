@@ -14,6 +14,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::audit::{self, Actor, Channel, Event};
+use super::saml::{self as saml_route, SamlCall};
 use crate::AppState;
 use crate::access;
 use crate::admin::routes::Settled;
@@ -63,6 +64,10 @@ pub async fn authorize(
         query.unwrap_or_default().into_bytes()
     };
     let params = parse(&raw);
+    // SAML has its own endpoint; this one speaks OAuth only.
+    if saml_route::is_saml(&params) {
+        return html::error(None, "SAML requests are sent to the tenant's saml2 endpoint.");
+    }
     let request = String::from_utf8_lossy(&raw).into_owned();
     match run(&st, &tenant_key, &headers, &params, &request, Interaction::None).await {
         Ok(resp) | Err(resp) => resp,
@@ -92,6 +97,8 @@ struct Validated {
     platform: RedirectPlatform,
     response_mode: ResponseMode,
     state: Option<String>,
+    /// Set when this is a SAML sign-in: it is answered with a SAML response.
+    saml: Option<SamlCall>,
 }
 
 /// The response types Entra accepts.
@@ -234,6 +241,9 @@ impl Validated {
     }
 
     fn error(&self, err: AadError) -> Response {
+        if let Some(call) = &self.saml {
+            return saml_route::error_answer(call, &self.redirect_uri, &saml_route::from_aad(&err));
+        }
         let error = err.error.as_str().to_string();
         self.respond(vec![("error", error), ("error_description", err.description())])
     }
@@ -255,6 +265,10 @@ async fn validate_client(
     tenant_key: &str,
     params: &Params,
 ) -> Result<(Tenant, Application, ServicePrincipal, url::Url, RedirectPlatform), Response> {
+    if saml_route::is_saml(params) {
+        let (tenant, app, sp, reply, _) = saml_route::resolve(st, tenant_key, params).await?;
+        return Ok((tenant, app, sp, reply, RedirectPlatform::Web));
+    }
     let page_error = |tenant: Option<&str>, err: AadError| html::error(tenant, &err.description());
     let internal = |e: anyhow::Error| page_error(None, AadError::from(e));
 
@@ -311,6 +325,9 @@ async fn run(
     request: &str,
     interaction: Interaction,
 ) -> Result<Response, Response> {
+    if saml_route::is_saml(params) {
+        return Ok(continue_saml(st, tenant_key, headers, params, request, interaction).await);
+    }
     let (tenant, client, sp, redirect_uri, platform) = validate_client(st, tenant_key, params).await?;
 
     // Entra defaults the response mode to fragment when an ID token is involved, and
@@ -331,6 +348,7 @@ async fn run(
                 // Report it through the mode this request should have used.
                 response_mode: ResponseMode::Fragment,
                 state: get(params, "state").map(str::to_string),
+                saml: None,
             };
             return Ok(v.error(AadError::invalid_request(
                 Aadsts::MissingOrInvalidParameter,
@@ -349,6 +367,7 @@ async fn run(
                 platform,
                 response_mode: ResponseMode::Query,
                 state: get(params, "state").map(str::to_string),
+                saml: None,
             };
             return Ok(v.error(AadError::invalid_request(
                 Aadsts::MissingOrInvalidParameter,
@@ -367,6 +386,7 @@ async fn run(
         platform,
         response_mode,
         state: get(params, "state").map(str::to_string),
+        saml: None,
     };
 
     match continue_authorize(st, headers, params, request, interaction, &v).await {
@@ -374,6 +394,102 @@ async fn run(
         Err(Step::Redirect(err)) => Ok(v.error(err)),
         Err(Step::Page(resp)) => Ok(resp),
     }
+}
+
+/// A SAML sign-in, through the same steps as an OIDC one.
+async fn continue_saml(
+    st: &AppState,
+    tenant_key: &str,
+    headers: &HeaderMap,
+    params: &Params,
+    request: &str,
+    interaction: Interaction,
+) -> Response {
+    let (tenant, client, sp, reply, call) = match saml_route::resolve(st, tenant_key, params).await {
+        Ok(found) => found,
+        Err(page) => return page,
+    };
+    let v = Validated {
+        tenant,
+        client,
+        sp,
+        redirect_uri: reply,
+        platform: RedirectPlatform::Web,
+        response_mode: ResponseMode::FormPost,
+        state: None,
+        saml: Some(call),
+    };
+    if !v.sp.enabled {
+        return v.error(AadError::app_disabled(&v.client.app_id, &v.client.display_name));
+    }
+    let prompt = match PromptSet::parse(get(params, "prompt").unwrap_or_default()) {
+        Ok(prompt) => prompt,
+        Err(err) => return v.error(err),
+    };
+    let asked = Asked {
+        prompt,
+        max_age: None,
+        login_hint: get(params, "login_hint"),
+    };
+    let (session, user) = match signed_in_user(st, headers, params, request, interaction, &v, &asked).await {
+        Ok(found) => found,
+        Err(Step::Redirect(err)) => return v.error(err),
+        Err(Step::Page(page)) => return page,
+    };
+    let call = v.saml.as_ref().expect("set above");
+    saml_route::issue(
+        st,
+        saml_route::Issue {
+            tenant: &v.tenant,
+            app: &v.client,
+            sp: &v.sp,
+            reply: &v.redirect_uri,
+            call,
+            user: &user,
+            session: &session,
+            headers,
+        },
+    )
+    .await
+}
+
+/// `/saml2`, once it knows the message is an AuthnRequest.
+pub(super) async fn run_saml(
+    st: &AppState,
+    tenant_key: &str,
+    headers: &HeaderMap,
+    params: &Params,
+    request: &str,
+) -> Response {
+    continue_saml(st, tenant_key, headers, params, request, Interaction::None).await
+}
+
+/// Start a sign-in to `app_id` from the signed-in user's app gallery. The caller
+/// has checked the form's CSRF token.
+pub(super) async fn launch_saml(
+    st: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    app: &Application,
+    user: &User,
+) -> Response {
+    let ticket = match crate::saml::create_launch_ticket(&st.pool, &tenant.id, app, &user.id).await {
+        Ok(ticket) => ticket,
+        Err(e) => return html::error(Some(&tenant.name), &AadError::from(e).description()),
+    };
+    let tenant_key = tenant.id.as_str();
+    let request = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair(saml_route::IDP_INITIATED, &ticket);
+        // An application of another tenant has no session of this user yet: its
+        // sign-in page opens with their name filled in.
+        if user.tenant_id != tenant.id {
+            query.append_pair("login_hint", &user.upn);
+        }
+        query.finish()
+    };
+    let params = saml_route::normalized(parse(request.as_bytes()), &request);
+    continue_saml(st, tenant_key, headers, &params, &request, Interaction::None).await
 }
 
 enum Step {
@@ -585,81 +701,12 @@ async fn continue_authorize(
         return Err(AadError::app_disabled(&v.client.app_id, &v.client.display_name).into());
     }
 
-    // ---- who is the user? ----
-    let session = session::find(&st.pool, headers, &v.tenant.id).await?;
-    let user = match &session {
-        // Of this tenant, or of another one signed in here (see `access`).
-        Some(s) => users::find_by_id(&st.pool, &s.user_id).await?,
-        None => None,
+    let asked = Asked {
+        prompt,
+        max_age,
+        login_hint,
     };
-    let fresh = interaction == Interaction::SignedIn;
-    // With `prompt=login consent` the sign-in page comes first and the consent
-    // page second, so by the time the consent answer arrives the user has already
-    // re-authenticated for this request. Honour that -- but only if the session
-    // really is that recent, so posting a consent answer cannot be used to dodge
-    // `prompt=login` on an old session.
-    let answered_consent = matches!(interaction, Interaction::Consented | Interaction::ConsentDenied)
-        && session
-            .as_ref()
-            .is_some_and(|s| now() - s.auth_time <= CONSENT_REAUTH_WINDOW);
-    let mut needs_login = user.is_none();
-    if !fresh {
-        needs_login |= prompt.login && !answered_consent;
-        if let (Some(max_age), Some(s)) = (max_age, &session) {
-            needs_login |= now() - s.auth_time > max_age;
-        }
-        if let (Some(hint), Some(u)) = (login_hint, &user) {
-            needs_login |= crate::util::fold(hint) != crate::util::fold(&u.upn);
-        }
-    }
-    if needs_login {
-        if prompt.none {
-            return Err(AadError::new(
-                StatusCode::BAD_REQUEST,
-                OAuthError::LoginRequired,
-                Aadsts::SilentSignInFailed,
-                "A silent sign-in request was sent but no user is signed in.",
-            )
-            .into());
-        }
-        return Err(Step::Page(login_page(
-            st,
-            v,
-            request,
-            login_hint.unwrap_or_default(),
-            None,
-        )));
-    }
-    let (session, user) = (session.expect("checked"), user.expect("checked"));
-
-    // ---- may this user use this application at all? ----
-    let decision = access::decide(&st.pool, &v.tenant, &v.sp, &user).await?;
-    if let Some(refusal) = decision.refusal {
-        return Err(Step::Page(refused_page(v, &decision.home, refusal)));
-    }
-
-    // ---- a second factor, where one is needed and this session has none ----
-    if !session.amr.iter().any(|m| m == Amr::Mfa.as_str()) {
-        let step = mfa::step(&st.pool, &decision.home, &user.id, mfa::At::App(&v.sp)).await?;
-        let step = stepped_up(step, params);
-        if step != mfa::Step::Done {
-            if prompt.none {
-                let (code, what) = match step {
-                    mfa::Step::Enroll => (
-                        Aadsts::MfaRegistrationRequired,
-                        "The user must set up multi-factor authentication.",
-                    ),
-                    _ => (Aadsts::MfaRequired, "The user must use multi-factor authentication."),
-                };
-                return Err(AadError::new(StatusCode::BAD_REQUEST, OAuthError::InteractionRequired, code, what).into());
-            }
-            return Err(Step::Page(start_mfa(st, v, request, &user, step, session.keep).await));
-        }
-    }
-
-    if prompt.select_account && interaction == Interaction::None {
-        return Err(Step::Page(account_picker(st, v, request, &user)));
-    }
+    let (session, user) = signed_in_user(st, headers, params, request, interaction, v, &asked).await?;
 
     // ---- consent, when the client asked for it ----
     if prompt.consent {
@@ -778,6 +825,107 @@ async fn continue_authorize(
         out.push(("client_info", crate::claims::client_info(&user)));
     }
     Ok(v.respond(out))
+}
+
+/// What a request asks about the sign-in itself, in either protocol.
+struct Asked<'a> {
+    prompt: PromptSet,
+    max_age: Option<i64>,
+    login_hint: Option<&'a str>,
+}
+
+/// The steps every browser sign-in shares, OIDC or SAML: who the user is, whether
+/// they may use this application, and a second factor where one is needed.
+async fn signed_in_user(
+    st: &AppState,
+    headers: &HeaderMap,
+    params: &Params,
+    request: &str,
+    interaction: Interaction,
+    v: &Validated,
+    asked: &Asked<'_>,
+) -> Result<(session::Session, User), Step> {
+    let Asked {
+        prompt,
+        max_age,
+        login_hint,
+    } = *asked;
+    // ---- who is the user? ----
+    let session = session::find(&st.pool, headers, &v.tenant.id).await?;
+    let user = match &session {
+        // Of this tenant, or of another one signed in here (see `access`).
+        Some(s) => users::find_by_id(&st.pool, &s.user_id).await?,
+        None => None,
+    };
+    let fresh = interaction == Interaction::SignedIn;
+    // With `prompt=login consent` the sign-in page comes first and the consent
+    // page second, so by the time the consent answer arrives the user has already
+    // re-authenticated for this request. Honour that -- but only if the session
+    // really is that recent, so posting a consent answer cannot be used to dodge
+    // `prompt=login` on an old session.
+    let answered_consent = matches!(interaction, Interaction::Consented | Interaction::ConsentDenied)
+        && session
+            .as_ref()
+            .is_some_and(|s| now() - s.auth_time <= CONSENT_REAUTH_WINDOW);
+    let mut needs_login = user.is_none();
+    if !fresh {
+        needs_login |= prompt.login && !answered_consent;
+        if let (Some(max_age), Some(s)) = (max_age, &session) {
+            needs_login |= now() - s.auth_time > max_age;
+        }
+        if let (Some(hint), Some(u)) = (login_hint, &user) {
+            needs_login |= crate::util::fold(hint) != crate::util::fold(&u.upn);
+        }
+    }
+    if needs_login {
+        if prompt.none {
+            return Err(AadError::new(
+                StatusCode::BAD_REQUEST,
+                OAuthError::LoginRequired,
+                Aadsts::SilentSignInFailed,
+                "A silent sign-in request was sent but no user is signed in.",
+            )
+            .into());
+        }
+        return Err(Step::Page(login_page(
+            st,
+            v,
+            request,
+            login_hint.unwrap_or_default(),
+            None,
+        )));
+    }
+    let (session, user) = (session.expect("checked"), user.expect("checked"));
+
+    // ---- may this user use this application at all? ----
+    let decision = access::decide(&st.pool, &v.tenant, &v.sp, &user).await?;
+    if let Some(refusal) = decision.refusal {
+        return Err(Step::Page(refused_page(v, &decision.home, refusal)));
+    }
+
+    // ---- a second factor, where one is needed and this session has none ----
+    if !session.amr.iter().any(|m| m == Amr::Mfa.as_str()) {
+        let step = mfa::step(&st.pool, &decision.home, &user.id, mfa::At::App(&v.sp)).await?;
+        let step = stepped_up(step, params);
+        if step != mfa::Step::Done {
+            if prompt.none {
+                let (code, what) = match step {
+                    mfa::Step::Enroll => (
+                        Aadsts::MfaRegistrationRequired,
+                        "The user must set up multi-factor authentication.",
+                    ),
+                    _ => (Aadsts::MfaRequired, "The user must use multi-factor authentication."),
+                };
+                return Err(AadError::new(StatusCode::BAD_REQUEST, OAuthError::InteractionRequired, code, what).into());
+            }
+            return Err(Step::Page(start_mfa(st, v, request, &user, step, session.keep).await));
+        }
+    }
+
+    if prompt.select_account && interaction == Interaction::None {
+        return Err(Step::Page(account_picker(st, v, request, &user)));
+    }
+    Ok((session, user))
 }
 
 fn form_action(st: &AppState, v: &Validated) -> String {
@@ -1281,11 +1429,15 @@ async fn second_step(
                 Settled::Respond(resp) => return resp,
             };
             let _ = mfa::finish(&st.pool, &ticket).await;
-            let again = format!(
-                "{}?{}",
-                st.public_url.tenant_url(&v.tenant.id, "oauth2/v2.0/authorize"),
-                request
-            );
+            let again = if v.saml.is_some() {
+                saml_route::restart_url(st, &v.tenant.id, params, request)
+            } else {
+                format!(
+                    "{}?{}",
+                    st.public_url.tenant_url(&v.tenant.id, "oauth2/v2.0/authorize"),
+                    request
+                )
+            };
             let mut resp = html::mfa_enrolled(&v.tenant.name, &codes, &again);
             let h = resp.headers_mut();
             h.append(
@@ -1432,19 +1584,36 @@ pub async fn login(
 ) -> Response {
     let form = parse(&body);
     let request = form.get("request").cloned().unwrap_or_default();
-    let params = parse(request.as_bytes());
+    let params = saml_route::normalized(parse(request.as_bytes()), &request);
 
-    let v = match validate_client(&st, &tenant_key, &params).await {
-        Ok((tenant, client, sp, redirect_uri, platform)) => Validated {
-            tenant,
-            client,
-            sp,
-            redirect_uri,
-            platform,
-            response_mode: ResponseMode::Query,
-            state: None,
-        },
-        Err(page) => return page,
+    let v = if saml_route::is_saml(&params) {
+        match saml_route::resolve(&st, &tenant_key, &params).await {
+            Ok((tenant, client, sp, redirect_uri, call)) => Validated {
+                tenant,
+                client,
+                sp,
+                redirect_uri,
+                platform: RedirectPlatform::Web,
+                response_mode: ResponseMode::FormPost,
+                state: None,
+                saml: Some(call),
+            },
+            Err(page) => return page,
+        }
+    } else {
+        match validate_client(&st, &tenant_key, &params).await {
+            Ok((tenant, client, sp, redirect_uri, platform)) => Validated {
+                tenant,
+                client,
+                sp,
+                redirect_uri,
+                platform,
+                response_mode: ResponseMode::Query,
+                state: None,
+                saml: None,
+            },
+            Err(page) => return page,
+        }
     };
 
     // Double-submit CSRF check: the form must echo the cookie set with the page.
@@ -1463,6 +1632,11 @@ pub async fn login(
     }
 
     let op = form.get("op").and_then(|raw| html::LoginOp::parse(raw));
+    // SAML has no consent step, so a consent answer can only be an attempt to
+    // use its re-authentication allowance.
+    if v.saml.is_some() && matches!(op, Some(html::LoginOp::ConsentAccept | html::LoginOp::ConsentDeny)) {
+        return html::error(Some(&v.tenant.name), "That is not a step of this sign-in.");
+    }
     let result = match op {
         Some(html::LoginOp::Continue) => {
             run(&st, &tenant_key, &headers, &params, &request, Interaction::ChoseAccount).await

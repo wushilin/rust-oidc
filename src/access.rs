@@ -383,6 +383,10 @@ pub enum Flow {
     Browser,
     PasswordGrant,
     Refresh,
+    /// SAML: the application sends the user here with a request.
+    SamlRequest,
+    /// SAML: the user opens it from My apps.
+    SamlGallery,
 }
 
 impl Flow {
@@ -391,6 +395,8 @@ impl Flow {
             Self::Browser => "Browser sign-in (and device code)",
             Self::PasswordGrant => "Password grant",
             Self::Refresh => "Refreshing a token",
+            Self::SamlRequest => "Sign-in started by the application",
+            Self::SamlGallery => "Opening it from My apps",
         }
     }
 }
@@ -406,9 +412,11 @@ pub struct Report {
     pub headline: String,
     pub sections: Vec<Section>,
     pub flows: Vec<FlowVerdict>,
+    /// The account the report is about, when it says anything about one.
+    pub user: Option<User>,
 }
 
-fn line(mark: Mark, text: impl Into<String>) -> Line {
+pub fn line(mark: Mark, text: impl Into<String>) -> Line {
     Line {
         mark,
         text: text.into(),
@@ -429,6 +437,7 @@ fn only(headline: String) -> Report {
         headline,
         sections: Vec::new(),
         flows: Vec::new(),
+        user: None,
     }
 }
 
@@ -764,6 +773,7 @@ pub(crate) async fn explain_in(
         },
         sections,
         flows: vec![browser, password_grant, refresh],
+        user: Some(user),
     })
 }
 

@@ -624,6 +624,8 @@ pub struct MyAccount<'a> {
     pub error: Option<&'a str>,
     /// New recovery codes, shown once.
     pub new_codes: Option<&'a [String]>,
+    /// The applications this user can open.
+    pub apps: &'a [crate::saml::GalleryApp],
 }
 
 /// The `op` values My Account's forms carry.
@@ -634,6 +636,8 @@ pub enum AccountOp {
     MfaReplace,
     RecoveryCodes,
     SignOutEverywhere,
+    /// Open an application from the gallery by signing in to it here.
+    LaunchApp,
 }
 
 impl AccountOp {
@@ -643,6 +647,7 @@ impl AccountOp {
         Self::MfaReplace,
         Self::RecoveryCodes,
         Self::SignOutEverywhere,
+        Self::LaunchApp,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -652,6 +657,7 @@ impl AccountOp {
             Self::MfaReplace => "account_mfa_replace",
             Self::RecoveryCodes => "account_recovery_codes",
             Self::SignOutEverywhere => "account_sign_out_everywhere",
+            Self::LaunchApp => "account_launch_app",
         }
     }
 
@@ -659,6 +665,9 @@ impl AccountOp {
         Self::ALL.iter().copied().find(|o| o.as_str() == raw)
     }
 }
+
+/// The gallery form's field naming the application to open.
+pub const LAUNCH_APP: &str = "app";
 
 /// My Account's form fields.
 pub const CURRENT_PASSWORD: &str = "current_password";
@@ -739,8 +748,39 @@ pub fn my_account(p: &MyAccount) -> Response {
         "Change password",
         "",
     );
+    // A Sign on URL is a plain link, so the application starts its own sign-in.
+    // Without one, a SAML application is opened by a post with this page's CSRF
+    // token: an IdP-initiated sign-in nobody else can start for this user.
+    let tiles: String = p
+        .apps
+        .iter()
+        .map(|a| match &a.sign_on_url {
+            Some(url) => format!(
+                r#"<li><a href="{}" rel="noopener noreferrer">{}</a></li>"#,
+                escape(url),
+                escape(&a.display_name)
+            ),
+            None => format!(
+                "<li>{}</li>",
+                form(
+                    AccountOp::LaunchApp,
+                    &format!(
+                        r#"<input type="hidden" name="{LAUNCH_APP}" value="{}">"#,
+                        escape(&a.app_id)
+                    ),
+                    &a.display_name,
+                    "secondary"
+                )
+            ),
+        })
+        .collect();
+    let gallery = if tiles.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<h2>My apps</h2><ul class="apps">{tiles}</ul>"#)
+    };
     let body = format!(
-        r#"<h1>My account</h1><p class="sub">{upn}</p>{banner}{codes}
+        r#"<h1>My account</h1><p class="sub">{upn}</p>{banner}{codes}{gallery}
 <h2>Profile</h2><dl class="profile">{name}{given}{family}{user}{email}</dl>
 <p class="sub">Ask an administrator to change these.</p>
 <h2>Password</h2>{password}
@@ -797,6 +837,12 @@ pub fn form_post(action: &url::Url, params: &[(&str, String)]) -> Response {
         "default-src 'none'; script-src 'nonce-{nonce}'; form-action {origin}; frame-ancestors 'none'; base-uri 'none'"
     );
     respond(StatusCode::OK, html, &csp)
+}
+
+/// A logout that could not reach every application.
+pub fn signed_out_partially(tenant_name: Option<&str>) -> Response {
+    let body = r#"<h1>You signed out, but some applications may still be signed in</h1><p class="sub">One or more applications could not be told. Close all browser windows to finish signing out.</p>"#;
+    respond(StatusCode::OK, page("Signed out", tenant_name, body), CSP_DEFAULT)
 }
 
 // ---- device authorization grant pages ----

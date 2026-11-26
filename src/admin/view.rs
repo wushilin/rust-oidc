@@ -152,7 +152,7 @@ p.verdict { font-weight:600; font-size:16px; padding:10px 14px; border-radius:6p
 p.verdict.works { border-color:var(--ok); color:var(--ok); }
 p.verdict.refused { border-color:var(--err); color:var(--err); }
 ul.checks { list-style:none; padding:0; margin:6px 0 14px; }
-ul.checks li { padding:3px 0; }
+ul.checks li { padding:3px 0; overflow-wrap:anywhere; }
 .mark { display:inline-block; width:1.4em; font-weight:700; }
 .mark.pass { color:var(--ok); } .mark.fail { color:var(--err); } .mark.note { color:var(--muted); }
 /* Dialogs: the browser's popover, centred over a dimmed page. */

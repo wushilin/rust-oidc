@@ -49,6 +49,8 @@ const SECRET_EXPIRY_WARNING_SECS: i64 = 30 * 24 * 60 * 60;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppSection {
     Overview,
+    /// Entra's *Single sign-on*: the method, and SAML's configuration.
+    SingleSignOn,
     Authentication,
     /// Which groups its tokens carry.
     TokenConfiguration,
@@ -66,6 +68,7 @@ pub enum AppSection {
 impl AppSection {
     pub const ALL: &'static [AppSection] = &[
         Self::Overview,
+        Self::SingleSignOn,
         Self::Authentication,
         Self::TokenConfiguration,
         Self::Credentials,
@@ -80,6 +83,7 @@ impl AppSection {
     pub fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::SingleSignOn => "Single sign-on",
             Self::Authentication => "Authentication",
             Self::TokenConfiguration => "Token configuration",
             Self::Credentials => "Certificates & secrets",
@@ -96,6 +100,7 @@ impl AppSection {
     pub fn path(self) -> &'static str {
         match self {
             Self::Overview => "",
+            Self::SingleSignOn => "sso",
             Self::Authentication => "authentication",
             Self::TokenConfiguration => "token",
             Self::Credentials => "credentials",
@@ -116,9 +121,12 @@ impl AppSection {
     fn group(self) -> Option<&'static str> {
         match self {
             Self::Overview => None,
-            Self::Authentication | Self::TokenConfiguration | Self::Credentials | Self::Api | Self::Roles => {
-                Some("Manage")
-            }
+            Self::SingleSignOn
+            | Self::Authentication
+            | Self::TokenConfiguration
+            | Self::Credentials
+            | Self::Api
+            | Self::Roles => Some("Manage"),
             Self::Assignments | Self::Permissions | Self::ApiPermissions => Some("Access"),
             Self::Check => Some("Troubleshoot"),
         }
@@ -160,6 +168,20 @@ pub enum AppOp {
     /// Grant this application a permission of the built-in Auth API.
     AuthApiGrant,
     AuthApiRevoke,
+    SamlEnable,
+    SamlDisable,
+    SamlBasic,
+    SamlClaims,
+    SamlSigning,
+    SamlCertificateAdd,
+    SamlCertificateActivate,
+    SamlCertificateRemove,
+    SamlRequireSigned,
+    SamlVerificationAdd,
+    SamlVerificationRemove,
+    SamlEncryption,
+    SignOnUrl,
+    Visibility,
 }
 
 impl AppOp {
@@ -178,6 +200,20 @@ impl AppOp {
             Self::Assign | Self::Unassign => AppSection::Assignments,
             Self::RoleAssign | Self::RoleUnassign => AppSection::Permissions,
             Self::AuthApiGrant | Self::AuthApiRevoke => AppSection::ApiPermissions,
+            Self::SamlEnable
+            | Self::SamlDisable
+            | Self::SamlBasic
+            | Self::SamlClaims
+            | Self::SamlSigning
+            | Self::SamlCertificateAdd
+            | Self::SamlCertificateActivate
+            | Self::SamlCertificateRemove
+            | Self::SamlRequireSigned
+            | Self::SamlVerificationAdd
+            | Self::SamlVerificationRemove
+            | Self::SamlEncryption
+            | Self::SignOnUrl
+            | Self::Visibility => AppSection::SingleSignOn,
         }
     }
 
@@ -201,6 +237,20 @@ impl AppOp {
         Self::RoleUnassign,
         Self::AuthApiGrant,
         Self::AuthApiRevoke,
+        Self::SamlEnable,
+        Self::SamlDisable,
+        Self::SamlBasic,
+        Self::SamlClaims,
+        Self::SamlSigning,
+        Self::SamlCertificateAdd,
+        Self::SamlCertificateActivate,
+        Self::SamlCertificateRemove,
+        Self::SamlRequireSigned,
+        Self::SamlVerificationAdd,
+        Self::SamlVerificationRemove,
+        Self::SamlEncryption,
+        Self::SignOnUrl,
+        Self::Visibility,
     ];
 
     /// The form's `op` field.
@@ -227,6 +277,20 @@ impl AppOp {
             Self::RoleUnassign => "role_unassign",
             Self::AuthApiGrant => "auth_api_grant",
             Self::AuthApiRevoke => "auth_api_revoke",
+            Self::SamlEnable => "saml_enable",
+            Self::SamlDisable => "saml_disable",
+            Self::SamlBasic => "saml_basic",
+            Self::SamlClaims => "saml_claims",
+            Self::SamlSigning => "saml_signing",
+            Self::SamlCertificateAdd => "saml_certificate_add",
+            Self::SamlCertificateActivate => "saml_certificate_activate",
+            Self::SamlCertificateRemove => "saml_certificate_remove",
+            Self::SamlRequireSigned => "saml_require_signed",
+            Self::SamlVerificationAdd => "saml_verification_add",
+            Self::SamlVerificationRemove => "saml_verification_remove",
+            Self::SamlEncryption => "saml_encryption",
+            Self::SignOnUrl => "sign_on_url",
+            Self::Visibility => "visibility",
         }
     }
 
@@ -240,6 +304,16 @@ impl AppOp {
             // Credentials are their own action: a role may administer an
             // application without being able to mint a credential for it.
             Self::SecretAdd | Self::SecretRemove | Self::CertificateAdd | Self::CertificateRemove => APP_ROTATE,
+            // SAML's keys and how they are used are credentials too.
+            Self::SamlEnable
+            | Self::SamlSigning
+            | Self::SamlCertificateAdd
+            | Self::SamlCertificateActivate
+            | Self::SamlCertificateRemove
+            | Self::SamlRequireSigned
+            | Self::SamlVerificationAdd
+            | Self::SamlVerificationRemove
+            | Self::SamlEncryption => APP_ROTATE,
             // Who holds a role is an assignment, not the registration.
             Self::Assign
             | Self::Unassign
@@ -255,7 +329,12 @@ impl AppOp {
             | Self::IdentifierUriAdd
             | Self::IdentifierUriRemove
             | Self::ScopeAdd
-            | Self::RoleAdd => APP_WRITE,
+            | Self::RoleAdd
+            | Self::SamlDisable
+            | Self::SamlBasic
+            | Self::SamlClaims
+            | Self::SignOnUrl
+            | Self::Visibility => APP_WRITE,
         }
     }
 
@@ -284,12 +363,28 @@ impl AppOp {
             Self::RoleUnassign => TxnKind::RevokeAppRole,
             Self::AuthApiGrant => TxnKind::GrantAuthApiPermission,
             Self::AuthApiRevoke => TxnKind::RevokeAuthApiPermission,
+            Self::SamlEnable => TxnKind::EnableSamlSso,
+            Self::SamlDisable => TxnKind::DisableSamlSso,
+            Self::SamlBasic => TxnKind::SaveSamlBasic,
+            Self::SamlClaims => TxnKind::SaveSamlClaims,
+            Self::SamlSigning => TxnKind::SaveSamlSigning,
+            Self::SamlCertificateAdd => TxnKind::AddSamlCertificate,
+            Self::SamlCertificateActivate => TxnKind::ActivateSamlCertificate,
+            Self::SamlCertificateRemove => TxnKind::RemoveSamlCertificate,
+            Self::SamlRequireSigned => TxnKind::SetSamlRequireSigned,
+            Self::SamlVerificationAdd => TxnKind::AddSamlVerificationCertificate,
+            Self::SamlVerificationRemove => TxnKind::RemoveSamlVerificationCertificate,
+            Self::SamlEncryption => TxnKind::SetSamlEncryption,
+            Self::SignOnUrl => TxnKind::SetAppSignOnUrl,
+            Self::Visibility => TxnKind::SetAppVisibility,
         }
     }
 }
 
 /// Form field names, spelled once.
 const NAME: &str = "name";
+/// Which section a newly created application opens on.
+const THEN: &str = "then";
 const DAYS: &str = "days";
 const KEY_ID: &str = "key_id";
 const CERT: &str = "certificate";
@@ -383,6 +478,19 @@ Application ID URI <code>api://{{appId}}</code>.</p></form>"#,
                 csrf = view::csrf_input(&ctx.csrf),
             ),
             error.is_some(),
+        ) + &view::expander(
+            "New application (SAML or other non-gallery)",
+            &format!(
+                r#"<form method="post" action="{url}">{csrf}<input type="hidden" name="{THEN}" value="{sso}">
+<label for="enterprise_name">What's the name of your app?</label><input id="enterprise_name" name="{NAME}" type="text" required>
+<div class="actions"><button type="submit">Create</button></div>
+<p class="muted">Integrate any other application you don't find in the gallery. Choose SAML under
+Single sign-on on the next page.</p></form>"#,
+                url = e(&apps_url(base, tenant)),
+                csrf = view::csrf_input(&ctx.csrf),
+                sso = AppSection::SingleSignOn.path(),
+            ),
+            false,
         )
     } else {
         String::new()
@@ -438,6 +546,12 @@ pub async fn create_app(
         display_name: field(&form, NAME).to_string(),
     };
     match settle(txn::run(&st.pool, &ctx.actor(), &create).await) {
+        Settled::Done(app) if field(&form, THEN) == AppSection::SingleSignOn.path() => view::see_other(&section_url(
+            st.public_url.base(),
+            tenant,
+            &app,
+            AppSection::SingleSignOn,
+        )),
         Settled::Done(app) => view::see_other(&app_url(st.public_url.base(), tenant, &app)),
         Settled::Refused(message) => list(&st, &ctx, tenant, Some(&message), StatusCode::BAD_REQUEST).await,
         Settled::Respond(resp) => resp,
@@ -537,6 +651,13 @@ async fn detail(
 
     let content = match section {
         AppSection::Overview => overview(st, ctx, tenant, app, &url, &csrf).await,
+        AppSection::SingleSignOn => {
+            let may = super::saml::May {
+                write: may_write,
+                rotate: may_rotate,
+            };
+            super::saml::section(st, tenant, app, &url, &csrf, may).await
+        }
         AppSection::Authentication => {
             let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
             let sp = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
@@ -823,8 +944,8 @@ struct Switches {
 async fn check_section(st: &AppState, tenant: &Tenant, app: &Application, upn: Option<&str>, url: &str) -> String {
     let form = format!(
         r#"<h2>Check sign-in</h2><p class="sub">Whether an account would be let in to this application, and what decides it:
-its state, its assignment and real group memberships, every setting involved, and what the token would carry. Nothing is
-changed and no password is asked for.</p>
+its state, its assignment and real group memberships, every setting involved, and what the token or SAML assertion would
+carry. Nothing is changed and no password is asked for.</p>
 <form method="get" action="{url}" class="find"><input name="{CHECK_UPN}" type="search" value="{value}" placeholder="User name" aria-label="User name" autocapitalize="none" spellcheck="false" autofocus>
 <button type="submit">Check</button></form>"#,
         url = e(url),
@@ -837,10 +958,13 @@ changed and no password is asked for.</p>
         Ok(Some(sp)) => sp,
         _ => return format!(r#"{form}<p class="error">This application has no service principal here.</p>"#),
     };
-    let report = match crate::access::explain(&st.pool, tenant, &sp, app, upn).await {
+    let mut report = match crate::access::explain(&st.pool, tenant, &sp, app, upn).await {
         Ok(r) => r,
         Err(err) => return format!(r#"{form}{}"#, view::error_block(Some(&err.to_string()))),
     };
+    if let Err(err) = super::saml::extend_check(st, tenant, &sp, app, &mut report).await {
+        return format!(r#"{form}{}"#, view::error_block(Some(&err.to_string())));
+    }
     use crate::access::Mark;
     let mark = |m: Mark| match m {
         Mark::Pass => r#"<span class="mark pass" aria-label="passes">&#x2713;</span>"#,
@@ -1658,7 +1782,16 @@ pub async fn detail_post(
         .map(|(_, v)| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .collect();
-    match settle(apply(&st, &ctx, tenant, &app, op, &form, ticked).await) {
+    let applied = if op.section() == AppSection::SingleSignOn {
+        match super::saml::apply(&st, &ctx.actor(), tenant, &app, op, &form, &body).await {
+            Outcome::Done(()) => Outcome::Done(Applied::Redirect),
+            Outcome::Refused(r) => Outcome::Refused(r),
+            Outcome::Failed(m) => Outcome::Failed(m),
+        }
+    } else {
+        apply(&st, &ctx, tenant, &app, op, &form, ticked).await
+    };
+    match settle(applied) {
         Settled::Done(Applied::Redirect) => {
             view::see_other(&section_url(st.public_url.base(), tenant, &app, op.section()))
         }
@@ -1713,6 +1846,21 @@ async fn apply(
     let text = |name: &str| field(form, name).to_string();
     let maybe = |name: &str| optional(form, name).map(str::to_string);
     match op {
+        // Applied by `super::saml`, which `detail_post` sends them to.
+        AppOp::SamlEnable
+        | AppOp::SamlDisable
+        | AppOp::SamlBasic
+        | AppOp::SamlClaims
+        | AppOp::SamlSigning
+        | AppOp::SamlCertificateAdd
+        | AppOp::SamlCertificateActivate
+        | AppOp::SamlCertificateRemove
+        | AppOp::SamlRequireSigned
+        | AppOp::SamlVerificationAdd
+        | AppOp::SamlVerificationRemove
+        | AppOp::SamlEncryption
+        | AppOp::SignOnUrl
+        | AppOp::Visibility => invalid("That is not an operation of this page."),
         AppOp::Flags => {
             // Every switch in one transaction: a refusal (stopping accepting
             // other tenants while theirs are assigned) saves none of them.

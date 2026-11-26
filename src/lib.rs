@@ -21,6 +21,8 @@ pub mod mfa;
 pub mod ratelimit;
 pub mod rbac;
 pub mod routes;
+pub mod saml;
+pub mod saml_protocol;
 pub mod scopes;
 pub mod secrets;
 pub mod server;

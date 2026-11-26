@@ -1050,7 +1050,7 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
             artifact,
             "",
             protocol::STATUS_REQUESTER,
-            protocol::STATUS_REQUEST_UNSUPPORTED,
+            protocol::STATUS_UNSUPPORTED_BINDING,
         ),
         (
             "",
@@ -1101,6 +1101,30 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
         ))
         .await;
     assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+
+    // Nor for a request addressed to another endpoint.
+    let misaddressed = r#"Destination="https://other.example/saml2""#;
+    let page = Browser::new()
+        .get(&redirect_url(
+            &w.s,
+            &w.f.tenant.id,
+            &authn_request(misaddressed, subject),
+            None,
+        ))
+        .await;
+    assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+
+    // The application's RelayState comes back with the answer.
+    let page = Browser::new()
+        .get(&redirect_url(
+            &w.s,
+            &w.f.tenant.id,
+            &authn_request("", subject),
+            Some("state-1"),
+        ))
+        .await;
+    assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
+    assert_eq!(page.field("RelayState").as_deref(), Some("state-1"));
 
     // And not for a request failing the application's signature requirement.
     let (_, _, cert_pem) = sp_key();

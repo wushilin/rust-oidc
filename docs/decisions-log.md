@@ -1994,6 +1994,13 @@ assigned, and the account's own tenant (or its own setting) allows it.
   request otherwise. The owner set full conformance as the release bar. An application
   sending a stale `Destination` after a host change now fails until it is corrected.
   An unsigned request with no `Destination` is still accepted, as the standard allows.
+- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
+  `Destination` must be the public URL, the tenant's id or one of its verified
+  domains (matched as the path segment itself is, without regard to case), then
+  `/saml2`, with nothing before, between or after. It was compared with the name the
+  request arrived under, but the sign-in form posts back under the tenant's id, so a
+  request sent to the domain form of the endpoint passed on arrival and was refused
+  after the password. Another tenant's endpoint on this server is still elsewhere.
 
 ### Unsupported SAML requests are answered in SAML (2026-11-24)
 
@@ -2020,3 +2027,8 @@ assigned, and the account's own tenant (or its own setting) allows it.
   request arrived under, but the sign-in form posts back under the tenant's id, so a
   request sent to the domain form of the endpoint passed on arrival and was refused
   after the password. Another tenant's endpoint on this server is still elsewhere.
+
+- **An unsupported `ProtocolBinding` gets `UnsupportedBinding`** (2026-11-26), under
+  `Requester`: SAML Core 3.2.2.2 has this code for exactly a response binding the
+  responder cannot use, where `RequestUnsupported` says only that the request is not
+  supported. Entra names the same condition (AADSTS75003, UnsupportedBindingError).

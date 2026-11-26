@@ -1900,10 +1900,13 @@ this server does not claim formal OASIS conformance.
 - **Each application has its own signing certificates**, three years by default,
   because SAML applications pin them. New ones start inactive. *To reverse*: sign
   with the shared token keys, which would break pinned applications at rotation.
-- **Signed requests are verified on the HTTP-Redirect binding only.** A POSTed
-  enveloped signature is not verified, so an application requiring signatures must
-  use Redirect. This keeps XML signature wrapping out of the design. *To reverse*:
-  add a canonicalizer and strict reference checks.
+- **Signed requests are verified on both bindings** (owner's release bar: full
+  conformance, 2026-11-23). On POST, `saml_dsig` accepts one shape: one signature,
+  one reference to the root, a unique ID, exclusive canonicalization, a registered
+  certificate; comments and CDATA are refused. A signature is also checked when an
+  application has a certificate but does not require signatures, so a message that
+  claims to be signed and is not cannot pass. With no certificate it cannot be
+  checked and counts as unsigned, as it does at Entra.
 - **Everything signed is generated in canonical form** instead of being serialized
   and canonicalized. *To reverse*: adopt a general XML security library.
 - **Token encryption is AES-256-CBC with RSA-OAEP.** Entra documents AES-256 but not
@@ -1967,3 +1970,46 @@ assigned, and the account's own tenant (or its own setting) allows it.
   they are not this tenant's to read, as with unassigned accounts of other tenants.
 - **An expired active certificate is reported as stopping sign-in.** The server would
   still sign, but applications validating the certificate's dates reject the result.
+
+### Sign-out requests stay compatible (owner's decision, 2026-11-23)
+
+- **An unsigned logout request may end a session**, at the OIDC logout endpoint
+  without an `id_token_hint`, and at SAML for an application the browser's session
+  used when no `SessionIndex` is sent. A forged request can therefore sign a user
+  out. The owner accepted this: it does not grant access, and requiring proof would
+  break existing applications. *To reverse*: ask for confirmation in
+  `routes::logout::logout`, and require `SessionIndex` in `logout_requested`.
+
+### A second step belongs to its request (2026-11-23)
+
+- **The browser sign-in's ticket stores a hash of the authorization request**, and
+  only that request can continue it. Otherwise a password entered for one request
+  could finish another that asked for a fresh sign-in. Device-code, My Account and
+  console steps have their own flows and are not tied to a request.
+
+### An unsigned SAML request's Destination is checked (2026-11-24)
+
+- **A `Destination` that is present must be this tenant's endpoint**, on signed and
+  unsigned sign-in and logout requests, because SAML Core 3.2.1 says to discard the
+  request otherwise. The owner set full conformance as the release bar. An application
+  sending a stale `Destination` after a host change now fails until it is corrected.
+  An unsigned request with no `Destination` is still accepted, as the standard allows.
+- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
+  `Destination` must be the public URL, the tenant's id or one of its verified
+  domains (matched as the path segment itself is, without regard to case), then
+  `/saml2`, with nothing before, between or after. It was compared with the name the
+  request arrived under, but the sign-in form posts back under the tenant's id, so a
+  request sent to the domain form of the endpoint passed on arrival and was refused
+  after the password. Another tenant's endpoint on this server is still elsewhere.
+
+### Unsupported SAML requests are answered in SAML (2026-11-24)
+
+- **A well-formed request we cannot honor gets an error `Response`** at the registered
+  Reply URL, after the application, Reply URL, `Destination` and signature checks.
+  This keeps Entra's refusal of `Subject` while meeting the SAML requirement for an
+  error status. A malformed request, or one failing those checks, still gets a local
+  page, since nothing establishes where an answer may safely go.
+- **An unsupported `ProtocolBinding` gets `UnsupportedBinding`** (2026-11-26), under
+  `Requester`: SAML Core 3.2.2.2 has this code for exactly a response binding the
+  responder cannot use, where `RequestUnsupported` says only that the request is not
+  supported. Entra names the same condition (AADSTS75003, UnsupportedBindingError).

@@ -452,7 +452,7 @@ async fn start_mfa(
         Ok(Some(u)) => u,
         _ => return login_page(st, tenant, pending, "", None),
     };
-    match mfa::begin(&st.pool, &tenant.id, user_id, purpose, keep).await {
+    match mfa::begin(&st.pool, &tenant.id, user_id, purpose, keep, None).await {
         Ok(ticket) => {
             let secret = if purpose == Purpose::Enroll {
                 mfa::pending(&st.pool, &ticket, &tenant.id)
@@ -883,6 +883,7 @@ async fn finish_sign_in(
             &user.id,
             Purpose::change_password(after_mfa),
             keep,
+            None,
         )
         .await
         {

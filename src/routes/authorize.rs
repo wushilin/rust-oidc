@@ -1081,7 +1081,7 @@ async fn start_mfa(
         mfa::Step::Enroll => Purpose::Enroll,
         _ => Purpose::Verify,
     };
-    match mfa::begin(&st.pool, &v.tenant.id, &user.id, purpose, keep).await {
+    match mfa::begin(&st.pool, &v.tenant.id, &user.id, purpose, keep, Some(request)).await {
         Ok(ticket) => {
             let secret = match purpose {
                 Purpose::Enroll => mfa::pending(&st.pool, &ticket, &v.tenant.id)
@@ -1104,7 +1104,7 @@ async fn start_mfa(
 /// "Set up an authenticator?", with its own ticket so the answer carries on the
 /// sign-in the password made.
 async fn suggest_mfa(st: &AppState, v: &Validated, request: &str, user: &User, keep: KeepSignedIn) -> Response {
-    let ticket = match mfa::begin(&st.pool, &v.tenant.id, &user.id, Purpose::Suggest, keep).await {
+    let ticket = match mfa::begin(&st.pool, &v.tenant.id, &user.id, Purpose::Suggest, keep, Some(request)).await {
         Ok(t) => t,
         Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
     };
@@ -1155,6 +1155,7 @@ async fn finish_sign_in(
                 &user.id,
                 Purpose::change_password(after_mfa),
                 keep,
+                Some(request),
             )
             .await
             {
@@ -1281,7 +1282,7 @@ async fn second_step(
     let typed = form.get(html::MFA_CODE).cloned().unwrap_or_default();
     // This page shows the code page after a wrong password too (decision 55),
     // so it reads such a ticket; the check below comes before anything else.
-    let pending = match mfa::pending_either(&st.pool, &ticket, &v.tenant.id).await {
+    let pending = match mfa::pending_for_request(&st.pool, &ticket, &v.tenant.id, request).await {
         Ok(Some(p)) => p,
         Ok(None) => return login_page(st, v, request, "", Some(MFA_EXPIRED)),
         Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
@@ -1905,7 +1906,7 @@ async fn unverified_code_page(
         None if v.tenant.settings.enforces_mfa() => (upn.to_string(), v.tenant.clone()),
         None => return Ok(None),
     };
-    let ticket = mfa::begin_unverified(&st.pool, &v.tenant.id, user_id, keep).await?;
+    let ticket = mfa::begin_unverified(&st.pool, &v.tenant.id, user_id, keep, Some(request)).await?;
     let offer = may_remember(&home, &v.tenant);
     Ok(Some(mfa_page(
         st,

@@ -14,6 +14,26 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   encryption, certificate rollover, federation metadata and Single Logout.
 - **My apps** on My Account: the applications a user is assigned to, directly or
   through a group, ready to open.
+- Signed SAML requests are verified on the HTTP-POST binding as well as
+  HTTP-Redirect. An invalid signature is refused whenever the application has a
+  verification certificate, even if it does not require signatures.
+
+### Fixed
+
+- A SAML request for an authentication context declaration, which is not
+  supported, is now refused with `NoAuthnContext` instead of signing in. An
+  unmet authentication context is reported with the top-level status `Responder`.
+- A SAML sign-in or logout request whose `Destination` names another endpoint is
+  now discarded even when unsigned, as SAML Core 3.2.1 requires.
+- A well-formed SAML request that cannot be honored (a `Subject`, an unsupported
+  response binding, NameID format or context comparison) now gets a SAML error
+  at the registered Reply URL instead of a local error page.
+
+### Security
+
+- A second sign-in step now belongs to the authorization request it began with,
+  so it cannot complete a different request, such as one asking for a fresh
+  sign-in.
 
 ## 0.6.0
 

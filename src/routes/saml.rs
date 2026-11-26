@@ -104,6 +104,8 @@ pub(super) struct SamlCall {
     pub request: Option<AuthnRequest>,
     /// The gallery launch this sign-in is, if it is one.
     pub launch: Option<String>,
+    /// The request's signature was verified.
+    pub signed: bool,
     pub config: SamlConfig,
     pub idp_entity: String,
     pub relay_state: Option<String>,
@@ -128,8 +130,11 @@ pub(crate) fn idp_entity_id(st: &AppState, tenant_id: &str) -> String {
 
 /// The sign-in and logout endpoint of a tenant.
 pub(crate) fn sso_url(st: &AppState, tenant_id: &str) -> String {
-    st.public_url.tenant_url(tenant_id, "saml2")
+    st.public_url.tenant_url(tenant_id, SSO_PATH)
 }
+
+/// The endpoint's path under a tenant.
+const SSO_PATH: &str = "saml2";
 
 fn page(tenant: Option<&Tenant>, message: &str) -> Response {
     html::error(tenant.map(|t| t.name.as_str()), message)
@@ -139,17 +144,37 @@ fn internal(tenant: Option<&Tenant>, e: anyhow::Error) -> Response {
     page(tenant, &AadError::from(e).description())
 }
 
-/// What a signed message must also satisfy: addressed to this tenant's endpoint
-/// (the bindings require `Destination` on a signed message), and recent.
-fn signed_message_ok(
-    st: &AppState,
-    tenant_key: &str,
-    tenant: &Tenant,
-    destination: Option<&str>,
-    issue_instant: Option<i64>,
-) -> Result<(), &'static str> {
-    if !destination.is_some_and(|d| d == sso_url(st, &tenant.id) || d == sso_url(st, tenant_key)) {
-        return Err("The signed request's Destination is not this endpoint.");
+/// A `Destination`, when a request has one, must be where it was received. SAML
+/// Core 3.2.1 requires discarding the request otherwise, signed or not.
+///
+/// The endpoint has one URL for each name of the tenant, its id and its verified
+/// domains, and a request addressed to any of them is addressed here. The
+/// sign-in form posts back under the tenant's id whichever name the request
+/// arrived under, so that name is not known when the request is validated
+/// again. Everything around the tenant's name is compared to the byte.
+async fn addressed_here(st: &AppState, tenant: &Tenant, destination: Option<&str>) -> anyhow::Result<bool> {
+    let Some(destination) = destination else {
+        return Ok(true);
+    };
+    let name = destination
+        .strip_prefix(st.public_url.base())
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_suffix(SSO_PATH))
+        .and_then(|rest| rest.strip_suffix('/'));
+    let Some(name) = name else {
+        return Ok(false);
+    };
+    let named = tenant::resolve(&st.pool, name).await?;
+    Ok(named.is_some_and(|named| named.id == tenant.id))
+}
+
+const WRONG_DESTINATION: &str = "The request's Destination is not this endpoint.";
+
+/// What a signed message must also satisfy: it names a `Destination` (the
+/// bindings require one on a signed message), and is recent.
+fn signed_message_ok(destination: Option<&str>, issue_instant: Option<i64>) -> Result<(), &'static str> {
+    if destination.is_none() {
+        return Err("The signed request has no Destination.");
     }
     if !protocol::is_fresh(issue_instant, now()) {
         return Err("The signed request has expired.");
@@ -157,15 +182,27 @@ fn signed_message_ok(
     Ok(())
 }
 
-/// Check the message's signature where the application requires one.
+/// Check the message's signature, and say whether one was verified.
+///
+/// An application requiring signatures must send one. Otherwise a signature is
+/// checked when the application has a certificate to check it with: a message
+/// that claims to be signed and is not must not pass. Without a certificate it
+/// cannot be checked, and is treated as unsigned.
 async fn check_signature(
     st: &AppState,
     app: &Application,
     config: &SamlConfig,
     query: &SamlQuery,
-) -> Result<(), SamlError> {
-    if !config.require_signed_requests {
-        return Ok(());
+) -> Result<bool, SamlError> {
+    let xml = protocol::decode_message(&query.message)?;
+    let detached = query.is_signed();
+    let enveloped = !detached && crate::saml_dsig::carries_signature(&xml);
+    if !detached && !enveloped {
+        return if config.require_signed_requests {
+            Err(SamlError::requester("The request is not signed."))
+        } else {
+            Ok(false)
+        };
     }
     let certificates: Vec<Vec<u8>> = saml::verification_certificates(&st.pool, app)
         .await
@@ -174,10 +211,16 @@ async fn check_signature(
         .filter(|c| c.not_after > now())
         .map(|c| c.cert_der)
         .collect();
-    query.verify(
-        &certificates,
-        config.signing_algorithm == protocol::SigningAlgorithm::Sha1,
-    )
+    if certificates.is_empty() && !config.require_signed_requests {
+        return Ok(false);
+    }
+    let allow_sha1 = config.signing_algorithm == protocol::SigningAlgorithm::Sha1;
+    if detached {
+        query.verify(&certificates, allow_sha1)?;
+    } else {
+        crate::saml_dsig::verify(&xml, &certificates, allow_sha1)?;
+    }
+    Ok(true)
 }
 
 fn refused(message: &str) -> SamlError {
@@ -265,19 +308,19 @@ pub(super) async fn resolve(
             "This application requires signed requests, so it must be opened from its own sign-in page.",
         ));
     }
+    let mut signed = false;
     if let (Some(request), Some(query)) = (&request, &query) {
-        check_signature(st, &app, &config, query)
+        let here = addressed_here(st, &tenant, request.destination.as_deref())
+            .await
+            .map_err(|e| internal(t, e))?;
+        if !here {
+            return Err(page(t, WRONG_DESTINATION));
+        }
+        signed = check_signature(st, &app, &config, query)
             .await
             .map_err(|e| page(t, &e.message))?;
-        if config.require_signed_requests {
-            signed_message_ok(
-                st,
-                tenant_key,
-                &tenant,
-                request.destination.as_deref(),
-                request.issue_instant,
-            )
-            .map_err(|m| page(t, m))?;
+        if signed {
+            signed_message_ok(request.destination.as_deref(), request.issue_instant).map_err(|m| page(t, m))?;
         }
     }
 
@@ -286,20 +329,21 @@ pub(super) async fn resolve(
         .and_then(|q| q.relay_state.clone())
         .or_else(|| config.relay_state.clone());
     let idp_entity = idp_entity_id(st, &tenant.id);
-    Ok((
-        tenant,
-        app,
-        sp,
-        reply,
-        SamlCall {
-            request,
-            launch,
-            config,
-            idp_entity,
-            relay_state,
-            reply_url,
-        },
-    ))
+    let call = SamlCall {
+        request,
+        launch,
+        signed,
+        config,
+        idp_entity,
+        relay_state,
+        reply_url,
+    };
+    // Only now is the requester known and the Reply URL registered, so a request
+    // that cannot be honored can be told so with a SAML status.
+    if let Some(refusal) = call.request.as_ref().and_then(|r| r.refusal.as_ref()) {
+        return Err(error_answer(&call, &reply, refusal));
+    }
+    Ok((tenant, app, sp, reply, call))
 }
 
 fn post_back(reply: &url::Url, response: String, relay_state: Option<&str>) -> Response {
@@ -335,7 +379,15 @@ pub(super) fn from_aad(err: &AadError) -> SamlError {
 
 /// The class the assertion states, and whether the request's can be met: a
 /// requested class this sign-in satisfies is echoed, else the strongest used.
-fn authn_context(requested: &[String], amr: &[String]) -> Result<&'static str, SamlError> {
+fn authn_context(requested: &[String], declaration: bool, amr: &[String]) -> Result<&'static str, SamlError> {
+    let unmet = || SamlError {
+        status: protocol::STATUS_RESPONDER,
+        sub_status: Some(protocol::STATUS_NO_AUTHN_CONTEXT),
+        message: "The requested authentication context cannot be satisfied.".into(),
+    };
+    if declaration {
+        return Err(unmet());
+    }
     let mfa = amr.iter().any(|m| m == Amr::Mfa.as_str());
     let strongest = if mfa { protocol::AC_MFA } else { protocol::AC_PASSWORD };
     if requested.is_empty() {
@@ -350,11 +402,7 @@ fn authn_context(requested: &[String], amr: &[String]) -> Result<&'static str, S
             _ => {}
         }
     }
-    Err(SamlError {
-        status: protocol::STATUS_REQUESTER,
-        sub_status: Some(protocol::STATUS_NO_AUTHN_CONTEXT),
-        message: "The requested authentication context cannot be satisfied.".into(),
-    })
+    Err(unmet())
 }
 
 fn single(name: &str, value: Option<String>) -> Option<AssertionAttribute> {
@@ -467,7 +515,8 @@ async fn build(st: &AppState, i: &Issue<'_>) -> anyhow::Result<String> {
     let config = &i.call.config;
     let request = i.call.request.as_ref();
     let requested_contexts: &[String] = request.map_or(&[], |r| r.authn_contexts.as_slice());
-    let context = authn_context(requested_contexts, &i.session.amr)?;
+    let declaration = request.is_some_and(|r| r.requests_declaration);
+    let context = authn_context(requested_contexts, declaration, &i.session.amr)?;
     let key = saml::active_key(&st.pool, i.app)
         .await?
         .ok_or_else(|| anyhow::anyhow!("the application has no active signing certificate"))?;
@@ -485,7 +534,7 @@ async fn build(st: &AppState, i: &Issue<'_>) -> anyhow::Result<String> {
         }
         .into());
     }
-    if config.require_signed_requests
+    if i.call.signed
         && let Some(r) = request
         && !saml::consume_message(&st.pool, &i.app.id, &r.id).await?
     {
@@ -572,7 +621,7 @@ pub async fn endpoint(
         Ok(query) => query,
         Err(e) => return page(None, &e.message),
     };
-    // A signature is verified on the Redirect binding only, so a POST has none.
+    // A POST's signature is inside the message; query parameters do not count.
     let raw = if method == Method::POST {
         query.without_signature()
     } else {
@@ -876,18 +925,16 @@ async fn logout_requested(
     let Some(logout_url) = config.logout_url.clone() else {
         return page(t, "No Logout URL is configured for this application.");
     };
-    if let Err(e) = check_signature(st, &app, &config, query).await {
-        return page(t, &e.message);
+    match addressed_here(st, &tenant, request.destination.as_deref()).await {
+        Ok(true) => {}
+        Ok(false) => return page(t, WRONG_DESTINATION),
+        Err(e) => return internal(t, e),
     }
-    if config.require_signed_requests
-        && let Err(m) = signed_message_ok(
-            st,
-            tenant_key,
-            &tenant,
-            request.destination.as_deref(),
-            request.issue_instant,
-        )
-    {
+    let signed = match check_signature(st, &app, &config, query).await {
+        Ok(signed) => signed,
+        Err(e) => return page(t, &e.message),
+    };
+    if signed && let Err(m) = signed_message_ok(request.destination.as_deref(), request.issue_instant) {
         return page(t, m);
     }
     let signed_in = match session::find(&st.pool, headers, &tenant.id).await {
@@ -931,7 +978,7 @@ async fn logout_requested(
     };
     // Used up only by a request that really ends this session, so that someone
     // holding a copy of the URL cannot burn it from another browser.
-    if config.require_signed_requests {
+    if signed {
         match saml::consume_message(&st.pool, &app.id, &request.id).await {
             Ok(true) => {}
             Ok(false) => return page(t, "This signed request has already been used."),

@@ -2208,3 +2208,11 @@ Both depart from Entra; the owner chose them.
   Overview shows the image inline as a `data:` URL, so the console's policy adds
   `img-src data:`. The address carries a version that changes with each upload, so a
   browser never keeps showing a replaced logo.
+
+- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
+  `Destination` must be the public URL, the tenant's id or one of its verified
+  domains (matched as the path segment itself is, without regard to case), then
+  `/saml2`, with nothing before, between or after. It was compared with the name the
+  request arrived under, but the sign-in form posts back under the tenant's id, so a
+  request sent to the domain form of the endpoint passed on arrival and was refused
+  after the password. Another tenant's endpoint on this server is still elsewhere.

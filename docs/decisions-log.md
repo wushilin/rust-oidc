@@ -2009,7 +2009,18 @@ assigned, and the account's own tenant (or its own setting) allows it.
   This keeps Entra's refusal of `Subject` while meeting the SAML requirement for an
   error status. A malformed request, or one failing those checks, still gets a local
   page, since nothing establishes where an answer may safely go.
+
 - **An unsupported `ProtocolBinding` gets `UnsupportedBinding`** (2026-11-26), under
   `Requester`: SAML Core 3.2.2.2 has this code for exactly a response binding the
   responder cannot use, where `RequestUnsupported` says only that the request is not
   supported. Entra names the same condition (AADSTS75003, UnsupportedBindingError).
+
+### Encrypted SAML responses are signed (2026-11-24)
+
+- **Encryption always adds a `Response` signature**, whatever the signing option,
+  because AES-CBC ciphertext has no integrity of its own and the SAML profile asks for
+  this. The encrypted key also names the application as `Recipient`.
+- **An invalidly signed request still gets a local page**, departing from a SAML
+  SHOULD (IIP-SSO01.ak). Answering would let anyone make this server post a signed
+  message, with an `InResponseTo` and `RelayState` they chose, to the application.
+  *To reverse*: answer at the default Reply URL from `check_signature`'s error path.

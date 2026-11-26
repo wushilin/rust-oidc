@@ -130,8 +130,11 @@ pub(crate) fn idp_entity_id(st: &AppState, tenant_id: &str) -> String {
 
 /// The sign-in and logout endpoint of a tenant.
 pub(crate) fn sso_url(st: &AppState, tenant_id: &str) -> String {
-    st.public_url.tenant_url(tenant_id, "saml2")
+    st.public_url.tenant_url(tenant_id, SSO_PATH)
 }
+
+/// The endpoint's path under a tenant.
+const SSO_PATH: &str = "saml2";
 
 fn page(tenant: Option<&Tenant>, message: &str) -> Response {
     html::error(tenant.map(|t| t.name.as_str()), message)
@@ -141,17 +144,37 @@ fn internal(tenant: Option<&Tenant>, e: anyhow::Error) -> Response {
     page(tenant, &AadError::from(e).description())
 }
 
-/// What a signed message must also satisfy: addressed to this tenant's endpoint
-/// (the bindings require `Destination` on a signed message), and recent.
-fn signed_message_ok(
-    st: &AppState,
-    tenant_key: &str,
-    tenant: &Tenant,
-    destination: Option<&str>,
-    issue_instant: Option<i64>,
-) -> Result<(), &'static str> {
-    if !destination.is_some_and(|d| d == sso_url(st, &tenant.id) || d == sso_url(st, tenant_key)) {
-        return Err("The signed request's Destination is not this endpoint.");
+/// A `Destination`, when a request has one, must be where it was received. SAML
+/// Core 3.2.1 requires discarding the request otherwise, signed or not.
+///
+/// The endpoint has one URL for each name of the tenant, its id and its verified
+/// domains, and a request addressed to any of them is addressed here. The
+/// sign-in form posts back under the tenant's id whichever name the request
+/// arrived under, so that name is not known when the request is validated
+/// again. Everything around the tenant's name is compared to the byte.
+async fn addressed_here(st: &AppState, tenant: &Tenant, destination: Option<&str>) -> anyhow::Result<bool> {
+    let Some(destination) = destination else {
+        return Ok(true);
+    };
+    let name = destination
+        .strip_prefix(st.public_url.base())
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_suffix(SSO_PATH))
+        .and_then(|rest| rest.strip_suffix('/'));
+    let Some(name) = name else {
+        return Ok(false);
+    };
+    let named = tenant::resolve(&st.pool, name).await?;
+    Ok(named.is_some_and(|named| named.id == tenant.id))
+}
+
+const WRONG_DESTINATION: &str = "The request's Destination is not this endpoint.";
+
+/// What a signed message must also satisfy: it names a `Destination` (the
+/// bindings require one on a signed message), and is recent.
+fn signed_message_ok(destination: Option<&str>, issue_instant: Option<i64>) -> Result<(), &'static str> {
+    if destination.is_none() {
+        return Err("The signed request has no Destination.");
     }
     if !protocol::is_fresh(issue_instant, now()) {
         return Err("The signed request has expired.");
@@ -287,18 +310,17 @@ pub(super) async fn resolve(
     }
     let mut signed = false;
     if let (Some(request), Some(query)) = (&request, &query) {
+        let here = addressed_here(st, &tenant, request.destination.as_deref())
+            .await
+            .map_err(|e| internal(t, e))?;
+        if !here {
+            return Err(page(t, WRONG_DESTINATION));
+        }
         signed = check_signature(st, &app, &config, query)
             .await
             .map_err(|e| page(t, &e.message))?;
         if signed {
-            signed_message_ok(
-                st,
-                tenant_key,
-                &tenant,
-                request.destination.as_deref(),
-                request.issue_instant,
-            )
-            .map_err(|m| page(t, m))?;
+            signed_message_ok(request.destination.as_deref(), request.issue_instant).map_err(|m| page(t, m))?;
         }
     }
 
@@ -903,19 +925,16 @@ async fn logout_requested(
     let Some(logout_url) = config.logout_url.clone() else {
         return page(t, "No Logout URL is configured for this application.");
     };
+    match addressed_here(st, &tenant, request.destination.as_deref()).await {
+        Ok(true) => {}
+        Ok(false) => return page(t, WRONG_DESTINATION),
+        Err(e) => return internal(t, e),
+    }
     let signed = match check_signature(st, &app, &config, query).await {
         Ok(signed) => signed,
         Err(e) => return page(t, &e.message),
     };
-    if signed
-        && let Err(m) = signed_message_ok(
-            st,
-            tenant_key,
-            &tenant,
-            request.destination.as_deref(),
-            request.issue_instant,
-        )
-    {
+    if signed && let Err(m) = signed_message_ok(request.destination.as_deref(), request.issue_instant) {
         return page(t, m);
     }
     let signed_in = match session::find(&st.pool, headers, &tenant.id).await {

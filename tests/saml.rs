@@ -965,6 +965,89 @@ async fn still_signed_in(w: &World, b: &Browser) -> bool {
 }
 
 #[tokio::test]
+async fn an_unsigned_request_addressed_elsewhere_is_discarded() {
+    let w = world().await;
+    let here = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let (b, _) = signed_in(&w).await;
+
+    // Control: the right Destination is accepted.
+    let right = authn_request(&format!(r#"Destination="{here}""#), "");
+    let page = b.get(&redirect_url(&w.s, &w.f.tenant.id, &right, None)).await;
+    assert_eq!(status_codes(&response_of(&page)), vec![protocol::STATUS_SUCCESS]);
+
+    let wrong = r#"Destination="https://other.example/saml2""#;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request(wrong, ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+
+    // A misaddressed logout request ends nothing.
+    let logout = logout_request(ENTITY).replace(r#"ID="_out1""#, &format!(r#"{wrong} ID="_out1""#));
+    let page = b.get(&logout_url(&w, &logout)).await;
+    assert_ne!(page.status, 302, "{}", page.body);
+    assert!(still_signed_in(&w, &b).await);
+}
+
+#[tokio::test]
+async fn a_request_addressed_by_the_tenants_domain_survives_the_sign_in_form() {
+    let w = world().await;
+    // The fixture tenant's verified domain: another name of the same endpoint.
+    let domain = "contoso.com";
+    let here = w.s.url(&format!("/{domain}/saml2"));
+    let xml = authn_request(&format!(r#"Destination="{here}""#), "");
+    let b = Browser::new();
+    // The form posts back under the tenant's id, where the same request is
+    // validated again.
+    let page = b.get(&redirect_url(&w.s, domain, &xml, None)).await;
+    assert!(at_sign_in(&page), "{}", page.body);
+    let page = b.login(&page, &w.f.upn, &w.f.password).await;
+    assert_eq!(status_codes(&response_of(&page)), vec![protocol::STATUS_SUCCESS]);
+}
+
+#[tokio::test]
+async fn a_destination_is_compared_exactly_and_names_this_tenant() {
+    let w = world().await;
+    let other = w.s.tenant("Fabrikam", "fabrikam.example").await;
+    let (b, _) = signed_in(&w).await;
+    let id = &w.f.tenant.id;
+    let here = w.s.url(&format!("/{id}/saml2"));
+    let send = async |destination: &str| {
+        let xml = authn_request(&format!(r#"Destination="{destination}""#), "");
+        b.get(&redirect_url(&w.s, id, &xml, None)).await
+    };
+
+    let page = send(&here).await;
+    assert_eq!(status_codes(&response_of(&page)), vec![protocol::STATUS_SUCCESS]);
+
+    for wrong in [
+        format!("{here}/"),
+        format!("{here}?x=1"),
+        format!("{here}#x"),
+        here.replace("saml2", "SAML2"),
+        here.replace("http://", "https://"),
+        here.replace("http://", "http://user@"),
+        here.replace(&format!("/{id}/"), &format!("//{id}/")),
+        here.replace(&format!("/{id}/"), &format!("/x/{id}/")),
+        // Another tenant's endpoint, though this server serves it too.
+        w.s.url(&format!("/{}/saml2", other.id)),
+        w.s.url("/fabrikam.example/saml2"),
+        w.s.url("/saml2"),
+        w.s.url("//saml2"),
+        String::new(),
+    ] {
+        let page = send(&wrong).await;
+        assert!(page.field("SAMLResponse").is_none(), "{wrong}: {}", page.body);
+    }
+
+    // The same on the POST binding, unsigned.
+    let xml = authn_request(r#"Destination="https://other.example/saml2""#, "");
+    let page = post_request(&w, &b, &xml).await;
+    assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+    let page = post_request(&w, &b, &authn_request(&format!(r#"Destination="{here}""#), "")).await;
+    assert_eq!(status_codes(&response_of(&page)), vec![protocol::STATUS_SUCCESS]);
+}
+
+#[tokio::test]
 async fn an_application_the_session_never_reached_cannot_end_it() {
     let w = world().await;
     let other = "https://other.example/";

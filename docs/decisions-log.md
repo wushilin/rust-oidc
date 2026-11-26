@@ -2035,3 +2035,11 @@ assigned, and the account's own tenant (or its own setting) allows it.
   `VersionMismatch` and IIP-SSO01-an requires `Requester` for the same request. We
   follow the version-specific rule (`VersionMismatch`), so IIP-SSO01-an reports a
   failure. Answering with a local page would avoid the failure but meets neither rule.
+
+- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
+  `Destination` must be the public URL, the tenant's id or one of its verified
+  domains (matched as the path segment itself is, without regard to case), then
+  `/saml2`, with nothing before, between or after. It was compared with the name the
+  request arrived under, but the sign-in form posts back under the tenant's id, so a
+  request sent to the domain form of the endpoint passed on arrival and was refused
+  after the password. Another tenant's endpoint on this server is still elsewhere.

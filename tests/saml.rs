@@ -1024,6 +1024,49 @@ async fn a_logout_answer_only_counts_in_the_browser_carrying_the_logout() {
 }
 
 #[tokio::test]
+async fn a_logout_answer_must_be_addressed_to_this_endpoint() {
+    let w = world().await;
+    let second = "https://second.example/";
+    saml_app(&w.s, &w.f, "second", second).await;
+    let (b, _) = signed_in(&w).await;
+    let to_second = authn_request("", "").replace(ENTITY, second);
+    b.get(&redirect_url(&w.s, &w.f.tenant.id, &to_second, None)).await;
+    // The first application signs what it sends from now on.
+    let (pem, der, cert_pem) = sp_key();
+    require_signed(&w, &cert_pem).await;
+    // The second asks to log out, so the first is told and must answer.
+    let told = b.get(&logout_url(&w, &logout_request(second))).await;
+    assert!(told.location.as_deref().unwrap().starts_with(LOGOUT), "{}", told.body);
+    let id = decoded_location(&told, "SAMLRequest").attr("ID").unwrap().to_string();
+    let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let answer = |destination: &str| {
+        let xml = format!(
+            r#"<samlp:LogoutResponse xmlns:samlp="{NS_PROTOCOL}" xmlns:saml="{NS_ASSERTION}" ID="_a1" InResponseTo="{id}" Version="2.0" IssueInstant="2026-11-23T00:00:00Z"{destination}><saml:Issuer>{ENTITY}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status></samlp:LogoutResponse>"#,
+            protocol::STATUS_SUCCESS
+        );
+        let query = sp_signer(&pem, &der)
+            .sign_redirect("SAMLResponse", &protocol::encode_redirect(&xml).unwrap(), None)
+            .unwrap();
+        format!("{endpoint}?{query}")
+    };
+    // Signed for another identity provider's endpoint: discarded.
+    let elsewhere = b
+        .get(&answer(r#" Destination="https://other-idp.example/saml2""#))
+        .await;
+    assert_ne!(elsewhere.status, 302, "{}", elsewhere.body);
+    // Signed, but saying nowhere: a signed message must say where it goes.
+    let nowhere = b.get(&answer("")).await;
+    assert_ne!(nowhere.status, 302, "{}", nowhere.body);
+    // Neither used up the waiting logout: the answer addressed here carries on.
+    let done = b.get(&answer(&format!(r#" Destination="{endpoint}""#))).await;
+    assert_eq!(done.status, 302, "{}", done.body);
+    assert_eq!(
+        status_codes(&decoded_location(&done, "SAMLResponse")),
+        vec![protocol::STATUS_SUCCESS]
+    );
+}
+
+#[tokio::test]
 async fn a_reply_url_is_used_exactly_as_registered() {
     let w = world().await;
     let registered = "https://sp.example:443/acs";

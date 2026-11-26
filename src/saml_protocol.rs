@@ -66,6 +66,7 @@ pub const STATUS_AUTHN_FAILED: &str = "urn:oasis:names:tc:SAML:2.0:status:AuthnF
 pub const STATUS_NO_AUTHN_CONTEXT: &str = "urn:oasis:names:tc:SAML:2.0:status:NoAuthnContext";
 pub const STATUS_INVALID_NAMEID_POLICY: &str = "urn:oasis:names:tc:SAML:2.0:status:InvalidNameIDPolicy";
 pub const STATUS_REQUEST_UNSUPPORTED: &str = "urn:oasis:names:tc:SAML:2.0:status:RequestUnsupported";
+pub const STATUS_UNSUPPORTED_BINDING: &str = "urn:oasis:names:tc:SAML:2.0:status:UnsupportedBinding";
 
 pub const STATUS_PARTIAL_LOGOUT: &str = "urn:oasis:names:tc:SAML:2.0:status:PartialLogout";
 pub const STATUS_UNKNOWN_PRINCIPAL: &str = "urn:oasis:names:tc:SAML:2.0:status:UnknownPrincipal";
@@ -423,7 +424,8 @@ pub struct AuthnRequest {
     pub issuer: String,
     /// Checked only on a signed request; Entra otherwise ignores it.
     pub issue_instant: Option<i64>,
-    /// Checked only on a signed request; Entra otherwise ignores it.
+    /// When present it must be where the request was received. A signed
+    /// request must have one.
     pub destination: Option<String>,
     pub acs_url: Option<String>,
     pub acs_index: Option<i64>,
@@ -436,6 +438,9 @@ pub struct AuthnRequest {
     /// The request names an authentication context declaration. None is
     /// supported, so such a request can never be satisfied.
     pub requests_declaration: bool,
+    /// Why this well-formed request cannot be honored. It is answered with this
+    /// SAML status at the registered Reply URL, once the requester is known.
+    pub refusal: Option<SamlError>,
 }
 
 impl AuthnRequest {
@@ -447,15 +452,17 @@ impl AuthnRequest {
         let id = check_id(root.attr("ID"))?;
         check_version(&root)?;
         let issuer = issuer_of(&root)?;
-        if root.child(NS_ASSERTION, "Subject").is_some() {
-            return Err(SamlError::unsupported("An AuthnRequest must not contain a Subject."));
-        }
+        let mut refusal = root
+            .child(NS_ASSERTION, "Subject")
+            .map(|_| SamlError::unsupported("An AuthnRequest must not contain a Subject."));
         if let Some(binding) = root.attr("ProtocolBinding")
             && binding != BINDING_POST
         {
-            return Err(SamlError::unsupported(
-                "Only the HTTP-POST binding is supported for the SAML response.",
-            ));
+            refusal.get_or_insert_with(|| SamlError {
+                status: STATUS_REQUESTER,
+                sub_status: Some(STATUS_UNSUPPORTED_BINDING),
+                message: "Only the HTTP-POST binding is supported for the SAML response.".into(),
+            });
         }
         let acs_index = match root.attr("AssertionConsumerServiceIndex") {
             Some(raw) => Some(
@@ -483,15 +490,17 @@ impl AuthnRequest {
                 let format = match policy.attr("Format") {
                     None => None,
                     Some(raw) if raw == NameIdFormat::Unspecified.as_str() => None,
-                    Some(raw) => Some(
-                        NameIdFormat::parse(raw)
-                            .filter(|f| *f != NameIdFormat::WindowsDomain)
-                            .ok_or(SamlError {
+                    Some(raw) => {
+                        let format = NameIdFormat::parse(raw).filter(|f| *f != NameIdFormat::WindowsDomain);
+                        if format.is_none() {
+                            refusal.get_or_insert_with(|| SamlError {
                                 status: STATUS_REQUESTER,
                                 sub_status: Some(STATUS_INVALID_NAMEID_POLICY),
                                 message: "The requested NameID format is not supported.".into(),
-                            })?,
-                    ),
+                            });
+                        }
+                        format
+                    }
                 };
                 (format, policy.attr("SPNameQualifier").map(str::to_string))
             }
@@ -501,7 +510,7 @@ impl AuthnRequest {
         let mut requests_declaration = false;
         if let Some(context) = root.child(NS_PROTOCOL, "RequestedAuthnContext") {
             if !matches!(context.attr("Comparison"), None | Some("exact")) {
-                return Err(SamlError {
+                refusal.get_or_insert_with(|| SamlError {
                     status: STATUS_RESPONDER,
                     sub_status: Some(STATUS_NO_AUTHN_CONTEXT),
                     message: "RequestedAuthnContext Comparison must be 'exact'.".into(),
@@ -531,6 +540,7 @@ impl AuthnRequest {
             sp_name_qualifier,
             authn_contexts,
             requests_declaration,
+            refusal,
         })
     }
 }
@@ -1186,7 +1196,8 @@ mod tests {
     #[test]
     fn refuses_a_subject_as_entra_does() {
         let xml = request("", "<saml:Subject></saml:Subject>");
-        assert!(AuthnRequest::parse(&xml).is_err());
+        let refusal = AuthnRequest::parse(&xml).unwrap().refusal.unwrap();
+        assert_eq!(refusal.sub_status, Some(STATUS_REQUEST_UNSUPPORTED));
     }
 
     #[test]
@@ -1202,7 +1213,7 @@ mod tests {
             r#"<samlp:RequestedAuthnContext Comparison="minimum"></samlp:RequestedAuthnContext>"#,
         );
         assert_eq!(
-            AuthnRequest::parse(&xml).unwrap_err().sub_status,
+            AuthnRequest::parse(&xml).unwrap().refusal.unwrap().sub_status,
             Some(STATUS_NO_AUTHN_CONTEXT)
         );
     }

@@ -2001,3 +2001,15 @@ assigned, and the account's own tenant (or its own setting) allows it.
   request arrived under, but the sign-in form posts back under the tenant's id, so a
   request sent to the domain form of the endpoint passed on arrival and was refused
   after the password. Another tenant's endpoint on this server is still elsewhere.
+
+### Unsupported SAML requests are answered in SAML (2026-11-24)
+
+- **A well-formed request we cannot honor gets an error `Response`** at the registered
+  Reply URL, after the application, Reply URL, `Destination` and signature checks.
+  This keeps Entra's refusal of `Subject` while meeting the SAML requirement for an
+  error status. A malformed request, or one failing those checks, still gets a local
+  page, since nothing establishes where an answer may safely go.
+- **An unsupported `ProtocolBinding` gets `UnsupportedBinding`** (2026-11-26), under
+  `Requester`: SAML Core 3.2.2.2 has this code for exactly a response binding the
+  responder cannot use, where `RequestUnsupported` says only that the request is not
+  supported. Entra names the same condition (AADSTS75003, UnsupportedBindingError).

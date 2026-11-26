@@ -15,6 +15,12 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - **My apps** on My Account: the applications a user is assigned to, directly or
   through a group, ready to open.
 
+### Security
+
+- A second sign-in step now belongs to the authorization request it began with,
+  so it cannot complete a different request, such as one asking for a fresh
+  sign-in.
+
 ## 0.6.0
 
 ### Fixed

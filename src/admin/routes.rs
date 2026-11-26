@@ -520,7 +520,7 @@ async fn console_unverified_page(st: &AppState, home: &Tenant, user_id: Option<&
         }
         None => upn.to_string(),
     };
-    match crate::mfa::begin_unverified(&st.pool, &home.id, user_id, crate::session::KeepSignedIn::No).await {
+    match crate::mfa::begin_unverified(&st.pool, &home.id, user_id, crate::session::KeepSignedIn::No, None).await {
         Ok(ticket) => Some(console_mfa_page(
             st,
             home,
@@ -609,7 +609,16 @@ async fn console_start_mfa(st: &AppState, home: &Tenant, user: &users::User, ste
     };
     // The console keeps its own short sessions and always asks an administrator
     // for the code: neither remembering switch applies here.
-    match crate::mfa::begin(&st.pool, &home.id, &user.id, purpose, crate::session::KeepSignedIn::No).await {
+    match crate::mfa::begin(
+        &st.pool,
+        &home.id,
+        &user.id,
+        purpose,
+        crate::session::KeepSignedIn::No,
+        None,
+    )
+    .await
+    {
         Ok(ticket) => {
             let secret = if purpose == Purpose::Enroll {
                 crate::mfa::pending(&st.pool, &ticket, &home.id)
@@ -841,6 +850,7 @@ async fn console_finish(st: &AppState, home: &Tenant, user: &users::User, after_
             &user.id,
             crate::mfa::Purpose::change_password(after_mfa),
             crate::session::KeepSignedIn::No,
+            None,
         )
         .await
         {

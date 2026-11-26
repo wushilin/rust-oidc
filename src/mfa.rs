@@ -757,6 +757,15 @@ pub struct Pending {
     /// it never ends in a sign-in. Its `user_id` is empty when the name named
     /// no account.
     pub password_right: bool,
+    /// Hash of the authorization request this step belongs to; empty outside
+    /// the browser sign-in. Read through [`pending_for_request`].
+    request_hash: String,
+}
+
+/// What a ticket stores for the request it is tied to. Empty, which no hash
+/// equals, for a step outside the browser sign-in.
+fn request_hash(request: Option<&str>) -> String {
+    request.map(|r| sha256_hex(r.as_bytes())).unwrap_or_default()
 }
 
 /// Start a second step for a user whose password was right (or whose session
@@ -767,9 +776,10 @@ pub async fn begin<'c>(
     user_id: &str,
     purpose: Purpose,
     keep: KeepSignedIn,
+    request: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut conn = db.acquire().await?;
-    begin_in(&mut conn, tenant_id, user_id, purpose, keep).await
+    begin_in(&mut conn, tenant_id, user_id, purpose, keep, request).await
 }
 
 pub(crate) async fn begin_in(
@@ -778,6 +788,7 @@ pub(crate) async fn begin_in(
     user_id: &str,
     purpose: Purpose,
     keep: KeepSignedIn,
+    request: Option<&str>,
 ) -> anyhow::Result<String> {
     let ticket = crate::util::b64url(&random_bytes(32));
     let ts = now();
@@ -787,8 +798,8 @@ pub(crate) async fn begin_in(
         .await?;
     let secret = (purpose == Purpose::Enroll).then(new_secret);
     sqlx::query(crate::db::qc(conn,
-        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at, keep_signed_in)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at, keep_signed_in, request_hash)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
     ))
     .bind(sha256_hex(ticket.as_bytes()))
     .bind(user_id)
@@ -798,6 +809,7 @@ pub(crate) async fn begin_in(
     .bind(ts)
     .bind(ts + TICKET_LIFETIME_SECS)
     .bind(keep.is_kept())
+    .bind(request_hash(request))
     .execute(&mut *conn)
     .await?;
     Ok(ticket)
@@ -812,13 +824,14 @@ pub async fn begin_unverified<'c>(
     tenant_id: &str,
     user_id: Option<&str>,
     keep: KeepSignedIn,
+    request: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut conn = db.acquire().await?;
     let ticket = crate::util::b64url(&random_bytes(32));
     let ts = now();
     sqlx::query(crate::db::qc(&conn,
-        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at, keep_signed_in, password_right)
-         VALUES (?, ?, ?, ?, NULL, 0, ?, ?, ?, ?)",
+        "INSERT INTO mfa_pending (ticket_hash, user_id, tenant_id, purpose, enroll_secret, attempts, created_at, expires_at, keep_signed_in, password_right, request_hash)
+         VALUES (?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?)",
     ))
     .bind(sha256_hex(ticket.as_bytes()))
     .bind(user_id.unwrap_or_default())
@@ -828,6 +841,7 @@ pub async fn begin_unverified<'c>(
     .bind(ts + TICKET_LIFETIME_SECS)
     .bind(keep.is_kept())
     .bind(false)
+    .bind(request_hash(request))
     .execute(&mut *conn)
     .await?;
     Ok(ticket)
@@ -869,6 +883,21 @@ pub async fn pending_either<'c>(db: impl Handle<'c>, ticket: &str, tenant_id: &s
     load_pending_in(&mut conn, ticket, tenant_id, Tickets::Either).await
 }
 
+/// [`pending_either`], for the browser sign-in: only the authorization request
+/// the step began with can continue it. Another request gets nothing, and the
+/// ticket stays usable by the right one.
+pub async fn pending_for_request<'c>(
+    db: impl Handle<'c>,
+    ticket: &str,
+    tenant_id: &str,
+    request: &str,
+) -> anyhow::Result<Option<Pending>> {
+    let mut conn = db.acquire().await?;
+    let found = load_pending_in(&mut conn, ticket, tenant_id, Tickets::Either).await?;
+    let expected = request_hash(Some(request));
+    Ok(found.filter(|p| p.request_hash == expected))
+}
+
 async fn load_pending_in(
     conn: &mut crate::db::Conn,
     ticket: &str,
@@ -877,11 +906,11 @@ async fn load_pending_in(
 ) -> anyhow::Result<Option<Pending>> {
     let sql = match which {
         Tickets::Verified => {
-            "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right FROM mfa_pending
+            "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right, request_hash FROM mfa_pending
              WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ? AND password_right = ?"
         }
         Tickets::Either => {
-            "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right FROM mfa_pending
+            "SELECT user_id, tenant_id, purpose, enroll_secret, keep_signed_in, password_right, request_hash FROM mfa_pending
              WHERE ticket_hash = ? AND tenant_id = ? AND expires_at > ? AND attempts < ? AND (password_right = ? OR password_right = ?)"
         }
     };
@@ -895,10 +924,17 @@ async fn load_pending_in(
         query = query.bind(false);
     }
     #[allow(clippy::type_complexity)]
-    let row: Option<(String, String, String, Option<String>, crate::db::Flag, crate::db::Flag)> =
-        query.fetch_optional(&mut *conn).await?;
-    Ok(
-        row.and_then(|(user_id, tenant_id, purpose, enroll_secret, kept, right)| {
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<String>,
+        crate::db::Flag,
+        crate::db::Flag,
+        String,
+    )> = query.fetch_optional(&mut *conn).await?;
+    Ok(row.and_then(
+        |(user_id, tenant_id, purpose, enroll_secret, kept, right, request_hash)| {
             Some(Pending {
                 user_id,
                 tenant_id,
@@ -906,9 +942,10 @@ async fn load_pending_in(
                 enroll_secret,
                 keep: KeepSignedIn::from_flag(kept.into()),
                 password_right: right.into(),
+                request_hash,
             })
-        }),
-    )
+        },
+    ))
 }
 
 /// Count a wrong code. `false` once the ticket has had its last attempt.

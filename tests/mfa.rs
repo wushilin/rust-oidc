@@ -99,6 +99,55 @@ fn amr(token: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A ticket earned on one request cannot finish another, such as one asking
+/// for a fresh sign-in, and the attempt does not use the ticket up.
+#[tokio::test]
+async fn a_second_step_only_continues_the_request_it_began_with() {
+    let s = TestServer::start().await;
+    let f = user_fixture(&s).await;
+    require_mfa_in_tenant(&s, &f, true, false).await;
+    let (verifier, challenge) = pkce();
+    let enrolling = Browser::new();
+    let login = enrolling
+        .authorize(&s, &f.tenant.id, &params(&f, &challenge, &[]))
+        .await;
+    let setup = enrolling.login(&login, &f.upn, &f.password).await;
+    let secret = key_on(&setup);
+    let enrolled = send_code(&enrolling, &setup, &fresh_code(&secret, 0)).await;
+    assert!(enrolled.body.contains("codes"), "{}", enrolled.body);
+
+    let b = Browser::new();
+    let login = b.authorize(&s, &f.tenant.id, &params(&f, &challenge, &[])).await;
+    let step = b.login(&login, &f.upn, &f.password).await;
+    let request = step.field("request").expect("the page carries its request");
+    let other = format!("{request}&prompt=login");
+    let mut form: Vec<(String, String)> = ["csrf", "op", "mfa_ticket", "tenant"]
+        .iter()
+        .filter_map(|n| step.field(n).map(|v| (n.to_string(), v)))
+        .collect();
+    form.push(("request".into(), other));
+    let code = fresh_code(&secret, 1);
+    form.push(("code".into(), code.clone()));
+    let refs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let swapped = b.post_form(&step.form_action(), &refs).await;
+    assert_ne!(swapped.status, 302, "{}", swapped.body);
+    assert!(swapped.body.contains("has expired"), "{}", swapped.body);
+
+    // The refusal page replaced the CSRF cookie; everything else is the original.
+    let csrf = swapped.field("csrf").expect("the sign-in page has a CSRF field");
+    let ticket = step.field("mfa_ticket").unwrap();
+    let op = step.field("op").unwrap();
+    let again = [
+        ("csrf", csrf.as_str()),
+        ("request", request.as_str()),
+        ("op", op.as_str()),
+        ("mfa_ticket", ticket.as_str()),
+        ("code", code.as_str()),
+    ];
+    let done = b.post_form(&step.form_action(), &again).await;
+    redeem(&s, &f, &done, &verifier).await;
+}
+
 /// The whole of it once: required by the tenant, set up at sign-in, signed out,
 /// signed in again with password and code, and the token says so.
 #[tokio::test]

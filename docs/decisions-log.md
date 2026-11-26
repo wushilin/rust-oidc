@@ -2010,6 +2010,11 @@ assigned, and the account's own tenant (or its own setting) allows it.
   error status. A malformed request, or one failing those checks, still gets a local
   page, since nothing establishes where an answer may safely go.
 
+- **An unsupported `ProtocolBinding` gets `UnsupportedBinding`** (2026-11-26), under
+  `Requester`: SAML Core 3.2.2.2 has this code for exactly a response binding the
+  responder cannot use, where `RequestUnsupported` says only that the request is not
+  supported. Entra names the same condition (AADSTS75003, UnsupportedBindingError).
+
 ### Encrypted SAML responses are signed (2026-11-24)
 
 - **Encryption always adds a `Response` signature**, whatever the signing option,
@@ -2019,16 +2024,3 @@ assigned, and the account's own tenant (or its own setting) allows it.
   SHOULD (IIP-SSO01.ak). Answering would let anyone make this server post a signed
   message, with an `InResponseTo` and `RelayState` they chose, to the application.
   *To reverse*: answer at the default Reply URL from `check_signature`'s error path.
-
-- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
-  `Destination` must be the public URL, the tenant's id or one of its verified
-  domains (matched as the path segment itself is, without regard to case), then
-  `/saml2`, with nothing before, between or after. It was compared with the name the
-  request arrived under, but the sign-in form posts back under the tenant's id, so a
-  request sent to the domain form of the endpoint passed on arrival and was refused
-  after the password. Another tenant's endpoint on this server is still elsewhere.
-
-- **An unsupported `ProtocolBinding` gets `UnsupportedBinding`** (2026-11-26), under
-  `Requester`: SAML Core 3.2.2.2 has this code for exactly a response binding the
-  responder cannot use, where `RequestUnsupported` says only that the request is not
-  supported. Entra names the same condition (AADSTS75003, UnsupportedBindingError).

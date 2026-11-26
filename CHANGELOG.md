@@ -61,7 +61,9 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   certificate can be added and its key verifies until it is removed. The
   console marks an expired one.
 - A SAML Identifier (Entity ID) may be up to 1024 characters, as SAML allows
-  (it was 512). Existing Unicode identifiers continue to work.
+  (it was 512). Existing Unicode identifiers continue to work. On MySQL,
+  migration 0027 stops if an Identifier already saved has a character outside
+  ASCII: percent-encode it first.
 
 - **My Account has tabs**: My apps, Profile and Security, each at its own
   address. My apps is where the page opens.

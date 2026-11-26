@@ -169,3 +169,40 @@ fn the_three_engines_have_the_same_numbered_history() {
     let expected: Vec<i64> = (1..=versions.len() as i64).collect();
     assert_eq!(versions, expected, "migration numbers have a gap or a repeat");
 }
+
+/// `0027_saml_entity_id_length` as each engine's file was first written, the
+/// SQLite one being what the deployed service applied. sqlx checks each engine's
+/// own file, so each is pinned: the MySQL one was once rewritten in place.
+const SAML_ENTITY_ID_LENGTH: (i64, [(&str, &str); 3]) = (
+    27,
+    [
+        (
+            "sqlite",
+            "0bab2330836a039cf75f44890d5e420803258cbeeb527d7eb02169eb00101e22aaac0d4681f84ecdc6e69c3314614b15",
+        ),
+        (
+            "postgres",
+            "0bab2330836a039cf75f44890d5e420803258cbeeb527d7eb02169eb00101e22aaac0d4681f84ecdc6e69c3314614b15",
+        ),
+        (
+            "mysql",
+            "d074b718124d9dfaf2d9a9d79bde11f222687e6fec6647f1b0043a86f31e355b316ec93d192140393762129f76953222",
+        ),
+    ],
+);
+
+#[test]
+fn saml_entity_id_length_is_unchanged_on_every_engine() {
+    let (version, pinned) = SAML_ENTITY_ID_LENGTH;
+    let here = [
+        sqlite(),
+        resolved(&sqlx::migrate!("./migrations/postgres")),
+        resolved(&sqlx::migrate!("./migrations/mysql")),
+    ];
+    for ((engine, checksum), migrations) in pinned.iter().zip(&here) {
+        assert_eq!(
+            &migrations[&version].1, checksum,
+            "{engine}'s migration {version} was edited: put the change in a new migration"
+        );
+    }
+}

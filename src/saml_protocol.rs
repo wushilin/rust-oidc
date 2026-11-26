@@ -729,6 +729,8 @@ impl LogoutRequest {
 pub struct LogoutResponse {
     pub in_response_to: Option<String>,
     pub issuer: String,
+    /// Where its sender addressed it, if it says.
+    pub destination: Option<String>,
     pub success: bool,
 }
 
@@ -748,6 +750,7 @@ impl LogoutResponse {
         Ok(Self {
             in_response_to: root.attr("InResponseTo").map(str::to_string),
             issuer: issuer_of(&root)?,
+            destination: root.attr("Destination").map(str::to_string),
             success,
         })
     }

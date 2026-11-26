@@ -15,6 +15,12 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 - **My apps** on My Account: the applications a user is assigned to, directly or
   through a group, ready to open.
 
+### Fixed
+
+- A SAML request for an authentication context declaration, which is not
+  supported, is now refused with `NoAuthnContext` instead of signing in. An
+  unmet authentication context is reported with the top-level status `Responder`.
+
 ### Security
 
 - A second sign-in step now belongs to the authorization request it began with,

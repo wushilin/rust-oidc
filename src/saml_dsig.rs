@@ -553,4 +553,260 @@ mod tests {
             assert!(parse(xml).is_err(), "{xml}");
         }
     }
+
+    /// The DER `DigestInfo` prefix of a SHA-1 hash (RFC 8017, section 9.2).
+    const SHA1_DIGEST_INFO: [u8; 15] = [
+        0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+    ];
+    const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+    const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+
+    /// A service provider's key, as PKCS#8, and its certificate.
+    fn sp_key() -> (Vec<u8>, Vec<u8>) {
+        use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256, RsaKeySize};
+        let key = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048).unwrap();
+        let cert = CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        (key.serialize_der(), cert.der().to_vec())
+    }
+
+    /// What a test's signature says about itself. Each is the accepted shape
+    /// with one thing changed, and every one is correctly signed: only the
+    /// checks on its shape stand between it and acceptance.
+    struct Shape {
+        /// The root's start tag; the reference is always to `_m`.
+        open: &'static str,
+        /// Canonical elements after the signature, covered by the digest.
+        body: &'static str,
+        c14n: &'static str,
+        sha1_signature: bool,
+        sha1_digest: bool,
+        /// The `Transform` elements, in canonical form.
+        transforms: String,
+    }
+
+    fn transform(algorithm: &str) -> String {
+        format!(r#"<ds:Transform Algorithm="{algorithm}"></ds:Transform>"#)
+    }
+
+    fn accepted() -> Shape {
+        Shape {
+            open: r#"<r ID="_m">"#,
+            body: "",
+            c14n: C14N_EXCLUSIVE,
+            sha1_signature: false,
+            sha1_digest: false,
+            transforms: transform(TRANSFORM_ENVELOPED) + &transform(C14N_EXCLUSIVE),
+        }
+    }
+
+    /// The message, written directly in canonical form, so that these tests do
+    /// not rely on the canonicalizer to produce what they verify.
+    fn signed(shape: &Shape, pkcs8: &[u8]) -> String {
+        let message = format!("{}{}</r>", shape.open, shape.body);
+        let (digest_uri, digest_algorithm) = if shape.sha1_digest {
+            (DIGEST_SHA1, &digest::SHA1_FOR_LEGACY_USE_ONLY)
+        } else {
+            (DIGEST_SHA256, &digest::SHA256)
+        };
+        let inner = format!(
+            r##"<ds:CanonicalizationMethod Algorithm="{}"></ds:CanonicalizationMethod><ds:SignatureMethod Algorithm="{}"></ds:SignatureMethod><ds:Reference URI="#_m"><ds:Transforms>{}</ds:Transforms><ds:DigestMethod Algorithm="{digest_uri}"></ds:DigestMethod><ds:DigestValue>{}</ds:DigestValue></ds:Reference>"##,
+            shape.c14n,
+            if shape.sha1_signature { RSA_SHA1 } else { RSA_SHA256 },
+            shape.transforms,
+            STANDARD.encode(digest::digest(digest_algorithm, message.as_bytes())),
+        );
+        let signed_info = format!(r#"<ds:SignedInfo xmlns:ds="{NS_DS}">{inner}</ds:SignedInfo>"#);
+        let value = if shape.sha1_signature {
+            // aws-lc-rs verifies RSA-SHA1 but will not create it.
+            use rsa::pkcs8::DecodePrivateKey;
+            let key = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8).unwrap();
+            let hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, signed_info.as_bytes());
+            let padding = rsa::Pkcs1v15Sign {
+                hash_len: Some(hash.as_ref().len()),
+                prefix: SHA1_DIGEST_INFO.to_vec().into_boxed_slice(),
+            };
+            key.sign(padding, hash.as_ref()).unwrap()
+        } else {
+            use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+            let key = RsaKeyPair::from_pkcs8(pkcs8).unwrap();
+            let mut value = vec![0u8; key.public_modulus_len()];
+            key.sign(
+                &RSA_PKCS1_SHA256,
+                &aws_lc_rs::rand::SystemRandom::new(),
+                signed_info.as_bytes(),
+                &mut value,
+            )
+            .unwrap();
+            value
+        };
+        format!(
+            r#"{}<ds:Signature xmlns:ds="{NS_DS}"><ds:SignedInfo>{inner}</ds:SignedInfo><ds:SignatureValue>{}</ds:SignatureValue></ds:Signature>{}</r>"#,
+            shape.open,
+            STANDARD.encode(value),
+            shape.body,
+        )
+    }
+
+    #[test]
+    fn sha1_is_accepted_only_where_it_is_allowed() {
+        let (key, cert) = sp_key();
+        let certs = [cert];
+        for (what, shape) in [
+            (
+                "an RSA-SHA1 signature",
+                Shape {
+                    sha1_signature: true,
+                    ..accepted()
+                },
+            ),
+            (
+                "a SHA-1 digest",
+                Shape {
+                    sha1_digest: true,
+                    ..accepted()
+                },
+            ),
+        ] {
+            let xml = signed(&shape, &key);
+            assert!(verify(&xml, &certs, true).is_ok(), "{what}, allowed");
+            assert!(verify(&xml, &certs, false).is_err(), "{what}, not allowed");
+        }
+    }
+
+    #[test]
+    fn only_the_two_saml_transforms_and_exclusive_canonicalization_are_accepted() {
+        const C14N_INCLUSIVE: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+        const C14N_EXCLUSIVE_WITH_COMMENTS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
+        const TRANSFORM_XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+        let (key, cert) = sp_key();
+        let certs = [cert];
+        assert!(verify(&signed(&accepted(), &key), &certs, false).is_ok());
+
+        let enveloped = transform(TRANSFORM_ENVELOPED);
+        let exclusive = transform(C14N_EXCLUSIVE);
+        let xpath =
+            format!(r#"<ds:Transform Algorithm="{TRANSFORM_XPATH}"><ds:XPath>self::r</ds:XPath></ds:Transform>"#);
+        // Every one of these is signed over the octets this verifier computes:
+        // the signature is good, and only its shape is not.
+        for (what, shape) in [
+            (
+                "inclusive canonicalization of SignedInfo",
+                Shape {
+                    c14n: C14N_INCLUSIVE,
+                    ..accepted()
+                },
+            ),
+            (
+                "canonicalization with comments of SignedInfo",
+                Shape {
+                    c14n: C14N_EXCLUSIVE_WITH_COMMENTS,
+                    ..accepted()
+                },
+            ),
+            (
+                "no canonicalization transform",
+                Shape {
+                    transforms: enveloped.clone(),
+                    ..accepted()
+                },
+            ),
+            (
+                "no enveloped-signature transform",
+                Shape {
+                    transforms: exclusive.clone(),
+                    ..accepted()
+                },
+            ),
+            (
+                "canonicalization in place of the enveloped-signature transform",
+                Shape {
+                    transforms: format!("{exclusive}{exclusive}"),
+                    ..accepted()
+                },
+            ),
+            (
+                "the transforms in the other order",
+                Shape {
+                    transforms: format!("{exclusive}{enveloped}"),
+                    ..accepted()
+                },
+            ),
+            (
+                "inclusive canonicalization as a transform",
+                Shape {
+                    transforms: format!("{enveloped}{}", transform(C14N_INCLUSIVE)),
+                    ..accepted()
+                },
+            ),
+            (
+                "canonicalization with comments as a transform",
+                Shape {
+                    transforms: format!("{enveloped}{}", transform(C14N_EXCLUSIVE_WITH_COMMENTS)),
+                    ..accepted()
+                },
+            ),
+            (
+                "an XPath transform",
+                Shape {
+                    transforms: format!("{enveloped}{xpath}{exclusive}"),
+                    ..accepted()
+                },
+            ),
+            (
+                "an XPath filter inside the enveloped-signature transform",
+                Shape {
+                    transforms: format!(
+                        r#"<ds:Transform Algorithm="{TRANSFORM_ENVELOPED}"><ds:XPath>self::r</ds:XPath></ds:Transform>{exclusive}"#
+                    ),
+                    ..accepted()
+                },
+            ),
+        ] {
+            assert!(verify(&signed(&shape, &key), &certs, true).is_err(), "{what}");
+        }
+    }
+
+    #[test]
+    fn the_signed_id_may_be_claimed_by_one_element_only() {
+        let (key, cert) = sp_key();
+        let certs = [cert];
+        let other = Shape {
+            body: r#"<e ID="_n"></e><e Id="_o"></e>"#,
+            ..accepted()
+        };
+        assert!(verify(&signed(&other, &key), &certs, false).is_ok());
+        // However the second element spells its ID attribute, a reader looking
+        // the reference up could land on it instead of the root.
+        for body in [
+            r#"<e ID="_m"></e>"#,
+            r#"<e Id="_m"></e>"#,
+            r#"<e id="_m"></e>"#,
+            r#"<e xml:id="_m"></e>"#,
+            r#"<e xmlns:w="urn:w" w:Id="_m"></e>"#,
+        ] {
+            let shape = Shape { body, ..accepted() };
+            assert!(verify(&signed(&shape, &key), &certs, false).is_err(), "{body}");
+        }
+        // The root's own ID is the unprefixed attribute, and must be there.
+        for open in [r#"<r>"#, r#"<r xmlns:w="urn:w" w:ID="_m">"#] {
+            let shape = Shape { open, ..accepted() };
+            assert!(verify(&signed(&shape, &key), &certs, false).is_err(), "{open}");
+        }
+    }
+
+    #[test]
+    fn a_message_too_large_or_too_complex_is_refused() {
+        assert!(parse(&format!("<r>{}</r>", "<e></e>".repeat(MAX_ELEMENTS - 1))).is_ok());
+        assert!(parse(&format!("<r>{}</r>", "<e></e>".repeat(MAX_ELEMENTS))).is_err());
+        assert!(parse(&format!("<r>{}</r>", "<e/>".repeat(MAX_ELEMENTS))).is_err());
+        let nested = |depth: usize| format!("{}{}", "<e>".repeat(depth), "</e>".repeat(depth));
+        assert!(parse(&nested(MAX_DEPTH)).is_ok());
+        assert!(parse(&nested(MAX_DEPTH + 1)).is_err());
+        let sized = |bytes: usize| format!("<r>{}</r>", "x".repeat(bytes - "<r></r>".len()));
+        assert!(parse(&sized(MAX_MESSAGE_BYTES)).is_ok());
+        assert!(parse(&sized(MAX_MESSAGE_BYTES + 1)).is_err());
+    }
 }

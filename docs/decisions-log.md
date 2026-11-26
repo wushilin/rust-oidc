@@ -2189,6 +2189,18 @@ Both depart from Entra; the owner chose them.
   MySQL widens its UTF-8 column and uses a digest
   for the tenant-wide unique index to stay within InnoDB's key limit. SQLite
   and Postgres already use TEXT. All three compare the full identifier.
+- **That MySQL change is migration 0029, not an edit of 0027.** 0027 first made
+  MySQL's column ASCII, and 0027 is applied on the deployed service (SQLite). An
+  applied migration never changes, and sqlx refuses to start on a file whose
+  checksum differs, so MySQL's 0027 stays as first written and 0029 undoes its
+  character set; SQLite and Postgres have a 0029 that changes nothing, to keep one
+  numbered history. 0029 is one statement, and the digest is in the primary key,
+  so it also runs where `sql_require_primary_key` is on. Left as is: on a MySQL
+  database that already holds an Identifier outside ASCII, 0027 itself stops
+  (error 1366, nothing changed) until that Identifier is percent-encoded.
+- **A metadata file's role may expire by itself**: `validUntil` on the
+  `SPSSODescriptor` is checked like the entity's and its groups' (SAML Metadata
+  2.4.1).
 - **Metadata import selects a role that supports SAML 2.0.** It fills the single
   Logout URL only when HTTP-Redirect is available and the browser bindings and
   response locations fit one URL. Otherwise, the preview explains why it leaves
@@ -2220,4 +2232,7 @@ Both depart from Entra; the owner chose them.
   and a sandboxing policy. My Account's policy adds `img-src 'self'` for it. The admin
   Overview shows the image inline as a `data:` URL, so the console's policy adds
   `img-src data:`. The logo route uses the same MFA requirement as the gallery
-  and disables browser caching so each request checks the current access.
+  and disables browser caching so each request checks the current access. It is
+  sent `Cross-Origin-Resource-Policy: same-origin`: the session cookie is
+  `SameSite=None`, so without it another site's page could tell from an `<img>`
+  loading or not whether the visitor has a given application.

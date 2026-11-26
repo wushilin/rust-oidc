@@ -332,10 +332,13 @@ pub(super) async fn resolve(
         }
     }
 
-    let relay_state = query
-        .as_ref()
-        .and_then(|q| q.relay_state.clone())
-        .or_else(|| config.relay_state.clone());
+    // A request's own RelayState comes back exactly, and none when it sent none
+    // (Bindings 3.4.3, 3.5.3). The configured Relay State is for sign-in started
+    // here, as Entra's is.
+    let relay_state = match &request {
+        Some(_) => query.as_ref().and_then(|q| q.relay_state.clone()),
+        None => config.relay_state.clone(),
+    };
     let idp_entity = idp_entity_id(st, &tenant.id);
     let signing_key = saml::active_key(&st.pool, &app).await.map_err(|e| internal(t, e))?;
     let call = SamlCall {
@@ -400,7 +403,8 @@ pub(super) fn from_aad(err: &AadError) -> SamlError {
 }
 
 /// The class the assertion states, and whether the request's can be met: a
-/// requested class this sign-in satisfies is echoed, else the strongest used.
+/// requested class this sign-in satisfies is echoed (`exact` comparison), and
+/// with none requested, the strongest used.
 fn authn_context(requested: &[String], declaration: bool, amr: &[String]) -> Result<&'static str, SamlError> {
     let unmet = || SamlError {
         status: protocol::STATUS_RESPONDER,
@@ -420,7 +424,7 @@ fn authn_context(requested: &[String], declaration: bool, amr: &[String]) -> Res
             protocol::AC_MFA if mfa => return Ok(protocol::AC_MFA),
             protocol::AC_PASSWORD => return Ok(protocol::AC_PASSWORD),
             protocol::AC_PASSWORD_PROTECTED => return Ok(protocol::AC_PASSWORD_PROTECTED),
-            protocol::AC_UNSPECIFIED => return Ok(strongest),
+            protocol::AC_UNSPECIFIED => return Ok(protocol::AC_UNSPECIFIED),
             _ => {}
         }
     }

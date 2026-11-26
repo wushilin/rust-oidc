@@ -755,12 +755,24 @@ impl AuthnRequest {
         let mut authn_contexts = Vec::new();
         let mut requests_declaration = false;
         if let Some(context) = root.child(NS_PROTOCOL, "RequestedAuthnContext") {
-            if !matches!(context.attr("Comparison"), None | Some("exact")) {
-                refusal.get_or_insert_with(|| SamlError {
-                    status: STATUS_RESPONDER,
-                    sub_status: Some(STATUS_NO_AUTHN_CONTEXT),
-                    message: "RequestedAuthnContext Comparison must be 'exact'.".into(),
-                });
+            match context.attr("Comparison") {
+                None | Some("exact") => {}
+                // The schema's other values: well formed, but not offered.
+                Some("minimum" | "maximum" | "better") => {
+                    refusal.get_or_insert_with(|| SamlError {
+                        status: STATUS_RESPONDER,
+                        sub_status: Some(STATUS_NO_AUTHN_CONTEXT),
+                        message: "RequestedAuthnContext Comparison must be 'exact'.".into(),
+                    });
+                }
+                // Anything else is not a Comparison at all: the request is at fault.
+                Some(_) => {
+                    refusal.get_or_insert_with(|| SamlError {
+                        status: STATUS_REQUESTER,
+                        sub_status: None,
+                        message: "RequestedAuthnContext Comparison is not a valid value.".into(),
+                    });
+                }
             }
             requests_declaration = context
                 .children
@@ -1562,6 +1574,11 @@ mod tests {
         let sealed = decode(success_response(&input, &signer, SigningOption::Assertion, Some(to)).unwrap());
         assert!(sealed.contains(r#"<xenc:EncryptedKey Recipient="https://sp.example/">"#));
         crate::saml_dsig::verify(&sealed, std::slice::from_ref(&der), false).unwrap();
+        // Signing the assertion still happens, inside, before it is encrypted.
+        let start = sealed.find("<saml:EncryptedAssertion").expect("an EncryptedAssertion");
+        let end = sealed.find("</saml:EncryptedAssertion>").expect("its end") + "</saml:EncryptedAssertion>".len();
+        let inner = decrypt_assertion(&sealed[start..end], &pem);
+        crate::saml_dsig::verify(&inner, std::slice::from_ref(&der), false).unwrap();
 
         // Control: without encryption the configured option still decides.
         let plain = decode(success_response(&input, &signer, SigningOption::Assertion, None).unwrap());
@@ -1729,6 +1746,13 @@ mod tests {
             AuthnRequest::parse(&xml).unwrap().refusal.unwrap().sub_status,
             Some(STATUS_NO_AUTHN_CONTEXT)
         );
+        // Not one of the schema's four values: the request is at fault.
+        let xml = request(
+            "",
+            r#"<samlp:RequestedAuthnContext Comparison="closest"></samlp:RequestedAuthnContext>"#,
+        );
+        let refusal = AuthnRequest::parse(&xml).unwrap().refusal.unwrap();
+        assert_eq!((refusal.status, refusal.sub_status), (STATUS_REQUESTER, None));
     }
 
     #[test]

@@ -61,9 +61,7 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   certificate can be added and its key verifies until it is removed. The
   console marks an expired one.
 - A SAML Identifier (Entity ID) may be up to 1024 characters, as SAML allows
-  (it was 512). Existing Unicode identifiers continue to work. On MySQL,
-  migration 0027 stops if an Identifier already saved has a character outside
-  ASCII: percent-encode it first.
+  (it was 512). Existing Unicode identifiers continue to work.
 
 - **My Account has tabs**: My apps, Profile and Security, each at its own
   address. My apps is where the page opens.
@@ -74,6 +72,14 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 
 ### Fixed
 
+- A SAML request for the `unspecified` authentication context class is answered
+  with that class, as `exact` comparison requires, instead of the class used.
+- A SAML request from an application gets back exactly the `RelayState` it sent,
+  and none if it sent none. The configured Relay State is used only for sign-in
+  started from My apps, as in Entra.
+- A `RequestedAuthnContext` whose `Comparison` is not one of the schema's values
+  is answered `Requester`; `minimum`, `maximum` and `better` still get
+  `NoAuthnContext`.
 - A user not assigned to an application that requires assignment (OIDC, SAML
   or device code) is now told so plainly. The page gives Entra's full
   AADSTS50105 text, naming the application, its ID and the signed-in account

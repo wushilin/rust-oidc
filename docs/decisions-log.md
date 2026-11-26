@@ -2189,15 +2189,15 @@ Both depart from Entra; the owner chose them.
   MySQL widens its UTF-8 column and uses a digest
   for the tenant-wide unique index to stay within InnoDB's key limit. SQLite
   and Postgres already use TEXT. All three compare the full identifier.
-- **That MySQL change is migration 0029, not an edit of 0027.** 0027 first made
-  MySQL's column ASCII, and 0027 is applied on the deployed service (SQLite). An
-  applied migration never changes, and sqlx refuses to start on a file whose
-  checksum differs, so MySQL's 0027 stays as first written and 0029 undoes its
-  character set; SQLite and Postgres have a 0029 that changes nothing, to keep one
-  numbered history. 0029 is one statement, and the digest is in the primary key,
-  so it also runs where `sql_require_primary_key` is on. Left as is: on a MySQL
-  database that already holds an Identifier outside ASCII, 0027 itself stops
-  (error 1366, nothing changed) until that Identifier is percent-encoded.
+- **MySQL's 0027 makes the final change itself; there is no 0029.** 0027 is
+  applied on the deployed service, but only its SQLite file, which is unchanged.
+  The MySQL file had never been released (it came with this change, unmerged)
+  and no MySQL database had applied it, so it was rewritten rather than followed
+  by a second migration: one statement that widens the column to 1024 UTF-8
+  characters and keys on a SHA-256 digest, keeping a primary key throughout so
+  it runs where `sql_require_primary_key` is on, and with no ASCII step to stop
+  on an existing Identifier. `tests/migration_pins.rs` pins each engine's 0027
+  as released, so a later edit fails in CI.
 - **A metadata file's role may expire by itself**: `validUntil` on the
   `SPSSODescriptor` is checked like the entity's and its groups' (SAML Metadata
   2.4.1).

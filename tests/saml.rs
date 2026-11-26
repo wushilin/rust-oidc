@@ -1515,6 +1515,85 @@ async fn an_authentication_context_that_cannot_be_met_is_refused() {
     }
 }
 
+/// `unspecified` asked for with `exact` comparison is what the assertion
+/// states: under `exact`, the class stated must be one of those requested.
+#[tokio::test]
+async fn an_unspecified_context_is_answered_with_unspecified() {
+    let w = world().await;
+    let class_of = |page: &Page| -> String {
+        response_of(page)
+            .child(NS_ASSERTION, "Assertion")
+            .and_then(|a| a.child(NS_ASSERTION, "AuthnStatement"))
+            .and_then(|s| s.child(NS_ASSERTION, "AuthnContext"))
+            .and_then(|c| c.child(NS_ASSERTION, "AuthnContextClassRef"))
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_else(|| panic!("no AuthnContextClassRef: {}", page.body))
+    };
+    let unspecified = "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified";
+    let body = format!(
+        r#"<samlp:RequestedAuthnContext Comparison="exact"><saml:AuthnContextClassRef>{unspecified}</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>"#
+    );
+    let b = Browser::new();
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", &body), None))
+        .await;
+    let page = b.login(&page, &w.f.upn, &w.f.password).await;
+    assert_eq!(class_of(&page), unspecified);
+    // Nothing requested: the class actually used.
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert_eq!(class_of(&page), "urn:oasis:names:tc:SAML:2.0:ac:classes:Password");
+}
+
+/// The configured Relay State is for sign-in started here. A request from the
+/// application gets back exactly the RelayState it sent, and none if it sent
+/// none (SAML Bindings 3.4.3, 3.5.3).
+#[tokio::test]
+async fn the_configured_relay_state_is_only_for_sign_in_started_here() {
+    let w = world().await;
+    let mut config = basic(ENTITY);
+    config.relay_state = Some("https://sp.example/landing".into());
+    let save = SaveSamlBasic {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        basic: config,
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &save).await.into_result().unwrap();
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
+    assert_eq!(page.field("RelayState"), None, "none sent, none returned");
+    let page = b
+        .get(&redirect_url(
+            &w.s,
+            &w.f.tenant.id,
+            &authn_request("", ""),
+            Some("mine"),
+        ))
+        .await;
+    assert_eq!(page.field("RelayState").as_deref(), Some("mine"));
+
+    // Opened from My apps: the configured one.
+    assign(&w).await;
+    let url = w.s.url(&format!("/{}/myaccount", w.f.tenant.id));
+    let csrf = my_account(&w, &b).await.field("csrf").unwrap();
+    let launch = rust_oidc::html::AccountOp::LaunchApp.as_str();
+    let answer = b
+        .post_form(
+            &url,
+            &[("csrf", csrf.as_str()), ("op", launch), ("app", w.app_id.as_str())],
+        )
+        .await;
+    assert!(answer.field("SAMLResponse").is_some(), "{}", answer.body);
+    assert_eq!(
+        answer.field("RelayState").as_deref(),
+        Some("https://sp.example/landing")
+    );
+}
+
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const EXC: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 

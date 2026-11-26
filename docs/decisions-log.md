@@ -1900,10 +1900,13 @@ this server does not claim formal OASIS conformance.
 - **Each application has its own signing certificates**, three years by default,
   because SAML applications pin them. New ones start inactive. *To reverse*: sign
   with the shared token keys, which would break pinned applications at rotation.
-- **Signed requests are verified on the HTTP-Redirect binding only.** A POSTed
-  enveloped signature is not verified, so an application requiring signatures must
-  use Redirect. This keeps XML signature wrapping out of the design. *To reverse*:
-  add a canonicalizer and strict reference checks.
+- **Signed requests are verified on both bindings** (owner's release bar: full
+  conformance, 2026-11-23). On POST, `saml_dsig` accepts one shape: one signature,
+  one reference to the root, a unique ID, exclusive canonicalization, a registered
+  certificate; comments and CDATA are refused. A signature is also checked when an
+  application has a certificate but does not require signatures, so a message that
+  claims to be signed and is not cannot pass. With no certificate it cannot be
+  checked and counts as unsigned, as it does at Entra.
 - **Everything signed is generated in canonical form** instead of being serialized
   and canonicalized. *To reverse*: adopt a general XML security library.
 - **Token encryption is AES-256-CBC with RSA-OAEP.** Entra documents AES-256 but not

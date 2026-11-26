@@ -1134,6 +1134,229 @@ async fn an_authentication_context_that_cannot_be_met_is_refused() {
     }
 }
 
+const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const EXC: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
+/// How a test's enveloped signature is put together. The message and SignedInfo
+/// are written directly in canonical form, so these tests do not rely on the
+/// canonicalizer under test to produce what they verify.
+struct Enveloped<'a> {
+    id: &'a str,
+    destination: String,
+    /// Canonical elements after the signature, covered by the digest.
+    body: &'a str,
+    uri: Option<&'a str>,
+    /// Extra markup inside `Signature`, outside what is signed.
+    after_value: &'a str,
+}
+
+fn enveloped(e: &Enveloped<'_>, pem: &str) -> String {
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    let issued = protocol::instant(rust_oidc::util::now()).unwrap();
+    let open = format!(
+        r#"<samlp:AuthnRequest xmlns:samlp="{NS_PROTOCOL}" Destination="{}" ID="{}" IssueInstant="{issued}" Version="2.0"><saml:Issuer xmlns:saml="{NS_ASSERTION}">{ENTITY}</saml:Issuer>"#,
+        e.destination, e.id
+    );
+    let close = "</samlp:AuthnRequest>";
+    let digest = aws_lc_rs::digest::digest(
+        &aws_lc_rs::digest::SHA256,
+        format!("{open}{}{close}", e.body).as_bytes(),
+    );
+    let inner = format!(
+        r##"<ds:CanonicalizationMethod Algorithm="{EXC}"></ds:CanonicalizationMethod><ds:SignatureMethod Algorithm="{}"></ds:SignatureMethod><ds:Reference URI="{}"><ds:Transforms><ds:Transform Algorithm="{DS}enveloped-signature"></ds:Transform><ds:Transform Algorithm="{EXC}"></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"></ds:DigestMethod><ds:DigestValue>{}</ds:DigestValue></ds:Reference>"##,
+        SigningAlgorithm::Sha256.signature_uri(),
+        e.uri.map_or_else(|| format!("#{}", e.id), str::to_string),
+        STANDARD.encode(digest.as_ref()),
+    );
+    let signed_info = format!(r#"<ds:SignedInfo xmlns:ds="{DS}">{inner}</ds:SignedInfo>"#);
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let key = RsaKeyPair::from_pkcs8(&STANDARD.decode(body).unwrap()).unwrap();
+    let mut value = vec![0u8; key.public_modulus_len()];
+    key.sign(
+        &RSA_PKCS1_SHA256,
+        &SystemRandom::new(),
+        signed_info.as_bytes(),
+        &mut value,
+    )
+    .unwrap();
+    format!(
+        r#"{open}<ds:Signature xmlns:ds="{DS}"><ds:SignedInfo>{inner}</ds:SignedInfo><ds:SignatureValue>{}</ds:SignatureValue>{}</ds:Signature>{}{close}"#,
+        STANDARD.encode(&value),
+        e.after_value,
+        e.body,
+    )
+}
+
+fn plain<'a>(w: &World, id: &'a str) -> Enveloped<'a> {
+    Enveloped {
+        id,
+        destination: w.s.url(&format!("/{}/saml2", w.f.tenant.id)),
+        body: "",
+        uri: None,
+        after_value: "",
+    }
+}
+
+/// The request was accepted and the browser is at the password page.
+fn at_sign_in(page: &Page) -> bool {
+    page.status == 200 && page.body.contains(r#"name="password""#)
+}
+
+async fn post_request(w: &World, b: &Browser, xml: &str) -> Page {
+    let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let encoded = STANDARD.encode(xml);
+    b.post_form(&endpoint, &[("SAMLRequest", encoded.as_str())]).await
+}
+
+#[tokio::test]
+async fn a_signed_post_request_signs_in_once() {
+    let w = world().await;
+    let (pem, _, cert_pem) = sp_key();
+    require_signed(&w, &cert_pem).await;
+    let xml = enveloped(&plain(&w, "_post1"), &pem);
+    let b = Browser::new();
+    let page = post_request(&w, &b, &xml).await;
+    let page = b.login(&page, &w.f.upn, &w.f.password).await;
+    assert_eq!(status_codes(&response_of(&page)), vec![protocol::STATUS_SUCCESS]);
+    let again = post_request(&w, &b, &xml).await;
+    assert!(
+        status_codes(&response_of(&again)) != vec![protocol::STATUS_SUCCESS],
+        "a signed request is single-use"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_or_misaddressed_signed_post_is_refused() {
+    let w = world().await;
+    let (pem, _, cert_pem) = sp_key();
+    require_signed(&w, &cert_pem).await;
+    let (other_pem, _, _) = sp_key();
+    let good = enveloped(&plain(&w, "_post2"), &pem);
+    let misaddressed = Enveloped {
+        destination: "https://elsewhere.example/saml2".into(),
+        ..plain(&w, "_post3")
+    };
+    for (what, xml) in [
+        ("changed issuer", good.replace(ENTITY, "https://other.example/")),
+        ("changed id", good.replace("_post2", "_post9")),
+        ("another key", enveloped(&plain(&w, "_post4"), &other_pem)),
+        ("wrong Destination", enveloped(&misaddressed, &pem)),
+    ] {
+        let page = post_request(&w, &Browser::new(), &xml).await;
+        assert!(page.field("SAMLResponse").is_none(), "{what}: {}", page.body);
+        assert!(!at_sign_in(&page), "{what}: reached sign-in");
+    }
+}
+
+#[test]
+fn only_one_signature_shape_is_accepted() {
+    let (pem, der, _) = sp_key();
+    let certs = [der];
+    let base = || Enveloped {
+        id: "_shape",
+        destination: "https://idp.example/saml2".into(),
+        body: "",
+        uri: None,
+        after_value: "",
+    };
+    assert!(rust_oidc::saml_dsig::verify(&enveloped(&base(), &pem), &certs, false).is_ok());
+
+    let duplicate_id = r#"<samlp:Extensions ID="_shape"></samlp:Extensions>"#.to_string();
+    let second_signature =
+        format!(r#"<samlp:Extensions><ds:Signature xmlns:ds="{DS}"></ds:Signature></samlp:Extensions>"#);
+    let object = format!(r#"<ds:Object xmlns:ds="{DS}"></ds:Object>"#);
+    for (what, xml) in [
+        (
+            "a second element with the signed ID",
+            enveloped(
+                &Enveloped {
+                    body: &duplicate_id,
+                    ..base()
+                },
+                &pem,
+            ),
+        ),
+        (
+            "a second signature",
+            enveloped(
+                &Enveloped {
+                    body: &second_signature,
+                    ..base()
+                },
+                &pem,
+            ),
+        ),
+        (
+            "a reference to something else",
+            enveloped(
+                &Enveloped {
+                    uri: Some("#_other"),
+                    ..base()
+                },
+                &pem,
+            ),
+        ),
+        (
+            "an empty reference",
+            enveloped(
+                &Enveloped {
+                    uri: Some(""),
+                    ..base()
+                },
+                &pem,
+            ),
+        ),
+        (
+            "an Object in the signature",
+            enveloped(
+                &Enveloped {
+                    after_value: &object,
+                    ..base()
+                },
+                &pem,
+            ),
+        ),
+        (
+            "a changed message under a valid SignedInfo",
+            enveloped(&base(), &pem).replace("https://idp.example/saml2", "https://evil.example/saml2"),
+        ),
+        (
+            "a comment inside a signed value",
+            enveloped(&base(), &pem).replace(ENTITY, &ENTITY.replacen("sp", "s<!-- x -->p", 1)),
+        ),
+    ] {
+        assert!(rust_oidc::saml_dsig::verify(&xml, &certs, false).is_err(), "{what}");
+    }
+}
+
+#[tokio::test]
+async fn a_bad_signature_is_refused_when_a_certificate_is_registered() {
+    let w = world().await;
+    let (pem, _, cert_pem) = sp_key();
+    let (other_pem, _, _) = sp_key();
+    let forged = enveloped(&plain(&w, "_opt1"), &other_pem);
+    // No certificate: the signature cannot be checked, and counts as absent.
+    let page = post_request(&w, &Browser::new(), &forged).await;
+    assert!(at_sign_in(&page), "{}", page.body);
+
+    let add = AddSamlVerificationCertificate {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        certificate_pem: cert_pem,
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &add).await.into_result().unwrap();
+    let page = post_request(&w, &Browser::new(), &forged).await;
+    assert!(!at_sign_in(&page), "a forged signature must not pass");
+    let good = enveloped(&plain(&w, "_opt2"), &pem);
+    let page = post_request(&w, &Browser::new(), &good).await;
+    assert!(at_sign_in(&page), "{}", page.body);
+    // Signatures are still optional here.
+    let unsigned = authn_request("", "").replace("_req1", "_opt3");
+    let page = post_request(&w, &Browser::new(), &unsigned).await;
+    assert!(at_sign_in(&page), "{}", page.body);
+}
+
 #[tokio::test]
 async fn a_logout_answer_must_be_addressed_to_this_endpoint() {
     let w = world().await;

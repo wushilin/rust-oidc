@@ -449,7 +449,7 @@ fn verification_form(
     let controls = if may_rotate {
         format!(
             r#"{open}<label><input type="checkbox" name="{REQUIRED}"{checked}> Require verification certificates</label>
-<p class="muted">Signed requests must use the HTTP-Redirect binding, with RSA-SHA256.</p>
+<p class="muted">Requests may be signed on the HTTP-Redirect or HTTP-POST binding, with RSA-SHA256.</p>
 <div class="actions"><button type="submit">Save</button></div></form>{add}"#,
             open = form_open(url, csrf, AppOp::SamlRequireSigned),
             checked = if c.require_signed_requests { " checked" } else { "" },

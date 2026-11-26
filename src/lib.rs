@@ -22,6 +22,7 @@ pub mod ratelimit;
 pub mod rbac;
 pub mod routes;
 pub mod saml;
+pub mod saml_dsig;
 pub mod saml_protocol;
 pub mod scopes;
 pub mod secrets;

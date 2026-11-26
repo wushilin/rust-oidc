@@ -9,10 +9,8 @@
 //! no self-closed tags, namespaces declared where first used), so the bytes we
 //! digest are the bytes we send and no general canonicalizer is needed.
 //!
-//! **Signed requests are verified on the HTTP-Redirect binding only**, over the
-//! query octets as received. An enveloped signature on a POSTed request is not
-//! verified, so an application that requires signed requests must use Redirect;
-//! a POST to it is refused. That keeps signature wrapping out of the design.
+//! **Signed requests** are verified over the query octets as received on the
+//! HTTP-Redirect binding, and by [`crate::saml_dsig`] on the POST binding.
 
 use aws_lc_rs::cipher::{AES_256, PaddedBlockEncryptingKey, UnboundCipherKey};
 use aws_lc_rs::digest;
@@ -79,8 +77,8 @@ pub const AC_MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
 
 /// The largest message accepted, encoded or inflated.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-const MAX_DEPTH: usize = 16;
-const MAX_ELEMENTS: usize = 256;
+pub(crate) const MAX_DEPTH: usize = 16;
+pub(crate) const MAX_ELEMENTS: usize = 256;
 const MAX_ID_CHARS: usize = 256;
 
 /// How long a bearer assertion may be delivered. Entra's `Conditions` window is
@@ -173,7 +171,7 @@ pub struct SamlError {
 }
 
 impl SamlError {
-    fn requester(message: impl Into<String>) -> Self {
+    pub(crate) fn requester(message: impl Into<String>) -> Self {
         Self {
             status: STATUS_REQUESTER,
             sub_status: None,
@@ -615,7 +613,7 @@ impl LogoutResponse {
 // ---- certificates ----
 
 /// The DER of the certificate's SubjectPublicKeyInfo, and of the RSA key in it.
-fn public_key_of(cert_der: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn public_key_of(cert_der: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use x509_cert::der::{Decode, Encode};
     let cert = x509_cert::Certificate::from_der(cert_der)?;
     let spki = cert.tbs_certificate().subject_public_key_info();
@@ -695,8 +693,13 @@ impl SamlQuery {
         })
     }
 
-    /// The same message with no signature: what a POST carries, because a
-    /// signature is only verified on the Redirect binding.
+    /// Whether the query carries a Redirect-binding signature (or part of one).
+    pub fn is_signed(&self) -> bool {
+        self.raw_sig_alg.is_some() || self.raw_signature.is_some()
+    }
+
+    /// The same message with no Redirect-binding signature: what a POST carries,
+    /// because its signature, if it has one, is inside the message.
     pub fn without_signature(&self) -> String {
         let mut out = format!("{}={}", self.param, self.raw_message);
         if let Some(relay) = &self.raw_relay_state {

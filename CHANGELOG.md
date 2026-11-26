@@ -14,6 +14,9 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   encryption, certificate rollover, federation metadata and Single Logout.
 - **My apps** on My Account: the applications a user is assigned to, directly or
   through a group, ready to open.
+- Signed SAML requests are verified on the HTTP-POST binding as well as
+  HTTP-Redirect. An invalid signature is refused whenever the application has a
+  verification certificate, even if it does not require signatures.
 
 ### Fixed
 

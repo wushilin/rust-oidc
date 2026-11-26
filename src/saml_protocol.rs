@@ -74,6 +74,7 @@ pub const STATUS_AUTHN_FAILED: &str = "urn:oasis:names:tc:SAML:2.0:status:AuthnF
 pub const STATUS_NO_AUTHN_CONTEXT: &str = "urn:oasis:names:tc:SAML:2.0:status:NoAuthnContext";
 pub const STATUS_INVALID_NAMEID_POLICY: &str = "urn:oasis:names:tc:SAML:2.0:status:InvalidNameIDPolicy";
 pub const STATUS_REQUEST_UNSUPPORTED: &str = "urn:oasis:names:tc:SAML:2.0:status:RequestUnsupported";
+pub const STATUS_UNSUPPORTED_BINDING: &str = "urn:oasis:names:tc:SAML:2.0:status:UnsupportedBinding";
 
 pub const STATUS_PARTIAL_LOGOUT: &str = "urn:oasis:names:tc:SAML:2.0:status:PartialLogout";
 pub const STATUS_UNKNOWN_PRINCIPAL: &str = "urn:oasis:names:tc:SAML:2.0:status:UnknownPrincipal";
@@ -698,8 +699,10 @@ impl AuthnRequest {
         if let Some(binding) = root.attr("ProtocolBinding")
             && binding != BINDING_POST
         {
-            refusal.get_or_insert_with(|| {
-                SamlError::unsupported("Only the HTTP-POST binding is supported for the SAML response.")
+            refusal.get_or_insert_with(|| SamlError {
+                status: STATUS_REQUESTER,
+                sub_status: Some(STATUS_UNSUPPORTED_BINDING),
+                message: "Only the HTTP-POST binding is supported for the SAML response.".into(),
             });
         }
         let acs_index = match root.attr("AssertionConsumerServiceIndex") {

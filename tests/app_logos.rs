@@ -7,6 +7,7 @@ use rust_oidc::apps;
 use rust_oidc::apps::Principal;
 use rust_oidc::db::Event;
 use rust_oidc::logos::{self, Image, LibraryIcon, Logo, Shown};
+use rust_oidc::mfa;
 use rust_oidc::txn::ops::apps::SetAppLogo;
 use rust_oidc::txn::ops::saml::SetAppSignOnUrl;
 use rust_oidc::txn::{self, Actor, Outcome, Refusal};
@@ -240,6 +241,7 @@ async fn a_tile_shows_its_initials_its_library_icon_or_its_uploaded_image() {
     assert_eq!(served.status(), 200);
     let h = served.headers().clone();
     assert_eq!(h["content-type"], "image/png");
+    assert_eq!(h["cache-control"], "private, no-store");
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert!(h["content-security-policy"].to_str().unwrap().contains("sandbox"));
     assert_eq!(served.bytes().await.unwrap().as_ref(), PNG);
@@ -274,6 +276,22 @@ async fn an_uploaded_logo_is_served_only_to_a_user_whose_apps_list_it() {
     // The api app is in the tenant but not on her My apps.
     let other = w.account(&format!("/apps/{}/logo?v=1", w.f.api.app_id));
     assert_eq!(alice.http.get(&other).send().await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn a_logo_requires_my_account_mfa() {
+    let w = world().await;
+    w.set(Some(png())).await.into_result().unwrap();
+    let browser = w.signed_in().await;
+    let path = w.account(&format!("/apps/{}/logo", w.f.web.app_id));
+
+    let password_only = browser.http.get(&path).send().await.unwrap();
+    assert_eq!(password_only.status(), 200);
+    mfa::enroll(&w.s.pool, &w.f.user_id, &mfa::new_secret()).await.unwrap();
+
+    let gated = browser.http.get(&path).send().await.unwrap();
+    assert_eq!(gated.status(), 404);
+    assert_eq!(gated.headers()["cache-control"], "private, no-store");
 }
 
 #[tokio::test]

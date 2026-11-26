@@ -318,7 +318,14 @@ fn basic_section(url: &str, csrf: &str, c: &SamlConfig, may_write: bool, draft: 
     } else {
         String::new()
     };
-    format!("{upload}{notice}{}", basic_form(url, csrf, &shown, may_write))
+    let logout_notice = draft
+        .and_then(|draft| draft.logout_notice)
+        .map(|message| format!(r#"<p class="notice" role="status">{}</p>"#, e(message)))
+        .unwrap_or_default();
+    format!(
+        "{upload}{notice}{logout_notice}{}",
+        basic_form(url, csrf, &shown, may_write)
+    )
 }
 
 fn basic_form(url: &str, csrf: &str, c: &SamlConfig, may_write: bool) -> String {

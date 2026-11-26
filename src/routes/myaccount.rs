@@ -65,6 +65,16 @@ async fn current(st: &AppState, tenant: &Tenant, headers: &HeaderMap) -> Option<
     user.enabled.then_some((user, s.amr, s.keep))
 }
 
+/// A session from an application may still need to complete My Account MFA.
+async fn required_step(st: &AppState, tenant: &Tenant, user: &User, amr: &[String]) -> anyhow::Result<Option<Purpose>> {
+    if amr.iter().any(|method| method == Amr::Mfa.as_str()) {
+        return Ok(None);
+    }
+    Ok(step_purpose(
+        mfa::step(&st.pool, tenant, &user.id, mfa::At::MyAccount).await?,
+    ))
+}
+
 fn with_csrf(mut resp: Response, st: &AppState, csrf: &str) -> Response {
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -332,13 +342,17 @@ pub async fn logo(
 ) -> Response {
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    let not_found = || StatusCode::NOT_FOUND.into_response();
+    let cache = || [(header::CACHE_CONTROL, "private, no-store")];
+    let not_found = || (StatusCode::NOT_FOUND, cache()).into_response();
     let Ok(Some(tenant)) = tenant::resolve(&st.pool, &tenant_key).await else {
         return not_found();
     };
-    let Some((user, _, _)) = current(&st, &tenant, &headers).await else {
+    let Some((user, amr, _)) = current(&st, &tenant, &headers).await else {
         return not_found();
     };
+    if !matches!(required_step(&st, &tenant, &user, &amr).await, Ok(None)) {
+        return not_found();
+    }
     let listed = crate::saml::gallery(&st.pool, &tenant.id, &user.id)
         .await
         .unwrap_or_default()
@@ -353,18 +367,13 @@ pub async fn logo(
     let Ok(Some(image)) = crate::logos::image(&st.pool, &app.id).await else {
         return not_found();
     };
-    let mut resp = (StatusCode::OK, image.bytes).into_response();
+    let mut resp = (StatusCode::OK, cache(), image.bytes).into_response();
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(image.kind.content_type()),
     );
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    // The page asks for it by version, so a new upload is a new address.
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=86400"),
-    );
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("default-src 'none'; sandbox"),
@@ -379,17 +388,10 @@ async fn show(st: &AppState, tenant_key: &str, tab: AccountTab, headers: &Header
     let Some((user, amr, keep)) = current(st, &tenant, headers).await else {
         return login_page(st, &tenant, "", None);
     };
-    // A session from an application's sign-in still needs a second factor here,
-    // where the user has one or needs one.
-    if !amr.iter().any(|m| m == Amr::Mfa.as_str()) {
-        match mfa::step(&st.pool, &tenant, &user.id, mfa::At::MyAccount).await {
-            Ok(step) => {
-                if let Some(purpose) = step_purpose(step) {
-                    return start(st, &tenant, &user, purpose, false, keep).await;
-                }
-            }
-            Err(e) => return fail(&tenant, e),
-        }
+    match required_step(st, &tenant, &user, &amr).await {
+        Ok(Some(purpose)) => return start(st, &tenant, &user, purpose, false, keep).await,
+        Ok(None) => {}
+        Err(e) => return fail(&tenant, e),
     }
     dashboard(st, &tenant, &user, plain(tab)).await
 }

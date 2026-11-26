@@ -2066,7 +2066,7 @@ assigned, and the account's own tenant (or its own setting) allows it.
 - **What is read**: the entity ID (first Identifier, others kept), the
   `AssertionConsumerService` endpoints on HTTP-POST with their `index`, the default
   chosen by SAML metadata 2.2.3 (first `isDefault="true"`, else first unmarked, else
-  first), and a Logout URL (HTTP-Redirect first, else HTTP-POST). Certificates in the
+  first), and a compatible Logout URL. Certificates in the
   file are not taken, as in Entra. A file describing more or fewer than one service
   provider is refused.
 - **Reply URLs now keep an explicit index and default**, which the existing columns
@@ -2182,14 +2182,17 @@ Both depart from Entra; the owner chose them.
   certificates rather than unexpired ones. The console marks an expired one as still
   verifying until removed. Revoking a key means removing it, as with Shibboleth's
   metadata keys.
-- **A SAML Identifier (Entity ID) may be 1024 characters, and must be ASCII.** SAML
-  Metadata 2.3.2 bounds `entityIDType` at 1024 characters, and the limit was 512, so
-  a valid metadata file could be imported but not saved (IIP-MD05.b). A URI is ASCII
-  (RFC 3986), as Reply URLs already had to be; requiring it keeps the indexed column
-  within every engine's key limit, which 1024 utf8mb4 characters would exceed on
-  MySQL. Migration 0027 makes MySQL's column `VARCHAR(1024)` in the ASCII character
-  set; SQLite and Postgres hold TEXT and need nothing. A request naming a non-ASCII
-  Issuer matches no application without asking the database.
+- **A SAML Identifier (Entity ID) may be 1024 characters.** SAML Metadata 2.3.2
+  bounds `entityIDType` at 1024 characters. Keep accepting Unicode identifiers
+  already supported by storage. A 2048-byte ceiling preserves every identifier
+  formerly accepted and keeps the PostgreSQL index within its size limit.
+  MySQL widens its UTF-8 column and uses a digest
+  for the tenant-wide unique index to stay within InnoDB's key limit. SQLite
+  and Postgres already use TEXT. All three compare the full identifier.
+- **Metadata import selects a role that supports SAML 2.0.** It fills the single
+  Logout URL only when HTTP-Redirect is available and the browser bindings and
+  response locations fit one URL. Otherwise, the preview explains why it leaves
+  the configured Logout URL in place and still offers the other values.
 
 ## My Account tabs and application logos
 
@@ -2216,7 +2219,5 @@ Both depart from Entra; the owner chose them.
   application**, from `/myaccount/apps/{app}/logo`, with its checked type, `nosniff`
   and a sandboxing policy. My Account's policy adds `img-src 'self'` for it. The admin
   Overview shows the image inline as a `data:` URL, so the console's policy adds
-  `img-src data:`. The address carries a version that changes with each upload, so a
-  browser never keeps showing a replaced logo.
-
-
+  `img-src data:`. The logo route uses the same MFA requirement as the gallery
+  and disables browser caching so each request checks the current access.

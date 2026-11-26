@@ -26,7 +26,7 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 
 - **Upload metadata file** under Basic SAML Configuration, as in Entra: the
   application's entity ID, its HTTP-POST Reply URLs with their indexes and
-  default, and its Logout URL fill in the form for review. Nothing is saved
+  default, and a compatible Logout URL fill in the form for review. Nothing is saved
   until the administrator saves it.
 - The metadata file upload takes this application's entry from a file grouping
   several (by its Identifier), accepts files up to 2 MB, and refuses metadata
@@ -61,7 +61,7 @@ Notable changes to rust-oidc. Releases before 0.6.0 are described on their
   certificate can be added and its key verifies until it is removed. The
   console marks an expired one.
 - A SAML Identifier (Entity ID) may be up to 1024 characters, as SAML allows
-  (it was 512). It must be ASCII; percent-encode anything else.
+  (it was 512). Existing Unicode identifiers continue to work.
 
 - **My Account has tabs**: My apps, Profile and Security, each at its own
   address. My apps is where the page opens.

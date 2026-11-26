@@ -34,6 +34,8 @@ pub struct SpMetadata {
     /// In index order; exactly one is the default.
     pub reply_urls: Vec<ReplyUrl>,
     pub logout_url: Option<String>,
+    /// Why the file's logout endpoints could not fill in the single URL.
+    pub logout_notice: Option<&'static str>,
     /// The service provider's signing certificates a request could be verified
     /// with, in document order, each once.
     pub signing_certificates: Vec<GivenCertificate>,
@@ -43,8 +45,16 @@ fn is(node: &Node, local: &str) -> bool {
     node.ns == NS_METADATA && node.local == local
 }
 
-fn children<'a>(node: &'a Node, local: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
+fn children<'a>(node: &'a Node, local: &'a str) -> impl Iterator<Item = &'a Node> + Clone + 'a {
     node.children.iter().filter(move |c| is(c, local))
+}
+
+/// Roles usable by this SAML 2.0 identity provider.
+fn saml2_roles(entity: &Node) -> impl Iterator<Item = &Node> {
+    children(entity, "SPSSODescriptor").filter(|role| {
+        role.attr("protocolSupportEnumeration")
+            .is_some_and(|protocols| protocols.split_ascii_whitespace().any(|p| p == NS_PROTOCOL))
+    })
 }
 
 /// `xs:boolean`: `true`, `false`, `1` or `0`.
@@ -113,10 +123,10 @@ pub fn read_sp_metadata(xml: &str, known: &[String], now: i64) -> Result<SpMetad
     }
     let providers: Vec<(&Node, bool)> = all
         .into_iter()
-        .filter(|(e, _)| children(e, "SPSSODescriptor").next().is_some())
+        .filter(|(e, _)| saml2_roles(e).next().is_some())
         .collect();
     let chosen: Vec<&(&Node, bool)> = match providers.len() {
-        0 => return Err("The file describes no service provider (SPSSODescriptor).".into()),
+        0 => return Err("The file describes no SAML 2.0 service provider (SPSSODescriptor).".into()),
         1 => providers.iter().collect(),
         _ => providers
             .iter()
@@ -141,9 +151,9 @@ pub fn read_sp_metadata(xml: &str, known: &[String], now: i64) -> Result<SpMetad
         .filter(|id| !id.is_empty())
         .ok_or("The EntityDescriptor has no entityID.")?
         .to_string();
-    let sp = children(entity, "SPSSODescriptor")
+    let sp = saml2_roles(entity)
         .next()
-        .ok_or("The file has no SPSSODescriptor.")?;
+        .ok_or("The file has no SAML 2.0 SPSSODescriptor.")?;
 
     // (index, explicit isDefault, URL), in document order.
     let mut endpoints = Vec::new();
@@ -187,21 +197,51 @@ pub fn read_sp_metadata(xml: &str, known: &[String], now: i64) -> Result<SpMetad
         .collect();
     reply_urls.sort_by_key(|r| r.index);
 
-    // We answer logout over HTTP-Redirect, so that endpoint first.
-    let logout_url = [BINDING_REDIRECT, BINDING_POST].iter().find_map(|binding| {
-        children(sp, "SingleLogoutService")
-            .find(|s| s.attr("Binding") == Some(binding))
-            .and_then(|s| s.attr("Location"))
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-    });
+    let (logout_url, logout_notice) = logout_endpoint(sp);
     Ok(SpMetadata {
         entity_id,
         reply_urls,
         logout_url,
+        logout_notice,
         signing_certificates: signing_certificates(sp),
     })
+}
+
+/// The console has one logout URL, and fan-out uses HTTP-Redirect. Import only
+/// endpoints whose browser bindings and response locations fit that model.
+fn logout_endpoint(sp: &Node) -> (Option<String>, Option<&'static str>) {
+    let endpoints = children(sp, "SingleLogoutService");
+    fn location(endpoint: &Node) -> Option<&str> {
+        endpoint.attr("Location").map(str::trim).filter(|url| !url.is_empty())
+    }
+    let redirect = endpoints
+        .clone()
+        .filter(|endpoint| endpoint.attr("Binding") == Some(BINDING_REDIRECT))
+        .find_map(location);
+    let Some(url) = redirect else {
+        let notice = endpoints
+            .clone()
+            .next()
+            .map(|_| "The file has no usable HTTP-Redirect logout endpoint. The Logout URL was left as configured.");
+        return (None, notice);
+    };
+    let incompatible = endpoints
+        .filter(|endpoint| matches!(endpoint.attr("Binding"), Some(BINDING_REDIRECT | BINDING_POST)))
+        .any(|endpoint| {
+            location(endpoint) != Some(url)
+                || endpoint
+                    .attr("ResponseLocation")
+                    .is_some_and(|response| response.trim() != url)
+        });
+    if incompatible {
+        return (
+            None,
+            Some(
+                "The file uses different logout URLs for requests, responses, or browser bindings. The Logout URL was left as configured.",
+            ),
+        );
+    }
+    (Some(url.to_string()), None)
 }
 
 fn in_ds<'a>(node: &'a Node, local: &'static str) -> impl Iterator<Item = &'a Node> + 'a {
@@ -259,7 +299,7 @@ mod tests {
     #[test]
     fn reads_the_entity_reply_urls_and_logout_url() {
         let slo = format!(
-            r#"<md:SingleLogoutService Binding="{BINDING_POST}" Location="https://sp.example/slo-post"/><md:SingleLogoutService Binding="{BINDING_REDIRECT}" Location="https://sp.example/slo"/>"#
+            r#"<md:SingleLogoutService Binding="{BINDING_POST}" Location="https://sp.example/slo"/><md:SingleLogoutService Binding="{BINDING_REDIRECT}" Location="https://sp.example/slo"/>"#
         );
         let m = parse_sp_metadata(&sp(&format!(
             "{slo}{}{}",
@@ -273,6 +313,33 @@ mod tests {
         assert_eq!(indexes, vec![1, 3]);
         // The first in the document, not the lowest index.
         assert_eq!(default_index(&m), 3);
+    }
+
+    #[test]
+    fn skips_a_legacy_role_before_the_saml2_role() {
+        let legacy = r#"<md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:1.0:protocol"/>"#;
+        let xml =
+            sp(&acs(7, None, BINDING_POST)).replacen("<md:SPSSODescriptor", &format!("{legacy}<md:SPSSODescriptor"), 1);
+        let imported = parse_sp_metadata(&xml).unwrap();
+        assert_eq!(imported.reply_urls[0].index, 7);
+    }
+
+    #[test]
+    fn warns_about_logout_endpoints_that_cannot_share_one_redirect_url() {
+        let post_only =
+            format!(r#"<md:SingleLogoutService Binding="{BINDING_POST}" Location="https://sp.example/slo"/>"#);
+        let split_response = format!(
+            r#"<md:SingleLogoutService Binding="{BINDING_REDIRECT}" Location="https://sp.example/slo" ResponseLocation="https://sp.example/slo-response"/>"#
+        );
+        let redirect = format!(
+            r#"<md:SingleLogoutService Binding="{BINDING_REDIRECT}" Location="https://sp.example/slo-redirect"/>"#
+        );
+        for logout in [post_only.clone(), split_response, format!("{redirect}{post_only}")] {
+            let imported = parse_sp_metadata(&sp(&format!("{logout}{}", acs(0, None, BINDING_POST)))).unwrap();
+            assert_eq!(imported.logout_url, None);
+            assert!(imported.logout_notice.is_some());
+            assert_eq!(imported.reply_urls.len(), 1);
+        }
     }
 
     #[test]

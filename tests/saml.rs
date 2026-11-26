@@ -65,6 +65,38 @@ async fn world() -> World {
     World { s, f, app_id }
 }
 
+#[tokio::test]
+async fn unicode_entity_ids_can_be_saved_and_resolved() {
+    let w = world().await;
+    let prefix = "https://sp.example/";
+    let existing = "https://sp.example/métadonnées";
+    let legacy_limit = format!("{prefix}{}", "🦀".repeat(saml::MAX_URI_CHARS - prefix.len()));
+    let new_limit = format!("{prefix}{}", "a".repeat(saml::MAX_ENTITY_ID_CHARS - prefix.len()));
+    let mut config = basic(existing);
+    config.identifiers.extend([legacy_limit.clone(), new_limit.clone()]);
+    txn::run(
+        &w.s.pool,
+        &Actor::Cli,
+        &SaveSamlBasic {
+            tenant_id: w.f.tenant.id.clone(),
+            app_id: w.app_id.clone(),
+            basic: config,
+        },
+    )
+    .await
+    .into_result()
+    .unwrap();
+
+    for id in [existing, &legacy_limit, &new_limit] {
+        let enabled = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, id).await.unwrap();
+        let any_mode = saml::find_by_identifier_any_mode(&w.s.pool, &w.f.tenant.id, id)
+            .await
+            .unwrap();
+        assert_eq!(enabled.unwrap().app_id, w.app_id);
+        assert_eq!(any_mode.unwrap().app_id, w.app_id);
+    }
+}
+
 fn authn_request(attrs: &str, body: &str) -> String {
     format!(
         r#"<samlp:AuthnRequest xmlns:samlp="{NS_PROTOCOL}" xmlns:saml="{NS_ASSERTION}" ID="_req1" Version="2.0" IssueInstant="2026-11-23T00:00:00Z" {attrs}><saml:Issuer>{ENTITY}</saml:Issuer>{body}</samlp:AuthnRequest>"#
@@ -645,14 +677,15 @@ async fn an_identifier_may_be_as_long_as_saml_allows() {
         .unwrap();
     assert_eq!(found.map(|a| a.app_id), Some(w.app_id.clone()));
 
-    for refused in [format!("{longest}a"), "urn:example:café".to_string()] {
-        let outcome = txn::run(&w.s.pool, &Actor::Cli, &save(refused)).await;
+    let too_many_bytes = format!("{prefix}{}", "🦀".repeat(saml::MAX_URI_CHARS));
+    for refused in [format!("{longest}a"), too_many_bytes] {
+        let outcome = txn::run(&w.s.pool, &Actor::Cli, &save(refused.clone())).await;
         assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
+        let found = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, &refused)
+            .await
+            .unwrap();
+        assert!(found.is_none());
     }
-    let found = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, "urn:example:café")
-        .await
-        .unwrap();
-    assert!(found.is_none());
 }
 
 #[tokio::test]

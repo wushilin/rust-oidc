@@ -1027,6 +1027,17 @@ async fn logout_answered(st: &AppState, tenant_key: &str, headers: &HeaderMap, q
     if let Err(e) = check_signature(st, &answering, &config, query).await {
         return page(t, &e.message);
     }
+    // A response that names a Destination must name this endpoint, or it is
+    // discarded (SAML Core 3.2.2); a signed one must name it (the bindings).
+    // Checked before the waiting logout is used up.
+    let here = |d: &str| d == sso_url(st, &tenant.id) || d == sso_url(st, tenant_key);
+    match response.destination.as_deref() {
+        Some(d) if !here(d) => return page(t, "The logout response's Destination is not this endpoint."),
+        None if config.require_signed_requests => {
+            return page(t, "The signed logout response has no Destination.");
+        }
+        _ => {}
+    }
     let hash = sha256_hex(browser.as_bytes());
     let mut state = match saml::take_logout_state(&st.pool, id, &tenant.id, &answering.id, &hash).await {
         Ok(Some(state)) => state,

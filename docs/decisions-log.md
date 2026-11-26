@@ -309,7 +309,6 @@ with explicit `value(name = ...)`.** The accepted spellings are unchanged
 command changes; clap now rejects a bad value with a list of the good ones instead of
 the server doing it in a `bail!`.
 
-
 **46. The OAuth `error` value and the AADSTS number are enums.** `AadError.error` was
 a `&'static str` and `.code` a bare `u32`, written out at 64 call sites.
 `error::OAuthError` (19 values) and `error::Aadsts` (47 numbers) are now the only lists.
@@ -665,7 +664,6 @@ lookup runs. That is the layering working as intended, but it meant the second l
 untested, so `a_group_lookup_is_scoped_to_its_tenant_whatever_the_id` now tests it
 directly, and that test does fail when the scoping is broken. The same is true of the
 tenant id in every other domain function's `WHERE`: the gate is what the HTTP tests prove.
-
 
 ---
 
@@ -1994,6 +1992,13 @@ assigned, and the account's own tenant (or its own setting) allows it.
   request otherwise. The owner set full conformance as the release bar. An application
   sending a stale `Destination` after a host change now fails until it is corrected.
   An unsigned request with no `Destination` is still accepted, as the standard allows.
+- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
+  `Destination` must be the public URL, the tenant's id or one of its verified
+  domains (matched as the path segment itself is, without regard to case), then
+  `/saml2`, with nothing before, between or after. It was compared with the name the
+  request arrived under, but the sign-in form posts back under the tenant's id, so a
+  request sent to the domain form of the endpoint passed on arrival and was refused
+  after the password. Another tenant's endpoint on this server is still elsewhere.
 
 ### Unsupported SAML requests are answered in SAML (2026-11-24)
 
@@ -2002,6 +2007,11 @@ assigned, and the account's own tenant (or its own setting) allows it.
   This keeps Entra's refusal of `Subject` while meeting the SAML requirement for an
   error status. A malformed request, or one failing those checks, still gets a local
   page, since nothing establishes where an answer may safely go.
+
+- **An unsupported `ProtocolBinding` gets `UnsupportedBinding`** (2026-11-26), under
+  `Requester`: SAML Core 3.2.2.2 has this code for exactly a response binding the
+  responder cannot use, where `RequestUnsupported` says only that the request is not
+  supported. Entra names the same condition (AADSTS75003, UnsupportedBindingError).
 
 ### Encrypted SAML responses are signed (2026-11-24)
 
@@ -2137,10 +2147,4 @@ assigned, and the account's own tenant (or its own setting) allows it.
   256 elements for a SAML message from the network; only a signed-in administrator can
   upload one.
 
-- **Any name of the tenant's endpoint counts as this endpoint** (2026-11-26): the
-  `Destination` must be the public URL, the tenant's id or one of its verified
-  domains (matched as the path segment itself is, without regard to case), then
-  `/saml2`, with nothing before, between or after. It was compared with the name the
-  request arrived under, but the sign-in form posts back under the tenant's id, so a
-  request sent to the domain form of the endpoint passed on arrival and was refused
-  after the password. Another tenant's endpoint on this server is still elsewhere.
+

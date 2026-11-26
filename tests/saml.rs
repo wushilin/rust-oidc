@@ -12,8 +12,8 @@ use rust_oidc::saml::{self, BasicConfig, NewCertificate};
 use rust_oidc::saml_protocol::{self as protocol, NS_ASSERTION, NS_PROTOCOL, Node, Signer, SigningAlgorithm};
 use rust_oidc::txn::ops::apps::SetAssignmentRequired;
 use rust_oidc::txn::ops::saml::{
-    ActivateSamlCertificate, AddSamlCertificate, AddSamlVerificationCertificate, EnableSamlSso, RemoveSamlCertificate,
-    SaveSamlBasic, SetAppSignOnUrl, SetAppVisibility, SetSamlRequireSigned,
+    ActivateSamlCertificate, AddSamlCertificate, AddSamlVerificationCertificate, DisableSamlSso, EnableSamlSso,
+    RemoveSamlCertificate, SaveSamlBasic, SaveSamlSigning, SetAppSignOnUrl, SetAppVisibility, SetSamlRequireSigned,
 };
 use rust_oidc::txn::{self, Actor, Outcome};
 
@@ -613,6 +613,93 @@ async fn certificate_rollover_follows_the_active_certificate() {
         .await
         .into_result()
         .unwrap();
+}
+
+#[tokio::test]
+async fn stopping_saml_refuses_sign_in_and_keeps_the_configuration() {
+    let w = world().await;
+    let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
+    let certificates = saml::certificates(&w.s.pool, &app).await.unwrap();
+    let (b, _) = signed_in(&w).await;
+    let request = redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None);
+    let metadata = w.s.url(&format!(
+        "/{}/federationmetadata/2007-06/federationmetadata.xml?appid={}",
+        w.f.tenant.id, w.app_id
+    ));
+
+    let stop = DisableSamlSso {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &stop).await.into_result().unwrap();
+    assert_eq!(audit_rows(&w.s, Event::AdminAppSamlDisable.as_str()).await.len(), 1);
+    // A browser already signed in gets no assertion, and nobody is asked to sign in.
+    let page = b.get(&request).await;
+    assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
+    let page = Browser::new().get(&request).await;
+    assert!(page.field("csrf").is_none(), "{}", page.body);
+    assert_eq!(Browser::new().get(&metadata).await.status, 404);
+
+    // Choosing SAML again brings back what was there, certificate included.
+    let again = EnableSamlSso {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        certificate: NewCertificate::generate(saml::CERT_VALIDITY_DAYS).unwrap(),
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &again).await.into_result().unwrap();
+    let config = saml::config(&w.s.pool, &app).await.unwrap().unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.identifiers, vec![ENTITY.to_string()]);
+    assert_eq!(saml::certificates(&w.s.pool, &app).await.unwrap(), certificates);
+    let page = b.get(&request).await;
+    assert_eq!(status_codes(&response_of(&page)), vec![protocol::STATUS_SUCCESS]);
+}
+
+#[tokio::test]
+async fn the_signing_option_decides_what_is_signed() {
+    const NS_DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    let request = redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None);
+    // (the response is signed, the assertion is signed), with the algorithm named.
+    let cases = [
+        (
+            protocol::SigningOption::Assertion,
+            SigningAlgorithm::Sha256,
+            (false, true),
+        ),
+        (
+            protocol::SigningOption::Response,
+            SigningAlgorithm::Sha256,
+            (true, false),
+        ),
+        (protocol::SigningOption::Both, SigningAlgorithm::Sha1, (true, true)),
+    ];
+    for (option, algorithm, expected) in cases {
+        let save = SaveSamlSigning {
+            tenant_id: w.f.tenant.id.clone(),
+            app_id: w.app_id.clone(),
+            option,
+            algorithm,
+        };
+        txn::run(&w.s.pool, &Actor::Cli, &save).await.into_result().unwrap();
+        let response = response_of(&b.get(&request).await);
+        let assertion = response.child(NS_ASSERTION, "Assertion").unwrap();
+        let signed = (
+            response.child(NS_DS, "Signature").is_some(),
+            assertion.child(NS_DS, "Signature").is_some(),
+        );
+        assert_eq!(signed, expected, "{option:?}");
+        let method = [&response, assertion]
+            .iter()
+            .find_map(|n| n.child(NS_DS, "Signature"))
+            .and_then(|s| s.child(NS_DS, "SignedInfo"))
+            .and_then(|i| i.child(NS_DS, "SignatureMethod"))
+            .and_then(|m| m.attr("Algorithm"))
+            .unwrap();
+        assert_eq!(method, algorithm.signature_uri(), "{option:?}");
+    }
+    assert_eq!(audit_rows(&w.s, Event::AdminAppSamlSigning.as_str()).await.len(), 3);
 }
 
 #[tokio::test]

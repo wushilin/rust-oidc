@@ -332,6 +332,10 @@ pub async fn tab_page(
     }
 }
 
+/// Who may load a response as a subresource (Fetch's CORP header).
+const CROSS_ORIGIN_RESOURCE_POLICY: header::HeaderName =
+    header::HeaderName::from_static("cross-origin-resource-policy");
+
 /// `GET /{tenant}/myaccount/apps/{app}/logo`: the uploaded logo of an
 /// application in the signed-in user's own My apps, and nothing else. Served
 /// as the image type it was checked to be, never sniffed, and sandboxed.
@@ -342,7 +346,14 @@ pub async fn logo(
 ) -> Response {
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::IntoResponse;
-    let cache = || [(header::CACHE_CONTROL, "private, no-store")];
+    // `same-origin`: another site's page cannot load the image, so it cannot
+    // learn from whether one loads which applications this user has.
+    let cache = || {
+        [
+            (header::CACHE_CONTROL, "private, no-store"),
+            (CROSS_ORIGIN_RESOURCE_POLICY, "same-origin"),
+        ]
+    };
     let not_found = || (StatusCode::NOT_FOUND, cache()).into_response();
     let Ok(Some(tenant)) = tenant::resolve(&st.pool, &tenant_key).await else {
         return not_found();

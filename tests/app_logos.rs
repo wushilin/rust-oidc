@@ -242,6 +242,8 @@ async fn a_tile_shows_its_initials_its_library_icon_or_its_uploaded_image() {
     let h = served.headers().clone();
     assert_eq!(h["content-type"], "image/png");
     assert_eq!(h["cache-control"], "private, no-store");
+    // Another site's page cannot load it, so cannot probe for it.
+    assert_eq!(h["cross-origin-resource-policy"], "same-origin");
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert!(h["content-security-policy"].to_str().unwrap().contains("sandbox"));
     assert_eq!(served.bytes().await.unwrap().as_ref(), PNG);

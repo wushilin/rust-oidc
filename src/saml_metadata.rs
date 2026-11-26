@@ -91,6 +91,8 @@ fn saml_element_in_extensions(node: &Node) -> bool {
         || node.children.iter().any(saml_element_in_extensions)
 }
 
+const EXPIRED: &str = "The metadata has expired: its validUntil has passed.";
+
 /// Read a metadata file describing exactly one service provider.
 pub fn parse_sp_metadata(xml: &str) -> Result<SpMetadata, String> {
     read_sp_metadata(xml, &[], crate::util::now())
@@ -143,7 +145,7 @@ pub fn read_sp_metadata(xml: &str, known: &[String], now: i64) -> Result<SpMetad
         }
     };
     if expired {
-        return Err("The metadata has expired: its validUntil has passed.".into());
+        return Err(EXPIRED.into());
     }
     let entity_id = entity
         .attr("entityID")
@@ -154,6 +156,10 @@ pub fn read_sp_metadata(xml: &str, known: &[String], now: i64) -> Result<SpMetad
     let sp = saml2_roles(entity)
         .next()
         .ok_or("The file has no SAML 2.0 SPSSODescriptor.")?;
+    // A role carries its own validUntil (SAML Metadata 2.4.1).
+    if sp.attr("validUntil").and_then(parse_instant).is_some_and(|t| t <= now) {
+        return Err(EXPIRED.into());
+    }
 
     // (index, explicit isDefault, URL), in document order.
     let mut endpoints = Vec::new();
@@ -439,6 +445,17 @@ mod tests {
             r#"<md:EntitiesDescriptor xmlns:md="{NS_METADATA}" validUntil="2020-01-01T00:00:00Z">{entity}</md:EntitiesDescriptor>"#
         );
         assert!(read_sp_metadata(&group, &[], now).is_err());
+        let role = |when: &str| {
+            entity.replace(
+                "<md:SPSSODescriptor ",
+                &format!(r#"<md:SPSSODescriptor validUntil="{when}" "#),
+            )
+        };
+        assert_eq!(
+            read_sp_metadata(&role("2020-01-01T00:00:00Z"), &[], now).unwrap_err(),
+            EXPIRED
+        );
+        assert!(read_sp_metadata(&role("2040-01-01T00:00:00Z"), &[], now).is_ok());
     }
 
     #[test]

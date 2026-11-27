@@ -3,7 +3,7 @@
 Notable changes to rust-oidc. Releases before 0.6.0 are described on their
 [GitHub release pages](https://github.com/wushilin/rust-oidc/releases).
 
-## Unreleased
+## 0.7.0
 
 ### Added
 

@@ -46,6 +46,20 @@ p.hint { color:var(--muted); font-size:13px; margin:4px 0 0 24px; }
 ul.consent { list-style:none; padding:0; margin:12px 0; }
 ul.consent li { border:1px solid var(--border); padding:10px 14px; margin:8px 0; }
 .code { color:var(--muted); font-size:12px; word-break:break-all; margin-top:18px; }
+p.reason { margin:16px 0 0; overflow-wrap:anywhere; }
+nav.tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 16px; }
+nav.tabs a { padding:8px 12px; color:var(--muted); text-decoration:none; border-bottom:2px solid transparent; margin-bottom:-1px; }
+nav.tabs a[aria-current=page] { color:var(--fg); border-bottom-color:var(--accent); font-weight:600; }
+main.wide nav.tabs + h2, main.wide nav.tabs + p + h2 { border-top:none; margin-top:8px; padding-top:0; }
+ul.apps { list-style:none; padding:0; margin:8px 0; display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:12px; }
+ul.apps li, ul.apps form { margin:0; height:100%; }
+.tile { display:flex; flex-direction:column; align-items:center; gap:10px; width:100%; height:100%; padding:16px 8px; border:1px solid var(--border); border-radius:8px; background:none; color:var(--fg); font-weight:600; text-align:center; text-decoration:none; cursor:pointer; }
+.tile:hover, .tile:focus-visible { border-color:var(--accent); }
+.tile .name { overflow-wrap:anywhere; font-size:13.5px; }
+.logo { width:56px; height:56px; border-radius:10px; object-fit:contain; flex:none; }
+.logo.initials { display:flex; align-items:center; justify-content:center; color:#fff; font-size:21px; font-weight:650; }
+details.trouble { color:var(--muted); font-size:12px; margin-top:22px; }
+details.trouble summary { cursor:pointer; color:var(--accent); font-size:13px; }
 main.wide { max-width:600px; }
 main.wide h2 { font-size:16px; margin:28px 0 6px; padding-top:18px; border-top:1px solid var(--border); }
 dl.profile { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:8px 0; }
@@ -92,6 +106,9 @@ fn respond(status: StatusCode, html: String, csp: &str) -> Response {
 
 const CSP_DEFAULT: &str =
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/// My Account's: the default, and its applications' uploaded logos from here.
+const CSP_ACCOUNT: &str = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 /// The policy for a sign-in page whose form the server may answer with a
 /// redirect to the client. Chrome holds a redirect that follows a form
@@ -626,6 +643,83 @@ pub struct MyAccount<'a> {
     pub new_codes: Option<&'a [String]>,
     /// The applications this user can open.
     pub apps: &'a [crate::saml::GalleryApp],
+    /// The tab shown.
+    pub tab: AccountTab,
+}
+
+/// My Account's tabs, each its own address under the page's: the page is
+/// script-free, so a tab is a link and the server shows one at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountTab {
+    Apps,
+    Profile,
+    Security,
+}
+
+impl AccountTab {
+    pub const ALL: &'static [AccountTab] = &[Self::Apps, Self::Profile, Self::Security];
+
+    /// Its path segment after `myaccount/`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Apps => "apps",
+            Self::Profile => "profile",
+            Self::Security => "security",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Apps => "My apps",
+            Self::Profile => "Profile",
+            Self::Security => "Security",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|t| t.as_str() == raw)
+    }
+
+    /// Where an operation's outcome is shown: opening an application is on My
+    /// apps; everything else is about signing in.
+    pub fn of(op: AccountOp) -> Self {
+        match op {
+            AccountOp::LaunchApp => Self::Apps,
+            AccountOp::Password
+            | AccountOp::MfaSetup
+            | AccountOp::MfaReplace
+            | AccountOp::RecoveryCodes
+            | AccountOp::SignOutEverywhere => Self::Security,
+        }
+    }
+}
+
+/// The path, under My Account's, of an application's uploaded logo.
+pub fn account_logo_path(app_id: &str, version: i64) -> String {
+    format!("apps/{}/logo?v={version}", url_segment(app_id))
+}
+
+fn url_segment(raw: &str) -> String {
+    url::form_urlencoded::byte_serialize(raw.as_bytes()).collect()
+}
+
+/// An application's logo on its tile: its library icon, its uploaded image
+/// (served from `logo_base`, My Account's own address), or its initials.
+fn app_logo(app: &crate::saml::GalleryApp, logo_base: &str) -> String {
+    use crate::logos::{self, Shown};
+    match app.logo {
+        Some(Shown::Library(icon)) => icon.svg(),
+        Some(Shown::Image { version }) => format!(
+            r#"<img class="logo" src="{}/{}" alt="">"#,
+            escape(logo_base),
+            escape(&account_logo_path(&app.app_id, version))
+        ),
+        None => format!(
+            r#"<span class="logo initials" style="background:{}" aria-hidden="true">{}</span>"#,
+            logos::initials_colour(&app.app_id),
+            escape(&logos::initials(&app.display_name))
+        ),
+    }
 }
 
 /// The `op` values My Account's forms carry.
@@ -750,63 +844,106 @@ pub fn my_account(p: &MyAccount) -> Response {
     );
     // A Sign on URL is a plain link, so the application starts its own sign-in.
     // Without one, a SAML application is opened by a post with this page's CSRF
-    // token: an IdP-initiated sign-in nobody else can start for this user.
+    // token: an IdP-initiated sign-in nobody else can start for this user. Either
+    // way the whole tile, logo and name, is what is clicked.
     let tiles: String = p
         .apps
         .iter()
-        .map(|a| match &a.sign_on_url {
-            Some(url) => format!(
-                r#"<li><a href="{}" rel="noopener noreferrer">{}</a></li>"#,
-                escape(url),
-                escape(&a.display_name)
-            ),
-            None => format!(
-                "<li>{}</li>",
-                form(
-                    AccountOp::LaunchApp,
-                    &format!(
-                        r#"<input type="hidden" name="{LAUNCH_APP}" value="{}">"#,
-                        escape(&a.app_id)
-                    ),
-                    &a.display_name,
-                    "secondary"
-                )
-            ),
+        .map(|a| {
+            let face = format!(
+                r#"{logo}<span class="name">{name}</span>"#,
+                logo = app_logo(a, p.action),
+                name = escape(&a.display_name)
+            );
+            match &a.sign_on_url {
+                Some(url) => format!(
+                    r#"<li><a class="tile" href="{}" rel="noopener noreferrer">{face}</a></li>"#,
+                    escape(url)
+                ),
+                None => format!(
+                    r#"<li><form method="post" action="{action}"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="op" value="{op}"><input type="hidden" name="{LAUNCH_APP}" value="{app}"><button type="submit" class="tile">{face}</button></form></li>"#,
+                    action = escape(p.action),
+                    csrf = escape(p.csrf),
+                    op = AccountOp::LaunchApp.as_str(),
+                    app = escape(&a.app_id),
+                ),
+            }
         })
         .collect();
-    let gallery = if tiles.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<h2>My apps</h2><ul class="apps">{tiles}</ul>"#)
-    };
-    let body = format!(
-        r#"<h1>My account</h1><p class="sub">{upn}</p>{banner}{codes}{gallery}
-<h2>Profile</h2><dl class="profile">{name}{given}{family}{user}{email}</dl>
-<p class="sub">Ask an administrator to change these.</p>
-<h2>Password</h2>{password}
+    let content = match p.tab {
+        AccountTab::Apps if tiles.is_empty() => {
+            r#"<p class="sub">No applications are assigned to you yet. An administrator assigns them.</p>"#.to_string()
+        }
+        AccountTab::Apps => format!(r#"<ul class="apps">{tiles}</ul>"#),
+        AccountTab::Profile => format!(
+            r#"<dl class="profile">{name}{given}{family}{user}{email}</dl>
+<p class="sub">Ask an administrator to change these.</p>"#,
+            name = row("Name", p.display_name),
+            given = row("Given name", p.given_name),
+            family = row("Family name", p.family_name),
+            user = row("User name", Some(p.upn)),
+            email = row("Email", p.email),
+        ),
+        AccountTab::Security => format!(
+            r#"<h2>Password</h2>{password}
 <h2>Multi-factor authentication</h2>{mfa}
 <h2>Sessions</h2><p>Sign out of every browser and application you are signed in to, this one included.
 Browsers you told not to ask for a code again will ask again.</p>{everywhere}"#,
+            everywhere = form(AccountOp::SignOutEverywhere, "", "Sign out everywhere", "secondary"),
+        ),
+    };
+    let tabs: String = AccountTab::ALL
+        .iter()
+        .map(|t| {
+            format!(
+                r#"<a href="{base}/{seg}"{current}>{label}</a>"#,
+                base = escape(p.action),
+                seg = t.as_str(),
+                current = if *t == p.tab { r#" aria-current="page""# } else { "" },
+                label = t.label(),
+            )
+        })
+        .collect();
+    let body = format!(
+        r#"<h1>My account</h1><p class="sub">{upn}</p><nav class="tabs" aria-label="My account">{tabs}</nav>{banner}{codes}{content}"#,
         upn = escape(p.upn),
-        name = row("Name", p.display_name),
-        given = row("Given name", p.given_name),
-        family = row("Family name", p.family_name),
-        user = row("User name", Some(p.upn)),
-        email = row("Email", p.email),
-        everywhere = form(AccountOp::SignOutEverywhere, "", "Sign out everywhere", "secondary"),
     );
     let status = if p.error.is_some() {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::OK
     };
-    respond(status, wide_page("My account", Some(p.tenant_name), &body), CSP_DEFAULT)
+    respond(
+        status,
+        wide_page(&format!("{} - My account", p.tab.label()), Some(p.tenant_name), &body),
+        CSP_ACCOUNT,
+    )
 }
 
 pub fn error(tenant_name: Option<&str>, message: &str) -> Response {
     let body = format!(
-        r#"<h1>Sorry, but we're having trouble signing you in.</h1><p class="code">{}</p>"#,
+        r#"<h1>Sorry, but we're having trouble signing you in.</h1><p class="reason">{}</p>"#,
         escape(message)
+    );
+    respond(
+        StatusCode::BAD_REQUEST,
+        page("Sign in error", tenant_name, &body),
+        CSP_DEFAULT,
+    )
+}
+
+/// A sign-in that ends in an AADSTS error, laid out as Entra's page is: the
+/// reason in plain text first, the identifiers for whoever investigates it
+/// under "Troubleshooting details".
+pub fn sign_in_error(tenant_name: Option<&str>, err: &crate::error::AadError) -> Response {
+    let t = err.troubleshooting();
+    let body = format!(
+        r#"<h1>Sorry, but we're having trouble signing you in.</h1><p class="reason">{headline}</p><details class="trouble"><summary>Troubleshooting details</summary><dl class="profile"><dt>Error code</dt><dd>AADSTS{code}</dd><dt>Trace ID</dt><dd>{trace}</dd><dt>Correlation ID</dt><dd>{correlation}</dd><dt>Timestamp</dt><dd>{timestamp}</dd></dl></details>"#,
+        headline = escape(&err.headline()),
+        code = err.code.code(),
+        trace = escape(&t.trace_id),
+        correlation = escape(&t.correlation_id),
+        timestamp = escape(&t.timestamp),
     );
     respond(
         StatusCode::BAD_REQUEST,

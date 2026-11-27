@@ -19,7 +19,10 @@ use sha1::{Digest, Sha1};
 
 use crate::apps::{Application, ServicePrincipal};
 use crate::db::{Conn, Flag, Handle};
-use crate::saml_protocol::{self as protocol, NameIdFormat, SigningAlgorithm, SigningOption};
+use crate::saml_protocol::{
+    self as protocol, ContentEncryption, EncryptionAlgorithms, KeyTransport, KeyTransportDigest, NameIdFormat,
+    SigningAlgorithm, SigningOption,
+};
 use crate::tenant::Tenant;
 use crate::users::User;
 use crate::util::{b64, new_guid, now};
@@ -30,8 +33,14 @@ pub const SSO_MODE_SAML: &str = "saml";
 /// How long a signing certificate is valid by default, and at most: three years.
 pub const CERT_VALIDITY_DAYS: i64 = 3 * 365;
 
-/// The longest Identifier or URL accepted, matching the indexed column.
+/// The longest URL or claim name accepted, matching the indexed column.
 pub const MAX_URI_CHARS: usize = 512;
+/// The longest Identifier (Entity ID) accepted: SAML Metadata 2.3.2 bounds
+/// `entityIDType` at 1024 characters, and a 1024-character one must be taken.
+pub const MAX_ENTITY_ID_CHARS: usize = 1024;
+/// The old 512-character limit allowed up to 2048 UTF-8 bytes. Preserve that
+/// range while keeping the full identifier within PostgreSQL's B-tree limit.
+const MAX_ENTITY_ID_BYTES: usize = 2048;
 /// The most Identifiers or Reply URLs an application may have.
 pub const MAX_URIS: usize = 32;
 /// The most custom claims an application may have.
@@ -65,6 +74,7 @@ closed_set!(
         Mail => "mail", "user.mail",
         ObjectId => "objectId", "user.objectid",
         PairwiseId => "pairwiseId", "user.pairwiseid",
+        PairwiseIdLowercase => "pairwiseIdLowercase", "user.pairwiseid (lowercase hex)",
     }
 );
 
@@ -168,13 +178,86 @@ pub fn thumbprint(der: &[u8]) -> String {
     hex::encode_upper(Sha1::digest(der))
 }
 
+/// A service provider's certificate as given to us: its DER and validity. The
+/// key may be RSA or EC; [`add_verification_certificate_in`] decides whether a
+/// request can be verified with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenCertificate {
+    pub der: Vec<u8>,
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+impl GivenCertificate {
+    pub fn from_der(der: &[u8]) -> anyhow::Result<Self> {
+        use x509_cert::der::{Decode, Encode};
+        let cert = x509_cert::Certificate::from_der(der).map_err(|_| anyhow::anyhow!("not an X.509 certificate"))?;
+        let validity = cert.tbs_certificate().validity();
+        Ok(Self {
+            der: cert.to_der()?,
+            not_before: validity.not_before.to_unix_duration().as_secs() as i64,
+            not_after: validity.not_after.to_unix_duration().as_secs() as i64,
+        })
+    }
+
+    pub fn from_pem(pem: &str) -> anyhow::Result<Self> {
+        use x509_cert::der::{DecodePem, Encode};
+        let cert = x509_cert::Certificate::from_pem(pem.as_bytes())
+            .map_err(|_| anyhow::anyhow!("not a PEM X.509 certificate"))?;
+        Self::from_der(&cert.to_der()?)
+    }
+
+    pub fn pem(&self) -> String {
+        let body: Vec<String> = b64(&self.der)
+            .as_bytes()
+            .chunks(64)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect();
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            body.join("\n")
+        )
+    }
+}
+
+/// One Reply URL (Assertion Consumer Service URL), with the index a request
+/// may name it by and whether it is the one used when a request names none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyUrl {
+    pub url: String,
+    pub index: u16,
+    pub default: bool,
+}
+
+impl ReplyUrl {
+    /// URLs in order: each indexed by its position, the first the default.
+    pub fn listed(urls: impl IntoIterator<Item = String>) -> Vec<ReplyUrl> {
+        urls.into_iter()
+            .enumerate()
+            .map(|(i, url)| ReplyUrl {
+                url,
+                index: u16::try_from(i).unwrap_or(u16::MAX),
+                default: i == 0,
+            })
+            .collect()
+    }
+
+    /// Whether these are exactly what `listed` would make of their URLs.
+    pub fn is_plain_list(replies: &[ReplyUrl]) -> bool {
+        replies
+            .iter()
+            .enumerate()
+            .all(|(i, r)| usize::from(r.index) == i && r.default == (i == 0))
+    }
+}
+
 /// Basic SAML Configuration, as read from a form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasicConfig {
     /// The first is the default.
     pub identifiers: Vec<String>,
-    /// The first is the default; the position is the index.
-    pub reply_urls: Vec<String>,
+    /// Exactly one is the default; indexes are distinct.
+    pub reply_urls: Vec<ReplyUrl>,
     pub sign_on_url: Option<String>,
     pub relay_state: Option<String>,
     pub logout_url: Option<String>,
@@ -222,16 +305,28 @@ impl BasicConfig {
             return Some(format!("An application may have at most {MAX_URIS} of each."));
         }
         for id in &self.identifiers {
-            if id.chars().count() > MAX_URI_CHARS || has_control(id) || id.trim() != id {
+            if id.len() > MAX_ENTITY_ID_BYTES
+                || id.chars().count() > MAX_ENTITY_ID_CHARS
+                || has_control(id)
+                || id.trim() != id
+            {
                 return Some(format!("Identifier '{id}' is not valid."));
             }
         }
         let distinct = |v: &[String]| v.iter().collect::<std::collections::BTreeSet<_>>().len() == v.len();
-        if !distinct(&self.identifiers) || !distinct(&self.reply_urls) {
+        let urls: Vec<String> = self.reply_urls.iter().map(|r| r.url.clone()).collect();
+        if !distinct(&self.identifiers) || !distinct(&urls) {
             return Some("The same value is listed twice.".into());
         }
+        let indexes: std::collections::BTreeSet<u16> = self.reply_urls.iter().map(|r| r.index).collect();
+        if indexes.len() != self.reply_urls.len() {
+            return Some("Two Reply URLs have the same index.".into());
+        }
+        if self.reply_urls.iter().filter(|r| r.default).count() != 1 {
+            return Some("Exactly one Reply URL must be the default.".into());
+        }
         for reply in &self.reply_urls {
-            if let Some(problem) = url_problem("Reply URL", reply) {
+            if let Some(problem) = url_problem("Reply URL", &reply.url) {
                 return Some(problem);
             }
         }
@@ -298,7 +393,8 @@ pub struct SamlConfig {
     /// `Some` while SAML is the application's single sign-on method.
     pub enabled: bool,
     pub identifiers: Vec<String>,
-    pub reply_urls: Vec<String>,
+    /// In index order.
+    pub reply_urls: Vec<ReplyUrl>,
     pub sign_on_url: Option<String>,
     pub relay_state: Option<String>,
     pub logout_url: Option<String>,
@@ -308,6 +404,8 @@ pub struct SamlConfig {
     pub signing_algorithm: SigningAlgorithm,
     pub require_signed_requests: bool,
     pub encryption_cert: Option<Vec<u8>>,
+    /// How assertions are encrypted when there is a certificate.
+    pub encryption_algorithms: EncryptionAlgorithms,
     pub claims: Vec<Claim>,
 }
 
@@ -317,7 +415,11 @@ impl SamlConfig {
     }
 
     pub fn default_reply_url(&self) -> Option<&str> {
-        self.reply_urls.first().map(String::as_str)
+        self.reply_urls
+            .iter()
+            .find(|r| r.default)
+            .or_else(|| self.reply_urls.first())
+            .map(|r| r.url.as_str())
     }
 
     /// Basic SAML Configuration is complete enough to sign anyone in.
@@ -329,11 +431,12 @@ impl SamlConfig {
     /// default. A URL that is not registered is never used.
     pub fn reply_url_for(&self, requested: Option<&str>, index: Option<i64>) -> Option<&str> {
         match (requested, index) {
-            (Some(url), _) => self.reply_urls.iter().find(|r| *r == url).map(String::as_str),
-            (None, Some(i)) => usize::try_from(i)
-                .ok()
-                .and_then(|i| self.reply_urls.get(i))
-                .map(String::as_str),
+            (Some(url), _) => self.reply_urls.iter().find(|r| r.url == url).map(|r| r.url.as_str()),
+            (None, Some(i)) => self
+                .reply_urls
+                .iter()
+                .find(|r| i64::from(r.index) == i)
+                .map(|r| r.url.as_str()),
             (None, None) => self.default_reply_url(),
         }
     }
@@ -381,6 +484,9 @@ type SettingsRow = (
     String,
     Flag,
     Option<String>,
+    String,
+    String,
+    String,
 );
 
 /// The application's SAML configuration, or `None` if SAML was never chosen.
@@ -393,14 +499,34 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
     let row: Option<SettingsRow> = sqlx::query_as(crate::db::qc(
         conn,
         "SELECT tenant_id, relay_state, logout_url, name_id_format, name_id_source, signing_option,
-                signing_algorithm, require_signed_requests, encryption_cert_b64
+                signing_algorithm, require_signed_requests, encryption_cert_b64,
+                encryption_method, key_transport, key_transport_digest
          FROM app_saml_settings WHERE application_id = ?",
     ))
     .bind(&app.id)
     .fetch_optional(&mut *conn)
     .await?;
-    let Some((tenant_id, relay_state, logout_url, format, source, option, algorithm, require, encryption)) = row else {
+    let Some((
+        tenant_id,
+        relay_state,
+        logout_url,
+        format,
+        source,
+        option,
+        algorithm,
+        require,
+        encryption,
+        content,
+        transport,
+        digest,
+    )) = row
+    else {
         return Ok(None);
+    };
+    let encryption_algorithms = EncryptionAlgorithms {
+        content: ContentEncryption::parse(&content).ok_or_else(|| anyhow!("unknown encryption method '{content}'"))?,
+        transport: KeyTransport::parse(&transport).ok_or_else(|| anyhow!("unknown key transport '{transport}'"))?,
+        digest: KeyTransportDigest::parse(&digest).ok_or_else(|| anyhow!("unknown key transport digest '{digest}'"))?,
     };
     let (mode, sign_on_url): (Option<String>, Option<String>) = sqlx::query_as(crate::db::qc(
         conn,
@@ -419,9 +545,9 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
     .bind(&app.id)
     .fetch_all(&mut *conn)
     .await?;
-    let replies: Vec<(String,)> = sqlx::query_as(crate::db::qc(
+    let replies: Vec<(String, i64, crate::db::Flag)> = sqlx::query_as(crate::db::qc(
         conn,
-        "SELECT url FROM app_saml_reply_urls WHERE application_id = ? ORDER BY url_index",
+        "SELECT url, url_index, is_default FROM app_saml_reply_urls WHERE application_id = ? ORDER BY url_index",
     ))
     .bind(&app.id)
     .fetch_all(&mut *conn)
@@ -443,7 +569,16 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
         tenant_id,
         enabled: mode.as_deref() == Some(SSO_MODE_SAML),
         identifiers: identifiers.into_iter().map(|(v,)| v).collect(),
-        reply_urls: replies.into_iter().map(|(v,)| v).collect(),
+        reply_urls: replies
+            .into_iter()
+            .map(|(url, index, default)| {
+                Ok(ReplyUrl {
+                    url,
+                    index: u16::try_from(index).map_err(|_| anyhow!("Reply URL index {index} is out of range"))?,
+                    default: default.into(),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?,
         sign_on_url,
         relay_state,
         logout_url,
@@ -453,6 +588,7 @@ pub(crate) async fn config_in(conn: &mut Conn, app: &Application) -> anyhow::Res
         signing_algorithm: SigningAlgorithm::parse(&algorithm).ok_or_else(|| anyhow!("unknown signing algorithm"))?,
         require_signed_requests: require.into(),
         encryption_cert: encryption.as_deref().map(unb64).transpose()?,
+        encryption_algorithms,
         claims,
     }))
 }
@@ -603,8 +739,9 @@ pub(crate) async fn enable_in(
         sqlx::query(crate::db::qc(
             conn,
             "INSERT INTO app_saml_settings (application_id, tenant_id, name_id_format, name_id_source,
-                                            signing_option, signing_algorithm, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                            signing_option, signing_algorithm, encryption_method,
+                                            key_transport, key_transport_digest, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ))
         .bind(&app.id)
         .bind(&tenant.id)
@@ -612,6 +749,9 @@ pub(crate) async fn enable_in(
         .bind(NameIdSource::UserPrincipalName.as_str())
         .bind(SigningOption::Assertion.as_str())
         .bind(SigningAlgorithm::Sha256.as_str())
+        .bind(EncryptionAlgorithms::RECOMMENDED.content.as_str())
+        .bind(EncryptionAlgorithms::RECOMMENDED.transport.as_str())
+        .bind(EncryptionAlgorithms::RECOMMENDED.digest.as_str())
         .bind(ts)
         .execute(&mut *conn)
         .await?;
@@ -739,15 +879,15 @@ pub(crate) async fn save_basic_in(
     .bind(&app.id)
     .execute(&mut *conn)
     .await?;
-    for (i, url) in basic.reply_urls.iter().enumerate() {
+    for reply in &basic.reply_urls {
         sqlx::query(crate::db::qc(
             conn,
             "INSERT INTO app_saml_reply_urls (application_id, url, url_index, is_default) VALUES (?, ?, ?, ?)",
         ))
         .bind(&app.id)
-        .bind(url)
-        .bind(i as i64)
-        .bind(i == 0)
+        .bind(&reply.url)
+        .bind(i64::from(reply.index))
+        .bind(reply.default)
         .execute(&mut *conn)
         .await?;
     }
@@ -892,14 +1032,8 @@ pub(crate) async fn remove_certificate_in(conn: &mut Conn, app: &Application, id
 
 /// Require signed requests, or stop. Requiring needs a verification certificate.
 pub(crate) async fn set_require_signed_in(conn: &mut Conn, app: &Application, required: bool) -> anyhow::Result<()> {
-    let at = now();
-    if required
-        && !verification_certificates_in(conn, app)
-            .await?
-            .iter()
-            .any(|c| c.not_after > at)
-    {
-        bail!("Add a valid verification certificate before requiring signed requests.");
+    if required && verification_certificates_in(conn, app).await?.is_empty() {
+        bail!("Add a verification certificate before requiring signed requests.");
     }
     sqlx::query(crate::db::qc(
         conn,
@@ -913,19 +1047,19 @@ pub(crate) async fn set_require_signed_in(conn: &mut Conn, app: &Application, re
 }
 
 /// Add a public certificate that verifies this application's signed requests.
+///
+/// Only its key is used. As the SAML V2.0 Metadata Interoperability Profile
+/// requires, nothing else in it (validity dates, extensions, key usage, subject
+/// or issuer) stops the key from verifying: an expired certificate's key works
+/// until an administrator removes it. Its expiry is kept to show.
 pub(crate) async fn add_verification_certificate_in(
     conn: &mut Conn,
     app: &Application,
     cert_der: &[u8],
-    not_before: i64,
     not_after: i64,
 ) -> anyhow::Result<String> {
-    if !protocol::usable_rsa_certificate(cert_der) {
-        bail!("The certificate must hold an RSA public key.");
-    }
-    let at = now();
-    if not_before > at || not_after <= at {
-        bail!("That certificate is not currently valid.");
+    if !protocol::usable_verification_certificate(cert_der) {
+        bail!("The certificate must hold an RSA public key, or an EC key on P-256 or P-384.");
     }
     let print = thumbprint(cert_der);
     if verification_certificates_in(conn, app)
@@ -963,10 +1097,8 @@ pub(crate) async fn remove_verification_certificate_in(
         bail!("There is no such certificate on this application.");
     };
     let required = config_in(conn, app).await?.is_some_and(|c| c.require_signed_requests);
-    let at = now();
-    let others_valid = found.iter().any(|c| c.id != id && c.not_after > at);
-    if required && !others_valid {
-        bail!("Stop requiring signed requests before removing the last valid verification certificate.");
+    if required && !found.iter().any(|c| c.id != id) {
+        bail!("Stop requiring signed requests before removing the last verification certificate.");
     }
     sqlx::query(crate::db::qc(
         conn,
@@ -979,22 +1111,50 @@ pub(crate) async fn remove_verification_certificate_in(
     Ok(certificate.thumbprint.clone())
 }
 
-/// Encrypt assertions to this certificate, or stop (`None`).
+/// What a change to token encryption does to the certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionCertificate<'a> {
+    /// Keep the one in use (or none), changing only how it is used.
+    Keep,
+    /// Encrypt to this certificate's key from now on.
+    Use(&'a [u8]),
+    /// Stop encrypting.
+    Stop,
+}
+
+/// Set how assertions are encrypted, and to which certificate.
 pub(crate) async fn set_encryption_in(
     conn: &mut Conn,
     app: &Application,
-    cert_der: Option<&[u8]>,
+    certificate: EncryptionCertificate<'_>,
+    algorithms: EncryptionAlgorithms,
 ) -> anyhow::Result<()> {
-    if let Some(der) = cert_der
+    if let EncryptionCertificate::Use(der) = certificate
         && !protocol::usable_rsa_certificate(der)
     {
         bail!("The certificate must hold an RSA public key.");
     }
     sqlx::query(crate::db::qc(
         conn,
+        "UPDATE app_saml_settings SET encryption_method = ?, key_transport = ?, key_transport_digest = ?
+         WHERE application_id = ?",
+    ))
+    .bind(algorithms.content.as_str())
+    .bind(algorithms.transport.as_str())
+    .bind(algorithms.digest.as_str())
+    .bind(&app.id)
+    .execute(&mut *conn)
+    .await?;
+    let cert = match certificate {
+        EncryptionCertificate::Keep => return Ok(()),
+        EncryptionCertificate::Use(der) => Some(b64(der)),
+        EncryptionCertificate::Stop => None,
+    };
+    sqlx::query(crate::db::qc(
+        conn,
         "UPDATE app_saml_settings SET encryption_cert_b64 = ? WHERE application_id = ?",
     ))
-    .bind(cert_der.map(b64))
+    .bind(cert)
     .bind(&app.id)
     .execute(&mut *conn)
     .await?;
@@ -1532,10 +1692,23 @@ pub struct GalleryApp {
     pub display_name: String,
     pub sign_on_url: Option<String>,
     pub is_saml: bool,
+    /// What its tile shows; `None` for its initials.
+    pub logo: Option<crate::logos::Shown>,
 }
 
-/// app id, tenant, name, Sign on URL, single sign-on mode, accepts other tenants.
-type GalleryRow = (String, String, String, Option<String>, Option<String>, Flag);
+/// app id, tenant, name, Sign on URL, single sign-on mode, accepts other
+/// tenants; then its logo: library icon, image content type, updated at.
+type GalleryRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Flag,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
 
 /// The enabled, visible applications this user is assigned to, directly or
 /// through a group, that can be launched: a Sign on URL, or SAML configured so
@@ -1548,10 +1721,11 @@ pub async fn gallery<'c>(db: impl Handle<'c>, home_tenant_id: &str, user_id: &st
     let rows: Vec<GalleryRow> = sqlx::query_as(crate::db::qc(
         conn,
         "SELECT DISTINCT a.app_id, sp.tenant_id, a.display_name, a.sign_on_url, sp.preferred_sso_mode,
-                sp.accept_other_tenants
+                sp.accept_other_tenants, l.library_icon, l.content_type, l.updated_at
          FROM app_assignments x
          JOIN service_principals sp ON sp.id = x.resource_id
          JOIN applications a ON a.app_id = sp.app_id AND a.deleted_at IS NULL
+         LEFT JOIN app_logos l ON l.application_id = a.id
          WHERE sp.enabled = ? AND sp.visible_to_users = ?
            AND ((x.principal_type = ? AND x.principal_id = ?)
              OR (x.principal_type = ? AND x.principal_id IN
@@ -1571,7 +1745,7 @@ pub async fn gallery<'c>(db: impl Handle<'c>, home_tenant_id: &str, user_id: &st
         None => false,
     };
     let mut out = Vec::with_capacity(rows.len());
-    for (app_id, tenant_id, display_name, sign_on_url, mode, accepts_others) in rows {
+    for (app_id, tenant_id, display_name, sign_on_url, mode, accepts_others, icon, image_type, logo_at) in rows {
         if tenant_id != home_tenant_id {
             let accepts: bool = accepts_others.into();
             let live = crate::tenant::resolve_in(&mut *conn, &tenant_id).await?.is_some();
@@ -1597,17 +1771,29 @@ pub async fn gallery<'c>(db: impl Handle<'c>, home_tenant_id: &str, user_id: &st
                 display_name,
                 sign_on_url,
                 is_saml,
+                logo: logo_at.and_then(|at| crate::logos::Shown::from_row(icon.as_deref(), image_type.is_some(), at)),
             });
         }
     }
     Ok(out)
 }
 
-/// What the assertion says the user's Name ID is. The value always comes from
-/// the configured source: a request may choose a compatible format, but never
-/// which user property identifies the user. As in Entra, `persistent` is the
-/// pairwise identifier and `transient` is generated; an empty source falls back
-/// to the user principal name.
+/// The pairwise identifier as lowercase hex, for an application that compares
+/// Name IDs without regard to case.
+fn lowercase_pairwise(pairwise: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(pairwise)
+        .map(hex::encode)
+        .unwrap_or_else(|_| pairwise.to_ascii_lowercase())
+}
+
+/// What the assertion says the user's Name ID is. The value comes from the
+/// configured source: a request may choose a compatible format, but never which
+/// user property identifies the user. `persistent` is always this application's
+/// own pairwise identifier (lowercase hex if that is the chosen source), so it is
+/// never a name such as a UPN that other applications also see; `transient` is
+/// generated; an empty source falls back to the user principal name.
 pub fn name_id_for(
     config: &SamlConfig,
     requested: Option<NameIdFormat>,
@@ -1616,17 +1802,24 @@ pub fn name_id_for(
 ) -> Result<(String, NameIdFormat), protocol::SamlError> {
     let app_tenant_id = config.tenant_id.as_str();
     let format = requested.unwrap_or(config.name_id_format);
+    let own_pairwise = match config.name_id_source {
+        NameIdSource::PairwiseIdLowercase => lowercase_pairwise(pairwise),
+        _ => pairwise.to_string(),
+    };
     let configured = match config.name_id_source {
         NameIdSource::UserPrincipalName => user.upn.clone(),
         NameIdSource::Mail => trusted_email(user, app_tenant_id).unwrap_or_else(|| user.upn.clone()),
         NameIdSource::ObjectId => user.id.clone(),
-        NameIdSource::PairwiseId => pairwise.to_string(),
+        NameIdSource::PairwiseId | NameIdSource::PairwiseIdLowercase => own_pairwise.clone(),
     };
     let value = match (format, requested.is_some()) {
         (NameIdFormat::Transient, _) => protocol::new_id(),
-        (NameIdFormat::Persistent, true) => pairwise.to_string(),
+        (NameIdFormat::Persistent, _) => own_pairwise,
         (NameIdFormat::EmailAddress, true)
-            if matches!(config.name_id_source, NameIdSource::ObjectId | NameIdSource::PairwiseId) =>
+            if matches!(
+                config.name_id_source,
+                NameIdSource::ObjectId | NameIdSource::PairwiseId | NameIdSource::PairwiseIdLowercase
+            ) =>
         {
             return Err(protocol::SamlError {
                 status: protocol::STATUS_REQUESTER,

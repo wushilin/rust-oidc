@@ -73,6 +73,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("AdminRoleRevoke", "admin.role.revoke"),
     ("AdminAppCreate", "admin.app.create"),
     ("AdminAppRename", "admin.app.rename"),
+    ("AdminAppLogo", "admin.app.logo"),
     ("AdminAppFlags", "admin.app.flags"),
     ("AdminAppIdentifierUriAdd", "admin.app.identifier_uri.add"),
     ("AdminAppIdentifierUriRemove", "admin.app.identifier_uri.remove"),

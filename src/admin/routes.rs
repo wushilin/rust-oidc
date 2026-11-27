@@ -37,6 +37,56 @@ pub fn parse_form(raw: &[u8]) -> Params {
     url::form_urlencoded::parse(raw).into_owned().collect()
 }
 
+/// A `multipart/form-data` post that could not be read.
+#[derive(Debug)]
+pub struct UnreadableUpload;
+
+/// The fields of a `multipart/form-data` post, a file's as its text: `Ok(None)`
+/// when the post is not multipart.
+pub async fn parse_multipart(headers: &HeaderMap, body: Bytes) -> Result<Option<Params>, UnreadableUpload> {
+    Ok(parse_multipart_with(headers, body, &[])
+        .await?
+        .map(|(fields, _)| fields))
+}
+
+/// Uploaded files kept as bytes, by field name.
+pub type Files = std::collections::HashMap<String, Vec<u8>>;
+
+/// As [`parse_multipart`], except that the fields named in `binary` are kept as
+/// bytes, in [`Files`], rather than read as text: an image is not text.
+pub async fn parse_multipart_with(
+    headers: &HeaderMap,
+    body: Bytes,
+    binary: &[&str],
+) -> Result<Option<(Params, Files)>, UnreadableUpload> {
+    use axum::extract::{FromRequest, Multipart};
+    let Some(content_type) = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
+        return Ok(None);
+    };
+    if !content_type.starts_with("multipart/form-data") {
+        return Ok(None);
+    }
+    let request = axum::http::Request::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .body(axum::body::Body::from(body))
+        .map_err(|_| UnreadableUpload)?;
+    let mut multipart = Multipart::from_request(request, &())
+        .await
+        .map_err(|_| UnreadableUpload)?;
+    let (mut fields, mut files) = (Params::new(), Files::new());
+    while let Some(part) = multipart.next_field().await.map_err(|_| UnreadableUpload)? {
+        let name = part.name().ok_or(UnreadableUpload)?.to_string();
+        if binary.contains(&name.as_str()) {
+            let bytes = part.bytes().await.map_err(|_| UnreadableUpload)?;
+            files.entry(name).or_insert_with(|| bytes.to_vec());
+        } else {
+            let value = part.text().await.map_err(|_| UnreadableUpload)?;
+            fields.entry(name).or_insert(value);
+        }
+    }
+    Ok(Some((fields, files)))
+}
+
 /// A field as a trimmed `&str`, empty when absent.
 pub fn field<'a>(form: &'a Params, name: &str) -> &'a str {
     form.get(name).map(|v| v.trim()).unwrap_or_default()

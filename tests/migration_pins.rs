@@ -7,8 +7,8 @@
 //! would not start there. These tests find such a mismatch in CI instead.
 //!
 //! The checksums are copied from `_sqlx_migrations` on the deployed SQLite
-//! database (gate.wushilin.net), taken 2026-11-04, after its records were
-//! aligned with `main` (decision 48). They are written out by hand
+//! database (gate.wushilin.net), taken 2026-11-04 after its records were
+//! aligned with `main` (decision 48); 22 to 28 taken 2026-11-27. They are written out by hand
 //! on purpose: an applied migration never changes, so neither may these. Add a
 //! line when a migration is first deployed; never edit one.
 
@@ -122,6 +122,41 @@ const DEPLOYED_SQLITE: &[(i64, &str, &str)] = &[
         "remember",
         "bb360498c05b2d687fa6e8f7f49babe04e155d89361eff4f266335191573e94c64becbb6950261774fb64f06453aba9f",
     ),
+    (
+        22,
+        "mfa setup snooze",
+        "344752b02304e4b0b34005de7e680c4167090dcf4e3ae82b9b83f91ae7cf33b7dbe8cd7201f6839dde9636f8f580cc5e",
+    ),
+    (
+        23,
+        "mfa pending password",
+        "40984a6c2640bd6cec6104981c3d4d73b8e162e1a3a699ad5c8ed99b4fad3b0252a8e0fc5d5d5d058d9ece45f83a0dc0",
+    ),
+    (
+        24,
+        "saml",
+        "b64a9d67c2beca1af66560a5aaaf6cb7d52c3ccea08851241c69b1a8a497b45e9c0e8860a42fd1fbbcedd79205265f14",
+    ),
+    (
+        25,
+        "mfa pending request",
+        "38a9e05ae76b29698bd5ca6221bc09bae278530c4b00412e02ebc05c06bdc15c6208998be7097e920669591ed9b15616",
+    ),
+    (
+        26,
+        "saml encryption algorithms",
+        "10d2da61eea6ad6edb221575a1898cc5dc42934c143e57c78ca0018915a1570523f3fd9f57e0e20777b6da498704d71f",
+    ),
+    (
+        27,
+        "saml entity id length",
+        "0bab2330836a039cf75f44890d5e420803258cbeeb527d7eb02169eb00101e22aaac0d4681f84ecdc6e69c3314614b15",
+    ),
+    (
+        28,
+        "app logos",
+        "ff91748496b43c0aeb338b64c273d8c222d766585fab68b1901079423dc371d33b9e943c682c2816dd953017da2c4108",
+    ),
 ];
 
 /// version -> (description, checksum), as the server's migrator resolves them.
@@ -168,4 +203,41 @@ fn the_three_engines_have_the_same_numbered_history() {
     let versions: Vec<i64> = sqlite.keys().copied().collect();
     let expected: Vec<i64> = (1..=versions.len() as i64).collect();
     assert_eq!(versions, expected, "migration numbers have a gap or a repeat");
+}
+
+/// `0027_saml_entity_id_length` as each engine's file was released, the SQLite
+/// one being what the deployed service applied. sqlx checks each engine's own
+/// file, so each is pinned: the MySQL one was rewritten once before release.
+const SAML_ENTITY_ID_LENGTH: (i64, [(&str, &str); 3]) = (
+    27,
+    [
+        (
+            "sqlite",
+            "0bab2330836a039cf75f44890d5e420803258cbeeb527d7eb02169eb00101e22aaac0d4681f84ecdc6e69c3314614b15",
+        ),
+        (
+            "postgres",
+            "0bab2330836a039cf75f44890d5e420803258cbeeb527d7eb02169eb00101e22aaac0d4681f84ecdc6e69c3314614b15",
+        ),
+        (
+            "mysql",
+            "877470afc1231c4c16b8f765759c699eef4006c9f13ba0eb8f4d856f1173d47657ec37086a10cacc56e7bb4bdbaad84d",
+        ),
+    ],
+);
+
+#[test]
+fn saml_entity_id_length_is_unchanged_on_every_engine() {
+    let (version, pinned) = SAML_ENTITY_ID_LENGTH;
+    let here = [
+        sqlite(),
+        resolved(&sqlx::migrate!("./migrations/postgres")),
+        resolved(&sqlx::migrate!("./migrations/mysql")),
+    ];
+    for ((engine, checksum), migrations) in pinned.iter().zip(&here) {
+        assert_eq!(
+            &migrations[&version].1, checksum,
+            "{engine}'s migration {version} was edited: put the change in a new migration"
+        );
+    }
 }

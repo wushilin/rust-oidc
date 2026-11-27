@@ -387,7 +387,7 @@ async fn step_after_code(st: &AppState, tenant: &Tenant, headers: &HeaderMap, us
 /// Whether this user may use the client at all ([`access::decide`]); the page
 /// saying why not, if not.
 async fn gate(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &str) -> Result<(), Response> {
-    let failed = |e: anyhow::Error| html::error(Some(&tenant.name), &AadError::from(e).description());
+    let failed = |e: anyhow::Error| html::sign_in_error(Some(&tenant.name), &AadError::from(e));
     let user = users::find_by_id(&st.pool, user_id)
         .await
         .map_err(failed)?
@@ -397,16 +397,9 @@ async fn gate(st: &AppState, tenant: &Tenant, pending: &Pending, user_id: &str) 
         .map_err(failed)?
         .ok_or_else(|| html::error(Some(&tenant.name), "That application is not available."))?;
     let decision = access::decide(&st.pool, tenant, &sp, &user).await.map_err(failed)?;
-    match decision.refusal {
+    match decision.page_error(&pending.client, tenant) {
         None => Ok(()),
-        Some(refusal) => Err(html::error(
-            Some(&tenant.name),
-            &format!(
-                "AADSTS{}: {}",
-                refusal.aadsts().code(),
-                refusal.message(&pending.client.display_name, &tenant.name, &decision.home.name)
-            ),
-        )),
+        Some(err) => Err(html::sign_in_error(Some(&tenant.name), &err)),
     }
 }
 
@@ -469,7 +462,7 @@ async fn start_mfa(
             let offer = home.as_ref().is_some_and(|h| super::authorize::may_remember(h, tenant));
             mfa_page(st, tenant, pending, &user.upn, purpose, &ticket, enroll, offer, None)
         }
-        Err(e) => html::error(Some(&tenant.name), &AadError::from(e).description()),
+        Err(e) => html::sign_in_error(Some(&tenant.name), &AadError::from(e)),
     }
 }
 
@@ -605,7 +598,7 @@ async fn second_step(
                 let _ = mfa::finish(&st.pool, &ticket).await;
                 // Both factors right: the count the password left alone is cleared.
                 if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
-                    return html::error(Some(&tenant.name), &AadError::from(e).description());
+                    return html::sign_in_error(Some(&tenant.name), &AadError::from(e));
                 }
                 let device = super::authorize::remember_if_asked(st, headers, form, &user, &home).await;
                 audit::record(
@@ -637,7 +630,7 @@ async fn second_step(
                 )
                 .await
                 {
-                    return html::error(Some(&tenant.name), &AadError::from(e).description());
+                    return html::sign_in_error(Some(&tenant.name), &AadError::from(e));
                 }
                 match mfa::failed_attempt(&st.pool, &ticket).await {
                     Ok(true) => mfa_page(
@@ -654,7 +647,7 @@ async fn second_step(
                     _ => login_page(st, tenant, &pending, "", Some(MFA_EXPIRED)),
                 }
             }
-            Err(e) => html::error(Some(&tenant.name), &AadError::from(e).description()),
+            Err(e) => html::sign_in_error(Some(&tenant.name), &AadError::from(e)),
         },
         Purpose::Enroll => {
             let secret = waiting.enroll_secret.unwrap_or_default();
@@ -771,14 +764,14 @@ async fn sign_in(
     // counts at once.
     let (outcome, mut trace) = match access::authenticate_deferred(&st.pool, tenant, sp.as_ref(), upn, password).await {
         Ok(o) => o,
-        Err(e) => return Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
+        Err(e) => return Err(html::sign_in_error(Some(&tenant.name), &AadError::from(e))),
     };
     if matches!(outcome, AuthResult::InvalidCredentials)
         && let Some(id) = trace.user_id.as_deref()
     {
         trace.lockout_triggered = match users::settle_attempt(&st.pool, id, Attempt::Failed).await {
             Ok(locked) => locked,
-            Err(e) => return Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
+            Err(e) => return Err(html::sign_in_error(Some(&tenant.name), &AadError::from(e))),
         };
     }
     audit::sign_in_failure(
@@ -834,7 +827,7 @@ async fn sign_in(
 
     gate(st, tenant, &pending, &user.id).await?;
     let keep = session::KeepSignedIn::chosen(tenant, html::ticked(form, html::KEEP_SIGNED_IN));
-    let fail = |e: anyhow::Error| html::error(Some(&tenant.name), &AadError::from(e).description());
+    let fail = |e: anyhow::Error| html::sign_in_error(Some(&tenant.name), &AadError::from(e));
     // A second step, where one is needed, before there is any session.
     let step = second_step_needed(st, tenant, &pending, &user.id, &[]).await;
     // A code is skipped on a browser remembered for it; setting an
@@ -888,7 +881,7 @@ async fn finish_sign_in(
         .await
         {
             Ok(ticket) => Ok(change_page(st, tenant, pending, &user.upn, &ticket, None)),
-            Err(e) => Err(html::error(Some(&tenant.name), &AadError::from(e).description())),
+            Err(e) => Err(html::sign_in_error(Some(&tenant.name), &AadError::from(e))),
         };
     }
     let amr: &[&str] = if after_mfa {
@@ -945,7 +938,7 @@ async fn establish(
     // Start a browser session so the next code does not ask again.
     let session::Created { cookie, max_age } = session::create(&st.pool, headers, tenant, &user.id, amr, keep)
         .await
-        .map_err(|e| html::error(Some(&tenant.name), &AadError::from(e).description()))?;
+        .map_err(|e| html::sign_in_error(Some(&tenant.name), &AadError::from(e)))?;
     let details = json!({ "via": Channel::Device.as_str(), "clientId": pending.client.app_id });
     audit::record(
         st,

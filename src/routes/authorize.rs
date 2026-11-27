@@ -269,7 +269,7 @@ async fn validate_client(
         let (tenant, app, sp, reply, _) = saml_route::resolve(st, tenant_key, params).await?;
         return Ok((tenant, app, sp, reply, RedirectPlatform::Web));
     }
-    let page_error = |tenant: Option<&str>, err: AadError| html::error(tenant, &err.description());
+    let page_error = |tenant: Option<&str>, err: AadError| html::sign_in_error(tenant, &err);
     let internal = |e: anyhow::Error| page_error(None, AadError::from(e));
 
     let tenant = tenant::resolve(&st.pool, tenant_key)
@@ -475,7 +475,7 @@ pub(super) async fn launch_saml(
 ) -> Response {
     let ticket = match crate::saml::create_launch_ticket(&st.pool, &tenant.id, app, &user.id).await {
         Ok(ticket) => ticket,
-        Err(e) => return html::error(Some(&tenant.name), &AadError::from(e).description()),
+        Err(e) => return html::sign_in_error(Some(&tenant.name), &AadError::from(e)),
     };
     let tenant_key = tenant.id.as_str();
     let request = {
@@ -899,8 +899,8 @@ async fn signed_in_user(
 
     // ---- may this user use this application at all? ----
     let decision = access::decide(&st.pool, &v.tenant, &v.sp, &user).await?;
-    if let Some(refusal) = decision.refusal {
-        return Err(Step::Page(refused_page(v, &decision.home, refusal)));
+    if let Some(page) = refused_page(v, &decision) {
+        return Err(Step::Page(page));
     }
 
     // ---- a second factor, where one is needed and this session has none ----
@@ -1029,14 +1029,10 @@ async fn consent_page(
 }
 
 /// The page for a user who may not use this application, saying why.
-fn refused_page(v: &Validated, home: &Tenant, refusal: access::Refusal) -> Response {
-    let err = AadError::new(
-        StatusCode::FORBIDDEN,
-        OAuthError::AccessDenied,
-        refusal.aadsts(),
-        refusal.message(&v.client.display_name, &v.tenant.name, &home.name),
-    );
-    html::error(Some(&v.tenant.name), &err.description())
+/// `None` when the decision lets them in.
+fn refused_page(v: &Validated, decision: &access::Decision) -> Option<Response> {
+    let err = decision.page_error(&v.client, &v.tenant)?;
+    Some(html::sign_in_error(Some(&v.tenant.name), &err))
 }
 
 /// Start the second step of a sign-in: a code, or setting an authenticator up.
@@ -1097,7 +1093,7 @@ async fn start_mfa(
             let offer = home.as_ref().is_some_and(|h| may_remember(h, &v.tenant));
             mfa_page(st, v, request, &user.upn, purpose, &ticket, enroll, offer, None)
         }
-        Err(e) => html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+        Err(e) => html::sign_in_error(Some(&v.tenant.name), &AadError::from(e)),
     }
 }
 
@@ -1106,7 +1102,7 @@ async fn start_mfa(
 async fn suggest_mfa(st: &AppState, v: &Validated, request: &str, user: &User, keep: KeepSignedIn) -> Response {
     let ticket = match mfa::begin(&st.pool, &v.tenant.id, &user.id, Purpose::Suggest, keep, Some(request)).await {
         Ok(t) => t,
-        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+        Err(e) => return html::sign_in_error(Some(&v.tenant.name), &AadError::from(e)),
     };
     let csrf = session::new_token();
     let hidden = format!(
@@ -1160,11 +1156,11 @@ async fn finish_sign_in(
             .await
             {
                 Ok(ticket) => change_page(st, v, request, &user.upn, &ticket, None),
-                Err(e) => html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+                Err(e) => html::sign_in_error(Some(&v.tenant.name), &AadError::from(e)),
             };
         }
         Ok(false) => {}
-        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+        Err(e) => return html::sign_in_error(Some(&v.tenant.name), &AadError::from(e)),
     }
     let amr: &[&str] = if after_mfa {
         &[Amr::Pwd.as_str(), Amr::Mfa.as_str()]
@@ -1285,7 +1281,7 @@ async fn second_step(
     let pending = match mfa::pending_for_request(&st.pool, &ticket, &v.tenant.id, request).await {
         Ok(Some(p)) => p,
         Ok(None) => return login_page(st, v, request, "", Some(MFA_EXPIRED)),
-        Err(e) => return html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+        Err(e) => return html::sign_in_error(Some(&v.tenant.name), &AadError::from(e)),
     };
     // A code page after a wrong password: never a sign-in, whatever is posted.
     if !pending.password_right {
@@ -1360,7 +1356,7 @@ async fn second_step(
                 let _ = mfa::finish(&st.pool, &ticket).await;
                 // Both factors right: the count the password left alone is cleared.
                 if let Err(e) = users::settle_attempt(&st.pool, &user.id, Attempt::Succeeded).await {
-                    return html::error(Some(&v.tenant.name), &AadError::from(e).description());
+                    return html::sign_in_error(Some(&v.tenant.name), &AadError::from(e));
                 }
                 let device = remember_if_asked(st, headers, form, &user, &home).await;
                 audit::record(
@@ -1383,7 +1379,7 @@ async fn second_step(
                 if let Err(e) =
                     wrong_code_counted(st, &v.tenant.id, &user.id, Channel::Authorize, Some(&v.client.app_id)).await
                 {
-                    return html::error(Some(&v.tenant.name), &AadError::from(e).description());
+                    return html::sign_in_error(Some(&v.tenant.name), &AadError::from(e));
                 }
                 match mfa::failed_attempt(&st.pool, &ticket).await {
                     Ok(true) => mfa_page(
@@ -1400,7 +1396,7 @@ async fn second_step(
                     _ => login_page(st, v, request, "", Some(MFA_EXPIRED)),
                 }
             }
-            Err(e) => html::error(Some(&v.tenant.name), &AadError::from(e).description()),
+            Err(e) => html::sign_in_error(Some(&v.tenant.name), &AadError::from(e)),
         },
         Purpose::Enroll => {
             let secret = pending.enroll_secret.unwrap_or_default();
@@ -1710,7 +1706,7 @@ async fn password_step(
     upn: &str,
     password: &str,
 ) -> Response {
-    let fail = |e: anyhow::Error| html::error(Some(&v.tenant.name), &AadError::from(e).description());
+    let fail = |e: anyhow::Error| html::sign_in_error(Some(&v.tenant.name), &AadError::from(e));
     let (outcome, mut trace) =
         match access::authenticate_deferred(&st.pool, &v.tenant, Some(&v.sp), upn, password).await {
             Ok(o) => o,
@@ -1747,8 +1743,8 @@ async fn password_step(
                 Ok(d) => d,
                 Err(e) => return fail(e),
             };
-            if let Some(refusal) = decision.refusal {
-                return refused_page(v, &decision.home, refusal);
+            if let Some(page) = refused_page(v, &decision) {
+                return page;
             }
             if remembered {
                 audit_remembered(st, &v.tenant.id, &user, Channel::Authorize).await;
@@ -1934,7 +1930,7 @@ async fn unverified_second_step(
     pending: &mfa::Pending,
     typed: &str,
 ) -> Response {
-    let fail = |e: anyhow::Error| html::error(Some(&v.tenant.name), &AadError::from(e).description());
+    let fail = |e: anyhow::Error| html::sign_in_error(Some(&v.tenant.name), &AadError::from(e));
     let user = if pending.user_id.is_empty() {
         None
     } else {
@@ -2020,7 +2016,7 @@ async fn signed_in(
 ) -> Result<Response, Response> {
     let session::Created { cookie, max_age } = session::create(&st.pool, headers, &v.tenant, &user.id, amr, keep)
         .await
-        .map_err(|e| html::error(Some(&v.tenant.name), &AadError::from(e).description()))?;
+        .map_err(|e| html::sign_in_error(Some(&v.tenant.name), &AadError::from(e)))?;
     let details = serde_json::json!({ "via": Channel::Authorize.as_str(), "clientId": v.client.app_id });
     audit::record(
         st,

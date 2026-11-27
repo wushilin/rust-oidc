@@ -8,8 +8,10 @@ use base64::engine::general_purpose::STANDARD;
 use common::*;
 use rust_oidc::apps::{self, MemberType, Principal};
 use rust_oidc::db::Event;
-use rust_oidc::saml::{self, BasicConfig, NewCertificate};
-use rust_oidc::saml_protocol::{self as protocol, NS_ASSERTION, NS_PROTOCOL, Node, Signer, SigningAlgorithm};
+use rust_oidc::saml::{self, BasicConfig, NewCertificate, ReplyUrl};
+use rust_oidc::saml_protocol::{
+    self as protocol, NS_ASSERTION, NS_PROTOCOL, Node, RequestSignature, Signer, SigningAlgorithm,
+};
 use rust_oidc::txn::ops::apps::SetAssignmentRequired;
 use rust_oidc::txn::ops::saml::{
     ActivateSamlCertificate, AddSamlCertificate, AddSamlVerificationCertificate, DisableSamlSso, EnableSamlSso,
@@ -31,7 +33,7 @@ struct World {
 fn basic(entity: &str) -> BasicConfig {
     BasicConfig {
         identifiers: vec![entity.to_string()],
-        reply_urls: vec![ACS.to_string(), SECOND_ACS.to_string()],
+        reply_urls: ReplyUrl::listed([ACS.to_string(), SECOND_ACS.to_string()]),
         sign_on_url: None,
         relay_state: None,
         logout_url: Some(LOGOUT.to_string()),
@@ -63,6 +65,38 @@ async fn world() -> World {
     World { s, f, app_id }
 }
 
+#[tokio::test]
+async fn unicode_entity_ids_can_be_saved_and_resolved() {
+    let w = world().await;
+    let prefix = "https://sp.example/";
+    let existing = "https://sp.example/métadonnées";
+    let legacy_limit = format!("{prefix}{}", "🦀".repeat(saml::MAX_URI_CHARS - prefix.len()));
+    let new_limit = format!("{prefix}{}", "a".repeat(saml::MAX_ENTITY_ID_CHARS - prefix.len()));
+    let mut config = basic(existing);
+    config.identifiers.extend([legacy_limit.clone(), new_limit.clone()]);
+    txn::run(
+        &w.s.pool,
+        &Actor::Cli,
+        &SaveSamlBasic {
+            tenant_id: w.f.tenant.id.clone(),
+            app_id: w.app_id.clone(),
+            basic: config,
+        },
+    )
+    .await
+    .into_result()
+    .unwrap();
+
+    for id in [existing, &legacy_limit, &new_limit] {
+        let enabled = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, id).await.unwrap();
+        let any_mode = saml::find_by_identifier_any_mode(&w.s.pool, &w.f.tenant.id, id)
+            .await
+            .unwrap();
+        assert_eq!(enabled.unwrap().app_id, w.app_id);
+        assert_eq!(any_mode.unwrap().app_id, w.app_id);
+    }
+}
+
 fn authn_request(attrs: &str, body: &str) -> String {
     format!(
         r#"<samlp:AuthnRequest xmlns:samlp="{NS_PROTOCOL}" xmlns:saml="{NS_ASSERTION}" ID="_req1" Version="2.0" IssueInstant="2026-11-23T00:00:00Z" {attrs}><saml:Issuer>{ENTITY}</saml:Issuer>{body}</samlp:AuthnRequest>"#
@@ -86,6 +120,18 @@ fn response_of(page: &Page) -> Node {
         .unwrap_or_else(|| panic!("no SAML response on: {}", page.body));
     let xml = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
     protocol::parse_xml(&xml).unwrap()
+}
+
+/// The raw XML of the `<samlp:Response>` a page posts to the application.
+fn response_xml(page: &Page) -> String {
+    let encoded = page.field("SAMLResponse").unwrap();
+    String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap()
+}
+
+/// The certificate the application's responses are signed with.
+async fn idp_signing_cert(w: &World) -> Vec<u8> {
+    let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
+    saml::active_key(&w.s.pool, &app).await.unwrap().unwrap().cert_der
 }
 
 fn status_codes(response: &Node) -> Vec<String> {
@@ -242,7 +288,30 @@ async fn assignment_required_keeps_an_unassigned_user_out() {
     txn::run(&w.s.pool, &Actor::Cli, &set).await.into_result().unwrap();
     let (_, page) = signed_in(&w).await;
     assert!(page.field("SAMLResponse").is_none(), "{}", page.body);
-    assert!(page.body.contains("AADSTS50105"), "{}", page.body);
+    // The reason is the page's first paragraph, in plain words: which account,
+    // which application, and who can fix it. The identifiers come after it.
+    let reason = page
+        .body
+        .split(r#"<p class="reason">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</p>").next())
+        .unwrap_or_else(|| panic!("no reason paragraph: {}", page.body));
+    assert!(reason.starts_with("AADSTS50105: "), "{reason}");
+    assert!(
+        reason.contains(&format!("user &#x27;{}&#x27; is blocked", w.f.upn)),
+        "{reason}"
+    );
+    assert!(reason.contains(&w.app_id), "{reason}");
+    assert!(
+        reason.contains("contact your administrator to assign access"),
+        "{reason}"
+    );
+    assert!(!reason.contains("Trace ID"), "{reason}");
+    assert!(
+        page.body.contains("<summary>Troubleshooting details</summary>"),
+        "{}",
+        page.body
+    );
 }
 
 /// The check on an existing session, which never passes through the password
@@ -398,7 +467,24 @@ async fn a_signed_request_must_be_addressed_here_and_recent() {
             .unwrap();
         let page = b.get(&format!("{endpoint}?{query}")).await;
         assert!(page.field("csrf").is_none(), "{xml}: {}", page.body);
+        assert!(page.field("SAMLResponse").is_none(), "{xml}: {}", page.body);
     }
+
+    // With no valid IssueInstant to judge, the request is schema-invalid: Requester.
+    let issued = protocol::parse_xml(&current)
+        .unwrap()
+        .attr("IssueInstant")
+        .unwrap()
+        .to_string();
+    let bad_time = current.replace(&issued, "not-a-saml-timestamp");
+    assert_ne!(bad_time, current);
+    let query = sp_signer(&pem, &der)
+        .sign_redirect("SAMLRequest", &protocol::encode_redirect(&bad_time).unwrap(), None)
+        .unwrap();
+    let page = b.get(&format!("{endpoint}?{query}")).await;
+    let response = response_of(&page);
+    assert_eq!(status_codes(&response), vec![protocol::STATUS_REQUESTER]);
+    assert!(response.child(NS_ASSERTION, "Assertion").is_none());
 }
 
 #[tokio::test]
@@ -573,6 +659,36 @@ async fn an_identifier_belongs_to_one_application_in_the_tenant() {
 }
 
 #[tokio::test]
+async fn an_identifier_may_be_as_long_as_saml_allows() {
+    let w = world().await;
+    let prefix = "urn:example:boundary:";
+    let save = |id: String| SaveSamlBasic {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        basic: basic(&id),
+    };
+    let longest = format!("{prefix}{}", "a".repeat(saml::MAX_ENTITY_ID_CHARS - prefix.len()));
+    txn::run(&w.s.pool, &Actor::Cli, &save(longest.clone()))
+        .await
+        .into_result()
+        .unwrap();
+    let found = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, &longest)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|a| a.app_id), Some(w.app_id.clone()));
+
+    let too_many_bytes = format!("{prefix}{}", "🦀".repeat(saml::MAX_URI_CHARS));
+    for refused in [format!("{longest}a"), too_many_bytes] {
+        let outcome = txn::run(&w.s.pool, &Actor::Cli, &save(refused.clone())).await;
+        assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
+        let found = saml::find_by_identifier(&w.s.pool, &w.f.tenant.id, &refused)
+            .await
+            .unwrap();
+        assert!(found.is_none());
+    }
+}
+
+#[tokio::test]
 async fn certificate_rollover_follows_the_active_certificate() {
     let w = world().await;
     let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
@@ -727,6 +843,32 @@ async fn federation_metadata_describes_the_endpoint_and_certificate() {
     assert_eq!(root.local, "EntityDescriptor");
     assert!(page.body.contains("X509Certificate"));
     assert!(!page.body.contains("PRIVATE"));
+    // The algorithms it signs and digests with are declared, from its settings.
+    let alg = "urn:oasis:names:tc:SAML:metadata:algsupport";
+    let declared = |root: &Node, local: &str| -> Vec<String> {
+        root.child(protocol::NS_METADATA, "Extensions")
+            .map(|e| {
+                e.children
+                    .iter()
+                    .filter(|c| c.ns == alg && c.local == local)
+                    .map(|c| c.attr("Algorithm").unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Then what requests to it may also be signed with.
+    assert_eq!(
+        declared(&root, "SigningMethod"),
+        vec![
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+        ]
+    );
+    assert_eq!(
+        declared(&root, "DigestMethod"),
+        vec!["http://www.w3.org/2001/04/xmlenc#sha256"]
+    );
 }
 
 async fn my_account(w: &World, b: &Browser) -> Page {
@@ -837,7 +979,8 @@ async fn an_unassigned_application_cannot_be_launched() {
     let w = world().await;
     let (b, _) = signed_in(&w).await;
     let url = w.s.url(&format!("/{}/myaccount", w.f.tenant.id));
-    let page = my_account(&w, &b).await;
+    // No application is listed, so the token comes from a tab with forms.
+    let page = b.get(&format!("{url}/security")).await;
     let csrf = page.field("csrf").unwrap();
     let launch = rust_oidc::html::AccountOp::LaunchApp.as_str();
     let answer = b
@@ -971,6 +1114,24 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
     let format = r#"<samlp:NameIDPolicy Format="urn:example:unknown"/>"#;
     let comparison = r#"<samlp:RequestedAuthnContext Comparison="minimum"><saml:AuthnContextClassRef>urn:example</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>"#;
     let artifact = r#"ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact""#;
+    let version = |v: &str| authn_request("", "").replace(r#"Version="2.0""#, &format!(r#"Version="{v}""#));
+    let mut cases: Vec<(String, &str, &str)> = vec![
+        (
+            version("1.1"),
+            protocol::STATUS_VERSION_MISMATCH,
+            protocol::STATUS_VERSION_TOO_LOW,
+        ),
+        (
+            version("3.0"),
+            protocol::STATUS_VERSION_MISMATCH,
+            protocol::STATUS_VERSION_TOO_HIGH,
+        ),
+        (
+            authn_request(r#"ForceAuthn="true" IsPassive="true""#, ""),
+            protocol::STATUS_RESPONDER,
+            protocol::STATUS_NO_PASSIVE,
+        ),
+    ];
     for (attrs, body, top, sub) in [
         (
             "",
@@ -997,15 +1158,30 @@ async fn a_request_that_cannot_be_honored_gets_a_saml_error_at_the_registered_ur
             protocol::STATUS_NO_AUTHN_CONTEXT,
         ),
     ] {
+        cases.push((authn_request(attrs, body), top, sub));
+    }
+    let certs = [idp_signing_cert(&w).await];
+    for (xml, top, sub) in cases {
         let page = Browser::new()
-            .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request(attrs, body), None))
+            .get(&redirect_url(&w.s, &w.f.tenant.id, &xml, None))
             .await;
         let response = response_of(&page);
-        assert_eq!(status_codes(&response), vec![top, sub], "{attrs}{body}");
+        assert_eq!(status_codes(&response), vec![top, sub], "{xml}");
+        // Signed, so the application can trust the status.
+        rust_oidc::saml_dsig::verify(&response_xml(&page), &certs, false).unwrap();
         assert_eq!(response.attr("Destination"), Some(ACS));
         assert_eq!(response.attr("InResponseTo"), Some("_req1"));
         assert!(response.child(NS_ASSERTION, "Assertion").is_none());
     }
+
+    // A schema-invalid IssueInstant is the requester's fault, with no second-level code.
+    let bad_time = authn_request("", "").replace("2026-11-23T00:00:00Z", "not-a-saml-timestamp");
+    let page = Browser::new()
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &bad_time, None))
+        .await;
+    let response = response_of(&page);
+    assert_eq!(status_codes(&response), vec![protocol::STATUS_REQUESTER]);
+    assert!(response.child(NS_ASSERTION, "Assertion").is_none());
 
     // Never to a URL the application did not register.
     let elsewhere = r#"AssertionConsumerServiceURL="https://evil.example/acs""#;
@@ -1167,6 +1343,40 @@ async fn a_wrong_session_index_ends_nothing() {
 }
 
 #[tokio::test]
+async fn single_logout_accepts_the_post_binding() {
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
+
+    let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let encoded = STANDARD.encode(logout_request(ENTITY));
+    let answer = b
+        .post_form(&endpoint, &[("SAMLRequest", encoded.as_str()), ("RelayState", "after")])
+        .await;
+    // Answered over POST too: a redirect after the application's form post can be
+    // refused by that page's own form-action policy.
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.form_action(), LOGOUT);
+    assert_eq!(answer.field("RelayState").as_deref(), Some("after"));
+    let xml = response_xml(&answer);
+    let response = protocol::parse_xml(&xml).unwrap();
+    assert_eq!(response.local, "LogoutResponse");
+    assert_eq!(response.attr("InResponseTo"), Some("_out1"));
+    assert_eq!(status_codes(&response), vec![protocol::STATUS_SUCCESS]);
+    // Signed inside, as the POST binding requires.
+    rust_oidc::saml_dsig::verify(&xml, &[idp_signing_cert(&w).await], false).unwrap();
+
+    // The session really ended.
+    let again = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(again.field("SAMLResponse").is_none(), "{}", again.body);
+}
+
+#[tokio::test]
 async fn an_expired_logout_request_is_refused() {
     let w = world().await;
     let (b, _) = signed_in(&w).await;
@@ -1305,6 +1515,85 @@ async fn an_authentication_context_that_cannot_be_met_is_refused() {
     }
 }
 
+/// `unspecified` asked for with `exact` comparison is what the assertion
+/// states: under `exact`, the class stated must be one of those requested.
+#[tokio::test]
+async fn an_unspecified_context_is_answered_with_unspecified() {
+    let w = world().await;
+    let class_of = |page: &Page| -> String {
+        response_of(page)
+            .child(NS_ASSERTION, "Assertion")
+            .and_then(|a| a.child(NS_ASSERTION, "AuthnStatement"))
+            .and_then(|s| s.child(NS_ASSERTION, "AuthnContext"))
+            .and_then(|c| c.child(NS_ASSERTION, "AuthnContextClassRef"))
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_else(|| panic!("no AuthnContextClassRef: {}", page.body))
+    };
+    let unspecified = "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified";
+    let body = format!(
+        r#"<samlp:RequestedAuthnContext Comparison="exact"><saml:AuthnContextClassRef>{unspecified}</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>"#
+    );
+    let b = Browser::new();
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", &body), None))
+        .await;
+    let page = b.login(&page, &w.f.upn, &w.f.password).await;
+    assert_eq!(class_of(&page), unspecified);
+    // Nothing requested: the class actually used.
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert_eq!(class_of(&page), "urn:oasis:names:tc:SAML:2.0:ac:classes:Password");
+}
+
+/// The configured Relay State is for sign-in started here. A request from the
+/// application gets back exactly the RelayState it sent, and none if it sent
+/// none (SAML Bindings 3.4.3, 3.5.3).
+#[tokio::test]
+async fn the_configured_relay_state_is_only_for_sign_in_started_here() {
+    let w = world().await;
+    let mut config = basic(ENTITY);
+    config.relay_state = Some("https://sp.example/landing".into());
+    let save = SaveSamlBasic {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        basic: config,
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &save).await.into_result().unwrap();
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
+    assert_eq!(page.field("RelayState"), None, "none sent, none returned");
+    let page = b
+        .get(&redirect_url(
+            &w.s,
+            &w.f.tenant.id,
+            &authn_request("", ""),
+            Some("mine"),
+        ))
+        .await;
+    assert_eq!(page.field("RelayState").as_deref(), Some("mine"));
+
+    // Opened from My apps: the configured one.
+    assign(&w).await;
+    let url = w.s.url(&format!("/{}/myaccount", w.f.tenant.id));
+    let csrf = my_account(&w, &b).await.field("csrf").unwrap();
+    let launch = rust_oidc::html::AccountOp::LaunchApp.as_str();
+    let answer = b
+        .post_form(
+            &url,
+            &[("csrf", csrf.as_str()), ("op", launch), ("app", w.app_id.as_str())],
+        )
+        .await;
+    assert!(answer.field("SAMLResponse").is_some(), "{}", answer.body);
+    assert_eq!(
+        answer.field("RelayState").as_deref(),
+        Some("https://sp.example/landing")
+    );
+}
+
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const EXC: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
@@ -1322,8 +1611,71 @@ struct Enveloped<'a> {
 }
 
 fn enveloped(e: &Enveloped<'_>, pem: &str) -> String {
-    use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let key = TestKey {
+        pkcs8: STANDARD.decode(body).unwrap(),
+        cert_pem: String::new(),
+        algorithm: RequestSignature::RsaSha256,
+    };
+    enveloped_by(e, &key)
+}
+
+/// A service provider's signing key, of any kind a request may be signed with.
+struct TestKey {
+    pkcs8: Vec<u8>,
+    cert_pem: String,
+    algorithm: RequestSignature,
+}
+
+impl TestKey {
+    fn ec(curve: &'static rcgen::SignatureAlgorithm, algorithm: RequestSignature) -> Self {
+        let key = rcgen::KeyPair::generate_for(curve).unwrap();
+        let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        Self {
+            pkcs8: key.serialize_der(),
+            cert_pem: cert.pem(),
+            algorithm,
+        }
+    }
+
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{self, EcdsaKeyPair, RsaKeyPair};
+        let ec = |alg| {
+            EcdsaKeyPair::from_pkcs8(alg, &self.pkcs8)
+                .unwrap()
+                .sign(&SystemRandom::new(), data)
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        };
+        match self.algorithm {
+            RequestSignature::EcdsaSha256 => ec(&signature::ECDSA_P256_SHA256_FIXED_SIGNING),
+            RequestSignature::EcdsaSha384 => ec(&signature::ECDSA_P384_SHA384_FIXED_SIGNING),
+            _ => {
+                let key = RsaKeyPair::from_pkcs8(&self.pkcs8).unwrap();
+                let mut value = vec![0u8; key.public_modulus_len()];
+                key.sign(&signature::RSA_PKCS1_SHA256, &SystemRandom::new(), data, &mut value)
+                    .unwrap();
+                value
+            }
+        }
+    }
+
+    /// The Redirect-binding query for `xml`, signed under the name `sig_alg`.
+    fn redirect_query(&self, xml: &str, sig_alg: &str) -> String {
+        let alg: String = url::form_urlencoded::byte_serialize(sig_alg.as_bytes()).collect();
+        let unsigned = format!("SAMLRequest={}&SigAlg={alg}", encoded_param(xml));
+        let signature = STANDARD.encode(self.sign(unsigned.as_bytes()));
+        let signature: String = url::form_urlencoded::byte_serialize(signature.as_bytes()).collect();
+        format!("{unsigned}&Signature={signature}")
+    }
+}
+
+fn enveloped_by(e: &Enveloped<'_>, key: &TestKey) -> String {
     let issued = protocol::instant(rust_oidc::util::now()).unwrap();
     let open = format!(
         r#"<samlp:AuthnRequest xmlns:samlp="{NS_PROTOCOL}" Destination="{}" ID="{}" IssueInstant="{issued}" Version="2.0"><saml:Issuer xmlns:saml="{NS_ASSERTION}">{ENTITY}</saml:Issuer>"#,
@@ -1336,21 +1688,12 @@ fn enveloped(e: &Enveloped<'_>, pem: &str) -> String {
     );
     let inner = format!(
         r##"<ds:CanonicalizationMethod Algorithm="{EXC}"></ds:CanonicalizationMethod><ds:SignatureMethod Algorithm="{}"></ds:SignatureMethod><ds:Reference URI="{}"><ds:Transforms><ds:Transform Algorithm="{DS}enveloped-signature"></ds:Transform><ds:Transform Algorithm="{EXC}"></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"></ds:DigestMethod><ds:DigestValue>{}</ds:DigestValue></ds:Reference>"##,
-        SigningAlgorithm::Sha256.signature_uri(),
+        key.algorithm.as_str(),
         e.uri.map_or_else(|| format!("#{}", e.id), str::to_string),
         STANDARD.encode(digest.as_ref()),
     );
     let signed_info = format!(r#"<ds:SignedInfo xmlns:ds="{DS}">{inner}</ds:SignedInfo>"#);
-    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
-    let key = RsaKeyPair::from_pkcs8(&STANDARD.decode(body).unwrap()).unwrap();
-    let mut value = vec![0u8; key.public_modulus_len()];
-    key.sign(
-        &RSA_PKCS1_SHA256,
-        &SystemRandom::new(),
-        signed_info.as_bytes(),
-        &mut value,
-    )
-    .unwrap();
+    let value = key.sign(signed_info.as_bytes());
     format!(
         r#"{open}<ds:Signature xmlns:ds="{DS}"><ds:SignedInfo>{inner}</ds:SignedInfo><ds:SignatureValue>{}</ds:SignatureValue>{}</ds:Signature>{}{close}"#,
         STANDARD.encode(&value),
@@ -1529,6 +1872,59 @@ async fn a_bad_signature_is_refused_when_a_certificate_is_registered() {
 }
 
 #[tokio::test]
+async fn an_ecdsa_signed_request_is_verified_on_both_bindings() {
+    for (curve, algorithm, other) in [
+        (
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            RequestSignature::EcdsaSha256,
+            RequestSignature::EcdsaSha384,
+        ),
+        (
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+            RequestSignature::EcdsaSha384,
+            RequestSignature::EcdsaSha256,
+        ),
+    ] {
+        let w = world().await;
+        let key = TestKey::ec(curve, algorithm);
+        require_signed(&w, &key.cert_pem).await;
+        let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+        let get = |query: String| {
+            let url = format!("{endpoint}?{query}");
+            async move { Browser::new().get(&url).await }
+        };
+
+        let page = get(key.redirect_query(&signed_request_xml(&w, "_ec1"), algorithm.as_str())).await;
+        assert!(at_sign_in(&page), "{algorithm:?}: {}", page.body);
+        // The algorithm named must be the one the key signs with.
+        let page = get(key.redirect_query(&signed_request_xml(&w, "_ec2"), other.as_str())).await;
+        assert!(!at_sign_in(&page), "{algorithm:?} named as {other:?}");
+        // A corrupted signature: the last byte of s changed.
+        let query = key.redirect_query(&signed_request_xml(&w, "_ec3"), algorithm.as_str());
+        let (unsigned, signature) = query.rsplit_once("&Signature=").unwrap();
+        let mut raw = STANDARD
+            .decode(
+                url::form_urlencoded::parse(format!("s={signature}").as_bytes())
+                    .next()
+                    .unwrap()
+                    .1
+                    .as_bytes(),
+            )
+            .unwrap();
+        *raw.last_mut().unwrap() ^= 1;
+        let corrupted: String = url::form_urlencoded::byte_serialize(STANDARD.encode(raw).as_bytes()).collect();
+        let page = get(format!("{unsigned}&Signature={corrupted}")).await;
+        assert!(!at_sign_in(&page), "{algorithm:?}: a corrupted signature must not pass");
+
+        let page = post_request(&w, &Browser::new(), &enveloped_by(&plain(&w, "_ec4"), &key)).await;
+        assert!(at_sign_in(&page), "{algorithm:?}: {}", page.body);
+        let stranger = TestKey::ec(curve, algorithm);
+        let page = post_request(&w, &Browser::new(), &enveloped_by(&plain(&w, "_ec5"), &stranger)).await;
+        assert!(!at_sign_in(&page), "{algorithm:?}: another key must not pass");
+    }
+}
+
+#[tokio::test]
 async fn a_logout_answer_must_be_addressed_to_this_endpoint() {
     let w = world().await;
     let second = "https://second.example/";
@@ -1579,7 +1975,7 @@ async fn a_reply_url_is_used_exactly_as_registered() {
         tenant_id: w.f.tenant.id.clone(),
         app_id: w.app_id.clone(),
         basic: BasicConfig {
-            reply_urls: vec![registered.to_string()],
+            reply_urls: ReplyUrl::listed([registered.to_string()]),
             ..basic(ENTITY)
         },
     };
@@ -1594,7 +1990,7 @@ async fn a_reply_url_is_used_exactly_as_registered() {
 }
 
 #[tokio::test]
-async fn the_last_valid_verification_certificate_is_kept_while_signatures_are_required() {
+async fn the_last_verification_certificate_is_kept_while_signatures_are_required() {
     let w = world().await;
     let (_, _, cert_pem) = sp_key();
     require_signed(&w, &cert_pem).await;
@@ -1607,22 +2003,45 @@ async fn the_last_valid_verification_certificate_is_kept_while_signatures_are_re
     txn::run(&w.s.pool, &Actor::Cli, &add).await.into_result().unwrap();
     let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
     let certs = saml::verification_certificates(&w.s.pool, &app).await.unwrap();
-    // One of the two has expired.
-    sqlx::query(rust_oidc::db::q(
-        &w.s.pool,
-        "UPDATE app_saml_verification_certs SET not_after = 1 WHERE id = ?",
-    ))
-    .bind(&certs[0].id)
-    .execute(&w.s.pool)
-    .await
-    .unwrap();
-    let remove = rust_oidc::txn::ops::saml::RemoveSamlVerificationCertificate {
+    let remove = |id: &str| rust_oidc::txn::ops::saml::RemoveSamlVerificationCertificate {
         tenant_id: w.f.tenant.id.clone(),
         app_id: w.app_id.clone(),
-        certificate_id: certs[1].id.clone(),
+        certificate_id: id.to_string(),
     };
-    let outcome = txn::run(&w.s.pool, &Actor::Cli, &remove).await;
+    txn::run(&w.s.pool, &Actor::Cli, &remove(&certs[1].id))
+        .await
+        .into_result()
+        .unwrap();
+    let outcome = txn::run(&w.s.pool, &Actor::Cli, &remove(&certs[0].id)).await;
     assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_certificates_key_verifies_whatever_its_dates() {
+    // Metadata Interoperability Profile: only the key counts, so an expired or
+    // not-yet-valid certificate is accepted and its key verifies.
+    for (from, to) in [(-30, -1), (1, 30)] {
+        let w = world().await;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let today = time::OffsetDateTime::now_utc();
+        params.not_before = today + time::Duration::days(from);
+        params.not_after = today + time::Duration::days(to);
+        let cert = params.self_signed(&key).unwrap();
+        let test_key = TestKey {
+            pkcs8: key.serialize_der(),
+            cert_pem: cert.pem(),
+            algorithm: RequestSignature::EcdsaSha256,
+        };
+        require_signed(&w, &test_key.cert_pem).await;
+        let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+        let query = test_key.redirect_query(
+            &signed_request_xml(&w, "_dated"),
+            RequestSignature::EcdsaSha256.as_str(),
+        );
+        let page = Browser::new().get(&format!("{endpoint}?{query}")).await;
+        assert!(at_sign_in(&page), "valid from {from} to {to} days: {}", page.body);
+    }
 }
 
 #[tokio::test]
@@ -2085,4 +2504,394 @@ async fn check_sign_in_is_unchanged_for_an_oidc_application() {
     assert!(page.body.contains("Password grant"), "{}", page.body);
     assert!(page.body.contains("In the token"), "{}", page.body);
     assert!(!page.body.contains("SAML setup"), "{}", page.body);
+}
+
+/// An SP metadata file: two POST endpoints, the second marked default, and an
+/// Artifact one that cannot be used.
+fn sp_metadata(entity: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{entity}"><md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://imported.example/slo"/><md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact" Location="https://imported.example/art" index="0"/><md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://imported.example/acs-1" index="1"/><md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://imported.example/acs-2" index="2" isDefault="true"/></md:SPSSODescriptor></md:EntityDescriptor>"#
+    )
+}
+
+async fn saved_config(w: &World) -> saml::SamlConfig {
+    let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
+    saml::config(&w.s.pool, &app).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn a_metadata_files_signing_certificate_is_offered_and_added_only_when_chosen() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    let app = apps::find(&w.s.pool, &w.app_id).await.unwrap().unwrap();
+    let registered = || async { saml::verification_certificates(&w.s.pool, &app).await.unwrap() };
+
+    let key = TestKey::ec(&rcgen::PKCS_ECDSA_P256_SHA256, RequestSignature::EcdsaSha256);
+    let given = saml::GivenCertificate::from_pem(&key.cert_pem).unwrap();
+    let descriptor = format!(
+        r#"<md:KeyDescriptor use="signing"><ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"#,
+        STANDARD.encode(&given.der)
+    );
+    let file = sp_metadata("https://imported.example/").replace(
+        r#"protocol"><md:SingleLogoutService"#,
+        &format!(r#"protocol">{descriptor}<md:SingleLogoutService"#),
+    );
+    let upload = || {
+        a.post_file(
+            &url,
+            &[("op", "saml_metadata_import")],
+            ("metadata_file", "sp.xml", &file),
+        )
+    };
+
+    let page = upload().await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let print = saml::thumbprint(&given.der);
+    assert!(page.body.contains(&print), "{}", page.body);
+    // Reading the file trusts nothing.
+    assert!(registered().await.is_empty());
+
+    let start = r#"<textarea name="certificate" hidden readonly>"#;
+    let offered = page
+        .body
+        .split_once(start)
+        .unwrap()
+        .1
+        .split_once("</textarea>")
+        .unwrap()
+        .0;
+    let added = a
+        .post(&url, &[("op", "saml_verification_add"), ("certificate", offered)])
+        .await;
+    assert_eq!(added.status, 303, "{}", added.body);
+    let now = registered().await;
+    assert_eq!(
+        now.iter().map(|c| c.thumbprint.as_str()).collect::<Vec<_>>(),
+        vec![print.as_str()]
+    );
+
+    // Once added, it is not offered again, and requests signed with it pass.
+    let page = upload().await;
+    assert!(!page.body.contains(start), "{}", page.body);
+    let set = SetSamlRequireSigned {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        required: true,
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &set).await.into_result().unwrap();
+    let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
+    let query = key.redirect_query(&signed_request_xml(&w, "_md1"), RequestSignature::EcdsaSha256.as_str());
+    let page = Browser::new().get(&format!("{endpoint}?{query}")).await;
+    assert!(at_sign_in(&page), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_metadata_file_fills_in_basic_saml_configuration_for_review() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    let before = saved_config(&w).await;
+
+    let entity = "https://imported.example/";
+    let page = a
+        .post_file(
+            &url,
+            &[("op", "saml_metadata_import")],
+            ("metadata_file", "sp.xml", &sp_metadata(entity)),
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Review the values"), "{}", page.body);
+    assert!(
+        page.body.contains("https://imported.example/acs-1 index=1"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("https://imported.example/acs-2 index=2 default"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("https://imported.example/slo"), "{}", page.body);
+    assert!(!page.body.contains("https://imported.example/art"), "{}", page.body);
+    // Reading the file changes nothing.
+    assert_eq!(saved_config(&w).await, before);
+
+    // Saving the reviewed form keeps the indexes and the default.
+    let saved = a
+        .post(
+            &url,
+            &[
+                ("op", "saml_basic"),
+                ("identifiers", &format!("{entity}\n{ENTITY}")),
+                (
+                    "reply_urls",
+                    "https://imported.example/acs-1 index=1\nhttps://imported.example/acs-2 index=2 default",
+                ),
+                ("logout_url", "https://imported.example/slo"),
+            ],
+        )
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    let config = saved_config(&w).await;
+    assert_eq!(config.default_reply_url(), Some("https://imported.example/acs-2"));
+    assert_eq!(
+        config.reply_url_for(None, Some(1)),
+        Some("https://imported.example/acs-1")
+    );
+    assert_eq!(config.reply_url_for(None, Some(0)), None);
+    assert_eq!(config.logout_url.as_deref(), Some("https://imported.example/slo"));
+
+    // A file that is not one application's metadata is refused with the reason.
+    let two = format!(
+        r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">{}{}</md:EntitiesDescriptor>"#,
+        sp_metadata("https://one.example/").replace(r#"<?xml version="1.0"?>"#, ""),
+        sp_metadata("https://two.example/").replace(r#"<?xml version="1.0"?>"#, "")
+    );
+    let page = a
+        .post_file(
+            &url,
+            &[("op", "saml_metadata_import")],
+            ("metadata_file", "sp.xml", &two),
+        )
+        .await;
+    assert_eq!(page.status, 400);
+    assert!(page.body.contains("2 service providers"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn reply_urls_keep_their_index_and_default_through_the_form() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    let save = |replies: &'static str| {
+        let a = &a;
+        let url = url.clone();
+        async move {
+            a.post(
+                &url,
+                &[("op", "saml_basic"), ("identifiers", ENTITY), ("reply_urls", replies)],
+            )
+            .await
+        }
+    };
+    // Plain lines: indexed in order, the first the default.
+    assert_eq!(save("https://a.example/acs\nhttps://b.example/acs").await.status, 303);
+    let c = saved_config(&w).await;
+    assert_eq!(c.default_reply_url(), Some("https://a.example/acs"));
+    assert_eq!(c.reply_url_for(None, Some(1)), Some("https://b.example/acs"));
+    // A line without an index takes the lowest unused one.
+    assert_eq!(
+        save("https://a.example/acs index=0\nhttps://b.example/acs default")
+            .await
+            .status,
+        303
+    );
+    let c = saved_config(&w).await;
+    assert_eq!(c.default_reply_url(), Some("https://b.example/acs"));
+    assert_eq!(c.reply_url_for(None, Some(1)), Some("https://b.example/acs"));
+    // Refused: two defaults, a repeated index, an unknown word.
+    for bad in [
+        "https://a.example/acs default\nhttps://b.example/acs default",
+        "https://a.example/acs index=3\nhttps://b.example/acs index=3",
+        "https://a.example/acs primary",
+    ] {
+        assert_eq!(save(bad).await.status, 400, "{bad}");
+    }
+    assert_eq!(
+        saved_config(&w).await.default_reply_url(),
+        Some("https://b.example/acs")
+    );
+}
+
+#[tokio::test]
+async fn the_encryption_method_can_change_without_the_certificate() {
+    let w = world().await;
+    bind_in_own_tenant(&w.s, &w.f, rust_oidc::rbac::RoleId::TenantAdministrator).await;
+    let a = signed_in_admin(&w.s, &w.f).await;
+    let url = w.s.url(&format!("/admin/tenants/{}/apps/{}", w.f.tenant.id, w.app_id));
+    // A newly set up application starts with the recommended choice.
+    assert_eq!(
+        saved_config(&w).await.encryption_algorithms,
+        protocol::EncryptionAlgorithms::RECOMMENDED
+    );
+    let (_, _, cert_pem) = sp_key();
+    let choose = |content: &'static str, cert: String| {
+        let a = &a;
+        let url = url.clone();
+        async move {
+            a.post(
+                &url,
+                &[
+                    ("op", "saml_encryption"),
+                    ("encryption_method", content),
+                    ("key_transport", "rsa-oaep-mgf1p"),
+                    ("key_transport_digest", "sha256"),
+                    ("certificate", &cert),
+                ],
+            )
+            .await
+        }
+    };
+    assert_eq!(choose("aes256-cbc", cert_pem.clone()).await.status, 303);
+    let with_cert = saved_config(&w).await.encryption_cert.clone();
+    assert!(with_cert.is_some());
+
+    // Only the method changes; the certificate stays.
+    assert_eq!(choose("aes128-gcm", String::new()).await.status, 303);
+    let config = saved_config(&w).await;
+    assert_eq!(config.encryption_cert, with_cert);
+    assert_eq!(
+        config.encryption_algorithms.content,
+        protocol::ContentEncryption::Aes128Gcm
+    );
+    assert_eq!(
+        config.encryption_algorithms.digest,
+        protocol::KeyTransportDigest::Sha256
+    );
+
+    // A sign-in encrypts that way.
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    let xml = response_xml(&page);
+    assert!(xml.contains("http://www.w3.org/2009/xmlenc11#aes128-gcm"), "{xml}");
+    assert!(xml.contains("http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"), "{xml}");
+
+    // An unknown method is refused and nothing changes.
+    assert_eq!(choose("aes512-xyz", String::new()).await.status, 400);
+    assert_eq!(saved_config(&w).await, config);
+
+    // Stop encrypting.
+    let stopped = a
+        .post(
+            &url,
+            &[
+                ("op", "saml_encryption"),
+                ("encryption_method", "aes256-gcm"),
+                ("key_transport", "rsa-oaep"),
+                ("key_transport_digest", "sha256"),
+                ("encryption_action", "stop"),
+            ],
+        )
+        .await;
+    assert_eq!(stopped.status, 303);
+    assert!(saved_config(&w).await.encryption_cert.is_none());
+}
+
+fn async_logout_request(issuer: &str) -> String {
+    logout_request(issuer).replace(
+        "<saml:NameID>",
+        r#"<samlp:Extensions><aslo:Asynchronous xmlns:aslo="urn:oasis:names:tc:SAML:2.0:protocol:ext:async-slo"/></samlp:Extensions><saml:NameID>"#,
+    )
+}
+
+#[tokio::test]
+async fn an_asynchronous_logout_is_not_answered() {
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    let page = b
+        .get(&redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None))
+        .await;
+    assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
+
+    // Signed out, shown our page, and the application gets no LogoutResponse.
+    let done = b.get(&logout_url(&w, &async_logout_request(ENTITY))).await;
+    assert_ne!(done.status, 302, "{}", done.body);
+    assert!(done.field("SAMLResponse").is_none(), "{}", done.body);
+    assert!(done.body.contains("signed out"), "{}", done.body);
+    assert!(!still_signed_in(&w, &b).await);
+
+    // With nothing left to end, the user is told it failed, and still no answer.
+    let again = b.get(&logout_url(&w, &async_logout_request(ENTITY))).await;
+    assert!(again.location.is_none(), "{:?}", again.location);
+    assert!(again.field("SAMLResponse").is_none(), "{}", again.body);
+    assert!(again.body.contains("could not be signed out"), "{}", again.body);
+}
+
+async fn set_name_id(w: &World, format: protocol::NameIdFormat, source: saml::NameIdSource) {
+    let save = rust_oidc::txn::ops::saml::SaveSamlClaims {
+        tenant_id: w.f.tenant.id.clone(),
+        app_id: w.app_id.clone(),
+        name_id_format: format,
+        name_id_source: source,
+        claims: saml::DEFAULT_CLAIMS
+            .iter()
+            .map(|(name, source)| saml::Claim {
+                name: name.to_string(),
+                source: *source,
+            })
+            .collect(),
+    };
+    txn::run(&w.s.pool, &Actor::Cli, &save).await.into_result().unwrap();
+}
+
+fn name_id_of(page: &Page) -> String {
+    response_of(page)
+        .child(NS_ASSERTION, "Assertion")
+        .and_then(|a| a.child(NS_ASSERTION, "Subject"))
+        .and_then(|s| s.child(NS_ASSERTION, "NameID"))
+        .unwrap()
+        .text
+        .clone()
+}
+
+#[tokio::test]
+async fn a_persistent_name_id_is_always_the_pairwise_identifier() {
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    let plain = redirect_url(&w.s, &w.f.tenant.id, &authn_request("", ""), None);
+    let sign_in = || b.get(&plain);
+
+    // Configured persistent with a user name source: still not the user name.
+    set_name_id(
+        &w,
+        protocol::NameIdFormat::Persistent,
+        saml::NameIdSource::UserPrincipalName,
+    )
+    .await;
+    let persistent = name_id_of(&sign_in().await);
+    assert_ne!(persistent, w.f.upn);
+    assert!(!persistent.contains('@'), "{persistent}");
+    // And the same as a request asking for persistent gets.
+    let asked = authn_request(
+        "",
+        r#"<samlp:NameIDPolicy Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"/>"#,
+    );
+    let page = b.get(&redirect_url(&w.s, &w.f.tenant.id, &asked, None)).await;
+    assert_eq!(name_id_of(&page), persistent);
+
+    // The lowercase form is the same identifier, in hex.
+    set_name_id(
+        &w,
+        protocol::NameIdFormat::Persistent,
+        saml::NameIdSource::PairwiseIdLowercase,
+    )
+    .await;
+    let lowercase = name_id_of(&sign_in().await);
+    assert_eq!(lowercase.len(), 64, "{lowercase}");
+    assert!(
+        lowercase
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{lowercase}"
+    );
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&persistent)
+        .unwrap();
+    assert_eq!(lowercase, hex::encode(decoded));
+
+    // Control: the email format still sends the configured user name.
+    set_name_id(
+        &w,
+        protocol::NameIdFormat::EmailAddress,
+        saml::NameIdSource::UserPrincipalName,
+    )
+    .await;
+    assert_eq!(name_id_of(&sign_in().await), w.f.upn);
 }

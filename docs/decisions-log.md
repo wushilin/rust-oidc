@@ -309,7 +309,6 @@ with explicit `value(name = ...)`.** The accepted spellings are unchanged
 command changes; clap now rejects a bad value with a list of the good ones instead of
 the server doing it in a `bail!`.
 
-
 **46. The OAuth `error` value and the AADSTS number are enums.** `AadError.error` was
 a `&'static str` and `.code` a bare `u32`, written out at 64 call sites.
 `error::OAuthError` (19 values) and `error::Aadsts` (47 numbers) are now the only lists.
@@ -665,7 +664,6 @@ lookup runs. That is the layering working as intended, but it meant the second l
 untested, so `a_group_lookup_is_scoped_to_its_tenant_whatever_the_id` now tests it
 directly, and that test does fail when the scoping is broken. The same is true of the
 tenant id in every other domain function's `WHERE`: the gate is what the HTTP tests prove.
-
 
 ---
 
@@ -2024,3 +2022,217 @@ assigned, and the account's own tenant (or its own setting) allows it.
   SHOULD (IIP-SSO01.ak). Answering would let anyone make this server post a signed
   message, with an `InResponseTo` and `RelayState` they chose, to the application.
   *To reverse*: answer at the default Reply URL from `check_signature`'s error path.
+
+### Version and ForceAuthn with IsPassive are answered in SAML (2026-11-24)
+
+- **A request of another version gets `VersionMismatch`**, as SAML Core 3.2.2.2
+  requires, with the second-level code saying whether it was too low or too high.
+  It is answered at the registered Reply URL after the usual checks, like the other
+  unsupported requests. Logout requests of another version still get a local page.
+- **`ForceAuthn` and `IsPassive` together get `NoPassive`.** Fresh authentication
+  here always needs the user, so it cannot be done without a sign-in page.
+- **A missing or invalid `IssueInstant` gets `Requester`**, also at the Reply URL,
+  since such a request is schema-invalid (SAML Core 3.2.1). This holds for a signed
+  request too: the freshness check needs a valid time, and replaying an error answer
+  gains nothing. A signed request with a valid but stale time still gets a local page.
+- **Error `Response`s are signed** with the application's active certificate and
+  algorithm, like successful ones with Response signing. SAMLscope accepts an error
+  status only from a signed Response (IIP-SSO01-ep), and signing lets the application
+  tell our refusal from a forged one. They are sent only after the request passed the
+  application, Reply URL, `Destination` and signature checks, so this does not let
+  anyone obtain a signed message for a request we would not answer.
+- **SAMLscope contradicts itself on Version 1.1**: IIP-SSO01-ep requires top-level
+  `VersionMismatch` and IIP-SSO01-an requires `Requester` for the same request. We
+  follow the version-specific rule (`VersionMismatch`), so IIP-SSO01-an reports a
+  failure. Answering with a local page would avoid the failure but meets neither rule.
+
+### Logout over HTTP-POST (2026-11-24)
+
+- **The owner chose to accept `LogoutRequest` on HTTP-POST**, departing from Entra,
+  whose Single Logout is Redirect only. SAMLscope sends its logout probes over POST,
+  and some applications only post. The metadata lists a POST `SingleLogoutService`.
+- **The answer stays on HTTP-Redirect** to the registered Logout URL, because without
+  the application's metadata we do not know whether it accepts a posted answer.
+- A cross-site POST carries our session cookie only because it is `SameSite=None`
+  over HTTPS; over plain HTTP that works only when the application is on the same site.
+
+### SP metadata import is file only (2026-11-24)
+
+- **The owner chose file import only**, as Entra's "Upload metadata file": no URL is
+  fetched, nothing is refreshed, and the file's signature and `validUntil` are not
+  relied on. The file only fills in Basic SAML Configuration, and the administrator
+  reviews and saves it, so it goes through the same checks and the same
+  `SaveSamlBasic` transaction and audit row as typed values.
+- **What is read**: the entity ID (first Identifier, others kept), the
+  `AssertionConsumerService` endpoints on HTTP-POST with their `index`, the default
+  chosen by SAML metadata 2.2.3 (first `isDefault="true"`, else first unmarked, else
+  first), and a compatible Logout URL. Certificates in the
+  file are not taken, as in Entra. A file describing more or fewer than one service
+  provider is refused.
+- **Reply URLs now keep an explicit index and default**, which the existing columns
+  already held. Exactly one must be the default and indexes must be distinct, checked
+  where they are saved. The text box stays one URL per line; `index=N` and `default`
+  are written only when the plain order would not say the same.
+- **axum's `multipart` feature** is turned on for the upload (adds `multer`).
+
+### Selectable assertion encryption (2026-11-24)
+
+- **The owner chose to offer AES-GCM and XML Encryption 1.1 RSA-OAEP**, departing
+  from Entra, which sends only AES-256-CBC with RSA-OAEP-MGF1P over SHA-1. The SAML
+  interoperability profile asks an IdP to support AES-GCM and both OAEP forms.
+- **Existing applications keep Entra's algorithms** (migration defaults), so no
+  service provider that works today stops decrypting. **New applications start with
+  AES-256-GCM and RSA-OAEP over SHA-256**, as recommended to the owner; an
+  administrator picks AES-256-CBC for one that cannot read GCM.
+- **The mask**: RSA-OAEP over SHA-256 states an MGF1-SHA256 mask in the message, the
+  usual modern pairing; every other choice uses the MGF1-SHA1 both names default to.
+  RSA-OAEP-MGF1P over SHA-256 is that mixed form, which aws-lc-rs does not offer, so
+  key wrapping uses the `rsa` crate (already a dependency) for every form. This is
+  encryption to a public key only; nothing is decrypted with it. A renamed `sha1`
+  0.10 dependency supplies the SHA-1 that crate takes.
+- **The encrypted assertion still always comes in a signed Response**, GCM or not.
+- **The form keeps the certificate unless a new one is pasted**; stopping is a separate
+  button, so changing only the method cannot drop encryption by accident.
+
+### A posted logout request is answered over POST (2026-11-24)
+
+- **Supersedes "the answer stays on HTTP-Redirect" above.** A browser refuses a
+  redirect that follows a form post when the posting page's `form-action` policy does
+  not list the redirect's target. SAMLscope's pages do exactly that, and so may an
+  application's; the logout then never reaches the application. Answering with our own
+  auto-posting page, as sign-in does, avoids it: our page's policy names the target.
+- **The LogoutResponse sent over POST is signed inside**, as the binding requires.
+  A request that came by Redirect is still answered by Redirect.
+
+### Asynchronous Single Logout (2026-11-24)
+
+- **A LogoutRequest carrying `aslo:Asynchronous` gets no LogoutResponse**, as the
+  extension requires: the session ends as for any logout, other applications are told,
+  and the browser is shown our signed-out page. With no matching session, the browser
+  is shown a failure page instead, and the session is untouched. Requests with a wrong
+  `Destination` or a bad signature are refused before this, as before. The extension is
+  honored signed or not; not answering an unsigned request gives nothing away.
+
+### Persistent Name ID, its lowercase form, and algorithm metadata (2026-11-24)
+
+- **The owner approved three small changes** the SAMLscope self-declarations pointed to.
+- **A persistent Name ID is always the pairwise identifier**, departing from Entra,
+  which sends whatever source is configured. A persistent identifier must not be a
+  business identifier such as a UPN or email (IIP-SSO05.a8), and must differ per
+  application. SAML is unreleased, so no deployed application sees its Name IDs change.
+- **`user.pairwiseid (lowercase hex)`** gives the same identifier as 64 lowercase hex
+  digits, for an application that compares Name IDs without regard to case (IIP-IDP21.a).
+  It is a Name ID source rather than a separate setting, so the stored column and the
+  claims transaction stay as they are.
+- **Metadata declares `alg:DigestMethod` and `alg:SigningMethod`** from the
+  application's signing algorithm, preferred first, with SHA-256 always listed since it
+  is always accepted (IIP-MD09.a, .b). Entra's metadata has none; it only adds.
+- **Not taken up**: decrypting an `EncryptedID` in logout requests (would need an IdP
+  encryption key in metadata), and answering a badly signed request in SAML (kept as a
+  local page, as recorded above).
+
+### Metadata file checks (2026-11-24)
+
+- **A file grouping several service providers is accepted** when exactly one of them
+  carries an Identifier the application already has; otherwise the administrator is
+  asked for the application's own file. Federation aggregates are such files.
+- **Refused**: metadata whose `validUntil` (on the entity or any group holding it) has
+  passed, a file listing one entityID twice, and a SAML-namespace element directly
+  inside `Extensions`, which the schema reserves for other namespaces.
+- **Not required**, though SAMLscope's metadata-trust checks expect it: a signature on
+  the file, and a `validUntil` at all or one within a set horizon (IIP-MD03.a, MD04.a,
+  MD04.c). An administrator uploading a file reviews it; requiring either would refuse
+  most ordinary SP metadata. These checks report failures by design under "file only".
+- **Size**: an uploaded file may be up to 2 MB and 50,000 elements, against 64 KB and
+  256 elements for a SAML message from the network; only a signed-in administrator can
+  upload one.
+
+### ECDSA request signatures and keys from metadata (2026-11-25)
+
+Both depart from Entra; the owner chose them.
+
+- **ECDSA request signatures** (IIP-ALG03.a). Accepted: ECDSA-SHA256 with a P-256
+  key and ECDSA-SHA384 with a P-384 key, each hash on its own curve only, which is
+  what aws-lc-rs offers as fixed-length verifiers. The signature is the fixed-length
+  r‖s of XML Signature 1.1, on both bindings; an ASN.1 DER signature is refused. The
+  algorithm named must match the certificate's key: an ECDSA name never verifies with
+  an RSA key, nor the reverse. Other curves and Ed25519 are refused when the
+  certificate is added. The federation metadata lists both ECDSA methods after the
+  application's own RSA method. Assertions are still signed with RSA only, and the
+  encryption certificate stays RSA.
+- **SAML verification certificates are read by a SAML parser**, not the OIDC client
+  assertion parser, which accepts RSA only. Client assertion certificates are
+  unchanged.
+- **Keys from an uploaded metadata file** are offered, not added. After an upload,
+  Verification certificates lists the file's signing certificates (a `KeyDescriptor`
+  marked `signing` or unmarked) that the server can verify with and that are not
+  already on the application, each with its own Add. Add runs the existing
+  *Add SAML verification certificate* transaction with that certificate, so there is no
+  new kind of change and the audit row is the same. Encryption keys in the file are
+  ignored, as are keys the server cannot use and text that is not a certificate.
+- **ALG03-a may stay unverified**: SAMLscope wants a SAML error answer for a corrupted
+  ECDSA signature, and a badly signed request gets a local page (decided earlier).
+- **A verification certificate's dates no longer matter.** The SAML V2.0 Metadata
+  Interoperability Profile makes the key the only thing a metadata consumer uses: an
+  expired or not-yet-valid certificate, or one with odd extensions, key usage, subject
+  or issuer, must not stop its key from verifying (IIP-MD06.a9, MD12.b, MD12.d). Keys
+  from metadata are added as verification certificates, so the rule applies to all
+  of them: adding no longer refuses a certificate outside its dates, sign-in no longer
+  skips an expired one, and "the last one stays while signatures are required" counts
+  certificates rather than unexpired ones. The console marks an expired one as still
+  verifying until removed. Revoking a key means removing it, as with Shibboleth's
+  metadata keys.
+- **A SAML Identifier (Entity ID) may be 1024 characters.** SAML Metadata 2.3.2
+  bounds `entityIDType` at 1024 characters. Keep accepting Unicode identifiers
+  already supported by storage. A 2048-byte ceiling preserves every identifier
+  formerly accepted and keeps the PostgreSQL index within its size limit.
+  MySQL widens its UTF-8 column and uses a digest
+  for the tenant-wide unique index to stay within InnoDB's key limit. SQLite
+  and Postgres already use TEXT. All three compare the full identifier.
+- **MySQL's 0027 makes the final change itself; there is no 0029.** 0027 is
+  applied on the deployed service, but only its SQLite file, which is unchanged.
+  The MySQL file had never been released (it came with this change, unmerged)
+  and no MySQL database had applied it, so it was rewritten rather than followed
+  by a second migration: one statement that widens the column to 1024 UTF-8
+  characters and keys on a SHA-256 digest, keeping a primary key throughout so
+  it runs where `sql_require_primary_key` is on, and with no ASCII step to stop
+  on an existing Identifier. `tests/migration_pins.rs` pins each engine's 0027
+  as released, so a later edit fails in CI.
+- **A metadata file's role may expire by itself**: `validUntil` on the
+  `SPSSODescriptor` is checked like the entity's and its groups' (SAML Metadata
+  2.4.1).
+- **Metadata import selects a role that supports SAML 2.0.** It fills the single
+  Logout URL only when HTTP-Redirect is available and the browser bindings and
+  response locations fit one URL. Otherwise, the preview explains why it leaves
+  the configured Logout URL in place and still offers the other values.
+
+## My Account tabs and application logos
+
+- **My Account is three tabs, each its own address**: `/myaccount/apps` (My apps),
+  `/myaccount/profile` and `/myaccount/security`. The page is script-free, so a tab is
+  a link and the server shows one at a time. `/myaccount` shows My apps, as Entra's
+  My Apps is where a user starts. Forms still post to `/myaccount`; the answer shows
+  the tab the action belongs to (opening an application: My apps; password,
+  authenticator, recovery codes, sessions: Security). Signing in lands on My apps,
+  whichever tab asked for it.
+- **A logo is the application's, not a tenant's**: one for every tenant that uses it,
+  set by whoever may write the application (`App:Write`), on its Overview. It is a new
+  kind of change, *Set application logo* (`admin.app.logo`). The audit row records the
+  image's type, size and SHA-256, never the image.
+- **Uploads follow Entra's application logo rules**: PNG, JPEG or BMP, at most 100 KB.
+  The format is told by the file's first bytes, never its name or declared type, and
+  checked again when the logo is stored and when it is served. SVG is never accepted,
+  as an SVG document can carry script. Images are not decoded or resized.
+- **The icon library is this server's own**: Entra has none. Sixteen line icons on
+  colours, drawn in `src/logos.rs` and sent as inline SVG; only the icon's name is
+  stored. An application without a logo shows its name's initials on a colour fixed
+  by its id.
+- **An uploaded logo is served only to a signed-in user whose My apps lists that
+  application**, from `/myaccount/apps/{app}/logo`, with its checked type, `nosniff`
+  and a sandboxing policy. My Account's policy adds `img-src 'self'` for it. The admin
+  Overview shows the image inline as a `data:` URL, so the console's policy adds
+  `img-src data:`. The logo route uses the same MFA requirement as the gallery
+  and disables browser caching so each request checks the current access. It is
+  sent `Cross-Origin-Resource-Policy: same-origin`: the session cookie is
+  `SameSite=None`, so without it another site's page could tell from an `<img>`
+  loading or not whether the visitor has a given application.

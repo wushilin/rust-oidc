@@ -17,24 +17,27 @@
 
 use crate::AppState;
 use crate::admin::context::{AdminContext, On};
-use crate::admin::routes::{At, Params, Settled, TenantTab, checked, chrome, field, optional, parse_form, settle};
+use crate::admin::routes::{
+    At, Files, Params, Settled, TenantTab, checked, chrome, field, optional, parse_form, parse_multipart_with, settle,
+};
 use crate::admin::view::{self, e};
 use crate::admin::{APP_READ, APP_ROTATE, APP_WRITE, ASSIGNMENT_READ, ASSIGNMENT_WRITE};
 use crate::apps::{self, Application, GroupMembershipClaims, MemberType, Principal, RedirectPlatform, ScopeConsent};
 use crate::directory::PrincipalType;
 use crate::rbac::Action;
+use crate::saml_metadata::{SpMetadata, read_sp_metadata};
 use crate::tenant::Tenant;
 use crate::txn::ops::apps::{
     AddAppCertificate, AddAppRole, AddAppScope, AddAppSecret, AddIdentifierUri, AddRedirectUri, AssignApp, CreateApp,
     GrantAppRole, GrantAuthApiPermission, RemoveAppCertificate, RemoveAppSecret, RemoveIdentifierUri,
-    RemoveRedirectUri, RenameApp, RevokeAppRole, RevokeAuthApiPermission, SaveAppFlags, SetGroupMembershipClaims,
-    UnassignApp,
+    RemoveRedirectUri, RenameApp, RevokeAppRole, RevokeAuthApiPermission, SaveAppFlags, SetAppLogo,
+    SetGroupMembershipClaims, UnassignApp,
 };
 use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
 use crate::util::now;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 
 /// What a post to an application's page asks for.
@@ -171,6 +174,7 @@ pub enum AppOp {
     SamlEnable,
     SamlDisable,
     SamlBasic,
+    SamlMetadataImport,
     SamlClaims,
     SamlSigning,
     SamlCertificateAdd,
@@ -182,6 +186,9 @@ pub enum AppOp {
     SamlEncryption,
     SignOnUrl,
     Visibility,
+    /// Its logo in My apps: an uploaded image, a library icon, or none, as
+    /// the form's [`LogoChoice`] says.
+    Logo,
 }
 
 impl AppOp {
@@ -189,7 +196,7 @@ impl AppOp {
     /// page goes back to after it.
     fn section(self) -> AppSection {
         match self {
-            Self::Rename => AppSection::Overview,
+            Self::Rename | Self::Logo => AppSection::Overview,
             Self::Flags | Self::RedirectUriAdd | Self::RedirectUriRemove => AppSection::Authentication,
             Self::GroupClaims => AppSection::TokenConfiguration,
             Self::SecretAdd | Self::SecretRemove | Self::CertificateAdd | Self::CertificateRemove => {
@@ -203,6 +210,7 @@ impl AppOp {
             Self::SamlEnable
             | Self::SamlDisable
             | Self::SamlBasic
+            | Self::SamlMetadataImport
             | Self::SamlClaims
             | Self::SamlSigning
             | Self::SamlCertificateAdd
@@ -240,6 +248,7 @@ impl AppOp {
         Self::SamlEnable,
         Self::SamlDisable,
         Self::SamlBasic,
+        Self::SamlMetadataImport,
         Self::SamlClaims,
         Self::SamlSigning,
         Self::SamlCertificateAdd,
@@ -251,6 +260,7 @@ impl AppOp {
         Self::SamlEncryption,
         Self::SignOnUrl,
         Self::Visibility,
+        Self::Logo,
     ];
 
     /// The form's `op` field.
@@ -280,6 +290,7 @@ impl AppOp {
             Self::SamlEnable => "saml_enable",
             Self::SamlDisable => "saml_disable",
             Self::SamlBasic => "saml_basic",
+            Self::SamlMetadataImport => "saml_metadata_import",
             Self::SamlClaims => "saml_claims",
             Self::SamlSigning => "saml_signing",
             Self::SamlCertificateAdd => "saml_certificate_add",
@@ -291,6 +302,7 @@ impl AppOp {
             Self::SamlEncryption => "saml_encryption",
             Self::SignOnUrl => "sign_on_url",
             Self::Visibility => "visibility",
+            Self::Logo => "logo",
         }
     }
 
@@ -332,18 +344,20 @@ impl AppOp {
             | Self::RoleAdd
             | Self::SamlDisable
             | Self::SamlBasic
+            | Self::SamlMetadataImport
             | Self::SamlClaims
             | Self::SignOnUrl
-            | Self::Visibility => APP_WRITE,
+            | Self::Visibility
+            | Self::Logo => APP_WRITE,
         }
     }
 
     /// The transaction it runs, for the test that the page asks for the same
-    /// action the transaction needs.
+    /// action the transaction needs; `None` for one that only shows a page.
     #[cfg(test)]
-    fn kind(self) -> crate::txn::TxnKind {
+    fn kind(self) -> Option<crate::txn::TxnKind> {
         use crate::txn::TxnKind;
-        match self {
+        Some(match self {
             Self::Rename => TxnKind::RenameApp,
             Self::Flags => TxnKind::SaveAppFlags,
             Self::GroupClaims => TxnKind::SetGroupMembershipClaims,
@@ -366,6 +380,8 @@ impl AppOp {
             Self::SamlEnable => TxnKind::EnableSamlSso,
             Self::SamlDisable => TxnKind::DisableSamlSso,
             Self::SamlBasic => TxnKind::SaveSamlBasic,
+            // Reading a metadata file only fills in the form; saving it is SamlBasic.
+            Self::SamlMetadataImport => return None,
             Self::SamlClaims => TxnKind::SaveSamlClaims,
             Self::SamlSigning => TxnKind::SaveSamlSigning,
             Self::SamlCertificateAdd => TxnKind::AddSamlCertificate,
@@ -377,7 +393,8 @@ impl AppOp {
             Self::SamlEncryption => TxnKind::SetSamlEncryption,
             Self::SignOnUrl => TxnKind::SetAppSignOnUrl,
             Self::Visibility => TxnKind::SetAppVisibility,
-        }
+            Self::Logo => TxnKind::SetAppLogo,
+        })
     }
 }
 
@@ -387,6 +404,35 @@ const NAME: &str = "name";
 const THEN: &str = "then";
 const DAYS: &str = "days";
 const KEY_ID: &str = "key_id";
+/// The logo forms' file, the library icon chosen, and which form it is.
+const LOGO_FILE: &str = "logo";
+const LOGO_ICON: &str = "icon";
+const LOGO_CHOICE: &str = "choice";
+
+/// Which of the Overview's logo forms was sent: one operation, one
+/// transaction, three ways to say what the logo becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogoChoice {
+    Upload,
+    Icon,
+    Remove,
+}
+
+impl LogoChoice {
+    const ALL: &'static [LogoChoice] = &[Self::Upload, Self::Icon, Self::Remove];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Icon => "icon",
+            Self::Remove => "remove",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == raw)
+    }
+}
 const CERT: &str = "certificate";
 const URI: &str = "uri";
 const PLATFORM: &str = "platform";
@@ -631,6 +677,8 @@ struct Page<'a> {
     reveal: Option<&'a str>,
     /// The user name the Check sign-in section was asked about.
     check: Option<&'a str>,
+    /// Values read from an uploaded SAML metadata file, to review before saving.
+    draft: Option<&'a SpMetadata>,
 }
 
 async fn detail(
@@ -656,7 +704,7 @@ async fn detail(
                 write: may_write,
                 rotate: may_rotate,
             };
-            super::saml::section(st, tenant, app, &url, &csrf, may).await
+            super::saml::section(st, tenant, app, &url, &csrf, may, page.draft).await
         }
         AppSection::Authentication => {
             let redirect_uris = apps::redirect_uris(&st.pool, app).await.unwrap_or_default();
@@ -785,6 +833,85 @@ other applications may hold. Add one under App roles, with the Application membe
         status,
         &format!("{} \u{b7} {}", app.display_name, section.label()),
         &body,
+    )
+}
+
+/// The application's logo, as its tile in My apps shows it, and the forms to
+/// upload one, choose one from the library, or remove it.
+async fn logo_section(
+    st: &AppState,
+    ctx: &AdminContext,
+    tenant: &Tenant,
+    app: &Application,
+    url: &str,
+    csrf: &str,
+) -> String {
+    use crate::logos::{self, LibraryIcon, MAX_IMAGE_BYTES, Shown};
+    let shown = logos::shown(&st.pool, &app.id).await.unwrap_or(None);
+    let current = match shown {
+        Some(Shown::Library(icon)) => format!("{} <span>Library icon: {}</span>", icon.svg(), e(icon.label())),
+        Some(Shown::Image { .. }) => match logos::image(&st.pool, &app.id).await {
+            Ok(Some(image)) => {
+                use base64::Engine;
+                format!(
+                    r#"<img class="logo" src="data:{};base64,{}" alt=""> <span>Uploaded image, {} KB</span>"#,
+                    image.kind.content_type(),
+                    base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+                    image.bytes.len().div_ceil(1024)
+                )
+            }
+            _ => String::new(),
+        },
+        None => format!(
+            r#"<span class="logo initials" style="background:{}" aria-hidden="true">{}</span> <span>No logo: My apps shows the name's initials.</span>"#,
+            logos::initials_colour(&app.app_id),
+            e(&logos::initials(&app.display_name))
+        ),
+    };
+    let preview = format!(r#"<h2>Logo</h2><div class="logo-current">{current}</div>"#);
+    if !ctx.can_in(APP_WRITE, tenant) {
+        return preview;
+    }
+    let open = |choice: LogoChoice, extra: &str| {
+        format!(
+            r#"<form method="post" action="{url}"{extra}>{csrf}<input type="hidden" name="{field}" value="{op}"><input type="hidden" name="{LOGO_CHOICE}" value="{choice}">"#,
+            url = e(url),
+            field = AppOp::FIELD,
+            op = AppOp::Logo.as_str(),
+            choice = choice.as_str(),
+        )
+    };
+    let icons: String = LibraryIcon::ALL
+        .iter()
+        .map(|icon| {
+            format!(
+                r#"<label><input type="radio" name="{LOGO_ICON}" value="{value}" required{checked}>{svg}<span>{label}</span></label>"#,
+                value = icon.as_str(),
+                checked = if shown == Some(Shown::Library(*icon)) { " checked" } else { "" },
+                svg = icon.svg(),
+                label = e(icon.label()),
+            )
+        })
+        .collect();
+    let remove = if shown.is_some() {
+        format!(
+            r#"{}<div class="actions"><button type="submit" class="secondary">Remove logo</button></div></form>"#,
+            open(LogoChoice::Remove, "")
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"{preview}<p class="muted">What the application's tile shows in My apps.</p>
+{upload}<label for="{LOGO_FILE}">Upload a logo</label>
+<input id="{LOGO_FILE}" name="{LOGO_FILE}" type="file" accept="image/png,image/jpeg,image/bmp" required>
+<p class="muted">PNG, JPEG or BMP, up to {max} KB, as in Entra. A square image looks best; Entra suggests 215 by 215 pixels.</p>
+<div class="actions"><button type="submit">Upload</button></div></form>
+{choose}<fieldset class="icons"><legend>Or choose an icon</legend>{icons}</fieldset>
+<div class="actions"><button type="submit">Use this icon</button></div></form>{remove}"#,
+        upload = open(LogoChoice::Upload, r#" enctype="multipart/form-data""#),
+        choose = open(LogoChoice::Icon, ""),
+        max = MAX_IMAGE_BYTES / 1024,
     )
 }
 
@@ -927,7 +1054,8 @@ flow needs before it runs anything.</p>"#,
     } else {
         String::new()
     };
-    format!(r#"{facts}{rename}<div class="tiles">{cards}</div>{flow}"#)
+    let logo = logo_section(st, ctx, tenant, app, url, csrf).await;
+    format!(r#"{facts}{rename}{logo}<div class="tiles">{cards}</div>{flow}"#)
 }
 
 /// The service principal's own switches, shown with the application's flags.
@@ -1754,9 +1882,16 @@ pub async fn detail_post(
     ctx: AdminContext,
     State(st): State<AppState>,
     Path((key, app_key)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let form = parse_form(&body);
+    // A metadata file comes as multipart; every other form is URL-encoded.
+    // A logo comes as bytes; a metadata file as text.
+    let (form, mut files) = match parse_multipart_with(&headers, body.clone(), &[LOGO_FILE]).await {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => (parse_form(&body), Files::new()),
+        Err(_) => return view::bad_request("The upload could not be read."),
+    };
     let Some(op) = AppOp::parse(field(&form, AppOp::FIELD)) else {
         return view::bad_request("That is not an operation this page offers.");
     };
@@ -1774,6 +1909,36 @@ pub async fn detail_post(
     let Ok(app) = apps::find_in_tenant(&st.pool, tenant, &app_key).await else {
         return view::not_found();
     };
+    // As in Entra, an uploaded metadata file only fills in Basic SAML
+    // Configuration; nothing changes until the administrator saves it.
+    if op == AppOp::SamlMetadataImport {
+        let file = form
+            .get(super::saml::METADATA_FILE)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let known = crate::saml::config(&st.pool, &app)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.identifiers)
+            .unwrap_or_default();
+        return match read_sp_metadata(file, &known, now()) {
+            Ok(draft) => {
+                let page = Page {
+                    draft: Some(&draft),
+                    ..Page::default()
+                };
+                detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::OK).await
+            }
+            Err(problem) => {
+                let page = Page {
+                    error: Some(&problem),
+                    ..Page::default()
+                };
+                detail(&st, &ctx, tenant, &app, op.section(), page, StatusCode::BAD_REQUEST).await
+            }
+        };
+    }
 
     // The role tick boxes repeat one field name, which the form map keeps only
     // one value of, so they are read from the body.
@@ -1789,7 +1954,12 @@ pub async fn detail_post(
             Outcome::Failed(m) => Outcome::Failed(m),
         }
     } else {
-        apply(&st, &ctx, tenant, &app, op, &form, ticked).await
+        let sent = Sent {
+            form: &form,
+            ticked,
+            upload: files.remove(LOGO_FILE),
+        };
+        apply(&st, &ctx, tenant, &app, op, sent).await
     };
     match settle(applied) {
         Settled::Done(Applied::Redirect) => {
@@ -1832,15 +2002,23 @@ async fn redirect<T: Transaction>(st: &AppState, actor: &Actor, t: &T) -> Outcom
 /// Carry out one operation as the signed-in administrator: one transaction,
 /// which checks, changes and records it, or does none of that. Only reading the
 /// form happens here; every rule about an application is in [`crate::apps`].
+/// What the form sent: its fields, the role boxes ticked (one name, several
+/// values) and an uploaded logo's bytes.
+struct Sent<'a> {
+    form: &'a Params,
+    ticked: Vec<String>,
+    upload: Option<Vec<u8>>,
+}
+
 async fn apply(
     st: &AppState,
     ctx: &AdminContext,
     tenant: &Tenant,
     app: &Application,
     op: AppOp,
-    form: &Params,
-    ticked: Vec<String>,
+    sent: Sent<'_>,
 ) -> Outcome<Applied> {
+    let Sent { form, ticked, upload } = sent;
     let actor = ctx.actor();
     let (tenant_id, app_id) = (tenant.id.clone(), app.app_id.clone());
     let text = |name: &str| field(form, name).to_string();
@@ -1850,6 +2028,7 @@ async fn apply(
         AppOp::SamlEnable
         | AppOp::SamlDisable
         | AppOp::SamlBasic
+        | AppOp::SamlMetadataImport
         | AppOp::SamlClaims
         | AppOp::SamlSigning
         | AppOp::SamlCertificateAdd
@@ -1874,6 +2053,31 @@ async fn apply(
                 allow_access_token_implicit: checked(form, ALLOW_ACCESS_TOKEN),
             };
             redirect(st, &actor, &t).await
+        }
+        AppOp::Logo => {
+            use crate::logos::{Image, LibraryIcon, Logo};
+            let logo = match LogoChoice::parse(field(form, LOGO_CHOICE)) {
+                Some(LogoChoice::Upload) => match Image::from_upload(upload.unwrap_or_default()) {
+                    Ok(image) => Some(Logo::Image(image)),
+                    Err(problem) => return invalid(&problem),
+                },
+                Some(LogoChoice::Icon) => match LibraryIcon::parse(field(form, LOGO_ICON)) {
+                    Some(icon) => Some(Logo::Library(icon)),
+                    None => return invalid("Choose an icon."),
+                },
+                Some(LogoChoice::Remove) => None,
+                None => return invalid("That is not a logo form."),
+            };
+            redirect(
+                st,
+                &actor,
+                &SetAppLogo {
+                    tenant_id,
+                    app_id,
+                    logo,
+                },
+            )
+            .await
         }
         AppOp::Rename => {
             let t = RenameApp {
@@ -2151,8 +2355,9 @@ mod tests {
     fn every_operation_runs_its_own_transaction_with_the_same_action() {
         let mut seen = std::collections::HashSet::new();
         for op in AppOp::ALL {
-            assert!(seen.insert(op.kind().info().event.as_str()), "{op:?} shares an event");
-            assert_eq!(op.kind().info().need, Need::Action(op.action()), "{op:?}");
+            let Some(kind) = op.kind() else { continue };
+            assert!(seen.insert(kind.info().event.as_str()), "{op:?} shares an event");
+            assert_eq!(kind.info().need, Need::Action(op.action()), "{op:?}");
         }
     }
 

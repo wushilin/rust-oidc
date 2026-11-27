@@ -229,6 +229,16 @@ details.add > .fold { border:1px solid var(--line); border-radius:0 6px 6px 6px;
 .banner { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; }
 .banner.bad { border-color:var(--err); }
 .once { display:block; margin:8px 0 0; padding:8px 10px; font:13px/1.45 var(--mono); word-break:break-all; user-select:all; -webkit-user-select:all; border:1px dashed var(--line); border-radius:4px; }
+.logo { width:56px; height:56px; border-radius:10px; object-fit:contain; flex:none; }
+.logo.initials { display:inline-flex; align-items:center; justify-content:center; color:#fff; font-size:21px; font-weight:650; }
+.logo-current { display:flex; align-items:center; gap:14px; }
+fieldset.icons { display:grid; grid-template-columns:repeat(auto-fill, minmax(84px, 1fr)); gap:8px; border:none; padding:0; margin:18px 0 0; }
+fieldset.icons legend { font-weight:600; margin-bottom:8px; padding:0; }
+fieldset.icons label { position:relative; display:flex; flex-direction:column; align-items:center; gap:4px; margin:0; padding:8px 4px; border:1px solid var(--border); border-radius:6px; cursor:pointer; font-size:12px; font-weight:400; }
+fieldset.icons label:has(input:checked) { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+fieldset.icons label:has(input:focus-visible) { outline:2px solid var(--accent); outline-offset:2px; }
+fieldset.icons input { position:absolute; opacity:0; width:1px; height:1px; }
+fieldset.icons .logo { width:40px; height:40px; }
 dl.facts { display:grid; grid-template-columns:max-content 1fr; gap:4px 18px; margin:0 0 10px; }
 dl.facts dt { color:var(--muted); }
 dl.facts dd { margin:0; word-break:break-all; font-family:var(--mono); font-size:13px; }
@@ -255,8 +265,9 @@ main:has(> .card) { min-height:100vh; display:flex; align-items:center; justify-
 }
 "#;
 
-const CSP: &str =
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+/// `img-src data:` for an application's uploaded logo, shown inline on its
+/// Overview: an image, which runs nothing.
+const CSP: &str = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 fn respond(status: StatusCode, html: String) -> Response {
     let mut resp = (status, html).into_response();

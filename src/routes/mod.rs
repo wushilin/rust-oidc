@@ -61,6 +61,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/{tenant}/oauth2/v2.0/logout", get(logout::logout).post(logout::logout))
         .route("/{tenant}/myaccount", get(myaccount::page).post(myaccount::post))
+        .route("/{tenant}/myaccount/{tab}", get(myaccount::tab_page))
+        .route("/{tenant}/myaccount/apps/{app}/logo", get(myaccount::logo))
         .route("/{tenant}/api/v1/authenticate", post(auth_api::authenticate))
         .route("/healthz", get(|| async { "ok" }))
         .route("/", get(front_door::page).post(front_door::post))

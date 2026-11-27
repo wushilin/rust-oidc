@@ -7,7 +7,7 @@ license = "Apache-2.0"
 [dependencies]
 anyhow = "1.0.104"
 argon2 = "0.6.0"
-axum = { version = "0.8.9", features = ["macros"] }
+axum = { version = "0.8.9", features = ["macros", "multipart"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
@@ -32,6 +32,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.6"
 sha1 = "0.11"
+# The SHA-1 the `rsa` crate's OAEP takes (digest 0.10), for XML Encryption's
+# rsa-oaep key transport with a SHA-1 mask.
+sha1_rsa = { package = "sha1", version = "0.10", default-features = false }
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres", "mysql", "migrate", "macros"] }
 subtle = "2.6.1"

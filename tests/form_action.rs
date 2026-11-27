@@ -19,6 +19,9 @@ const CLIENT_FORM_ACTION: &str = "form-action 'self' https://venus.example;";
 const SELF_ONLY: &str =
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
+/// The console's: the same, and an application's uploaded logo inline (`data:`).
+const CONSOLE: &str = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
 fn csp(page: &Page) -> String {
     page.headers["content-security-policy"].to_str().unwrap().to_string()
 }
@@ -132,7 +135,7 @@ async fn admin_pages_keep_form_action_self_alone() {
     let s = TestServer::start().await;
     let f = admin_fixture(&s).await;
     let anonymous = Browser::new().get(&s.url("/admin")).await;
-    assert_eq!(csp(&anonymous), SELF_ONLY, "the console sign-in form");
+    assert_eq!(csp(&anonymous), CONSOLE, "the console sign-in form");
     let admin = signed_in_admin(&s, &f).await;
     // A signed-in /admin sends the administrator to their tenant's console.
     let mut page = admin.get(&s.url("/admin")).await;
@@ -141,7 +144,7 @@ async fn admin_pages_keep_form_action_self_alone() {
         page = admin.get(&next).await;
     }
     assert_eq!(page.status, 200, "{}", page.body);
-    assert_eq!(csp(&page), SELF_ONLY, "the console home page");
+    assert_eq!(csp(&page), CONSOLE, "the console home page");
 }
 
 #[tokio::test]

@@ -19,13 +19,17 @@ use crate::access::{Flow, FlowVerdict, Mark, Report, Section, line};
 use crate::apps::{self, Application, ServicePrincipal};
 use crate::claims::Amr;
 use crate::routes::saml as endpoints;
-use crate::saml::{self, BasicConfig, Claim, ClaimSource, NameIdSource, NewCertificate, SamlConfig};
-use crate::saml_protocol::{NameIdFormat, SigningAlgorithm, SigningOption};
+use crate::saml::{self, BasicConfig, Claim, ClaimSource, NameIdSource, NewCertificate, ReplyUrl, SamlConfig};
+use crate::saml_metadata::SpMetadata;
+use crate::saml_protocol::{
+    ContentEncryption, EncryptionAlgorithms, KeyTransport, KeyTransportDigest, NameIdFormat, SigningAlgorithm,
+    SigningOption,
+};
 use crate::tenant::Tenant;
 use crate::txn::ops::saml::{
     ActivateSamlCertificate, AddSamlCertificate, AddSamlVerificationCertificate, DisableSamlSso, EnableSamlSso,
-    RemoveSamlCertificate, RemoveSamlVerificationCertificate, SaveSamlBasic, SaveSamlClaims, SaveSamlSigning,
-    SetAppSignOnUrl, SetAppVisibility, SetSamlEncryption, SetSamlRequireSigned,
+    EncryptionKey, RemoveSamlCertificate, RemoveSamlVerificationCertificate, SaveSamlBasic, SaveSamlClaims,
+    SaveSamlSigning, SetAppSignOnUrl, SetAppVisibility, SetSamlEncryption, SetSamlRequireSigned,
 };
 use crate::txn::{self, Actor, Outcome, Refusal, Transaction};
 use crate::util::{b64, now};
@@ -42,6 +46,12 @@ const CLAIM_SOURCE: &str = "claim_source";
 const SIGNING_OPTION: &str = "signing_option";
 const SIGNING_ALGORITHM: &str = "signing_algorithm";
 const CERTIFICATE: &str = "certificate";
+const ENCRYPTION_METHOD: &str = "encryption_method";
+const KEY_TRANSPORT: &str = "key_transport";
+const KEY_TRANSPORT_DIGEST: &str = "key_transport_digest";
+/// The encryption form's button: Save, or this one to stop encrypting.
+const ENCRYPTION_ACTION: &str = "encryption_action";
+const STOP_ENCRYPTING: &str = "stop";
 const CERTIFICATE_ID: &str = "certificate_id";
 const DAYS: &str = "days";
 const REQUIRED: &str = "required";
@@ -120,7 +130,18 @@ pub(super) struct May {
     pub rotate: bool,
 }
 
-/// The Single sign-on section.
+/// What the SAML page shows beyond the saved configuration.
+struct Shown<'a> {
+    may: &'a May,
+    /// Values read from a metadata file, not yet saved.
+    draft: Option<&'a SpMetadata>,
+}
+
+/// The uploaded SAML metadata file's field.
+pub(super) const METADATA_FILE: &str = "metadata_file";
+
+/// The Single sign-on section; with a draft, Basic SAML Configuration shows the
+/// values read from a metadata file, for the administrator to review and save.
 pub(super) async fn section(
     st: &AppState,
     tenant: &Tenant,
@@ -128,6 +149,7 @@ pub(super) async fn section(
     url: &str,
     csrf: &str,
     may: May,
+    draft: Option<&SpMetadata>,
 ) -> String {
     let config = saml::config(&st.pool, app).await.ok().flatten();
     let sp = apps::service_principal(&st.pool, &tenant.id, &app.app_id)
@@ -141,7 +163,7 @@ pub(super) async fn section(
     let properties = visibility_form(url, csrf, visible, may.write);
     match config.filter(|c| c.enabled) {
         Some(config) => {
-            let body = saml_page(st, tenant, app, url, csrf, &config, &may).await;
+            let body = saml_page(st, tenant, app, url, csrf, &config, Shown { may: &may, draft }).await;
             format!("{body}{properties}")
         }
         None => {
@@ -209,8 +231,9 @@ async fn saml_page(
     url: &str,
     csrf: &str,
     config: &SamlConfig,
-    may: &May,
+    shown: Shown<'_>,
 ) -> String {
+    let Shown { may, draft } = shown;
     let certificates = saml::certificates(&st.pool, app).await.unwrap_or_default();
     let verification = saml::verification_certificates(&st.pool, app).await.unwrap_or_default();
     let metadata_url = format!(
@@ -234,11 +257,11 @@ async fn saml_page(
 <h3>Attributes &amp; Claims</h3>{claims}
 <h3>SAML Certificates</h3>{certs}{signing}{verify}{encrypt}
 <h3>Set up {name}</h3>{login}{identifier}{logout}{metadata}"#,
-        basic = basic_form(url, csrf, config, may.write),
+        basic = basic_section(url, csrf, config, may.write, draft),
         claims = claims_form(url, csrf, config, may.write),
         certs = certificates_table(url, csrf, app, tenant, st.public_url.base(), &certificates, may.rotate),
         signing = signing_form(url, csrf, config, may.rotate),
-        verify = verification_form(url, csrf, config, &verification, may.rotate),
+        verify = verification_form(url, csrf, config, &verification, may.rotate, draft),
         encrypt = encryption_form(url, csrf, config, may.rotate),
         name = e(&app.display_name),
         login = copy_field("saml_login_url", "Login URL", &sso),
@@ -260,6 +283,51 @@ async fn saml_page(
     out
 }
 
+/// The saved configuration with a metadata file's values in place: its entity ID
+/// first among the Identifiers, its Reply URLs, and its Logout URL if it has one.
+fn with_draft(c: &SamlConfig, draft: &SpMetadata) -> SamlConfig {
+    let mut merged = c.clone();
+    merged.identifiers = std::iter::once(draft.entity_id.clone())
+        .chain(c.identifiers.iter().filter(|i| **i != draft.entity_id).cloned())
+        .collect();
+    merged.reply_urls = draft.reply_urls.clone();
+    if draft.logout_url.is_some() {
+        merged.logout_url = draft.logout_url.clone();
+    }
+    merged
+}
+
+/// Basic SAML Configuration, with the metadata file upload beside it.
+fn basic_section(url: &str, csrf: &str, c: &SamlConfig, may_write: bool, draft: Option<&SpMetadata>) -> String {
+    let (notice, shown) = match draft {
+        Some(draft) => (
+            r#"<p class="notice" role="status">Read from the metadata file. Review the values, then Save; nothing has changed yet.</p>"#,
+            with_draft(c, draft),
+        ),
+        None => ("", c.clone()),
+    };
+    let upload = if may_write {
+        format!(
+            r#"<form method="post" action="{action}" enctype="multipart/form-data">{csrf}<input type="hidden" name="{field}" value="{op}">
+<label for="{METADATA_FILE}">Upload metadata file</label><input id="{METADATA_FILE}" name="{METADATA_FILE}" type="file" accept=".xml,application/xml,text/xml,application/samlmetadata+xml" required>
+<div class="actions"><button type="submit" class="secondary">Read file</button></div></form>"#,
+            action = e(url),
+            field = AppOp::FIELD,
+            op = AppOp::SamlMetadataImport.as_str(),
+        )
+    } else {
+        String::new()
+    };
+    let logout_notice = draft
+        .and_then(|draft| draft.logout_notice)
+        .map(|message| format!(r#"<p class="notice" role="status">{}</p>"#, e(message)))
+        .unwrap_or_default();
+    format!(
+        "{upload}{notice}{logout_notice}{}",
+        basic_form(url, csrf, &shown, may_write)
+    )
+}
+
 fn basic_form(url: &str, csrf: &str, c: &SamlConfig, may_write: bool) -> String {
     let readonly = if may_write { "" } else { " readonly" };
     let button = if may_write {
@@ -270,14 +338,14 @@ fn basic_form(url: &str, csrf: &str, c: &SamlConfig, may_write: bool) -> String 
     format!(
         r#"{open}<label for="{IDENTIFIERS}">Identifier (Entity ID), one per line; the first is the default</label>
 <textarea id="{IDENTIFIERS}" name="{IDENTIFIERS}" rows="3"{readonly}>{identifiers}</textarea>
-<label for="{REPLY_URLS}">Reply URL (Assertion Consumer Service URL), one per line; the first is the default</label>
+<label for="{REPLY_URLS}">Reply URL (Assertion Consumer Service URL), one per line; the first is the default. To set them yourself, add <code>index=N</code> and mark one <code>default</code>.</label>
 <textarea id="{REPLY_URLS}" name="{REPLY_URLS}" rows="3"{readonly}>{replies}</textarea>
 <label for="{SIGN_ON_URL}">Sign on URL (optional)</label><input id="{SIGN_ON_URL}" name="{SIGN_ON_URL}" type="text" inputmode="url" value="{sign_on}"{readonly}>
 <label for="{RELAY_STATE}">Relay State (optional)</label><input id="{RELAY_STATE}" name="{RELAY_STATE}" type="text" value="{relay}"{readonly}>
 <label for="{LOGOUT_URL}">Logout URL (optional)</label><input id="{LOGOUT_URL}" name="{LOGOUT_URL}" type="text" inputmode="url" value="{logout}"{readonly}>{button}</form>"#,
         open = form_open(url, csrf, AppOp::SamlBasic),
         identifiers = e(&c.identifiers.join("\n")),
-        replies = e(&c.reply_urls.join("\n")),
+        replies = e(&reply_lines(&c.reply_urls)),
         sign_on = e(c.sign_on_url.as_deref().unwrap_or_default()),
         relay = e(c.relay_state.as_deref().unwrap_or_default()),
         logout = e(c.logout_url.as_deref().unwrap_or_default()),
@@ -310,6 +378,7 @@ fn claims_form(url: &str, csrf: &str, c: &SamlConfig, may_write: bool) -> String
 <select id="{NAME_ID_FORMAT}" name="{NAME_ID_FORMAT}"{disabled}>{formats}</select>
 <label for="{NAME_ID_SOURCE}">Name ID source attribute</label>
 <select id="{NAME_ID_SOURCE}" name="{NAME_ID_SOURCE}"{disabled}>{sources}</select>
+<p class="muted">A persistent Name ID is always this application's own pairwise identifier, whatever the source; choose the lowercase hex form for an application that ignores case.</p>
 <table><tr><th>Claim name</th><th>Source attribute</th></tr>{rows}</table>{button}</form>"#,
         open = form_open(url, csrf, AppOp::SamlClaims),
         formats = options(NameIdFormat::ALL, c.name_id_format, NameIdFormat::as_str, format_label),
@@ -421,7 +490,15 @@ fn verification_form(
     c: &SamlConfig,
     certificates: &[saml::VerificationCertificate],
     may_rotate: bool,
+    draft: Option<&SpMetadata>,
 ) -> String {
+    let offered = if may_rotate {
+        draft
+            .map(|d| offered_certificates(url, csrf, d, certificates))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let rows: String = certificates
         .iter()
         .map(|x| {
@@ -434,8 +511,14 @@ fn verification_form(
             } else {
                 String::new()
             };
+            // Only the key is used, so an expired certificate still verifies.
+            let expired = if x.not_after <= now() {
+                " (expired; its key still verifies until removed)"
+            } else {
+                ""
+            };
             format!(
-                r#"<tr><td class="muted">{}</td><td>{}</td><td>{remove}</td></tr>"#,
+                r#"<tr><td class="muted">{}</td><td>{}{expired}</td><td>{remove}</td></tr>"#,
                 e(&x.thumbprint),
                 e(&view::ts(x.not_after))
             )
@@ -449,7 +532,7 @@ fn verification_form(
     let controls = if may_rotate {
         format!(
             r#"{open}<label><input type="checkbox" name="{REQUIRED}"{checked}> Require verification certificates</label>
-<p class="muted">Requests may be signed on the HTTP-Redirect or HTTP-POST binding, with RSA-SHA256.</p>
+<p class="muted">Requests may be signed on the HTTP-Redirect or HTTP-POST binding, with RSA-SHA256, or with ECDSA-SHA256 (P-256) or ECDSA-SHA384 (P-384) keys.</p>
 <div class="actions"><button type="submit">Save</button></div></form>{add}"#,
             open = form_open(url, csrf, AppOp::SamlRequireSigned),
             checked = if c.require_signed_requests { " checked" } else { "" },
@@ -467,24 +550,140 @@ fn verification_form(
     } else {
         String::new()
     };
-    format!(r#"<h4>Verification certificates</h4>{table}{controls}"#)
+    format!(r#"<h4>Verification certificates</h4>{table}{offered}{controls}"#)
+}
+
+/// The metadata file's signing certificates not yet on the application, each
+/// with its own Add: nothing in the file is trusted until an administrator
+/// chooses it.
+fn offered_certificates(
+    url: &str,
+    csrf: &str,
+    draft: &SpMetadata,
+    registered: &[saml::VerificationCertificate],
+) -> String {
+    let rows: String = draft
+        .signing_certificates
+        .iter()
+        .filter(|c| !registered.iter().any(|r| r.thumbprint == saml::thumbprint(&c.der)))
+        .map(|c| {
+            format!(
+                r#"<tr><td class="muted">{thumbprint}</td><td>{expires}</td><td>{open}<textarea name="{CERTIFICATE}" hidden readonly>{pem}</textarea><button type="submit" class="secondary">Add</button></form></td></tr>"#,
+                thumbprint = e(&saml::thumbprint(&c.der)),
+                expires = e(&view::ts(c.not_after)),
+                open = form_open(url, csrf, AppOp::SamlVerificationAdd),
+                pem = e(&c.pem()),
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<p class="notice" role="status">Signing certificates in the metadata file. Add the ones this application signs its requests with; nothing has changed yet.</p>
+<table><tr><th>Thumbprint</th><th>Expires</th><th></th></tr>{rows}</table>"#
+    )
+}
+
+fn content_label(content: ContentEncryption) -> &'static str {
+    match content {
+        ContentEncryption::Aes256Gcm => "AES-256-GCM",
+        ContentEncryption::Aes128Gcm => "AES-128-GCM",
+        ContentEncryption::Aes256Cbc => "AES-256-CBC (as Entra)",
+    }
+}
+
+fn transport_label(transport: KeyTransport) -> &'static str {
+    match transport {
+        KeyTransport::RsaOaep => "RSA-OAEP (XML Encryption 1.1)",
+        KeyTransport::RsaOaepMgf1p => "RSA-OAEP-MGF1P (as Entra)",
+    }
+}
+
+fn digest_label(digest: KeyTransportDigest) -> &'static str {
+    match digest {
+        KeyTransportDigest::Sha256 => "SHA-256",
+        KeyTransportDigest::Sha1 => "SHA-1 (as Entra)",
+    }
+}
+
+fn select<T: Copy + PartialEq>(
+    id: &str,
+    label: &str,
+    all: &[T],
+    current: T,
+    wire: impl Fn(T) -> &'static str,
+    shown: impl Fn(T) -> &'static str,
+    disabled: &str,
+) -> String {
+    let options: String = all
+        .iter()
+        .map(|v| {
+            let selected = if *v == current { " selected" } else { "" };
+            format!(r#"<option value="{}"{selected}>{}</option>"#, wire(*v), e(shown(*v)))
+        })
+        .collect();
+    format!(r#"<label for="{id}">{label}</label><select id="{id}" name="{id}"{disabled}>{options}</select>"#)
 }
 
 fn encryption_form(url: &str, csrf: &str, c: &SamlConfig, may_rotate: bool) -> String {
+    let a = c.encryption_algorithms;
     let state = match &c.encryption_cert {
         Some(der) => format!(
-            r#"<p>Assertions are encrypted (AES-256) to the certificate <code>{}</code>.</p>"#,
+            r#"<p>Assertions are encrypted ({}, key wrapped with {} over {}) to the certificate <code>{}</code>.</p>"#,
+            e(content_label(a.content)),
+            e(transport_label(a.transport)),
+            e(digest_label(a.digest)),
             e(&saml::thumbprint(der))
         ),
         None => r#"<p class="empty">Assertions are not encrypted.</p>"#.to_string(),
     };
+    let disabled = if may_rotate { "" } else { " disabled" };
+    let choices = format!(
+        "{}{}{}",
+        select(
+            ENCRYPTION_METHOD,
+            "Encryption method",
+            ContentEncryption::ALL,
+            a.content,
+            ContentEncryption::as_str,
+            content_label,
+            disabled
+        ),
+        select(
+            KEY_TRANSPORT,
+            "Key transport",
+            KeyTransport::ALL,
+            a.transport,
+            KeyTransport::as_str,
+            transport_label,
+            disabled
+        ),
+        select(
+            KEY_TRANSPORT_DIGEST,
+            "Key transport digest",
+            KeyTransportDigest::ALL,
+            a.digest,
+            KeyTransportDigest::as_str,
+            digest_label,
+            disabled
+        ),
+    );
     if !may_rotate {
-        return format!("<h4>Token encryption</h4>{state}");
+        return format!("<h4>Token encryption</h4>{state}{choices}");
     }
+    let stop = if c.encryption_cert.is_some() {
+        format!(
+            r#"<button type="submit" class="secondary" name="{ENCRYPTION_ACTION}" value="{STOP_ENCRYPTING}" formnovalidate>Stop encrypting</button>"#
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<h4>Token encryption</h4>{state}{open}<label for="encrypt_cert">Certificate (PEM, public key only); leave empty to stop encrypting</label>
+        r#"<h4>Token encryption</h4>{state}{open}{choices}<label for="encrypt_cert">Certificate (PEM, public key only); leave empty to keep the current one</label>
 <textarea id="encrypt_cert" name="{CERTIFICATE}" rows="6"></textarea>
-<div class="actions"><button type="submit">Save</button></div></form>"#,
+<p class="muted">Pick what the application can decrypt. AES-GCM also protects the assertion's integrity; an encrypted assertion always comes in a signed response.</p>
+<div class="actions"><button type="submit">Save</button>{stop}</div></form>"#,
         open = form_open(url, csrf, AppOp::SamlEncryption),
     )
 }
@@ -535,7 +734,15 @@ pub(super) async fn extend_check(
     );
     require(
         !config.reply_urls.is_empty(),
-        format!("Reply URL: {}", config.reply_urls.join(", ")),
+        format!(
+            "Reply URL: {}",
+            config
+                .reply_urls
+                .iter()
+                .map(|r| r.url.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         "no Reply URL is set",
         &mut setup,
     );
@@ -725,6 +932,80 @@ fn invalid(message: &str) -> Outcome<()> {
     Outcome::Refused(Refusal::Invalid(message.to_string()))
 }
 
+/// Marks a Reply URL line's index.
+const INDEX_PREFIX: &str = "index=";
+/// Marks the default Reply URL's line.
+const DEFAULT_MARK: &str = "default";
+
+/// Reply URLs as the form shows them: plain lines when each is indexed by its
+/// position and the first is the default, else every line with its index.
+fn reply_lines(replies: &[ReplyUrl]) -> String {
+    if ReplyUrl::is_plain_list(replies) {
+        return replies.iter().map(|r| r.url.as_str()).collect::<Vec<_>>().join("\n");
+    }
+    replies
+        .iter()
+        .map(|r| {
+            let mark = if r.default {
+                format!(" {DEFAULT_MARK}")
+            } else {
+                String::new()
+            };
+            format!("{} {INDEX_PREFIX}{}{mark}", r.url, r.index)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reply URL lines: `URL`, optionally followed by `index=N` and `default`. A
+/// line without an index takes the lowest one not yet used; with no line
+/// marked default, the first is.
+fn parse_reply_lines(lines: &[String]) -> Result<Vec<ReplyUrl>, String> {
+    let mut parsed = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut words = line.split_whitespace();
+        let Some(url) = words.next() else { continue };
+        let (mut index, mut default) = (None, false);
+        for word in words {
+            if word == DEFAULT_MARK {
+                default = true;
+            } else if let Some(n) = word.strip_prefix(INDEX_PREFIX) {
+                index = Some(
+                    n.parse::<u16>()
+                        .map_err(|_| format!("'{word}' is not an index from 0 to 65535."))?,
+                );
+            } else {
+                return Err(format!(
+                    "'{word}' is not understood after a Reply URL; use {INDEX_PREFIX}N or {DEFAULT_MARK}."
+                ));
+            }
+        }
+        parsed.push((url.to_string(), index, default));
+    }
+    let mut used: std::collections::BTreeSet<u16> = parsed.iter().filter_map(|(_, i, _)| *i).collect();
+    let any_default = parsed.iter().any(|(_, _, d)| *d);
+    let mut replies = Vec::with_capacity(parsed.len());
+    for (position, (url, index, default)) in parsed.into_iter().enumerate() {
+        let index = match index {
+            Some(i) => i,
+            None => {
+                let free = (0..=u16::MAX)
+                    .find(|i| !used.contains(i))
+                    .ok_or("There are too many Reply URLs.")?;
+                used.insert(free);
+                free
+            }
+        };
+        replies.push(ReplyUrl {
+            url,
+            index,
+            default: default || (!any_default && position == 0),
+        });
+    }
+    replies.sort_by_key(|r| r.index);
+    Ok(replies)
+}
+
 fn lines(form: &Params, name: &str) -> Vec<String> {
     field(form, name)
         .lines()
@@ -771,9 +1052,13 @@ pub(super) async fn apply(
         }
         AppOp::SamlDisable => run(st, actor, &DisableSamlSso { tenant_id, app_id }).await,
         AppOp::SamlBasic => {
+            let reply_urls = match parse_reply_lines(&lines(form, REPLY_URLS)) {
+                Ok(replies) => replies,
+                Err(problem) => return invalid(&problem),
+            };
             let basic = BasicConfig {
                 identifiers: lines(form, IDENTIFIERS),
-                reply_urls: lines(form, REPLY_URLS),
+                reply_urls,
                 sign_on_url: maybe(SIGN_ON_URL),
                 relay_state: maybe(RELAY_STATE),
                 logout_url: maybe(LOGOUT_URL),
@@ -923,14 +1208,33 @@ pub(super) async fn apply(
             .await
         }
         AppOp::SamlEncryption => {
-            let certificate_pem = maybe(CERTIFICATE);
+            let (Some(content), Some(transport), Some(digest)) = (
+                ContentEncryption::parse(field(form, ENCRYPTION_METHOD)),
+                KeyTransport::parse(field(form, KEY_TRANSPORT)),
+                KeyTransportDigest::parse(field(form, KEY_TRANSPORT_DIGEST)),
+            ) else {
+                return invalid("Choose how assertions are encrypted.");
+            };
+            let certificate = if field(form, ENCRYPTION_ACTION) == STOP_ENCRYPTING {
+                EncryptionKey::Stop
+            } else {
+                match maybe(CERTIFICATE) {
+                    Some(pem) => EncryptionKey::Use(pem),
+                    None => EncryptionKey::Keep,
+                }
+            };
             run(
                 st,
                 actor,
                 &SetSamlEncryption {
                     tenant_id,
                     app_id,
-                    certificate_pem,
+                    certificate,
+                    algorithms: EncryptionAlgorithms {
+                        content,
+                        transport,
+                        digest,
+                    },
                 },
             )
             .await

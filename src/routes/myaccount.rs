@@ -25,7 +25,7 @@ use crate::AppState;
 use crate::admin::routes::Settled;
 use crate::claims::Amr;
 use crate::error::AadError;
-use crate::html::{self, AccountOp, LoginOp};
+use crate::html::{self, AccountOp, AccountTab, LoginOp};
 use crate::mfa::{self, Purpose};
 use crate::session::{self, CSRF_COOKIE, KeepSignedIn, SESSION_COOKIE};
 use crate::tenant::{self, Tenant};
@@ -54,7 +54,7 @@ fn get<'a>(form: &'a Params, name: &str) -> &'a str {
 }
 
 fn fail(tenant: &Tenant, e: anyhow::Error) -> Response {
-    html::error(Some(&tenant.name), &AadError::from(e).description())
+    html::sign_in_error(Some(&tenant.name), &AadError::from(e))
 }
 
 /// The signed-in user of this browser in this tenant, with the methods their
@@ -63,6 +63,16 @@ async fn current(st: &AppState, tenant: &Tenant, headers: &HeaderMap) -> Option<
     let s = session::find(&st.pool, headers, &tenant.id).await.ok()??;
     let user = users::find(&st.pool, &tenant.id, &s.user_id).await.ok()??;
     user.enabled.then_some((user, s.amr, s.keep))
+}
+
+/// A session from an application may still need to complete My Account MFA.
+async fn required_step(st: &AppState, tenant: &Tenant, user: &User, amr: &[String]) -> anyhow::Result<Option<Purpose>> {
+    if amr.iter().any(|method| method == Amr::Mfa.as_str()) {
+        return Ok(None);
+    }
+    Ok(step_purpose(
+        mfa::step(&st.pool, tenant, &user.id, mfa::At::MyAccount).await?,
+    ))
 }
 
 fn with_csrf(mut resp: Response, st: &AppState, csrf: &str) -> Response {
@@ -91,16 +101,21 @@ fn login_page(st: &AppState, tenant: &Tenant, upn: &str, error: Option<&str>) ->
 }
 
 struct Shown<'a> {
+    tab: AccountTab,
     notice: Option<&'a str>,
     error: Option<&'a str>,
     new_codes: Option<&'a [String]>,
 }
 
-const PLAIN: Shown<'static> = Shown {
-    notice: None,
-    error: None,
-    new_codes: None,
-};
+/// A tab with nothing to report.
+const fn plain(tab: AccountTab) -> Shown<'static> {
+    Shown {
+        tab,
+        notice: None,
+        error: None,
+        new_codes: None,
+    }
+}
 
 async fn dashboard(st: &AppState, tenant: &Tenant, user: &User, shown: Shown<'_>) -> Response {
     let csrf = session::new_token();
@@ -131,6 +146,7 @@ async fn dashboard(st: &AppState, tenant: &Tenant, user: &User, shown: Shown<'_>
         error: shown.error,
         new_codes: shown.new_codes,
         apps: &apps,
+        tab: shown.tab,
     });
     with_csrf(resp, st, &csrf)
 }
@@ -264,7 +280,7 @@ async fn finish(
     } else {
         vec![Amr::Pwd.as_str()]
     };
-    signed_in(st, tenant, headers, user, &amr, keep, PLAIN).await
+    signed_in(st, tenant, headers, user, &amr, keep, plain(AccountTab::Apps)).await
 }
 
 /// Make (or remake) this browser's session and show the page.
@@ -299,27 +315,96 @@ async fn signed_in(
     resp
 }
 
-/// `GET /{tenant}/myaccount`
+/// `GET /{tenant}/myaccount`: My apps.
 pub async fn page(State(st): State<AppState>, Path(tenant_key): Path<String>, headers: HeaderMap) -> Response {
+    show(&st, &tenant_key, AccountTab::Apps, &headers).await
+}
+
+/// `GET /{tenant}/myaccount/{tab}`
+pub async fn tab_page(
+    State(st): State<AppState>,
+    Path((tenant_key, tab)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    match AccountTab::parse(&tab) {
+        Some(tab) => show(&st, &tenant_key, tab, &headers).await,
+        None => html::error(None, "That account page is not valid."),
+    }
+}
+
+/// Who may load a response as a subresource (Fetch's CORP header).
+const CROSS_ORIGIN_RESOURCE_POLICY: header::HeaderName =
+    header::HeaderName::from_static("cross-origin-resource-policy");
+
+/// `GET /{tenant}/myaccount/apps/{app}/logo`: the uploaded logo of an
+/// application in the signed-in user's own My apps, and nothing else. Served
+/// as the image type it was checked to be, never sniffed, and sandboxed.
+pub async fn logo(
+    State(st): State<AppState>,
+    Path((tenant_key, app_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    // `same-origin`: another site's page cannot load the image, so it cannot
+    // learn from whether one loads which applications this user has.
+    let cache = || {
+        [
+            (header::CACHE_CONTROL, "private, no-store"),
+            (CROSS_ORIGIN_RESOURCE_POLICY, "same-origin"),
+        ]
+    };
+    let not_found = || (StatusCode::NOT_FOUND, cache()).into_response();
     let Ok(Some(tenant)) = tenant::resolve(&st.pool, &tenant_key).await else {
+        return not_found();
+    };
+    let Some((user, amr, _)) = current(&st, &tenant, &headers).await else {
+        return not_found();
+    };
+    if !matches!(required_step(&st, &tenant, &user, &amr).await, Ok(None)) {
+        return not_found();
+    }
+    let listed = crate::saml::gallery(&st.pool, &tenant.id, &user.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .any(|a| a.app_id == app_id);
+    if !listed {
+        return not_found();
+    }
+    let Ok(Some(app)) = crate::apps::find(&st.pool, &app_id).await else {
+        return not_found();
+    };
+    let Ok(Some(image)) = crate::logos::image(&st.pool, &app.id).await else {
+        return not_found();
+    };
+    let mut resp = (StatusCode::OK, cache(), image.bytes).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(image.kind.content_type()),
+    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    resp
+}
+
+async fn show(st: &AppState, tenant_key: &str, tab: AccountTab, headers: &HeaderMap) -> Response {
+    let Ok(Some(tenant)) = tenant::resolve(&st.pool, tenant_key).await else {
         return html::error(None, "That account page is not valid.");
     };
-    let Some((user, amr, keep)) = current(&st, &tenant, &headers).await else {
-        return login_page(&st, &tenant, "", None);
+    let Some((user, amr, keep)) = current(st, &tenant, headers).await else {
+        return login_page(st, &tenant, "", None);
     };
-    // A session from an application's sign-in still needs a second factor here,
-    // where the user has one or needs one.
-    if !amr.iter().any(|m| m == Amr::Mfa.as_str()) {
-        match mfa::step(&st.pool, &tenant, &user.id, mfa::At::MyAccount).await {
-            Ok(step) => {
-                if let Some(purpose) = step_purpose(step) {
-                    return start(&st, &tenant, &user, purpose, false, keep).await;
-                }
-            }
-            Err(e) => return fail(&tenant, e),
-        }
+    match required_step(st, &tenant, &user, &amr).await {
+        Ok(Some(purpose)) => return start(st, &tenant, &user, purpose, false, keep).await,
+        Ok(None) => {}
+        Err(e) => return fail(&tenant, e),
     }
-    dashboard(&st, &tenant, &user, PLAIN).await
+    dashboard(st, &tenant, &user, plain(tab)).await
 }
 
 /// `POST /{tenant}/myaccount`: signing in, its further steps, and every action.
@@ -542,6 +627,7 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
                 // and the codes on the page this once.
                 let amr = [Amr::Pwd.as_str(), Amr::Mfa.as_str()];
                 let shown = Shown {
+                    tab: AccountTab::Security,
                     notice: Some(
                         "Your authenticator is set up. You will be asked for a code from it at every sign-in.",
                     ),
@@ -587,7 +673,7 @@ async fn pending_step(st: &AppState, tenant: &Tenant, headers: &HeaderMap, form:
             if waiting.purpose == Purpose::ChangePasswordAfterMfa {
                 amr.push(Amr::Mfa.as_str());
             }
-            signed_in(st, tenant, headers, &user, &amr, waiting.keep, PLAIN).await
+            signed_in(st, tenant, headers, &user, &amr, waiting.keep, plain(AccountTab::Apps)).await
         }
     }
 }
@@ -612,6 +698,7 @@ async fn action(
                 tenant,
                 user,
                 Shown {
+                    tab: AccountTab::of(op),
                     notice: None,
                     error: Some(&message),
                     new_codes: None,
@@ -661,6 +748,7 @@ async fn action(
             // A new password ends every session; this browser stays signed in.
             let amr: Vec<&str> = amr.iter().map(String::as_str).collect();
             let shown = Shown {
+                tab: AccountTab::Security,
                 notice: Some("Your password is changed. You have been signed out everywhere else."),
                 error: None,
                 new_codes: None,
@@ -734,6 +822,7 @@ async fn action(
                 tenant,
                 user,
                 Shown {
+                    tab: AccountTab::Security,
                     notice: None,
                     error: None,
                     new_codes: Some(&codes),

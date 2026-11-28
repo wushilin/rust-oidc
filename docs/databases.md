@@ -16,6 +16,19 @@ SQLite remains the default. The deployed service uses SQLite and is unaffected.
 
 Migrations run at startup from `migrations/<engine>/`.
 
+## Protecting SQLite files
+
+The database contains private signing keys, including a separate key for each
+SAML application. On Unix, new directories created for SQLite use mode
+`0700` and new database files use `0600` under the service account. Existing
+paths keep their permissions.
+
+For an existing deployment, stop the service before changing permissions.
+Keep the database and its `-wal` and `-shm` files, if present, in a directory
+accessible only to the service account. Use mode `0600` for those files on
+Unix, and restrict backup and snapshot access to their intended operators.
+Restart the service under the account that owns the database.
+
 ## Running the tests
 
 - `cargo test` covers **SQLite only**. It prints two skip lines for the engines that are not

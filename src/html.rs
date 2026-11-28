@@ -976,6 +976,37 @@ pub fn form_post(action: &url::Url, params: &[(&str, String)]) -> Response {
     respond(StatusCode::OK, html, &csp)
 }
 
+/// Keep the IdP tab available while the app gets a top-level visit for its cookies.
+pub fn logout_progress(tenant_name: &str, app_url: &str, continue_url: &str) -> Response {
+    const REFRESH_SECS: u64 = 3;
+    let app_url = escape(app_url);
+    let continue_url = escape(continue_url);
+    let body = format!(
+        r#"<h1>Signing out of your applications</h1><p>Open the application to sign out in a new tab. Return here to continue. If the application doesn’t answer, sign-out will continue automatically.</p><p><a id="logout-application" href="{app_url}" target="_blank" rel="noopener noreferrer">Open application</a></p><p><a id="logout-continue" href="{continue_url}">Check sign-out progress</a></p>"#,
+    );
+    let refresh = format!(r#"<meta http-equiv="refresh" content="{REFRESH_SECS};url={continue_url}">"#);
+    let html = page("Signing out", Some(tenant_name), &body).replacen("</head>", &format!("{refresh}</head>"), 1);
+    respond(StatusCode::OK, html, CSP_DEFAULT)
+}
+
+pub fn logout_answer_received(tenant_name: &str) -> Response {
+    let body = "<h1>Application sign-out response received</h1><p>Return to the original tab to continue.</p>";
+    respond(
+        StatusCode::OK,
+        page("Signing out", Some(tenant_name), body),
+        CSP_DEFAULT,
+    )
+}
+
+pub fn logout_failed(tenant_name: Option<&str>) -> Response {
+    let body = r#"<h1>We couldn’t sign you out</h1><p>Please try signing out again.</p>"#;
+    respond(
+        StatusCode::SERVICE_UNAVAILABLE,
+        page("Sign-out failed", tenant_name, body),
+        CSP_DEFAULT,
+    )
+}
+
 /// A logout that could not reach every application.
 pub fn signed_out_partially(tenant_name: Option<&str>) -> Response {
     let body = r#"<h1>You signed out, but some applications may still be signed in</h1><p class="sub">One or more applications could not be told. Close all browser windows to finish signing out.</p>"#;

@@ -90,9 +90,10 @@ const ALLOWED: &[(&str, &str)] = &[
     ("saml", "create_launch_ticket"),
     ("saml", "take_launch_ticket"),
     ("saml", "consume_message"),
-    ("saml", "take_participants"),
-    ("saml", "save_logout_state"),
-    ("saml", "take_logout_state"),
+    ("saml", "end_session"),
+    ("saml", "move_logout_state"),
+    ("saml", "record_logout_answer"),
+    ("saml", "prune_periodically"),
 ];
 
 /// Tables that hold protocol or session state rather than the directory: written

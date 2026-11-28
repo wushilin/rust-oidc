@@ -1230,12 +1230,9 @@ pub struct Participant {
 /// sign-in, and a cross-site page could otherwise grow the logout chain.
 const MAX_NAME_IDS_PER_APP: i64 = 8;
 
-/// This session's entry for this user, application and Name ID, created or
-/// refreshed, and the SessionIndex its assertions carry. An entry is never
-/// rewritten to another Name ID, and another user's on this browser stays, so a
-/// logout names every subject the application was actually told about. Sign-in
-/// state, like a session.
-#[allow(clippy::too_many_arguments)]
+/// The SessionIndex for this exact subject, created or refreshed while the
+/// browser session is still live. At the limit no assertion can be issued for
+/// another subject, since we would have no way to sign that subject out.
 pub async fn ensure_participant<'c>(
     db: impl Handle<'c>,
     session_hash: &str,
@@ -1244,179 +1241,198 @@ pub async fn ensure_participant<'c>(
     user_id: &str,
     name_id: &str,
     format: NameIdFormat,
-    expires_at: i64,
 ) -> anyhow::Result<String> {
     let mut conn = db.acquire().await?;
-    ensure_participant_in(
-        &mut conn,
-        session_hash,
-        tenant_id,
-        app,
-        user_id,
-        name_id,
-        format,
-        expires_at,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn ensure_participant_in(
-    conn: &mut Conn,
-    session_hash: &str,
-    tenant_id: &str,
-    app: &Application,
-    user_id: &str,
-    name_id: &str,
-    format: NameIdFormat,
-    expires_at: i64,
-) -> anyhow::Result<String> {
-    let engine = crate::db::engine_of_conn(conn);
-    let key = crate::util::sha256_hex(name_id.as_bytes());
-    let mut tx = crate::db::begin_write(&mut *conn).await?;
-    sqlx::query(crate::db::sql_stmt(
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = crate::db::begin_write(&mut conn).await?;
+    let at = now();
+    let expires: Option<(i64,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
-        "DELETE FROM saml_session_participants WHERE expires_at <= ?",
+        "SELECT expires_at FROM sessions WHERE cookie_hash = ? AND tenant_id = ? AND user_id = ? AND expires_at > ?",
     ))
-    .bind(now())
-    .execute(&mut *tx)
+    .bind(session_hash)
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(at)
+    .fetch_optional(&mut *tx)
     .await?;
+    let (expires_at,) =
+        expires.ok_or_else(|| anyhow!("the browser session ended before the assertion could be issued"))?;
+    // Keep matching rows originally keyed only by the value. New rows include
+    // the format because two formats can carry the same value.
+    let old_key = crate::util::sha256_hex(name_id.as_bytes());
+    let key = crate::util::sha256_hex(format!("{}:{name_id}", format.as_str()).as_bytes());
     let existing: Option<(String,)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
         "SELECT session_index FROM saml_session_participants
-         WHERE session_hash = ? AND application_id = ? AND user_id = ? AND name_id_key = ?",
+         WHERE session_hash = ? AND application_id = ? AND user_id = ?
+           AND name_id_key IN (?, ?) AND name_id_format = ? AND expires_at > ?",
     ))
     .bind(session_hash)
     .bind(&app.id)
     .bind(user_id)
     .bind(&key)
+    .bind(&old_key)
+    .bind(format.as_str())
+    .bind(at)
     .fetch_optional(&mut *tx)
     .await?;
     let index = if let Some((index,)) = existing {
         sqlx::query(crate::db::sql_stmt(
             engine,
-            "UPDATE saml_session_participants SET name_id_format = ?, expires_at = ? WHERE session_index = ?",
+            "UPDATE saml_session_participants SET expires_at = ? WHERE session_index = ?",
         ))
-        .bind(format.as_str())
         .bind(expires_at)
         .bind(&index)
         .execute(&mut *tx)
         .await?;
         index
     } else {
-        let recorded: Vec<(String,)> = sqlx::query_as(crate::db::sql_stmt(
+        let (count,): (i64,) = sqlx::query_as(crate::db::sql_stmt(
             engine,
-            "SELECT session_index FROM saml_session_participants
-             WHERE session_hash = ? AND application_id = ? AND user_id = ?
-             ORDER BY created_at DESC, session_index",
+            "SELECT COUNT(*) FROM saml_session_participants
+             WHERE session_hash = ? AND application_id = ? AND user_id = ? AND expires_at > ?",
         ))
         .bind(session_hash)
         .bind(&app.id)
         .bind(user_id)
-        .fetch_all(&mut *tx)
+        .bind(at)
+        .fetch_one(&mut *tx)
         .await?;
-        match recorded.first() {
-            Some((latest,)) if recorded.len() as i64 >= MAX_NAME_IDS_PER_APP => latest.clone(),
-            _ => {
-                let index = protocol::new_id();
-                sqlx::query(crate::db::sql_stmt(
-                    engine,
-                    "INSERT INTO saml_session_participants (session_index, session_hash, tenant_id, application_id,
-                                                            user_id, name_id, name_id_key, name_id_format,
-                                                            created_at, expires_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ))
-                .bind(&index)
-                .bind(session_hash)
-                .bind(tenant_id)
-                .bind(&app.id)
-                .bind(user_id)
-                .bind(name_id)
-                .bind(&key)
-                .bind(format.as_str())
-                .bind(now())
-                .bind(expires_at)
-                .execute(&mut *tx)
-                .await?;
-                index
+        if count >= MAX_NAME_IDS_PER_APP {
+            return Err(protocol::SamlError {
+                status: protocol::STATUS_RESPONDER,
+                sub_status: None,
+                message:
+                    "This session has reached its sign-in limit for this application. Sign out before trying again."
+                        .into(),
             }
+            .into());
         }
+        sqlx::query(crate::db::sql_stmt(
+            engine,
+            "DELETE FROM saml_session_participants
+             WHERE session_hash = ? AND application_id = ? AND user_id = ? AND name_id_key = ? AND expires_at <= ?",
+        ))
+        .bind(session_hash)
+        .bind(&app.id)
+        .bind(user_id)
+        .bind(&key)
+        .bind(at)
+        .execute(&mut *tx)
+        .await?;
+        let index = protocol::new_id();
+        sqlx::query(crate::db::sql_stmt(
+            engine,
+            "INSERT INTO saml_session_participants (session_index, session_hash, tenant_id, application_id,
+                                                    user_id, name_id, name_id_key, name_id_format,
+                                                    created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(&index)
+        .bind(session_hash)
+        .bind(tenant_id)
+        .bind(&app.id)
+        .bind(user_id)
+        .bind(name_id)
+        .bind(&key)
+        .bind(format.as_str())
+        .bind(at)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        index
     };
     tx.commit().await?;
     Ok(index)
 }
 
-/// The SessionIndexes this user holds at this application in this browser.
-pub async fn participant_indexes<'c>(
-    db: impl Handle<'c>,
-    session_hash: &str,
-    tenant_id: &str,
-    application_id: &str,
-    user_id: &str,
-) -> anyhow::Result<Vec<String>> {
-    let mut conn = db.acquire().await?;
-    let rows: Vec<(String,)> = sqlx::query_as(crate::db::qc(
-        &conn,
-        "SELECT session_index FROM saml_session_participants
-         WHERE session_hash = ? AND tenant_id = ? AND application_id = ? AND user_id = ? AND expires_at > ?",
-    ))
-    .bind(session_hash)
-    .bind(tenant_id)
-    .bind(application_id)
-    .bind(user_id)
-    .bind(now())
-    .fetch_all(&mut *conn)
-    .await?;
-    Ok(rows.into_iter().map(|(index,)| index).collect())
+/// An application can end a browser session only if it holds a matching
+/// SessionIndex. An empty list selects every index it holds for this user.
+pub struct LogoutRequest<'a> {
+    pub application_id: &'a str,
+    pub session_indexes: &'a [String],
+    pub signed_message_id: Option<&'a str>,
 }
 
-/// Take this session's participants in the tenant, in one transaction: each is
-/// told about the logout once.
-pub async fn take_participants<'c>(
-    db: impl Handle<'c>,
-    session_hash: &str,
-    tenant_id: &str,
-) -> anyhow::Result<Vec<Participant>> {
-    let mut conn = db.acquire().await?;
-    take_participants_in(&mut conn, session_hash, tenant_id).await
+pub enum SessionLogout {
+    Ended {
+        user_id: Option<String>,
+        participants: Vec<Participant>,
+    },
+    NoMatch,
+    Replay,
 }
 
-async fn take_participants_in(
-    conn: &mut Conn,
-    session_hash: &str,
+/// End the IdP session and take its participants together. A signed request
+/// becomes single-use only when the logout commits.
+pub async fn end_session<'c>(
+    db: impl Handle<'c>,
+    headers: &axum::http::HeaderMap,
     tenant_id: &str,
-) -> anyhow::Result<Vec<Participant>> {
-    let engine = crate::db::engine_of_conn(conn);
-    let mut tx = crate::db::begin_write(&mut *conn).await?;
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(crate::db::sql_stmt(
+    request: Option<LogoutRequest<'_>>,
+) -> anyhow::Result<SessionLogout> {
+    use crate::session::{self, SESSION_COOKIE};
+
+    let Some(cookie) = session::cookie(headers, SESSION_COOKIE) else {
+        return Ok(SessionLogout::NoMatch);
+    };
+    let session_hash = crate::util::sha256_hex(cookie.as_bytes());
+    let mut conn = db.acquire().await?;
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = crate::db::begin_write(&mut conn).await?;
+    let session = session::find_in(&mut tx, &session_hash, tenant_id).await?;
+    let user_id = session.map(|s| s.user_id);
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(crate::db::sql_stmt(
         engine,
-        "SELECT session_index, application_id, name_id, name_id_format FROM saml_session_participants
+        "SELECT session_index, application_id, user_id, name_id, name_id_format FROM saml_session_participants
          WHERE session_hash = ? AND tenant_id = ? AND expires_at > ? ORDER BY created_at, session_index",
     ))
-    .bind(session_hash)
+    .bind(&session_hash)
     .bind(tenant_id)
     .bind(now())
     .fetch_all(&mut *tx)
     .await?;
+    let mut participants = Vec::with_capacity(rows.len());
+    let mut matched_request = false;
+    for (session_index, application_id, participant_user, name_id, format) in rows {
+        let matched = request.as_ref().is_some_and(|r| {
+            application_id == r.application_id
+                && user_id.as_deref() == Some(&participant_user)
+                && (r.session_indexes.is_empty() || r.session_indexes.contains(&session_index))
+        });
+        if matched {
+            matched_request = true;
+            continue;
+        }
+        participants.push(Participant {
+            session_index,
+            application_id,
+            name_id,
+            name_id_format: NameIdFormat::parse(&format).ok_or_else(|| anyhow!("unknown NameID format"))?,
+        });
+    }
+    if let Some(request) = request {
+        if !matched_request {
+            return Ok(SessionLogout::NoMatch);
+        }
+        if let Some(id) = request.signed_message_id
+            && !consume_message_in(&mut tx, request.application_id, id).await?
+        {
+            return Ok(SessionLogout::Replay);
+        }
+    }
     sqlx::query(crate::db::sql_stmt(
         engine,
         "DELETE FROM saml_session_participants WHERE session_hash = ? AND tenant_id = ?",
     ))
-    .bind(session_hash)
+    .bind(&session_hash)
     .bind(tenant_id)
     .execute(&mut *tx)
     .await?;
+    session::end_in(&mut tx, &session_hash, tenant_id).await?;
     tx.commit().await?;
-    rows.into_iter()
-        .map(|(session_index, application_id, name_id, format)| {
-            Ok(Participant {
-                session_index,
-                application_id,
-                name_id,
-                name_id_format: NameIdFormat::parse(&format).ok_or_else(|| anyhow!("unknown NameID format"))?,
-            })
-        })
-        .collect()
+    Ok(SessionLogout::Ended { user_id, participants })
 }
 
 // ---- gallery launches ----
@@ -1439,13 +1455,6 @@ pub async fn create_launch_ticket<'c>(
 ) -> anyhow::Result<String> {
     let ticket = crate::session::new_token();
     let mut conn = db.acquire().await?;
-    sqlx::query(crate::db::qc(
-        &conn,
-        "DELETE FROM saml_launch_tickets WHERE expires_at <= ?",
-    ))
-    .bind(now())
-    .execute(&mut *conn)
-    .await?;
     sqlx::query(crate::db::qc(
         &conn,
         "INSERT INTO saml_launch_tickets (ticket_hash, tenant_id, application_id, user_id, expires_at)
@@ -1512,35 +1521,59 @@ pub async fn take_launch_ticket<'c>(
 /// Record a signed message as acted on. `false` if it already was: a replay.
 pub async fn consume_message<'c>(db: impl Handle<'c>, application_id: &str, message_id: &str) -> anyhow::Result<bool> {
     let mut conn = db.acquire().await?;
-    sqlx::query(crate::db::qc(
-        &conn,
-        "DELETE FROM saml_seen_messages WHERE expires_at <= ?",
+    consume_message_in(&mut conn, application_id, message_id).await
+}
+
+async fn consume_message_in(conn: &mut Conn, application_id: &str, message_id: &str) -> anyhow::Result<bool> {
+    let engine = crate::db::engine_of_conn(conn);
+    let mut tx = crate::db::begin_write(conn).await?;
+    let at = now();
+    sqlx::query(crate::db::sql_stmt(
+        engine,
+        "DELETE FROM saml_seen_messages WHERE application_id = ? AND message_id = ? AND expires_at <= ?",
     ))
-    .bind(now())
-    .execute(&mut *conn)
+    .bind(application_id)
+    .bind(message_id)
+    .bind(at)
+    .execute(&mut *tx)
     .await?;
-    let inserted = sqlx::query(crate::db::qc(
-        &conn,
+    let inserted = sqlx::query(crate::db::sql_stmt(
+        engine,
         "INSERT INTO saml_seen_messages (application_id, message_id, expires_at) VALUES (?, ?, ?)",
     ))
     .bind(application_id)
     .bind(message_id)
-    // Kept for as long as the message itself could still be accepted.
-    .bind(now() + protocol::SIGNED_MESSAGE_MAX_AGE_SECS + 2 * protocol::CLOCK_SKEW_SECS)
-    .execute(&mut *conn)
+    .bind(at + protocol::SIGNED_MESSAGE_MAX_AGE_SECS + 2 * protocol::CLOCK_SKEW_SECS)
+    .execute(&mut *tx)
     .await;
-    Ok(crate::db::inserted(inserted)?)
+    if crate::db::inserted(inserted)? {
+        tx.commit().await?;
+        Ok(true)
+    } else {
+        tx.rollback().await?;
+        Ok(false)
+    }
 }
 
-/// A logout in progress, waiting for one participant's answer.
+/// The next application to notify and the logout left to finish after it.
+pub struct LogoutStep<'a> {
+    pub request_id: &'a str,
+    pub pending_app: &'a str,
+    pub url: &'a str,
+    pub remaining: &'a [Participant],
+    pub finish: &'a crate::routes::saml::LogoutFinish,
+}
+
 pub struct LogoutState {
-    pub pending_app: String,
+    pub next_url: Option<String>,
+    /// Pending until the app answers or the deadline passes.
+    pub answered: Option<bool>,
     pub remaining: Vec<Participant>,
     pub finish: crate::routes::saml::LogoutFinish,
 }
 
-/// How long a participant has to answer a logout request.
-const LOGOUT_STATE_SECS: i64 = 600;
+pub const LOGOUT_STATE_SECS: i64 = 600;
+const LOGOUT_ANSWER_SECS: i64 = 45;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredParticipant {
@@ -1550,51 +1583,71 @@ struct StoredParticipant {
     name_id_format: String,
 }
 
-/// Remember where a logout is, keyed by the id of the request just sent.
-pub async fn save_logout_state<'c>(
+/// Replace a ready step and its continuation in one commit. A concurrent
+/// refresh can observe the old step but only one can continue it.
+pub async fn move_logout_state<'c>(
     db: impl Handle<'c>,
-    request_id: &str,
     tenant_id: &str,
-    pending_app: &str,
     browser_hash: &str,
-    remaining: &[Participant],
-    finish: &crate::routes::saml::LogoutFinish,
-) -> anyhow::Result<()> {
-    let stored: Vec<StoredParticipant> = remaining
-        .iter()
-        .map(|p| StoredParticipant {
-            session_index: p.session_index.clone(),
-            application_id: p.application_id.clone(),
-            name_id: p.name_id.clone(),
-            name_id_format: p.name_id_format.as_str().to_string(),
-        })
-        .collect();
+    previous: Option<&str>,
+    next: Option<LogoutStep<'_>>,
+) -> anyhow::Result<bool> {
     let mut conn = db.acquire().await?;
-    sqlx::query(crate::db::qc(
-        &conn,
-        "DELETE FROM saml_logout_state WHERE expires_at <= ?",
-    ))
-    .bind(now())
-    .execute(&mut *conn)
-    .await?;
-    sqlx::query(crate::db::qc(
-        &conn,
-        "INSERT INTO saml_logout_state (request_id, tenant_id, pending_app, browser_hash, remaining, finish, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ))
-    .bind(request_id)
-    .bind(tenant_id)
-    .bind(pending_app)
-    .bind(browser_hash)
-    .bind(serde_json::to_string(&stored)?)
-    .bind(serde_json::to_string(finish)?)
-    .bind(now() + LOGOUT_STATE_SECS)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
+    let engine = crate::db::engine_of_conn(&conn);
+    let mut tx = crate::db::begin_write(&mut conn).await?;
+    let at = now();
+    if let Some(previous) = previous {
+        let deleted = sqlx::query(crate::db::sql_stmt(
+            engine,
+            "DELETE FROM saml_logout_state
+             WHERE request_id = ? AND tenant_id = ? AND browser_hash = ? AND expires_at > ?
+               AND (answer_success IS NOT NULL OR (next_url IS NOT NULL AND resume_at <= ?))",
+        ))
+        .bind(previous)
+        .bind(tenant_id)
+        .bind(browser_hash)
+        .bind(at)
+        .bind(at)
+        .execute(&mut *tx)
+        .await?;
+        if deleted.rows_affected() == 0 {
+            return Ok(false);
+        }
+    }
+    if let Some(next) = next {
+        let stored: Vec<StoredParticipant> = next
+            .remaining
+            .iter()
+            .map(|p| StoredParticipant {
+                session_index: p.session_index.clone(),
+                application_id: p.application_id.clone(),
+                name_id: p.name_id.clone(),
+                name_id_format: p.name_id_format.as_str().to_string(),
+            })
+            .collect();
+        sqlx::query(crate::db::sql_stmt(
+            engine,
+            "INSERT INTO saml_logout_state (request_id, tenant_id, pending_app, browser_hash, remaining, finish,
+                                            expires_at, next_url, resume_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(next.request_id)
+        .bind(tenant_id)
+        .bind(next.pending_app)
+        .bind(browser_hash)
+        .bind(serde_json::to_string(&stored)?)
+        .bind(serde_json::to_string(next.finish)?)
+        .bind(at + LOGOUT_STATE_SECS)
+        .bind(next.url)
+        .bind(at + LOGOUT_ANSWER_SECS)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
-/// Whether this browser still has a logout waiting for an answer.
+/// Whether this browser still has a logout in progress.
 pub async fn logout_in_progress<'c>(db: impl Handle<'c>, browser_hash: &str) -> anyhow::Result<bool> {
     let mut conn = db.acquire().await?;
     let (n,): (i64,) = sqlx::query_as(crate::db::qc(
@@ -1608,43 +1661,76 @@ pub async fn logout_in_progress<'c>(db: impl Handle<'c>, browser_hash: &str) -> 
     Ok(n > 0)
 }
 
-/// Take the logout waiting on this request: each answer counts once.
-pub async fn take_logout_state<'c>(
+/// Accept one answer from the expected app and browser before the deadline.
+pub async fn record_logout_answer<'c>(
     db: impl Handle<'c>,
     request_id: &str,
     tenant_id: &str,
     application_id: &str,
     browser_hash: &str,
-) -> anyhow::Result<Option<LogoutState>> {
+    success: bool,
+) -> anyhow::Result<bool> {
     let mut conn = db.acquire().await?;
-    let row: Option<(String, String)> = sqlx::query_as(crate::db::qc(
+    let at = now();
+    let answer = sqlx::query(crate::db::qc(
         &conn,
-        "SELECT remaining, finish FROM saml_logout_state
-         WHERE request_id = ? AND tenant_id = ? AND pending_app = ? AND browser_hash = ? AND expires_at > ?",
+        "UPDATE saml_logout_state SET answer_success = ?
+         WHERE request_id = ? AND tenant_id = ? AND pending_app = ? AND browser_hash = ?
+           AND expires_at > ? AND answer_success IS NULL AND (next_url IS NULL OR resume_at > ?)",
     ))
+    .bind(success)
     .bind(request_id)
     .bind(tenant_id)
     .bind(application_id)
     .bind(browser_hash)
-    .bind(now())
-    .fetch_optional(&mut *conn)
+    .bind(at)
+    .bind(at)
+    .execute(&mut *conn)
     .await?;
-    let Some((remaining, finish)) = row else {
-        return Ok(None);
-    };
-    let deleted = sqlx::query(crate::db::qc(
+    Ok(answer.rows_affected() == 1)
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredLogoutState {
+    remaining: String,
+    finish: String,
+    next_url: Option<String>,
+    answer_success: Option<Flag>,
+    resume_at: i64,
+}
+
+pub async fn logout_state<'c>(
+    db: impl Handle<'c>,
+    request_id: &str,
+    tenant_id: &str,
+    browser_hash: &str,
+) -> anyhow::Result<Option<LogoutState>> {
+    let mut conn = db.acquire().await?;
+    let at = now();
+    let row: Option<StoredLogoutState> = sqlx::query_as(crate::db::qc(
         &conn,
-        "DELETE FROM saml_logout_state WHERE request_id = ? AND tenant_id = ? AND pending_app = ?",
+        "SELECT remaining, finish, next_url, answer_success, resume_at FROM saml_logout_state
+         WHERE request_id = ? AND tenant_id = ? AND browser_hash = ? AND expires_at > ?",
     ))
     .bind(request_id)
     .bind(tenant_id)
-    .bind(application_id)
-    .execute(&mut *conn)
+    .bind(browser_hash)
+    .bind(at)
+    .fetch_optional(&mut *conn)
     .await?;
-    if deleted.rows_affected() == 0 {
+    let Some(StoredLogoutState {
+        remaining,
+        finish,
+        next_url,
+        answer_success,
+        resume_at,
+    }) = row
+    else {
         return Ok(None);
-    }
-    let pending_app = application_id.to_string();
+    };
+    let answered = answer_success
+        .map(bool::from)
+        .or_else(|| (next_url.is_some() && resume_at <= at).then_some(false));
     let stored: Vec<StoredParticipant> = serde_json::from_str(&remaining)?;
     let remaining = stored
         .into_iter()
@@ -1657,12 +1743,62 @@ pub async fn take_logout_state<'c>(
                     .ok_or_else(|| anyhow!("unknown NameID format"))?,
             })
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<anyhow::Result<_>>()?;
     Ok(Some(LogoutState {
-        pending_app,
+        next_url,
+        answered,
         remaining,
         finish: serde_json::from_str(&finish)?,
     }))
+}
+
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const PRUNE_BACKLOG_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const PRUNE_BATCH: i64 = 256;
+
+pub async fn prune_periodically(pool: crate::db::DbPool) {
+    loop {
+        let delay = match prune_expired(&pool, now()).await {
+            Ok(n) if n >= PRUNE_BATCH as u64 => PRUNE_BACKLOG_DELAY,
+            Ok(_) => PRUNE_INTERVAL,
+            Err(error) => {
+                tracing::warn!(%error, "SAML state cleanup failed");
+                PRUNE_INTERVAL
+            }
+        };
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Each statement has its own bounded write, using the expiry index to pick
+/// rows and the primary key to delete them. Recheck expiry at deletion time
+/// in case another request refreshed a selected row.
+pub async fn prune_expired<'c>(db: impl Handle<'c>, at: i64) -> anyhow::Result<u64> {
+    let mut conn = db.acquire().await?;
+    let mut deleted = 0;
+    for statement in [
+        "DELETE FROM saml_session_participants WHERE session_index IN
+         (SELECT session_index FROM (SELECT session_index FROM saml_session_participants
+          WHERE expires_at <= ? ORDER BY expires_at LIMIT ?) AS expired) AND expires_at <= ?",
+        "DELETE FROM saml_launch_tickets WHERE ticket_hash IN
+         (SELECT ticket_hash FROM (SELECT ticket_hash FROM saml_launch_tickets
+          WHERE expires_at <= ? ORDER BY expires_at LIMIT ?) AS expired) AND expires_at <= ?",
+        "DELETE FROM saml_seen_messages WHERE (application_id, message_id) IN
+         (SELECT application_id, message_id FROM (SELECT application_id, message_id FROM saml_seen_messages
+          WHERE expires_at <= ? ORDER BY expires_at LIMIT ?) AS expired) AND expires_at <= ?",
+        "DELETE FROM saml_logout_state WHERE request_id IN
+         (SELECT request_id FROM (SELECT request_id FROM saml_logout_state
+          WHERE expires_at <= ? ORDER BY expires_at LIMIT ?) AS expired) AND expires_at <= ?",
+    ] {
+        deleted += sqlx::query(crate::db::qc(&conn, statement))
+            .bind(at)
+            .bind(PRUNE_BATCH)
+            .bind(at)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+    }
+    Ok(deleted)
 }
 
 /// An application by its object id (`applications.id`).

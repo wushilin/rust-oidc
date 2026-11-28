@@ -103,21 +103,34 @@ pub fn new_token() -> String {
     b64url(&random_bytes(32))
 }
 
-pub async fn find(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<Option<Session>> {
+pub async fn find<'c>(
+    db: impl crate::db::Handle<'c>,
+    headers: &HeaderMap,
+    tenant_id: &str,
+) -> anyhow::Result<Option<Session>> {
     let Some(cookie) = cookie(headers, SESSION_COOKIE) else {
         return Ok(None);
     };
-    let row: Option<(String, i64, String, crate::db::Flag)> = sqlx::query_as(crate::db::q(
-        pool,
+    let mut conn = db.acquire().await?;
+    find_in(&mut conn, &sha256_hex(cookie.as_bytes()), tenant_id).await
+}
+
+pub(crate) async fn find_in(
+    conn: &mut crate::db::Conn,
+    cookie_hash: &str,
+    tenant_id: &str,
+) -> anyhow::Result<Option<Session>> {
+    let row: Option<(String, i64, String, crate::db::Flag)> = sqlx::query_as(crate::db::qc(
+        conn,
         "SELECT s.user_id, s.auth_time, s.amr, s.keep_signed_in FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.cookie_hash = ? AND s.tenant_id = ? AND s.expires_at > ? AND u.enabled = ?
            AND u.deleted_at IS NULL",
     ))
-    .bind(sha256_hex(cookie.as_bytes()))
+    .bind(cookie_hash)
     .bind(tenant_id)
     .bind(now())
     .bind(true)
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await?;
     Ok(row.map(|(user_id, auth_time, amr, kept)| Session {
         user_id,
@@ -217,17 +230,23 @@ async fn cookie_lifetime(pool: &DbPool, cookie: &str) -> anyhow::Result<i64> {
     Ok(latest.map_or(0, |at| (at - now()).max(0)))
 }
 
-pub async fn end(pool: &DbPool, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {
+pub async fn end<'c>(db: impl crate::db::Handle<'c>, headers: &HeaderMap, tenant_id: &str) -> anyhow::Result<()> {
     if let Some(cookie) = cookie(headers, SESSION_COOKIE) {
-        sqlx::query(crate::db::q(
-            pool,
-            "DELETE FROM sessions WHERE cookie_hash = ? AND tenant_id = ?",
-        ))
-        .bind(sha256_hex(cookie.as_bytes()))
-        .bind(tenant_id)
-        .execute(pool)
-        .await?;
+        let mut conn = db.acquire().await?;
+        end_in(&mut conn, &sha256_hex(cookie.as_bytes()), tenant_id).await?;
     }
+    Ok(())
+}
+
+pub(crate) async fn end_in(conn: &mut crate::db::Conn, cookie_hash: &str, tenant_id: &str) -> anyhow::Result<()> {
+    sqlx::query(crate::db::qc(
+        conn,
+        "DELETE FROM sessions WHERE cookie_hash = ? AND tenant_id = ?",
+    ))
+    .bind(cookie_hash)
+    .bind(tenant_id)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 

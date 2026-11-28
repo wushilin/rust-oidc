@@ -38,18 +38,14 @@ pub async fn logout(
     let Ok(Some(tenant)) = tenant::resolve(&st.pool, &tenant_key).await else {
         return html::signed_out(None);
     };
-    let signed_in = session::find(&st.pool, &headers, &tenant.id).await.ok().flatten();
-    let participants = match session::cookie(&headers, SESSION_COOKIE) {
-        Some(cookie) => {
-            crate::saml::take_participants(&st.pool, &crate::util::sha256_hex(cookie.as_bytes()), &tenant.id)
-                .await
-                .unwrap_or_default()
+    let (user_id, participants) = match crate::saml::end_session(&st.pool, &headers, &tenant.id, None).await {
+        Ok(crate::saml::SessionLogout::Ended { user_id, participants }) => (user_id, participants),
+        Ok(crate::saml::SessionLogout::NoMatch | crate::saml::SessionLogout::Replay) => (None, Vec::new()),
+        Err(e) => {
+            tracing::error!(error = ?e, "ending session failed");
+            return html::logout_failed(Some(&tenant.name));
         }
-        None => Vec::new(),
     };
-    if let Err(e) = session::end(&st.pool, &headers, &tenant.id).await {
-        tracing::error!(error = ?e, "ending session failed");
-    }
 
     // The hint may be expired; only its signature and issuer matter here.
     let hinted_client = match get("id_token_hint") {
@@ -86,7 +82,7 @@ pub async fn logout(
     }
 
     // Only a real session ending is an event; anonymous hits on this endpoint are noise.
-    if let Some(s) = signed_in {
+    if let Some(user_id) = user_id {
         let details = serde_json::json!({
             "via": Channel::EndSession.as_str(),
             "clientId": registered.as_ref().map(|app| app.app_id.clone()),
@@ -95,9 +91,9 @@ pub async fn logout(
         audit::record(
             &st,
             &tenant.id,
-            Actor::Id(&s.user_id),
+            Actor::Id(&user_id),
             Event::SessionEnd,
-            Some(&s.user_id),
+            Some(&user_id),
             details,
         )
         .await;

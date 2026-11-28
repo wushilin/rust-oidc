@@ -447,7 +447,6 @@ async fn main() -> anyhow::Result<()> {
         println!("wrote {} and {}", cert.display(), key.display());
         return Ok(());
     }
-    ensure_db_dir(&cli.database)?;
     let policy = if matches!(command, Command::Serve { .. }) {
         db::FoldPolicy::FailClosed
     } else {
@@ -464,6 +463,7 @@ async fn main() -> anyhow::Result<()> {
             }
             tracing::info!(base = public_url.base(), "public URL");
             tokio::spawn(trim_audit_hourly(pool.clone()));
+            tokio::spawn(rust_oidc::saml::prune_periodically(pool.clone()));
             let app = routes::router(AppState::new(pool, public_url));
             server::serve(app, bind, &tls).await?;
         }
@@ -1155,16 +1155,6 @@ fn password_or_stdin(password: Option<String>) -> anyhow::Result<String> {
         .read_line(&mut line)
         .context("reading password from stdin")?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
-}
-
-fn ensure_db_dir(url: &str) -> anyhow::Result<()> {
-    if let Some(path) = db::database_file_path(url)
-        && let Some(parent) = std::path::Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(())
 }
 
 fn print_json(value: serde_json::Value) {

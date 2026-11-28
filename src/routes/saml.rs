@@ -50,7 +50,7 @@ const RAW_REQUEST: &str = "saml_raw";
 const LOGIN_HINT: &str = "login_hint";
 /// Binds a logout in progress to the browser it started in.
 const LOGOUT_COOKIE: &str = "saml_logout";
-const LOGOUT_COOKIE_SECS: i64 = 600;
+const LOGOUT_PROGRESS_PATH: &str = "saml2/logout";
 
 const METADATA_CONTENT_TYPE: &str = "application/samlmetadata+xml";
 
@@ -580,22 +580,18 @@ async fn build(st: &AppState, i: &Issue<'_>) -> anyhow::Result<String> {
     };
     let attributes = attributes(st, i.tenant, i.app, i.sp, config, i.user, &i.session.amr).await?;
     let ts = now();
-    let session_index = match session::cookie(i.headers, SESSION_COOKIE) {
-        Some(cookie) => {
-            saml::ensure_participant(
-                &st.pool,
-                &sha256_hex(cookie.as_bytes()),
-                &i.tenant.id,
-                i.app,
-                &i.user.id,
-                &name_id,
-                name_id_format,
-                i.session.auth_time + i.session.keep.lifetime(i.tenant),
-            )
-            .await?
-        }
-        None => protocol::new_id(),
-    };
+    let cookie =
+        session::cookie(i.headers, SESSION_COOKIE).ok_or_else(|| anyhow::anyhow!("the browser session is missing"))?;
+    let session_index = saml::ensure_participant(
+        &st.pool,
+        &sha256_hex(cookie.as_bytes()),
+        &i.tenant.id,
+        i.app,
+        &i.user.id,
+        &name_id,
+        name_id_format,
+    )
+    .await?;
     let input = protocol::AssertionInput {
         idp_entity_id: &i.call.idp_entity,
         audience: &audience,
@@ -745,7 +741,7 @@ fn with_query(url: &str, query: &str) -> String {
 }
 
 /// A signed Redirect-binding message to `url`, from this application's key.
-async fn signed_redirect(
+async fn signed_redirect_url(
     st: &AppState,
     app: &Application,
     config: &SamlConfig,
@@ -753,7 +749,7 @@ async fn signed_redirect(
     param: &str,
     xml: &str,
     relay_state: Option<&str>,
-) -> anyhow::Result<Response> {
+) -> anyhow::Result<String> {
     let key = saml::active_key(&st.pool, app)
         .await?
         .ok_or_else(|| anyhow::anyhow!("the application has no active signing certificate"))?;
@@ -763,7 +759,7 @@ async fn signed_redirect(
         algorithm: config.signing_algorithm,
     };
     let query = signer.sign_redirect(param, &protocol::encode_redirect(xml)?, relay_state)?;
-    Ok(redirect(&with_query(url, &query)))
+    Ok(with_query(url, &query))
 }
 
 /// Clear the session cookie unless the browser still has a session in another
@@ -795,15 +791,22 @@ pub struct LogoutFinish {
     pub answer_by_post: bool,
 }
 
-/// Tell the next participant, or finish. `browser` is the cookie value that ties
-/// this logout to the browser carrying it.
+fn progress_page(st: &AppState, tenant: &Tenant, request_id: &str, url: &str) -> Response {
+    let path = format!("{LOGOUT_PROGRESS_PATH}/{request_id}");
+    html::logout_progress(&tenant.name, url, &st.public_url.tenant_url(&tenant.id, &path))
+}
+
+/// Prepare a signed visit to the next app. The IdP tab can continue even if
+/// the new tab never returns. Store the next step before replacing the old one.
 async fn advance(
     st: &AppState,
     tenant: &Tenant,
     mut remaining: Vec<Participant>,
     mut finish: LogoutFinish,
     browser: &str,
+    previous: Option<&str>,
 ) -> anyhow::Result<Response> {
+    let hash = sha256_hex(browser.as_bytes());
     while let Some(next) = remaining.pop() {
         let target = match saml::application_by_object_id(&st.pool, &next.application_id).await? {
             Some(app) => saml::config(&st.pool, &app)
@@ -824,33 +827,86 @@ async fn advance(
             &next.session_index,
             now(),
         )?;
-        let hash = sha256_hex(browser.as_bytes());
-        let sent = match saml::save_logout_state(&st.pool, &id, &tenant.id, &app.id, &hash, &remaining, &finish).await {
-            Ok(()) => signed_redirect(st, &app, &config, &logout_url, SAML_REQUEST, &xml, None).await,
-            Err(e) => Err(e),
-        };
-        // One application that cannot be reached must not stop the others.
-        let mut resp = match sent {
-            Ok(resp) => resp,
+        let url = match signed_redirect_url(st, &app, &config, &logout_url, SAML_REQUEST, &xml, None).await {
+            Ok(url) => url,
             Err(e) => {
-                tracing::error!(error = ?e, "telling a SAML application about a logout failed");
+                tracing::error!(error = ?e, "preparing a SAML logout request failed");
                 finish.partial = true;
                 continue;
             }
         };
+        let step = saml::LogoutStep {
+            request_id: &id,
+            pending_app: &app.id,
+            url: &url,
+            remaining: &remaining,
+            finish: &finish,
+        };
+        if !saml::move_logout_state(&st.pool, &tenant.id, &hash, previous, Some(step)).await? {
+            return Ok(no_logout(tenant));
+        }
+        let mut resp = progress_page(st, tenant, &id, &url);
         resp.headers_mut().append(
             header::SET_COOKIE,
-            session::set_cookie(&st.public_url, LOGOUT_COOKIE, browser, LOGOUT_COOKIE_SECS),
+            session::set_cookie(&st.public_url, LOGOUT_COOKIE, browser, saml::LOGOUT_STATE_SECS),
         );
         return Ok(resp);
     }
     let mut resp = finished(st, tenant, finish).await?;
+    if previous.is_some() && !saml::move_logout_state(&st.pool, &tenant.id, &hash, previous, None).await? {
+        return Ok(no_logout(tenant));
+    }
     // The cookie is per browser: another tenant's logout may still need it.
-    if !saml::logout_in_progress(&st.pool, &sha256_hex(browser.as_bytes())).await? {
+    if !saml::logout_in_progress(&st.pool, &hash).await? {
         resp.headers_mut()
             .append(header::SET_COOKIE, session::clear_cookie(&st.public_url, LOGOUT_COOKIE));
     }
     Ok(resp)
+}
+
+fn no_logout(tenant: &Tenant) -> Response {
+    page(Some(tenant), "This sign-out step has already continued or expired.")
+}
+
+pub async fn logout_progress(
+    State(st): State<AppState>,
+    Path((tenant_key, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let tenant = match tenant::resolve(&st.pool, &tenant_key).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return page(None, &AadError::tenant_not_found(&tenant_key).description()),
+        Err(e) => return internal(None, e),
+    };
+    let Some(browser) = session::cookie(&headers, LOGOUT_COOKIE) else {
+        return no_logout(&tenant);
+    };
+    let hash = sha256_hex(browser.as_bytes());
+    match saml::logout_state(&st.pool, &id, &tenant.id, &hash).await {
+        Ok(Some(state)) => continue_logout(&st, &tenant, &id, &browser, state).await,
+        Ok(None) => no_logout(&tenant),
+        Err(e) => internal(Some(&tenant), e),
+    }
+}
+
+async fn continue_logout(
+    st: &AppState,
+    tenant: &Tenant,
+    id: &str,
+    browser: &str,
+    mut state: saml::LogoutState,
+) -> Response {
+    if let Some(success) = state.answered {
+        state.finish.partial |= !success;
+        match advance(st, tenant, state.remaining, state.finish, browser, Some(id)).await {
+            Ok(resp) => resp,
+            Err(e) => internal(Some(tenant), e),
+        }
+    } else if let Some(url) = state.next_url {
+        progress_page(st, tenant, id, &url)
+    } else {
+        no_logout(tenant)
+    }
 }
 
 /// The value tying a logout to this browser: the one it already holds, so that
@@ -890,7 +946,8 @@ async fn answer_logout(
             now(),
             None,
         )?;
-        return signed_redirect(st, app, config, logout_url, SAML_RESPONSE, &xml, answer.relay_state).await;
+        let url = signed_redirect_url(st, app, config, logout_url, SAML_RESPONSE, &xml, answer.relay_state).await?;
+        return Ok(redirect(&url));
     }
     let key = saml::active_key(&st.pool, app)
         .await?
@@ -995,72 +1052,48 @@ async fn logout_requested(
     if signed && let Err(m) = signed_message_ok(request.destination.as_deref(), request.issue_instant) {
         return page(t, m);
     }
-    let signed_in = match session::find(&st.pool, headers, &tenant.id).await {
-        Ok(s) => s,
-        Err(e) => return internal(t, e),
+    let logout = saml::LogoutRequest {
+        application_id: &app.id,
+        session_indexes: &request.session_indexes,
+        signed_message_id: signed.then_some(request.id.as_str()),
     };
-    let hash = session::cookie(headers, SESSION_COOKIE).map(|c| sha256_hex(c.as_bytes()));
-    let held = match (&signed_in, &hash) {
-        (Some(s), Some(hash)) => {
-            match saml::participant_indexes(&st.pool, hash, &tenant.id, &app.id, &s.user_id).await {
-                Ok(held) => held,
-                Err(e) => return internal(t, e),
+    let participants = match saml::end_session(&st.pool, headers, &tenant.id, Some(logout)).await {
+        Ok(saml::SessionLogout::Ended { user_id, participants }) => {
+            if let Some(user_id) = user_id {
+                audit::record(
+                    st,
+                    &tenant.id,
+                    Actor::Id(&user_id),
+                    Event::SessionEnd,
+                    Some(&user_id),
+                    serde_json::json!({ "via": Channel::SamlLogout.as_str(), "clientId": app.app_id }),
+                )
+                .await;
             }
+            participants
         }
-        _ => Vec::new(),
-    };
-    // The entries this request is about: the SessionIndexes it names, or all of
-    // this user's at this application when it names none.
-    let matched: Vec<String> = held
-        .into_iter()
-        .filter(|i| request.session_indexes.is_empty() || request.session_indexes.contains(i))
-        .collect();
-    let (Some(session), Some(hash), false) = (&signed_in, &hash, matched.is_empty()) else {
-        // An application that asked for no answer gets none; the user is told.
-        if request.asynchronous {
-            return page(t, NOTHING_TO_SIGN_OUT);
+        Ok(saml::SessionLogout::Replay) => return page(t, "This signed request has already been used."),
+        Ok(saml::SessionLogout::NoMatch) => {
+            if request.asynchronous {
+                return page(t, NOTHING_TO_SIGN_OUT);
+            }
+            let answer = LogoutAnswer {
+                in_response_to: &request.id,
+                relay_state: query.relay_state.as_deref(),
+                status: protocol::STATUS_RESPONDER,
+                sub_status: Some(protocol::STATUS_UNKNOWN_PRINCIPAL),
+                by_post: posted,
+            };
+            return match answer_logout(st, &tenant, &app, &config, &logout_url, answer).await {
+                Ok(resp) => resp,
+                Err(e) => internal(t, e),
+            };
         }
-        // Nothing of this application's here to end: say so, and end nothing.
-        let answer = LogoutAnswer {
-            in_response_to: &request.id,
-            relay_state: query.relay_state.as_deref(),
-            status: protocol::STATUS_RESPONDER,
-            sub_status: Some(protocol::STATUS_UNKNOWN_PRINCIPAL),
-            by_post: posted,
-        };
-        return match answer_logout(st, &tenant, &app, &config, &logout_url, answer).await {
-            Ok(resp) => resp,
-            Err(e) => internal(t, e),
-        };
-    };
-    // Used up only by a request that really ends this session, so that someone
-    // holding a copy of the URL cannot burn it from another browser.
-    if signed {
-        match saml::consume_message(&st.pool, &app.id, &request.id).await {
-            Ok(true) => {}
-            Ok(false) => return page(t, "This signed request has already been used."),
-            Err(e) => return internal(t, e),
+        Err(e) => {
+            tracing::error!(error = ?e, "ending a SAML session failed");
+            return html::logout_failed(t.map(|tenant| tenant.name.as_str()));
         }
-    }
-    let mut participants = match saml::take_participants(&st.pool, hash, &tenant.id).await {
-        Ok(p) => p,
-        Err(e) => return internal(t, e),
     };
-    if let Err(e) = session::end(&st.pool, headers, &tenant.id).await {
-        return internal(t, e);
-    }
-    audit::record(
-        st,
-        &tenant.id,
-        Actor::Id(&session.user_id),
-        Event::SessionEnd,
-        Some(&session.user_id),
-        serde_json::json!({ "via": Channel::SamlLogout.as_str(), "clientId": app.app_id }),
-    )
-    .await;
-    // The application that asked is answered last, not asked again.
-    participants.retain(|p| !matched.contains(&p.session_index));
-    // Asynchronous: nobody is answered, so the logout ends on our own page.
     let (initiator, in_response_to) = if request.asynchronous {
         (None, None)
     } else {
@@ -1074,7 +1107,7 @@ async fn logout_requested(
         partial: false,
         answer_by_post: posted,
     };
-    match advance(st, &tenant, participants, finish, &logout_browser(headers)).await {
+    match advance(st, &tenant, participants, finish, &logout_browser(headers), None).await {
         Ok(mut resp) => {
             clear_cookie_if_last(st, headers, &mut resp).await;
             resp
@@ -1129,19 +1162,21 @@ async fn logout_answered(st: &AppState, tenant_key: &str, headers: &HeaderMap, q
         _ => {}
     }
     let hash = sha256_hex(browser.as_bytes());
-    let mut state = match saml::take_logout_state(&st.pool, id, &tenant.id, &answering.id, &hash).await {
-        Ok(Some(state)) => state,
-        Ok(None) => {
+    match saml::record_logout_answer(&st.pool, id, &tenant.id, &answering.id, &hash, response.success).await {
+        Ok(true) => {}
+        Ok(false) => {
             return page(
                 t,
-                "The logout response does not answer a request sent to this application.",
+                "The logout response does not answer a pending request sent to this application.",
             );
         }
         Err(e) => return internal(t, e),
-    };
-    state.finish.partial |= !response.success;
-    match advance(st, &tenant, state.remaining, state.finish, &browser).await {
-        Ok(resp) => resp,
+    }
+    match saml::logout_state(&st.pool, id, &tenant.id, &hash).await {
+        // A request sent before upgrade already took this tab to the app,
+        // so this is the only IdP tab that can continue it.
+        Ok(Some(state)) if state.next_url.is_none() => continue_logout(st, &tenant, id, &browser, state).await,
+        Ok(_) => html::logout_answer_received(&tenant.name),
         Err(e) => internal(t, e),
     }
 }
@@ -1166,7 +1201,7 @@ pub(super) async fn logout_participants(
         partial: false,
         answer_by_post: false,
     };
-    match advance(st, tenant, participants, finish, &logout_browser(headers)).await {
+    match advance(st, tenant, participants, finish, &logout_browser(headers), None).await {
         Ok(resp) => Some(resp),
         Err(e) => {
             tracing::error!(error = ?e, "SAML logout failed");

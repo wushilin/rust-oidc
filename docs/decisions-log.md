@@ -2189,7 +2189,7 @@ Both depart from Entra; the owner chose them.
   MySQL widens its UTF-8 column and uses a digest
   for the tenant-wide unique index to stay within InnoDB's key limit. SQLite
   and Postgres already use TEXT. All three compare the full identifier.
-- **MySQL's 0027 makes the final change itself; there is no 0029.** 0027 is
+- **MySQL's 0027 makes the entity-ID change itself.** 0027 is
   applied on the deployed service, but only its SQLite file, which is unchanged.
   The MySQL file had never been released (it came with this change, unmerged)
   and no MySQL database had applied it, so it was rewritten rather than followed
@@ -2236,3 +2236,24 @@ Both depart from Entra; the owner chose them.
   sent `Cross-Origin-Resource-Policy: same-origin`: the session cookie is
   `SameSite=None`, so without it another site's page could tell from an `<img>`
   loading or not whether the visitor has a given application.
+
+
+### SQLite deployment and SAML logout after v0.7.0
+
+- On Unix, create a new SQLite database and any missing parent directories
+  privately. Keep existing permissions and document how operators can restrict
+  a deployed database, its WAL and shared-memory files, and its backups.
+- End the browser session and take its SAML participants in one storage
+  transaction. A verified SAML logout request is marked used in that commit.
+- Keep the IdP logout page in its own tab. The user opens each participant in
+  a new tab so the app gets a top-level visit and its normal cookies. The IdP
+  continues after an answer or 45 seconds, marking an unanswered hop partial.
+  It keeps state for ten minutes per hop and replaces each completed step and
+  its successor in one write transaction. Pre-upgrade requests can still
+  continue when their app answers.
+- At the eight-subject limit, refuse an additional subject rather than issuing
+  a transient NameID paired with another subject's SessionIndex. Preserve the
+  stored indices of existing matching subjects.
+- Migration 0029 adds logout continuation state and expiry indexes. Server
+  maintenance prunes in batches of 256 rows per table. It checks every 30
+  seconds when caught up and pauses briefly between batches during a backlog.

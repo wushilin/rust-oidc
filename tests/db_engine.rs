@@ -30,6 +30,61 @@ async fn a_sqlite_url_still_connects_and_migrates() {
     assert_eq!(rust_oidc::db::engine_of(&pool), Engine::Sqlite);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn sqlite_creates_private_database_and_sidecar_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("private directory");
+    let db = sub.join("store?.db");
+    let encoded = db.display().to_string().replace(' ', "%20").replace('?', "%3F");
+    let pool = rust_oidc::db::connect(&format!("sqlite://{encoded}")).await.unwrap();
+    assert_eq!(sub.metadata().unwrap().permissions().mode() & 0o077, 0);
+    for file in ["store?.db", "store?.db-wal", "store?.db-shm"] {
+        let mode = sub.join(file).metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{file} can be accessed by other accounts");
+    }
+    pool.close().await;
+    let absent = dir.path().join("absent.db");
+    assert!(
+        rust_oidc::db::connect(&format!("sqlite://{}?mode=rw", absent.display()))
+            .await
+            .is_err()
+    );
+    assert!(!absent.exists(), "mode=rw should require an existing file");
+}
+
+#[tokio::test]
+async fn saml_cleanup_prunes_expired_state_in_bounded_batches() {
+    let fixture = common::pool_for(Engine::Sqlite).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO tenants (id, name, created_at) VALUES ('t', 'Fixture', 1);
+         INSERT INTO applications (id, app_id, tenant_id, display_name, created_at)
+            VALUES ('a', 'client', 't', 'Fixture app', 1);
+         CREATE TEMP TABLE expiry_fixture (id TEXT, expires_at INTEGER);
+         WITH RECURSIVE seq(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM seq WHERE i < 258)
+         INSERT INTO expiry_fixture SELECT CAST(i AS TEXT), CASE WHEN i < 258 THEN 1 ELSE 3 END FROM seq;
+         INSERT INTO saml_session_participants (session_index, session_hash, tenant_id, application_id, user_id,
+                                                name_id, name_id_key, name_id_format, created_at, expires_at)
+         SELECT id, id, 't', 'a', 'u', id, id, 'urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified',
+                1, expires_at FROM expiry_fixture;
+         INSERT INTO saml_launch_tickets (ticket_hash, tenant_id, application_id, user_id, expires_at)
+            SELECT id, 't', 'a', 'u', expires_at FROM expiry_fixture;
+         INSERT INTO saml_seen_messages (application_id, message_id, expires_at)
+            SELECT 'a', id, expires_at FROM expiry_fixture;
+         INSERT INTO saml_logout_state (request_id, tenant_id, pending_app, browser_hash, remaining, finish, expires_at)
+            SELECT id, 't', 'a', 'b', '[]', '{}', expires_at FROM expiry_fixture;",
+    )
+    .execute(&*fixture)
+    .await
+    .unwrap();
+    assert_eq!(rust_oidc::saml::prune_expired(&*fixture, 2).await.unwrap(), 4 * 256);
+    assert_eq!(rust_oidc::saml::prune_expired(&*fixture, 2).await.unwrap(), 4);
+    assert_eq!(rust_oidc::saml::prune_expired(&*fixture, 2).await.unwrap(), 0);
+    assert_eq!(rust_oidc::saml::prune_expired(&*fixture, 3).await.unwrap(), 4);
+}
+
 /// The schema relies on ON DELETE CASCADE (a deleted tenant's role bindings must
 /// grant nothing). SQLite enforces it only with `PRAGMA foreign_keys = ON`, which
 /// `db::connect` sets on every connection; Postgres and MySQL always enforce it.

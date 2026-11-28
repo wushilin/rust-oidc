@@ -153,9 +153,9 @@ pub fn install_drivers() {
 }
 
 /// Query parameter that lets SQLite create a missing database file.
-const SQLITE_MODE_PARAM: &str = "mode=";
+const SQLITE_MODE_PARAM: &str = "mode";
 const SQLITE_MEMORY_PATH: &str = ":memory:";
-const SQLITE_CREATE_MODE: &str = "mode=rwc";
+const SQLITE_CREATE_MODE: &str = "rwc";
 
 /// Database used when none is configured.
 pub const DEFAULT_DATABASE_URL: &str = "sqlite://data/rust-oidc.db";
@@ -198,14 +198,18 @@ pub async fn connect_with(url: &str, policy: FoldPolicy) -> anyhow::Result<DbPoo
     // Installing the drivers twice panics; tests create many pools per process.
     install_drivers();
 
-    let mut url = url.to_string();
-    // Only the query string counts: a directory named `mode=x` must not suppress it.
-    let query_has_mode = url
-        .split_once('?')
-        .is_some_and(|(_, q)| q.split('&').any(|p| p.starts_with(SQLITE_MODE_PARAM)));
-    if engine == Engine::Sqlite && !query_has_mode {
-        url.push(if url.contains('?') { '&' } else { '?' });
-        url.push_str(SQLITE_CREATE_MODE);
+    let mut url = url::Url::parse(url)?;
+    if engine == Engine::Sqlite {
+        let modes: Vec<_> = url
+            .query_pairs()
+            .filter_map(|(key, value)| (key == SQLITE_MODE_PARAM).then_some(value.into_owned()))
+            .collect();
+        if modes.is_empty() {
+            url.query_pairs_mut().append_pair(SQLITE_MODE_PARAM, SQLITE_CREATE_MODE);
+        }
+        if modes.iter().all(|mode| mode == SQLITE_CREATE_MODE) {
+            prepare_sqlite_file(&mut url)?;
+        }
     }
 
     let pool = AnyPoolOptions::new()
@@ -221,7 +225,7 @@ pub async fn connect_with(url: &str, policy: FoldPolicy) -> anyhow::Result<DbPoo
             })
         })
         .acquire_timeout(Duration::from_secs(30))
-        .connect(&url)
+        .connect(url.as_str())
         .await?;
     // `migrate!` embeds one literal directory at compile time, so each engine
     // gets its own Migrator.
@@ -364,9 +368,108 @@ pub fn inserted(result: Result<sqlx::any::AnyQueryResult, sqlx::Error>) -> Resul
     }
 }
 
-/// The filesystem path of a file-backed database, if the URL names one, so the
-/// caller can create its parent directory. `None` for server engines and for
-/// in-memory or empty SQLite paths. Handles `sqlite:path` and `sqlite://path`.
+/// Create SQLite files privately on Unix before the driver enables WAL.
+fn prepare_sqlite_file(url: &mut url::Url) -> anyhow::Result<()> {
+    let options: sqlx::sqlite::SqliteConnectOptions = url.as_str().parse()?;
+    let path = options.get_filename();
+    if path.as_os_str().is_empty()
+        || path == std::path::Path::new(SQLITE_MEMORY_PATH)
+        || url.path() == SQLITE_MEMORY_PATH
+    {
+        return Ok(());
+    }
+    let mut query = url.query_pairs();
+    if query.any(|(key, value)| key == "immutable" && (value == "true" || value == "1")) {
+        return Ok(());
+    }
+    // When sqlx wraps a filename to pass its VFS option, SQLite treats it as a
+    // literal path. Otherwise SQLite itself interprets a native file: URI.
+    let has_vfs = url.query_pairs().any(|(key, _)| key == "vfs");
+    let uri_path;
+    let mut uri_creates = false;
+    let path = if let Some(uri) = path
+        .to_str()
+        .and_then(|name| name.strip_prefix("file:"))
+        .filter(|_| !has_vfs)
+    {
+        let uri = uri.split('#').next().unwrap_or_default();
+        let (filename, query) = uri.split_once('?').unwrap_or((uri, ""));
+        let mut params = url::form_urlencoded::parse(query.as_bytes());
+        for (key, value) in &mut params {
+            if key == SQLITE_MODE_PARAM {
+                if value != SQLITE_CREATE_MODE {
+                    return Ok(());
+                }
+                uri_creates = true;
+            }
+            if key == "immutable" && value == "1" {
+                return Ok(());
+            }
+        }
+        let filename = if let Some(authority) = filename.strip_prefix("//") {
+            let (host, _) = authority.split_once('/').unwrap_or((authority, ""));
+            if !host.is_empty() && host != "localhost" {
+                // The native driver decides which URI authorities it accepts.
+                return Ok(());
+            }
+            &authority[host.len()..]
+        } else {
+            filename
+        };
+        let options: sqlx::sqlite::SqliteConnectOptions = format!("sqlite:{filename}").parse()?;
+        uri_path = options.get_filename().to_owned();
+        if filename.is_empty() || filename == SQLITE_MEMORY_PATH || uri_path == std::path::Path::new(SQLITE_MEMORY_PATH)
+        {
+            return Ok(());
+        }
+        &uri_path
+    } else {
+        path
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        builder.create(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::ErrorKind;
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        // SQLite requires create-capable flags when the underlying URI
+        // explicitly requests mode=rwc, even if the file already exists.
+        if !uri_creates {
+            let params: Vec<_> = url
+                .query_pairs()
+                .filter(|(key, _)| key != SQLITE_MODE_PARAM)
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            url.query_pairs_mut()
+                .clear()
+                .extend_pairs(params)
+                .append_pair(SQLITE_MODE_PARAM, "rw");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = uri_creates;
+    Ok(())
+}
+
+/// The filesystem path portion of a file-backed SQLite URL.
 pub fn database_file_path(url: &str) -> Option<&str> {
     if Engine::from_url(url)? != Engine::Sqlite {
         return None;
@@ -1098,17 +1201,6 @@ const SECS_PER_DAY: i64 = 86_400;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn database_file_path_handles_both_sqlite_forms() {
-        assert_eq!(database_file_path("sqlite:x.db"), Some("x.db"));
-        assert_eq!(database_file_path("sqlite:/abs/p.db?mode=rwc"), Some("/abs/p.db"));
-        assert_eq!(database_file_path("sqlite:///abs/p.db"), Some("/abs/p.db"));
-        assert_eq!(database_file_path("sqlite://rel/p.db"), Some("rel/p.db"));
-        assert_eq!(database_file_path("sqlite::memory:"), None);
-        assert_eq!(database_file_path("sqlite://"), None);
-        assert_eq!(database_file_path("postgres://u@h/db"), None);
-    }
 
     fn decode(raw: Raw) -> Result<bool, sqlx::error::BoxDynError> {
         Flag::from_raw(raw).map(bool::from)

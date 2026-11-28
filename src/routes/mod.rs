@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/{tenant}/login", post(authorize::login))
         .route("/{tenant}/saml2", get(saml::endpoint).post(saml::endpoint))
+        .route("/{tenant}/saml2/logout/{request_id}", get(saml::logout_progress))
         .route(
             "/{tenant}/federationmetadata/2007-06/federationmetadata.xml",
             get(saml::metadata),

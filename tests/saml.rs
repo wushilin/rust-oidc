@@ -1003,6 +1003,26 @@ fn decoded_location(page: &Page, param: &str) -> Node {
     protocol::parse_xml(&protocol::decode_message(&encoded).unwrap()).unwrap()
 }
 
+fn logout_link(page: &Page, id: &str) -> String {
+    let marker = format!(r#"id="{id}" href=""#);
+    let link = page
+        .body
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing {id}: {}", page.body))
+        .1;
+    common::unescape(link.split_once('"').unwrap().0)
+}
+
+fn logout_step(page: &Page) -> (Node, String) {
+    assert_eq!(page.status, 200, "{}", page.body);
+    let app = url::Url::parse(&logout_link(page, "logout-application")).unwrap();
+    assert!(app.as_str().starts_with(LOGOUT));
+    let params: std::collections::HashMap<_, _> = app.query_pairs().collect();
+    assert!(params.contains_key("Signature"));
+    let request = protocol::parse_xml(&protocol::decode_message(&params["SAMLRequest"]).unwrap()).unwrap();
+    (request, logout_link(page, "logout-continue"))
+}
+
 #[tokio::test]
 async fn single_logout_tells_every_participant_then_answers_the_initiator() {
     let w = world().await;
@@ -1024,9 +1044,7 @@ async fn single_logout_tells_every_participant_then_answers_the_initiator() {
         u.to_string()
     };
     let told = b.get(&url).await;
-    assert_eq!(told.status, 302);
-    assert!(told.location.as_deref().unwrap().starts_with(LOGOUT));
-    let request = decoded_location(&told, "SAMLRequest");
+    let (request, resume) = logout_step(&told);
     assert_eq!(request.local, "LogoutRequest");
     let issued = request.attr("IssueInstant").unwrap();
     let not_after = request
@@ -1036,7 +1054,6 @@ async fn single_logout_tells_every_participant_then_answers_the_initiator() {
         not_after.ends_with('Z') && not_after > issued,
         "{issued} .. {not_after}"
     );
-    assert!(told.redirect_params().contains_key("Signature"));
     let id = request.attr("ID").unwrap().to_string();
 
     // A response from the wrong application does not advance it.
@@ -1053,10 +1070,12 @@ async fn single_logout_tells_every_participant_then_answers_the_initiator() {
         u.to_string()
     };
     let wrong = b.get(&send(answer(ENTITY))).await;
-    assert_ne!(wrong.status, 302, "{}", wrong.body);
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
 
-    // The application it went to answers: the chain goes on to the initiator.
-    let done = b.get(&send(answer(second_entity))).await;
+    // The application answers in its tab. The IdP tab goes on to the initiator.
+    let answered = b.get(&send(answer(second_entity))).await;
+    assert_eq!(answered.status, 200, "{}", answered.body);
+    let done = b.get(&resume).await;
     assert_eq!(done.status, 302, "{}", done.body);
     let response = decoded_location(&done, "SAMLResponse");
     assert_eq!(response.local, "LogoutResponse");
@@ -1065,7 +1084,105 @@ async fn single_logout_tells_every_participant_then_answers_the_initiator() {
 
     // An answer counts once.
     let replay = b.get(&send(answer(second_entity))).await;
-    assert_ne!(replay.status, 302, "{}", replay.body);
+    assert_eq!(replay.status, 400, "{}", replay.body);
+}
+
+#[tokio::test]
+async fn an_unresponsive_application_times_out_and_logout_continues() {
+    let w = world().await;
+    let others = [
+        ("second", "https://second.example/"),
+        ("third", "https://third.example/"),
+    ];
+    let (b, _) = signed_in(&w).await;
+    for (name, entity) in others {
+        saml_app(&w.s, &w.f, name, entity).await;
+        let request = authn_request("", "").replace(ENTITY, entity);
+        let signed_in = b.get(&redirect_url(&w.s, &w.f.tenant.id, &request, None)).await;
+        assert!(response_of(&signed_in).child(NS_ASSERTION, "Assertion").is_some());
+    }
+    let initial = b.get(&logout_url(&w, &logout_request(ENTITY))).await;
+    assert!(initial.body.contains(r#"target="_blank" rel="noopener noreferrer""#));
+    let (first, resume) = logout_step(&initial);
+    let first_id = first.attr("ID").unwrap();
+    let still_waiting = b.get(&resume).await;
+    assert_eq!(logout_step(&still_waiting).0.attr("ID"), Some(first_id));
+    assert_eq!(Browser::new().get(&resume).await.status, 400);
+
+    let (first_app,): (String,) = sqlx::query_as("SELECT pending_app FROM saml_logout_state WHERE request_id = ?")
+        .bind(first_id)
+        .fetch_one(&w.s.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE saml_logout_state SET resume_at = 0 WHERE request_id = ?")
+        .bind(first_id)
+        .execute(&w.s.pool)
+        .await
+        .unwrap();
+
+    let (second, next_resume) = logout_step(&b.get(&resume).await);
+    let second_id = second.attr("ID").unwrap();
+    assert_ne!(second_id, first_id);
+    let (second_app,): (String,) = sqlx::query_as("SELECT pending_app FROM saml_logout_state WHERE request_id = ?")
+        .bind(second_id)
+        .fetch_one(&w.s.pool)
+        .await
+        .unwrap();
+    assert_ne!(first_app, second_app);
+    let (issuer,): (String,) = sqlx::query_as("SELECT entity_id FROM app_saml_identifiers WHERE application_id = ?")
+        .bind(&second_app)
+        .fetch_one(&w.s.pool)
+        .await
+        .unwrap();
+    let answer = format!(
+        r#"<samlp:LogoutResponse xmlns:samlp="{NS_PROTOCOL}" xmlns:saml="{NS_ASSERTION}" ID="_answer" InResponseTo="{second_id}" Version="2.0" IssueInstant="2026-11-23T00:00:00Z"><saml:Issuer>{issuer}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status></samlp:LogoutResponse>"#,
+        protocol::STATUS_SUCCESS
+    );
+    let mut endpoint = url::Url::parse(&w.s.url(&format!("/{}/saml2", w.f.tenant.id))).unwrap();
+    endpoint
+        .query_pairs_mut()
+        .append_pair("SAMLResponse", &protocol::encode_redirect(&answer).unwrap());
+    assert_eq!(b.get(endpoint.as_str()).await.status, 200);
+    let done = b.get(&next_resume).await;
+    assert_eq!(done.status, 302, "{}", done.body);
+    assert_eq!(
+        status_codes(&decoded_location(&done, "SAMLResponse")),
+        vec![protocol::STATUS_RESPONDER, protocol::STATUS_PARTIAL_LOGOUT]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_session_delete_rolls_back_logout_on_both_routes() {
+    let w = world().await;
+    let (b, _) = signed_in(&w).await;
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_session_delete BEFORE DELETE ON sessions
+         BEGIN SELECT RAISE(ABORT, 'test: session delete failed'); END",
+    )
+    .execute(&w.s.pool)
+    .await
+    .unwrap();
+    let saml_url = logout_url(&w, &logout_request(ENTITY));
+    let oidc_url = w.s.url(&format!("/{}/oauth2/v2.0/logout", w.f.tenant.id));
+    for url in [&saml_url, &oidc_url] {
+        let failed = b.get(url).await;
+        assert_eq!(failed.status, 503, "{}", failed.body);
+        let (participants, sessions): (i64, i64) =
+            sqlx::query_as("SELECT (SELECT COUNT(*) FROM saml_session_participants), (SELECT COUNT(*) FROM sessions)")
+                .fetch_one(&w.s.pool)
+                .await
+                .unwrap();
+        assert_eq!((participants, sessions), (1, 1));
+    }
+    sqlx::raw_sql("DROP TRIGGER fail_session_delete")
+        .execute(&w.s.pool)
+        .await
+        .unwrap();
+    let done = b.get(&saml_url).await;
+    assert_eq!(
+        status_codes(&decoded_location(&done, "SAMLResponse")),
+        vec![protocol::STATUS_SUCCESS]
+    );
 }
 
 #[tokio::test]
@@ -1462,7 +1579,8 @@ async fn a_logout_answer_only_counts_in_the_browser_carrying_the_logout() {
     let to_second = authn_request("", "").replace(ENTITY, second);
     b.get(&redirect_url(&w.s, &w.f.tenant.id, &to_second, None)).await;
     let told = b.get(&logout_url(&w, &logout_request(ENTITY))).await;
-    let id = decoded_location(&told, "SAMLRequest").attr("ID").unwrap().to_string();
+    let (request, resume) = logout_step(&told);
+    let id = request.attr("ID").unwrap().to_string();
     let answer = format!(
         r#"<samlp:LogoutResponse xmlns:samlp="{NS_PROTOCOL}" xmlns:saml="{NS_ASSERTION}" ID="_a1" InResponseTo="{id}" Version="2.0" IssueInstant="2026-11-23T00:00:00Z"><saml:Issuer>{second}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status></samlp:LogoutResponse>"#,
         protocol::STATUS_RESPONDER
@@ -1472,7 +1590,7 @@ async fn a_logout_answer_only_counts_in_the_browser_carrying_the_logout() {
         .append_pair("SAMLResponse", &protocol::encode_redirect(&answer).unwrap());
     // Another browser cannot use it up.
     let stranger = Browser::new().get(u.as_str()).await;
-    assert_ne!(stranger.status, 302, "{}", stranger.body);
+    assert_eq!(stranger.status, 400, "{}", stranger.body);
     // Nor can one holding a logout cookie of its own.
     let other_logout = Browser::new()
         .http
@@ -1481,9 +1599,11 @@ async fn a_logout_answer_only_counts_in_the_browser_carrying_the_logout() {
         .send()
         .await
         .unwrap();
-    assert_ne!(other_logout.status().as_u16(), 302);
+    assert_eq!(other_logout.status().as_u16(), 400);
     // The right browser can, and a participant's failure is reported as partial.
-    let done = b.get(u.as_str()).await;
+    let answered = b.get(u.as_str()).await;
+    assert_eq!(answered.status, 200, "{}", answered.body);
+    let done = b.get(&resume).await;
     assert_eq!(done.status, 302, "{}", done.body);
     assert_eq!(
         status_codes(&decoded_location(&done, "SAMLResponse")),
@@ -1937,8 +2057,8 @@ async fn a_logout_answer_must_be_addressed_to_this_endpoint() {
     require_signed(&w, &cert_pem).await;
     // The second asks to log out, so the first is told and must answer.
     let told = b.get(&logout_url(&w, &logout_request(second))).await;
-    assert!(told.location.as_deref().unwrap().starts_with(LOGOUT), "{}", told.body);
-    let id = decoded_location(&told, "SAMLRequest").attr("ID").unwrap().to_string();
+    let (request, resume) = logout_step(&told);
+    let id = request.attr("ID").unwrap().to_string();
     let endpoint = w.s.url(&format!("/{}/saml2", w.f.tenant.id));
     let answer = |destination: &str| {
         let xml = format!(
@@ -1954,12 +2074,14 @@ async fn a_logout_answer_must_be_addressed_to_this_endpoint() {
     let elsewhere = b
         .get(&answer(r#" Destination="https://other-idp.example/saml2""#))
         .await;
-    assert_ne!(elsewhere.status, 302, "{}", elsewhere.body);
+    assert_eq!(elsewhere.status, 400, "{}", elsewhere.body);
     // Signed, but saying nowhere: a signed message must say where it goes.
     let nowhere = b.get(&answer("")).await;
-    assert_ne!(nowhere.status, 302, "{}", nowhere.body);
+    assert_eq!(nowhere.status, 400, "{}", nowhere.body);
     // Neither used up the waiting logout: the answer addressed here carries on.
-    let done = b.get(&answer(&format!(r#" Destination="{endpoint}""#))).await;
+    let answered = b.get(&answer(&format!(r#" Destination="{endpoint}""#))).await;
+    assert_eq!(answered.status, 200, "{}", answered.body);
+    let done = b.get(&resume).await;
     assert_eq!(done.status, 302, "{}", done.body);
     assert_eq!(
         status_codes(&decoded_location(&done, "SAMLResponse")),
@@ -2109,8 +2231,34 @@ async fn a_transient_request_does_not_replace_the_name_id_told_at_logout() {
     .await
     .unwrap();
     assert_eq!(both, 2, "the transient subject is recorded beside it");
-    for _ in 0..12 {
-        b.get(&redirect_url(&w.s, &w.f.tenant.id, &transient, None)).await;
+    for i in 0..12 {
+        let page = b.get(&redirect_url(&w.s, &w.f.tenant.id, &transient, None)).await;
+        let response = response_of(&page);
+        let assertion = response.child(NS_ASSERTION, "Assertion");
+        if i < 6 {
+            let assertion = assertion.unwrap();
+            let name_id = &assertion
+                .child(NS_ASSERTION, "Subject")
+                .unwrap()
+                .child(NS_ASSERTION, "NameID")
+                .unwrap()
+                .text;
+            let index = assertion
+                .child(NS_ASSERTION, "AuthnStatement")
+                .unwrap()
+                .attr("SessionIndex")
+                .unwrap();
+            let stored: (String,) =
+                sqlx::query_as("SELECT name_id FROM saml_session_participants WHERE session_index = ?")
+                    .bind(index)
+                    .fetch_one(&w.s.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(&stored.0, name_id);
+        } else {
+            assert!(assertion.is_none(), "an untracked subject must not be signed in");
+            assert_eq!(status_codes(&response), vec![protocol::STATUS_RESPONDER]);
+        }
     }
     let (n,): (i64,) = sqlx::query_as(rust_oidc::db::q(
         &w.s.pool,
@@ -2147,7 +2295,7 @@ async fn logout_still_tells_an_application_the_previous_user_signed_in_to() {
     let page = b.login(&page, "bob@contoso.com", &w.f.password).await;
     assert!(page.field("SAMLResponse").is_some(), "{}", page.body);
     let told = b.get(&logout_url(&w, &logout_request(second))).await;
-    let request = decoded_location(&told, "SAMLRequest");
+    let (request, _) = logout_step(&told);
     assert_eq!(request.child(NS_ASSERTION, "NameID").unwrap().text, w.f.upn);
 }
 
